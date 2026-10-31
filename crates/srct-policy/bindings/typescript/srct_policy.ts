@@ -62,6 +62,7 @@ export interface DelegationProofDoc {
 /** The Rust backend behind this binding. */
 export interface PolicyBackend {
   decide(
+    networkId: string,
     policyPortableJson: string,
     intentJson: string,
     approvalThresholdSat?: number | null,
@@ -77,7 +78,7 @@ export interface PolicyBackend {
  *
  * ```ts
  * const guard = new PolicyClient(new NodeHttpBackend("http://127.0.0.1:8080"));
- * const decision = await guard.decide(portablePolicyJson, intent, 100);
+ * const decision = await guard.decide("srct/testnet", portablePolicyJson, intent, 100);
  * ```
  */
 export class NodeHttpBackend implements PolicyBackend {
@@ -98,10 +99,16 @@ export class NodeHttpBackend implements PolicyBackend {
   }
 
   async decide(
+    networkId: string,
     policyPortableJson: string,
     intentJson: string,
     approvalThresholdSat?: number | null,
   ): Promise<string> {
+    // The node frames the intent in its own network and height, so the
+    // caller's networkId never travels: it exists so direct-Rust backends
+    // and this backend share one call shape, and the rail cannot forget
+    // to name itself.
+    void networkId;
     const intent = JSON.parse(intentJson) as PaymentIntent;
     const doc = await this.post("/v1/policy/decide", {
       policy_portable_json: policyPortableJson,
@@ -185,11 +192,13 @@ export class PolicyClient {
   constructor(private readonly backend: PolicyBackend) {}
 
   async decide(
+    networkId: string,
     policyPortableJson: string,
     intent: PaymentIntent,
     approvalThresholdSat?: number | null,
   ): Promise<PolicyDecision> {
     const out = await this.backend.decide(
+      networkId,
       policyPortableJson,
       encodeIntent(intent),
       approvalThresholdSat ?? null,

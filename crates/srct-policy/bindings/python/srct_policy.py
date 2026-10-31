@@ -15,7 +15,7 @@ Quick start against a local node::
     from srct_policy import NodeHttpBackend, PaymentIntent, PolicyClient
 
     guard = PolicyClient.for_node("http://127.0.0.1:8080")
-    decision = guard.decide(portable_policy_json, PaymentIntent(...), 100)
+    decision = guard.decide("srct/testnet", portable_policy_json, PaymentIntent(...), 100)
 """
 
 from __future__ import annotations
@@ -97,13 +97,18 @@ def parse_delegation_proof(raw: str) -> dict:
 class PolicyClient:
     """The agent wallet guard: allow, deny, or approval-needed, via a backend.
 
-    ``decide`` is any callable ``(policy_json, intent_json, threshold) -> str``
-    backed by the Rust engine (FFI, subprocess, or node HTTP).
+    ``decide`` is any callable
+    ``(network_id, policy_json, intent_json, threshold) -> str`` backed by the
+    Rust engine (FFI, subprocess, or node HTTP). ``network_id`` is the rail
+    asking the question — the caller's own network, never a field copied from
+    agent-supplied JSON. The node backend ignores it on the wire (the node
+    frames the intent in its own network) but still requires it so a direct
+    Rust backend and the node backend share one call shape.
     """
 
     def __init__(
         self,
-        decide: Callable[[str, str, Optional[int]], str],
+        decide: Callable[[str, str, str, Optional[int]], str],
         verify_proof: Optional[Callable[[str], str]] = None,
         verify_audit: Optional[Callable[[str], int]] = None,
     ) -> None:
@@ -119,11 +124,14 @@ class PolicyClient:
 
     def decide(
         self,
+        network_id: str,
         policy_portable_json: str,
         intent: PaymentIntent,
         approval_threshold_sat: Optional[int] = None,
     ) -> PolicyDecision:
-        out = self._decide(policy_portable_json, intent.to_json(), approval_threshold_sat)
+        out = self._decide(
+            network_id, policy_portable_json, intent.to_json(), approval_threshold_sat
+        )
         return PolicyDecision.parse(out)
 
     def verify_proof(self, proof_json: str) -> str:
@@ -175,10 +183,16 @@ class NodeHttpBackend:
 
     def decide(
         self,
+        network_id: str,
         policy_portable_json: str,
         intent_json: str,
         approval_threshold_sat: Optional[int] = None,
     ) -> str:
+        # The node frames the intent in its own network and height, so the
+        # caller's network_id never travels: it exists so direct-Rust backends
+        # and this backend share one call shape, and the rail cannot forget
+        # to name itself.
+        _ = network_id
         intent = json.loads(intent_json)
         doc = self._post(
             "/v1/policy/decide",

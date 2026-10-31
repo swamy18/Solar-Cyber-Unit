@@ -93,6 +93,9 @@ def decide_live(args: argparse.Namespace) -> int:
     # Structural read first (routing without trusting); the node verifies.
     parse_portable_policy(policy_json)
     client = PolicyClient.for_node(args.node)
+    # Rail identity for the call shape; the node backend ignores it on the
+    # wire and frames the intent in its own network.
+    rail_network = "srct/mini"
     intent = PaymentIntent(
         agent_id=args.agent_id,
         recipient=args.recipient,
@@ -100,10 +103,10 @@ def decide_live(args: argparse.Namespace) -> int:
         service=args.service,
         height=0,  # the node decides at its own height
         nonce=0,  # decide commits nothing, so no nonce is consumed
-        network_id="",  # the node frames the intent in its own network
+        network_id=rail_network,
     )
     try:
-        decision = client.decide(policy_json, intent, args.threshold_sat)
+        decision = client.decide(rail_network, policy_json, intent, args.threshold_sat)
     except RuntimeError as e:
         print(f"node refused: {e}")
         return 1
