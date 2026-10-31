@@ -14,6 +14,7 @@ and redistribute.
 ## Contents
 
 - [What this is](#what-this-is)
+- [The four pieces](#the-four-pieces)
 - [Why a new coin](#why-a-new-coin)
 - [Glossary](#glossary)
 - [Honest limits](#honest-limits)
@@ -62,6 +63,70 @@ hash binding both into the value that must fall below the target. Capped
 share (30–50% of modelled work) and no floating point anywhere keep the
 neural stage a cost model rather than a liability. Full detail:
 [Mining](#mining).
+
+---
+
+## The four pieces
+
+SRCT is one coin doing four jobs. Each job is a separate layer — you can
+use one without the others — but they settle in the same coin.
+
+### 1. Native cryptocurrency
+
+SRCT itself is an ordinary mined coin on a UTXO chain (Layer 1). Wallets,
+transfers, blocks and P2P work like any Bitcoin-shaped chain: 1 SRCT =
+100,000,000 sats, integer-only accounting, no floats anywhere. New coins
+come only from mining (`hybrid-v1` proof of work); genesis minted nothing,
+so the premine is 0%. There is no stock cap — a halving ladder issues
+39,157,124 SRCT, then a small tail emission pays miners forever. Every
+block's base fee splits 50/50 into a burn and the on-chain PSCB reserve,
+so usage removes supply from the spendable set. Full detail:
+[Supply](#supply), [Mining](#mining).
+
+### 2. AI agent authorization
+
+An owner writes a spending policy once — per-transaction cap, tumbling
+window cap, named recipients, named services, validity heights, a strictly
+increasing nonce — and signs it offline. From then on every spend by that
+agent is checked against the policy at admission, the same way the chain
+refuses a double-spend: a violating payment never enters a block, even
+with the owner offline. A signed policy travels as a portable grant any
+rail can verify without a node, delegations chain root-first with a
+narrowing rule, and short-lived grants bind one exact transaction with a
+30-block lifetime. The `srct-policy` crate (plus `POST /v1/policy/decide`
+and the TypeScript/Python bindings) answers allow / deny /
+approval-needed identically on every rail. Full detail:
+[Machines and agents](#machines-and-agents),
+[`docs/portable-policy.md`](docs/portable-policy.md).
+
+### 3. Machine payments
+
+Per-call billing without a transaction per call. Agents pay over the x402
+challenge/response shape (`402 Payment Required` → `PAYMENT-SIGNATURE` →
+`200` with receipt), batched quotes merge N payments into one transaction,
+stream channels settle a whole usage window once, and sponsors can cover
+fees without minting authority. None of this changes consensus — every
+primitive reuses ordinary `MachinePayment`s under a spend policy — and the
+wallet around them is gated by construction: session budgets, enforced
+high-value human approval, idempotency, receipts with reconciliation, and
+a hash-chained audit log. Full detail:
+[Agent payments (x402)](#agent-payments-x402),
+[Micro-payments and wallet safety](#micro-payments-and-wallet-safety).
+
+### 4. Verifiable task economy
+
+Layer 2 is where compute gets paid for without trusting either side. A
+submitter locks escrow for a described task, a worker claims it and submits
+a result hash, anyone may challenge with a counter-result, and a committee
+settles: correct work is paid, fakes are slashed (half burned, half vested),
+the challenger earns a bounty. Fraud is decided by a canonical CPU
+reference over the task's own committed fields — nobody can dictate the
+verdict, and an inconclusive arbitration settles nothing. Settled work
+yields a verified-work certificate, and value exits back to Layer 1 through
+a queue, maturity and a permissionless crank. Full detail:
+[What the chain is for](#what-the-chain-is-for),
+[How fraud is detected](#how-fraud-is-detected),
+[How withdrawals work](#how-withdrawals-work).
 
 ---
 
