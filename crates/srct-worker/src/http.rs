@@ -238,6 +238,57 @@ fn exchange(
     path: &str,
     body: Option<&str>,
 ) -> Result<Vec<u8>, Transport> {
+    exchange_full(
+        endpoint,
+        connect_timeout,
+        read_timeout,
+        max_response_bytes,
+        method,
+        path,
+        body,
+        &[],
+    )
+    .and_then(|(code, _, done)| {
+        if (200..300).contains(&code) {
+            return Ok(done);
+        }
+        let detail = String::from_utf8_lossy(&done);
+        let detail = serde_json::from_slice::<Value>(&done)
+            .ok()
+            .and_then(|v| {
+                v.get("detail")
+                    .or_else(|| v.get("error"))
+                    .map(|d| d.to_string())
+            })
+            .unwrap_or_else(|| truncate(&detail, 200));
+        Err(Transport::Status { code, detail })
+    })
+}
+
+/// The same exchange, but with caller-supplied request headers and the full
+/// response: status code, response headers as `(name, value)` pairs, and the
+/// body. Non-2xx is returned, not refused — the x402 challenge *is* a 402.
+/// `exchange` above is this function with the historical 2xx-only contract, so
+/// every existing call site keeps its exact behaviour.
+/// A full HTTP response: status code, response headers as `(name, value)`
+/// pairs, and the body. Used by the x402 paid path, where the challenge *is*
+/// a non-2xx and headers carry the protocol.
+pub type FullResponse = (u16, Vec<(String, String)>, Vec<u8>);
+
+/// Same knobs as [`exchange`], plus caller headers — kept as one function
+/// rather than a new transport so the framing, caps and error taxonomy stay
+/// in exactly one place.
+#[allow(clippy::too_many_arguments)]
+fn exchange_full(
+    endpoint: &Endpoint,
+    connect_timeout: Duration,
+    read_timeout: Duration,
+    max_response_bytes: usize,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+    extra_headers: &[(String, String)],
+) -> Result<FullResponse, Transport> {
     let addrs = (endpoint.host.as_str(), endpoint.port)
         .to_socket_addrs()
         .map_err(|_| Transport::Unreachable("node address does not resolve"))?
@@ -264,6 +315,21 @@ fn exchange(
         "{method} {target} HTTP/1.1\r\nHost: {}:{}\r\nConnection: close\r\nAccept: application/json\r\n",
         endpoint.host, endpoint.port
     );
+    for (name, value) in extra_headers {
+        if name.len() > 128 || value.len() > 16 * 1024 {
+            return Err(Transport::Malformed("request header over cap"));
+        }
+        if !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+            return Err(Transport::Malformed("request header name is not a token"));
+        }
+        if value.bytes().any(|b| b == b'\r' || b == b'\n') {
+            return Err(Transport::Malformed("request header value splits lines"));
+        }
+        req.push_str(name);
+        req.push_str(": ");
+        req.push_str(value);
+        req.push_str("\r\n");
+    }
     if let Some(b) = body {
         req.push_str("Content-Type: application/json\r\n");
         req.push_str(&format!("Content-Length: {}\r\n", b.len()));
@@ -381,19 +447,21 @@ fn exchange(
         return Err(Transport::Malformed("response body over cap"));
     }
 
-    if (200..300).contains(&code) {
-        return Ok(done);
+    let mut headers_out: Vec<(String, String)> = Vec::new();
+    for line in header_block.lines() {
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() {
+            continue;
+        }
+        let Some((name, value)) = line.split_once(':') else {
+            return Err(Transport::Malformed("response header has no colon"));
+        };
+        if headers_out.len() >= 64 {
+            return Err(Transport::Malformed("too many response headers"));
+        }
+        headers_out.push((name.trim().to_string(), value.trim().to_string()));
     }
-    let detail = String::from_utf8_lossy(&done);
-    let detail = serde_json::from_slice::<Value>(&done)
-        .ok()
-        .and_then(|v| {
-            v.get("detail")
-                .or_else(|| v.get("error"))
-                .map(|d| d.to_string())
-        })
-        .unwrap_or_else(|| truncate(&detail, 200));
-    Err(Transport::Status { code, detail })
+    Ok((code, headers_out, done))
 }
 
 fn head_line_len(head: &str) -> usize {
@@ -596,7 +664,9 @@ impl HttpNode {
             ))
     }
 
-    fn get_json(&self, path: &str) -> WorkerResult<Value> {
+    /// Fetch and decode the node's JSON object at `path`. The paid-resource,
+    /// stream and policy reads share this seam rather than each growing one.
+    pub fn get_json(&self, path: &str) -> WorkerResult<Value> {
         let body = self.request("GET", path, None)?;
         let value: Value = serde_json::from_slice(&body)
             .map_err(|_| WorkerError::ObservationMalformed("response is not JSON"))?;
@@ -717,6 +787,144 @@ impl HttpNode {
     /// (`payment_hex` carries the canonical `MachinePayment` bytes).
     pub fn payment(&self, payment_id: &Hash) -> WorkerResult<Value> {
         self.get_json(&format!("/v1/payment/{}", hex::encode(payment_id)))
+    }
+
+    /// Raw exchange with caller headers and the full response: status code,
+    /// response headers, body. The x402 challenge *is* a non-2xx, so the paid
+    /// path cannot use the 2xx-only `request` above.
+    pub fn get_full(
+        &self,
+        path: &str,
+        extra_headers: &[(String, String)],
+    ) -> WorkerResult<FullResponse> {
+        exchange_full(
+            &self.endpoint,
+            self.connect_timeout,
+            self.read_timeout,
+            self.max_response_bytes,
+            "GET",
+            path,
+            None,
+            extra_headers,
+        )
+        .map_err(|e| e.into_observation())
+    }
+
+    /// The chain's nonce counter for one agent's live grant, or `None` when the
+    /// agent has no published grant. The next spend must use exactly one more —
+    /// anything else is refused at admission, so a client that guesses instead
+    /// of reading burns a broadcast.
+    pub fn policy_last_nonce(&self, agent_id: &[u8; 20]) -> WorkerResult<Option<u64>> {
+        let path = format!("/v1/policies/{}", hex::encode(agent_id));
+        let Some(body) = self
+            .raw("GET", &path, None)
+            .map_err(|e| e.into_observation())?
+        else {
+            return Ok(None);
+        };
+        let value: Value = serde_json::from_slice(&body)
+            .map_err(|_| WorkerError::ObservationMalformed("policy response is not JSON"))?;
+        value
+            .get("last_nonce")
+            .and_then(Value::as_u64)
+            .map(Some)
+            .ok_or(WorkerError::ObservationMalformed(
+                "policy response has no last_nonce",
+            ))
+    }
+
+    /// POST a JSON body and decode the JSON object answer. Used by the
+    /// micro-payment helpers (batch quotes, stream open/settle), which are
+    /// read/admission calls rather than observations or broadcasts.
+    pub fn post_json(
+        &self,
+        path: &str,
+        body: &serde_json::Value,
+    ) -> WorkerResult<serde_json::Value> {
+        let raw = exchange(
+            &self.endpoint,
+            self.connect_timeout,
+            self.read_timeout,
+            self.max_response_bytes,
+            "POST",
+            path,
+            Some(&body.to_string()),
+        )
+        .map_err(|e| e.into_observation())?;
+        let value: serde_json::Value = serde_json::from_slice(&raw)
+            .map_err(|_| WorkerError::ObservationMalformed("response is not JSON"))?;
+        if !value.is_object() {
+            return Err(WorkerError::ObservationMalformed(
+                "response is not a JSON object",
+            ));
+        }
+        Ok(value)
+    }
+
+    /// POST a JSON body and return the status with the body, without deciding
+    /// success: a refusal carries the server's named reason (`error` +
+    /// `detail`), and the verb — not the transport — decides what a status
+    /// means. Without this the node names the cause and the CLI swallows it.
+    pub fn post_full(
+        &self,
+        path: &str,
+        body: &serde_json::Value,
+    ) -> WorkerResult<(u16, serde_json::Value)> {
+        let (code, _, done) = exchange_full(
+            &self.endpoint,
+            self.connect_timeout,
+            self.read_timeout,
+            self.max_response_bytes,
+            "POST",
+            path,
+            Some(&body.to_string()),
+            &[],
+        )
+        .map_err(|e| e.into_observation())?;
+        if done.is_empty() {
+            return Ok((code, serde_json::Value::Null));
+        }
+        let value: serde_json::Value = serde_json::from_slice(&done)
+            .map_err(|_| WorkerError::ObservationMalformed("response is not JSON"))?;
+        Ok((code, value))
+    }
+
+    /// GET and return the status with the decoded body. Like [`Self::post_full`]:
+    /// the caller decides what the status means; the node names its refusals.
+    pub fn get_full_json(&self, path: &str) -> WorkerResult<(u16, serde_json::Value)> {
+        let (code, _, done) = exchange_full(
+            &self.endpoint,
+            self.connect_timeout,
+            self.read_timeout,
+            self.max_response_bytes,
+            "GET",
+            path,
+            None,
+            &[],
+        )
+        .map_err(|e| e.into_observation())?;
+        if done.is_empty() {
+            return Ok((code, serde_json::Value::Null));
+        }
+        let value: serde_json::Value = serde_json::from_slice(&done)
+            .map_err(|_| WorkerError::ObservationMalformed("response is not JSON"))?;
+        Ok((code, value))
+    }
+
+    /// The server's own refusal (`error: detail`), when it bothered to name
+    /// one. Callers print this rather than a generic transport line so the
+    /// operator sees the node's reason, not the SDK's paraphrase.
+    pub fn refusal_detail(body: &serde_json::Value) -> Option<String> {
+        let error = body.get("error")?.as_str()?;
+        let detail = body
+            .get("detail")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        Some(if detail.is_empty() {
+            error.to_string()
+        } else {
+            format!("{error}: {detail}")
+        })
     }
 
     /// The node's live conservation report (joint L1 + L2 − sink supply vs

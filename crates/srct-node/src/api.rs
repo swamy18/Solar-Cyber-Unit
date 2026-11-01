@@ -96,6 +96,10 @@
 //! GET /v1/lending/collateral/{p} live collateral vs debt valuation
 //! POST /v1/lending/autorepay  register standing auto-repay instruction
 //! GET /v1/lending/autorepay/{b} the live instruction, if any
+//! POST /v1/trials/request     record a sponsored first task (usage-based credit)
+//! POST /v1/trials/fund        confirm the sponsor's L1 payment to the agent
+//! GET /v1/trials/{agent}      trial record + state
+//! POST /v1/trials/repay       confirm the agent's L1 repayment to the sponsor
 //! GET  /v1/exit/crankable      the exit claims this node could settle now
 //! POST /v1/escrow/open         open a conditional escrow with a chosen arbitrator
 //! POST /v1/escrow/{id}/release arbiter- or mutual-release a live escrow (non-consensus)
@@ -206,7 +210,7 @@ const MAX_BODY_BYTES: usize = 5 * 1024 * 1024;
 /// refused instead of merged. Books are network-scoped (payment networks,
 /// policy scopes, job ids), so loading `srct/mini` books onto `srct/mainnet`
 /// would mix scopes that must never meet.
-const STATE_ENVELOPE_VERSION: u8 = 8;
+const STATE_ENVELOPE_VERSION: u8 = 9;
 
 /// Largest entry count any single map section in the state envelope may
 /// declare, checked before allocation. Real books are bounded by their own
@@ -354,6 +358,61 @@ pub struct EscrowExitBinding {
     pub nonce: u64,
 }
 
+/// One usage-based-credit trial: a first task funded by a sponsor, not by the
+/// agent. The sponsor's coins are real (an ordinary L1 payment the node itself
+/// verifies), so every trial is real SRCT consumption. The node never signs
+/// anything here: it records intents and verifies receipts against its own
+/// chain. One trial per agent, ever — a second request for a funded or repaid
+/// agent is refused by name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrialState {
+    /// Recorded, awaiting the sponsor's payment.
+    Requested,
+    /// A confirmed L1 payment to the agent covers the trial amount.
+    Funded,
+    /// A confirmed L1 payment back to the sponsor covers it.
+    Repaid,
+}
+
+impl TrialState {
+    fn as_u8(self) -> u8 {
+        match self {
+            TrialState::Requested => 0,
+            TrialState::Funded => 1,
+            TrialState::Repaid => 2,
+        }
+    }
+
+    fn from_u8(b: u8) -> Option<Self> {
+        match b {
+            0 => Some(TrialState::Requested),
+            1 => Some(TrialState::Funded),
+            2 => Some(TrialState::Repaid),
+            _ => None,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            TrialState::Requested => "requested",
+            TrialState::Funded => "funded",
+            TrialState::Repaid => "repaid",
+        }
+    }
+}
+
+/// The trial book entry for one agent identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrialRecord {
+    pub agent: Address,
+    pub amount_sat: u64,
+    pub sponsor: Address,
+    pub state: TrialState,
+    pub fund_txid: Option<Hash512>,
+    pub repay_txid: Option<Hash512>,
+    pub requested_height: u64,
+}
+
 /// Everything the API and the serve loop share. One lock: the serve loop
 /// takes it per iteration, handlers take it per request. No handler ever
 /// holds it across an await (handlers do not await), so the async runtime
@@ -472,6 +531,10 @@ pub struct SharedNode {
             srct_core::sig::Bundle,
         ),
     >,
+    /// Usage-based-credit trials by agent: one sponsored first task per agent.
+    /// Node-local like jobs and ramps (never consensus, never committed); the
+    /// money itself moves through ordinary L1 payments the node verifies.
+    pub trials: BTreeMap<Address, TrialRecord>,
     /// Bounded in-memory audit ring (hash-chained, tamper-evident). The full
     /// history lives in the payment/receipt stores this ring references;
     /// intentionally not persisted, so a restart starts a fresh chain.
@@ -538,6 +601,7 @@ impl SharedNode {
             ramp_intents: BTreeMap::new(),
             loan_offers: BTreeMap::new(),
             standing_repay: BTreeMap::new(),
+            trials: BTreeMap::new(),
             audit: srct_core::safety::AuditLog::default(),
             escrows: BTreeMap::new(),
             escrow_exit: BTreeMap::new(),
@@ -779,6 +843,33 @@ impl SharedNode {
             put_bundle(&mut standing, keys);
         }
         put_section(&mut w, &standing.into_vec());
+        // Usage-based-credit trials (v9): one sponsored first task per agent.
+        // agent -> amount + sponsor + state + optional fund/repay txids.
+        let mut trials = Writer::with_capacity(4 + self.trials.len() * 160);
+        trials.u32le(self.trials.len() as u32);
+        for (agent, t) in self.trials.iter() {
+            trials.fixed(agent);
+            trials.u64le(t.amount_sat).fixed(&t.sponsor);
+            trials.u8(t.state.as_u8());
+            match t.fund_txid {
+                Some(h) => {
+                    trials.u8(1).fixed(&h);
+                }
+                None => {
+                    trials.u8(0);
+                }
+            }
+            match t.repay_txid {
+                Some(h) => {
+                    trials.u8(1).fixed(&h);
+                }
+                None => {
+                    trials.u8(0);
+                }
+            }
+            trials.u64le(t.requested_height);
+        }
+        put_section(&mut w, &trials.into_vec());
         w.into_vec()
     }
 
@@ -1343,6 +1434,62 @@ impl SharedNode {
             }
             Ok(map)
         })?;
+        let trials = decode_section(&mut r, "trials", |sr| {
+            let count = sr.u32le().map_err(|e| format!("trials: {e}"))? as usize;
+            if count > MAX_STATE_ENTRIES {
+                return Err(format!(
+                    "trials: {count} entries over the {MAX_STATE_ENTRIES} cap"
+                ));
+            }
+            let mut map = BTreeMap::new();
+            for _ in 0..count {
+                let agent: Address = sr.fixed().map_err(|e| format!("trials: {e}"))?;
+                let amount_sat = sr.u64le().map_err(|e| format!("trials: {e}"))?;
+                let sponsor: Address = sr.fixed().map_err(|e| format!("trials: {e}"))?;
+                let state = TrialState::from_u8(sr.u8().map_err(|e| format!("trials: {e}"))?)
+                    .ok_or("trials: unknown state")?;
+                let fund_txid = match sr.u8().map_err(|e| format!("trials: {e}"))? {
+                    0 => None,
+                    1 => Some(sr.fixed().map_err(|e| format!("trials: {e}"))?),
+                    _ => return Err("trials: bad fund flag".into()),
+                };
+                let repay_txid = match sr.u8().map_err(|e| format!("trials: {e}"))? {
+                    0 => None,
+                    1 => Some(sr.fixed().map_err(|e| format!("trials: {e}"))?),
+                    _ => return Err("trials: bad repay flag".into()),
+                };
+                let requested_height = sr.u64le().map_err(|e| format!("trials: {e}"))?;
+                // A funded trial without its funding proof, or a repaid trial
+                // without its repayment proof, is a half-written record: refuse
+                // the file rather than trusting a bare flag.
+                if (state == TrialState::Funded || state == TrialState::Repaid)
+                    && fund_txid.is_none()
+                {
+                    return Err("trials: funded without fund txid".into());
+                }
+                if state == TrialState::Repaid && repay_txid.is_none() {
+                    return Err("trials: repaid without repay txid".into());
+                }
+                if map
+                    .insert(
+                        agent,
+                        TrialRecord {
+                            agent,
+                            amount_sat,
+                            sponsor,
+                            state,
+                            fund_txid,
+                            repay_txid,
+                            requested_height,
+                        },
+                    )
+                    .is_some()
+                {
+                    return Err("trials: duplicate agent".into());
+                }
+            }
+            Ok(map)
+        })?;
         // Anything after the last section means the envelope is malformed.
         r.expect_end().map_err(|e| format!("state envelope: {e}"))?;
 
@@ -1370,6 +1517,7 @@ impl SharedNode {
         self.ramp_intents = ramp_intents;
         self.loan_offers = loan_offers;
         self.standing_repay = standing_repay;
+        self.trials = trials;
         Ok(())
     }
 
@@ -7968,6 +8116,343 @@ async fn lending_autorepay_get(
 }
 
 // ---------------------------------------------------------------------------
+// Usage-based credits: the trial faucet (service layer, never consensus)
+// ---------------------------------------------------------------------------
+// A new agent with no coins cannot post the claim deposit a task requires, so
+// its first task is unfundable — and an on-chain loan cannot help either,
+// because collateral must be the borrower's own money. The trial faucet closes
+// that gap without touching consensus: an operator-funded sponsor drips one
+// fixed amount to the agent over ordinary L1 rails, the node verifies the
+// receipt against its own chain, and the agent repays the same way later.
+// Every trial is real SRCT the sponsor spent; the node only records and
+// verifies, it never signs and never mints. One trial per agent, ever.
+
+/// Trial drip in satoshis (`SRCT_TRIAL_AMOUNT_SAT`). The default is the L2
+/// deposit floor: a trial must at least clear one minimum sink output, or the
+/// agent cannot move the drip onto Layer 2 at all.
+const TRIAL_DEFAULT_AMOUNT_SAT: u64 = 1_000_000;
+/// Cap on unpaid trial money at once (`SRCT_TRIAL_MAX_OUTSTANDING_SAT`): the
+/// sponsor's live exposure across requested-but-unrepaid trials.
+const TRIAL_DEFAULT_MAX_OUTSTANDING_SAT: u64 = 10_000_000;
+
+/// The trial sponsor (`SRCT_TRIAL_SPONSOR`, hex address). Unset means trials
+/// are closed: with no sponsor there is no money behind a trial, so every
+/// request is refused rather than recorded against nothing.
+fn trial_sponsor() -> Option<Address> {
+    let raw = std::env::var("SRCT_TRIAL_SPONSOR").unwrap_or_default();
+    decode_address(&raw).ok()
+}
+
+fn trial_amount_sat() -> u64 {
+    std::env::var("SRCT_TRIAL_AMOUNT_SAT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(TRIAL_DEFAULT_AMOUNT_SAT)
+}
+
+fn trial_max_outstanding_sat() -> u64 {
+    std::env::var("SRCT_TRIAL_MAX_OUTSTANDING_SAT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(TRIAL_DEFAULT_MAX_OUTSTANDING_SAT)
+}
+
+/// Sponsor exposure right now: trials recorded but not yet repaid.
+fn trial_outstanding(trials: &BTreeMap<Address, TrialRecord>) -> u64 {
+    trials
+        .values()
+        .filter(|t| t.state != TrialState::Repaid)
+        .map(|t| t.amount_sat)
+        .fold(0u64, u64::saturating_add)
+}
+
+fn trial_json(t: &TrialRecord) -> Value {
+    json!({
+        "agent": address_to_hex(&t.agent),
+        "amount_sat": t.amount_sat,
+        "sponsor": address_to_hex(&t.sponsor),
+        "state": t.state.name(),
+        "fund_txid": t.fund_txid.map(|h| hash512_to_hex(&h)),
+        "repay_txid": t.repay_txid.map(|h| hash512_to_hex(&h)),
+        "requested_height": t.requested_height,
+    })
+}
+
+/// A confirmed L1 payment of at least `amount_sat` to `to`, by txid. The scan
+/// is the same canonical O(tip) walk `tx_lookup` pays for a node with no tx
+/// index. Only confirmed blocks count: a trial funded by a mempool payment
+/// could vanish on a reorg and leave the books claiming money moved.
+fn confirmed_payment_to(
+    chain: &srct_core::chain::Chain,
+    txid: &Hash512,
+    to: &Address,
+    amount_sat: u64,
+) -> bool {
+    for height in 1..=chain.height() {
+        let Some(block) = chain.block_at(height) else {
+            continue;
+        };
+        for tx in &block.txs {
+            if &tx.txid() != txid {
+                continue;
+            }
+            let mut paid = 0u64;
+            for out in &tx.outputs {
+                if &out.address == to {
+                    paid = paid.saturating_add(out.value);
+                }
+            }
+            if paid >= amount_sat {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// A txid is single-use across the whole trial book: one L1 payment funds or
+/// repays at most one trial, so a receipt can never be double-counted.
+fn trial_txid_used(
+    trials: &BTreeMap<Address, TrialRecord>,
+    except: Option<&Address>,
+    txid: &Hash512,
+) -> bool {
+    trials.iter().any(|(agent, t)| {
+        Some(agent) != except
+            && (t.fund_txid.as_ref() == Some(txid) || t.repay_txid.as_ref() == Some(txid))
+    })
+}
+
+#[derive(Deserialize)]
+struct TrialAgentReq {
+    agent_hex: String,
+}
+
+#[derive(Deserialize)]
+struct TrialTxReq {
+    agent_hex: String,
+    txid_hex: String,
+}
+
+/// `POST /v1/trials/request` — record a sponsored first task. No coin moves
+/// here: the record is the sponsor's promise of a drip, and the drip itself
+/// is an ordinary L1 payment the operator (or their sponsor script) makes out
+/// of band, confirmed by `POST /v1/trials/fund`.
+async fn trial_request(State(state): State<ApiState>, Json(req): Json<TrialAgentReq>) -> ApiResult {
+    let agent = decode_address(&req.agent_hex)?;
+    with_shared(&state, |sh| {
+        let sponsor = trial_sponsor().ok_or_else(|| {
+            fail(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "trials_disabled",
+                "no trial sponsor is configured; set SRCT_TRIAL_SPONSOR",
+            )
+        })?;
+        if sh.trials.contains_key(&agent) {
+            return Err(fail(
+                StatusCode::CONFLICT,
+                "trial_exists",
+                "one trial per agent, ever — this agent already has one",
+            ));
+        }
+        let amount = trial_amount_sat();
+        let live = trial_outstanding(&sh.trials).saturating_add(amount);
+        if live > trial_max_outstanding_sat() {
+            return Err(fail(
+                StatusCode::CONFLICT,
+                "trial_cap_reached",
+                "unpaid trials would exceed the sponsor cap; repay first",
+            ));
+        }
+        let record = TrialRecord {
+            agent,
+            amount_sat: amount,
+            sponsor,
+            state: TrialState::Requested,
+            fund_txid: None,
+            repay_txid: None,
+            requested_height: sh.chain.height(),
+        };
+        sh.trials.insert(agent, record.clone());
+        audit_push(
+            sh,
+            "trial_request",
+            None,
+            Some(amount),
+            format!("trial {} drip {}", address_to_hex(&agent), amount),
+        );
+        Ok(Json(trial_json(&record)))
+    })?
+}
+
+/// `POST /v1/trials/fund` — confirm an L1 payment to the agent covering the
+/// trial amount. The tx must be confirmed on this node's chain; who sent it
+/// is not checked (a self-funded trial buys nothing — the agent could have
+/// deposited directly — while the receipt check is what gates progress).
+/// A fund whose tx later orphans off the chain may be re-confirmed with its
+/// replacement: the books follow the chain, never lead it.
+async fn trial_fund(State(state): State<ApiState>, Json(req): Json<TrialTxReq>) -> ApiResult {
+    let agent = decode_address(&req.agent_hex)?;
+    let txid = decode_hash512(&req.txid_hex)?;
+    with_shared(&state, |sh| {
+        let trial = sh.trials.get(&agent).cloned().ok_or_else(|| {
+            fail(
+                StatusCode::NOT_FOUND,
+                "no_trial",
+                "no trial recorded for this agent — request one first",
+            )
+        })?;
+        match trial.state {
+            TrialState::Requested => {}
+            TrialState::Funded => {
+                // Idempotent re-confirmation, or a re-fund after the recorded
+                // payment orphaned off the chain. A live funding cannot be
+                // replaced by pointing at another payment.
+                if trial.fund_txid == Some(txid)
+                    && confirmed_payment_to(&sh.chain, &txid, &agent, trial.amount_sat)
+                {
+                    return Ok(Json(trial_json(&trial)));
+                }
+                if let Some(old) = trial.fund_txid {
+                    if confirmed_payment_to(&sh.chain, &old, &agent, trial.amount_sat) {
+                        return Err(fail(
+                            StatusCode::CONFLICT,
+                            "trial_funded",
+                            "this trial already has a confirmed funding payment",
+                        ));
+                    }
+                }
+            }
+            TrialState::Repaid => {
+                return Err(fail(
+                    StatusCode::CONFLICT,
+                    "trial_closed",
+                    "this trial is repaid and closed",
+                ));
+            }
+        }
+        if trial_txid_used(&sh.trials, Some(&agent), &txid) {
+            return Err(fail(
+                StatusCode::CONFLICT,
+                "txid_reused",
+                "one L1 payment funds at most one trial",
+            ));
+        }
+        if !confirmed_payment_to(&sh.chain, &txid, &agent, trial.amount_sat) {
+            return Err(fail(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "trial_unfunded",
+                "no confirmed L1 payment of the trial amount to this agent in that tx",
+            ));
+        }
+        let mut updated = trial.clone();
+        updated.state = TrialState::Funded;
+        updated.fund_txid = Some(txid);
+        sh.trials.insert(agent, updated.clone());
+        audit_push(
+            sh,
+            "trial_fund",
+            None,
+            Some(trial.amount_sat),
+            format!(
+                "trial {} funded by {}",
+                address_to_hex(&agent),
+                hash512_to_hex(&txid)
+            ),
+        );
+        Ok(Json(trial_json(&updated)))
+    })?
+}
+
+/// `GET /v1/trials/{agent}` — the trial record and its state.
+async fn trial_get(State(state): State<ApiState>, Path(raw): Path<String>) -> ApiResult {
+    let agent = decode_address(&raw)?;
+    with_shared(&state, |sh| {
+        sh.trials
+            .get(&agent)
+            .map(|t| Ok(Json(trial_json(t))))
+            .unwrap_or_else(|| {
+                Err(fail(
+                    StatusCode::NOT_FOUND,
+                    "no_trial",
+                    "no trial recorded for this agent",
+                ))
+            })
+    })?
+}
+
+/// `POST /v1/trials/repay` — confirm the agent's L1 repayment to the sponsor.
+/// Same confirmation rule as funding: the tx must be on this node's chain and
+/// pay the sponsor at least the trial amount. A repayment that orphans may be
+/// re-confirmed with its replacement.
+async fn trial_repay(State(state): State<ApiState>, Json(req): Json<TrialTxReq>) -> ApiResult {
+    let agent = decode_address(&req.agent_hex)?;
+    let txid = decode_hash512(&req.txid_hex)?;
+    with_shared(&state, |sh| {
+        let trial = sh.trials.get(&agent).cloned().ok_or_else(|| {
+            fail(
+                StatusCode::NOT_FOUND,
+                "no_trial",
+                "no trial recorded for this agent — request one first",
+            )
+        })?;
+        if trial.state != TrialState::Funded {
+            return Err(fail(
+                StatusCode::CONFLICT,
+                "trial_not_due",
+                "only a funded trial can be repaid",
+            ));
+        }
+        if let Some(old) = trial.repay_txid {
+            if old == txid
+                && confirmed_payment_to(&sh.chain, &txid, &trial.sponsor, trial.amount_sat)
+            {
+                return Ok(Json(trial_json(&trial)));
+            }
+            if confirmed_payment_to(&sh.chain, &old, &trial.sponsor, trial.amount_sat) {
+                return Err(fail(
+                    StatusCode::CONFLICT,
+                    "trial_repaid",
+                    "this trial already has a confirmed repayment",
+                ));
+            }
+        }
+        if trial_txid_used(&sh.trials, Some(&agent), &txid) {
+            return Err(fail(
+                StatusCode::CONFLICT,
+                "txid_reused",
+                "one L1 payment repays at most one trial",
+            ));
+        }
+        if !confirmed_payment_to(&sh.chain, &txid, &trial.sponsor, trial.amount_sat) {
+            return Err(fail(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "trial_unpaid",
+                "no confirmed L1 payment of the trial amount back to the sponsor in that tx",
+            ));
+        }
+        let mut updated = trial.clone();
+        updated.state = TrialState::Repaid;
+        updated.repay_txid = Some(txid);
+        sh.trials.insert(agent, updated.clone());
+        audit_push(
+            sh,
+            "trial_repay",
+            None,
+            Some(trial.amount_sat),
+            format!(
+                "trial {} repaid by {}",
+                address_to_hex(&agent),
+                hash512_to_hex(&txid)
+            ),
+        );
+        Ok(Json(trial_json(&updated)))
+    })?
+}
+
+// ---------------------------------------------------------------------------
 // Always-on + exposed middleware (SPEC.md §19.2: opt-in, loopback by default)
 // ---------------------------------------------------------------------------
 // `dos_guard` always runs (timeout + in-flight cap, on every bind including
@@ -8073,7 +8558,11 @@ pub fn router(state: ApiState, cfg: &ApiConfig) -> Router {
         .route(
             "/v1/lending/autorepay/{borrower}",
             get(lending_autorepay_get),
-        );
+        )
+        .route("/v1/trials/request", post(trial_request))
+        .route("/v1/trials/fund", post(trial_fund))
+        .route("/v1/trials/{agent}", get(trial_get))
+        .route("/v1/trials/repay", post(trial_repay));
     // The stack stays `Router<ApiState>` (no state yet) until the end, where a
     // single `with_state` resolves it to the servable `Router<()>`.
     let mut app: Router<ApiState> = app.layer(DefaultBodyLimit::max(MAX_BODY_BYTES));
