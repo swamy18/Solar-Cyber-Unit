@@ -14,29 +14,33 @@
 \usepackage{lipsum}
 \usepackage{fancyhdr}       % header
 \usepackage{graphicx}       % graphics
+\usepackage{tikz}           % diagrams
+\usetikzlibrary{shapes,arrows,positioning,fit}
+\usepackage[skip=8pt]{caption} % breathing room between tables/figures and captions
+\usepackage[section]{placeins} % keep floats inside their own section
+\usepackage{needspace}      % keep headings with following text
+\raggedbottom               % avoid stretched empty space at page bottoms
 \graphicspath{{media/}}     % organize your images and other figures under media/ folder
 
 %Header
 \pagestyle{fancy}
 \thispagestyle{empty}
-\rhead{ \textit{ }} 
+\rhead{ \textit{ }}
 
 % Update your Headers here
-\fancyhead[LO]{Solar Cyber Unit: a settlement layer for autonomous agents, machines and robots}
+\fancyhead[LO]{Solar Cyber Unit: programmable money for machines}
 % \fancyhead[RE]{Firstauthor and Secondauthor} % Firstauthor et al. if more than 2 - must use \documentclass[twoside]{article}
 
 
 
   
 %% Title
-\title{Solar Cyber Unit: A Proof-of-Work Settlement Layer for Humans, Machines, Robots
-and AI Agents\\
+\title{Solar Cyber Unit: Programmable Money for Machines\\
 {\large Design, Security Analysis and Implementation Report of the SRCT Protocol}
 %%%% Cite as
 %%%% Update your official citation here when published 
 \thanks{\textit{\underline{Citation}}: 
-\textbf{Gadila, S. Solar Cyber Unit: A Proof-of-Work Settlement Layer for Humans, Machines,
-Robots and AI Agents. Preprint, 2026. DOI:000000/11111.}} 
+\textbf{Gadila, S. Solar Cyber Unit: Programmable Money for Machines. Preprint, 2026. DOI:000000/11111.}} 
 }
 
 \author{
@@ -51,12 +55,17 @@ Robots and AI Agents. Preprint, 2026. DOI:000000/11111.}}
 
 
 \begin{abstract}
-Solar Cyber Unit is an open-source cryptocurrency and settlement protocol designed around a
-single question that general-purpose blockchains do not answer well: how should a
-machine be paid for work that a third party can verify without re-running it? This
+Solar Cyber Unit (ticker \texttt{SRCT}) is programmable money for machines:
+an open-source cryptocurrency whose base layer enforces spending policies at
+admission, holds escrow for verifiable work, and settles micro-payments with a
+safety-first wallet. It is designed around a single question that
+general-purpose blockchains do not answer well: how should a
+machine be paid for work that a third party can verify without re-running it,
+and how should that machine spend without a human approving every step? This
 paper describes the protocol end to end --- its proof-of-work layer, its task
-marketplace, its wallet and agent-authorisation layer, and its security
-engineering --- from the perspective of its sole author and implementer. The
+marketplace, its on-chain agent-authority and credit layer, its portable
+grants and payment rails (x402, batching, streams, sponsored intents), and its
+security engineering --- from the perspective of its sole author and implementer. The
 consensus core is a linear UTXO chain whose fork choice is heaviest cumulative
 work, whose proof of work is a three-stage hybrid (a SHA-256 chain, an
 integer-only neural network seeded from the epoch identifier, and a binding
@@ -70,22 +79,28 @@ about: agent authority and credit as \emph{consensus} state rather than as
 node-local bookkeeping --- a grant published on chain that binds its owner to a
 named spender and a named agent, whose caps, allow-lists, window and nonce the
 chain enforces, and a loan whose lender signs the terms, whose principal
-really moves, and whose collateral answers for the debt. The paper documents the
+really moves, and whose collateral answers for the debt. Portable grants,
+delegations and short-lived exact-transaction grants travel off chain and verify
+anywhere, so any rail --- another chain, a web API, a robot fleet --- decides
+identically. The paper documents the
 trust boundaries explicitly (what is trusted, what is not, and why reputation is
 deliberately excluded from consensus),
 the concrete security mechanisms that were built and the audit-driven improvements
 that followed them, the wallet and key-management design, the operational tooling
-(HTTP API, keyless MCP surface, worker SDK, command line), the open-source and
+(HTTP API, keyless MCP surface, worker SDK, external miner and pools, command line), the open-source and
 governance
-posture, and the limitations that remain before mainnet deployment.
+posture, and the limitations that remain before mainnet deployment. The result
+is an economic infrastructure for AI agents, autonomous machines and robots:
+bounded spending authority the network itself enforces, verifiable payment for
+verifiable work, and micro-payments priced in the same unit miners are paid in.
 \end{abstract}
 
 
 % keywords can be removed
-\keywords{Proof of Work \and Agent Payments \and Escrow \and Task Markets \and
-Autonomous Agents \and Consensus Security \and Post-Quantum Signatures}
+\keywords{Proof of Work \and Programmable Money \and Agent Payments \and Escrow \and Task Markets \and
+Autonomous Agents \and Machine-to-Machine Payments \and Consensus Security \and Post-Quantum Signatures}
 
-
+\clearpage
 \section{Introduction}
 \label{sec:intro}
 
@@ -98,7 +113,10 @@ behalf. First, an autonomous agent that receives a payment must be able to prove
 what it did and to be paid for it without a human approving every step. Second,
 a principal that delegates spending authority to such an agent needs a way to
 bound that authority --- by amount, by recipient, by time window --- and to
-revoke it, without re-authorising each transaction by hand.
+revoke it, without re-authorising each transaction by hand. On existing chains a
+spending policy is a contract the base layer does not know about: it can advise,
+never refuse. That is why agent payments today are either custodial or
+unbounded.
 
 The second failure mode is the more consequential one, and it is not specific to
 cryptocurrencies. Agent frameworks are proliferating rapidly \cite{sutton2019bitter,
@@ -119,9 +137,10 @@ exact thing a blockchain exists to avoid.
 
 \subsection{The claim}
 
-Solar Cyber Unit (ticker \texttt{SRCT}) is an attempt to build the missing settlement
-primitive directly into a cryptocurrency: a chain that can act as escrow and
-arbiter for work performed by machines. The economic claim is deliberately
+Solar Cyber Unit (ticker \texttt{SRCT}) is programmable money for machines: a cryptocurrency
+that enforces spend policies at admission the way it refuses a double-spend, holds
+escrow for verifiable work, and prices micro-payments in the same unit miners are
+paid in. The economic claim is deliberately
 narrow and testable:
 
 \begin{quote}
@@ -153,13 +172,20 @@ trivedi2017sok}.
 \item \textbf{A trust-minimal bridge.} Layer-2 deposits and exits are authorised
 by on-chain inclusion proofs rather than by a privileged operator, and the exit
 crank is permissionless \cite{wood2014decentralized}.
-\item \textbf{An agent-first authorisation layer, enforced by the chain.} A grant
-published on chain binds its owner to a named spender and a named agent, and
-the chain enforces the per-transaction cap, the tumbling per-window cap, the
-allow-lists, the validity window and the nonce; a delegated grant that widens
-its parent is refused, and revocation reaches every descendant. The same
-applies to credit: the lender signs, the principal moves, the collateral
-answers for the debt \cite{yao2023survey}.
+\item \textbf{Native authorisation for AI agents.} Spend policies enforced at
+admission by consensus, portable grants and delegations that verify on any rail,
+short-lived exact-transaction grants, machine-to-machine payments, and a
+safety-first wallet with session budgets, risk gates and audit trails.
+\item \textbf{A verifiable task economy.} Escrow, slashing, bonds and fee burns as
+chain state; a canonical fraud reference computed by the engine; quorum and
+window-elapsed certificates distinguished so ``nobody objected'' is never
+mistaken for verification.
+\item \textbf{An economic infrastructure for agents, machines and robots.}
+Batch quotes, stream channels and sponsored intents for micro-payments; x402
+paid resources with client-side budgets; portable reputation and tiered wallets;
+agent-to-agent job escrow with result binding; dollar quotes settled in SRCT;
+auditable fiat ramps; productive lending on top of a collateralized on-chain
+primitive \cite{yao2023survey}.
 \item \textbf{A second implementation of those rules.} The authority and credit
 rules are written twice --- once in the protocol, once in an independent
 reference derived from the specification --- and the two are compared scenario
@@ -168,8 +194,8 @@ than a matter of taste.
 \item \textbf{A documented security programme.} An explicit threat model, a
 concrete list of implemented mechanisms, an audit-driven remediation history, a
 fuzzing campaign, and an honest statement of the gaps that remain.
-\item \textbf{An open governance posture.} Permissive dual licensing, community
-ownership of the name, separation of the trademark from the licence, and a stated
+\item \textbf{An open governance posture.} MIT licensing, community
+ownership of the project, and a stated
 refusal of post-launch governance in the style of Bitcoin
 \cite{nakamoto2008bitcoin,bonneau2018sok}.
 \end{itemize}
@@ -216,26 +242,18 @@ than merely stated: a fleet of agents can be given bounded spending authority
 that the network itself checks, and one agent can lend to another with a
 signature, a collateral and a deadline that every node can see.
 
-\begin{figure}[t]
+\begin{figure}[htbp]
 \centering
-\fbox{\parbox{0.93\textwidth}{
-\centering
-\textbf{Layer 2 --- authority and credit}\\[2pt]
-\textit{grant $\rightarrow$ spend $\rightarrow$ revoke; loan $\rightarrow$
-collateral $\rightarrow$ repay $\rightarrow$ default}\\[6pt]
-\rule{0.9\textwidth}{0.4pt}\\[6pt]
-\textbf{Layer 2 --- task economy}\\[2pt]
-\textit{post $\rightarrow$ claim $\rightarrow$ submit $\rightarrow$
-(dispute?) $\rightarrow$ settle $\rightarrow$ exit}\\[6pt]
-\rule{0.9\textwidth}{0.4pt}\\[6pt]
-\textbf{Layer 1 --- UTXO settlement}\\[2pt]
-\textit{wallets $\rightarrow$ transactions $\rightarrow$ blocks $\rightarrow$
-hybrid proof of work $\rightarrow$ fees, burn, issuance}\\[6pt]
-\rule{0.9\textwidth}{0.4pt}\\[6pt]
-\textbf{Peer-to-peer layer}\\[2pt]
-\textit{framing, handshake, relay, synchronisation, bans}
-}}
-\caption{The three-layer structure of Solar Cyber Unit. Layer-2 transactions are carried
+\begin{tikzpicture}[node distance=4mm, box/.style={draw, rounded corners, minimum width=0.9\textwidth, minimum height=9mm, align=center, font=\small}]
+\node[box, fill=gray!8] (l2ac) {\textbf{Layer 2 --- authority and credit} \\ \textit{grant $\rightarrow$ spend $\rightarrow$ revoke; \; loan $\rightarrow$ collateral $\rightarrow$ repay $\rightarrow$ default}};
+\node[box, fill=gray!5, below=of l2ac] (l2task) {\textbf{Layer 2 --- task economy} \\ \textit{post $\rightarrow$ claim $\rightarrow$ submit $\rightarrow$ (dispute?) $\rightarrow$ settle $\rightarrow$ exit}};
+\node[box, below=of l2task] (l1) {\textbf{Layer 1 --- UTXO settlement} \\ \textit{wallets $\rightarrow$ transactions $\rightarrow$ blocks $\rightarrow$ hybrid PoW $\rightarrow$ fees, burn, issuance}};
+\node[box, fill=gray!8, below=of l1] (p2p) {\textbf{Peer-to-peer layer} \\ \textit{framing, handshake, relay, synchronisation, bans}};
+\draw[->, thick] (l2ac) -- (l2task);
+\draw[->, thick] (l2task) -- (l1);
+\draw[->, thick] (l1) -- (p2p);
+\end{tikzpicture}
+\caption{The layered structure of Solar Cyber Unit. Layer-2 transactions are carried
 inside Layer-1 blocks and committed by the block's Merkle root; Layer-2 state is
 rebuilt by deterministic replay, so no second consensus protocol exists.}
 \label{fig:layers}
@@ -288,14 +306,10 @@ guarantee is enforced by the compiler.
 \subsection{Authorship and ownership}
 
 Solar Cyber Unit was conceived, specified, implemented and documented by a single author,
-Swamy Gadila, and is published under a permissive dual licence
-(\texttt{MIT OR Apache-2.0}). The author has disclaimed individual ownership of
-the project: the code and the name are community property in the Bitcoin sense
-\cite{srct-repo,srct-readiness}. The trademark treatment is deliberately
-separate from the licence --- the name and ticker are community marks that
-anyone may use to refer to the project factually, but a fork must take a
-different name and a different ticker, so that two chains cannot both display
-\texttt{SRCT}. Section~\ref{sec:governance} discusses this in full.
+Swamy Gadila, and is published under the MIT licence.
+The project is fully open source: the code and the name are free for anyone to
+use, including in forks, products and services
+\cite{srct-repo,srct-readiness}. Section~\ref{sec:governance} discusses this in full.
 
 \subsection{How the protocol was developed}
 
@@ -346,28 +360,34 @@ part of the result.
 
 \subsection{Crate layout}
 
-The implementation is a single Rust workspace with seven crates
+The implementation is a single Rust workspace with nine crates
 \cite{srct-repo}.
 
-\begin{table}[t]
+\begin{table}[htbp]
 \centering
 \begin{tabular}{p{0.15\textwidth}p{0.13\textwidth}p{0.62\textwidth}}
 \toprule
 \textbf{Crate} & \textbf{Role} & \textbf{Notable contents} \\
 \midrule
 \texttt{srct-core} & Consensus & chain, blocks, ledger, PoW puzzle, difficulty,
-  supply, fees, bonds, finality, BLS, signatures, escrow, credit, L1/L2 bridge \\
+  supply, fees, bonds, finality, BLS, signatures, escrow, credit, L1/L2 bridge,
+  agent policy, portable grants, micro-payments, reputation, jobs, FX, ramps \\
 \texttt{srct-l2} & Layer 2 & task and service contracts, disputes, deposits,
-  exits, verified work certificates, replay \\
+  exits, verified work certificates, replay, authority vectors \\
 \texttt{srct-net} & Networking & framing, handshake, messages, relay, sync,
   address book, bans \\
 \texttt{srct-store} & Persistence & append-only checksummed block log, metadata
   file, node-local state container \\
-\texttt{srct-node} & Node & CLI, daemon, REST API, wallet file, mediator \\
+\texttt{srct-node} & Node & CLI, daemon, REST API, wallet file, mediator,
+  conservation surface, metrics \\
+\texttt{srct-miner} & Mining & template grinder, stratum-lite pool with PPLNS,
+  CPU and portable backends \\
 \texttt{srct-worker} & Worker SDK & discovery, claim, execute, submit, dispute,
-  exit; client only \\
+  exit, authority and credit flows; client only \\
 \texttt{srct-mcp} & Agent surface & keyless dispatcher over identity, payments,
-  receipts \\
+  receipts, wallet guard, delegation, audit \\
+\texttt{srct-policy} & Portable policy & chain-agnostic intent $\rightarrow$
+  allow/deny/approval-needed engine with TypeScript and Python bindings \\
 \bottomrule
 \end{tabular}
 \caption{Workspace layout. All consensus logic lives in \texttt{srct-core}.}
@@ -503,9 +523,22 @@ where $d$ is the block difficulty.
 
 A second proof-of-work family, a memory-hard scratchpad puzzle, has been
 specified and implemented and has passed a scoped internal security review
-\cite{srct-hbm-review}, but it is deliberately \emph{not registered} as an
-active puzzle identifier: an unregistered puzzle validates nothing, so the
-alternative cannot silently displace the deployed one.
+\cite{srct-hbm-review}, but it is registered only as \texttt{puzzle\_id = 2}
+(\texttt{hbm-v1}) and is \emph{not} the active mining puzzle on any profile:
+every profile mines \texttt{hybrid-v1} (\texttt{puzzle\_id = 1}). The HBM
+scratchpad is the designed upgrade route for ASIC pressure, not a second live
+puzzle.
+
+\paragraph{Mining in practice.} Three paths produce the same blocks and the same
+coinbase: in-node mining for launch and solo operation, a standalone
+\texttt{srct-miner} binary (multithreaded template grinder over
+\texttt{GET /v1/mine/template} and \texttt{POST /v1/mine/submit}, with CPU and
+independently written portable backends that must agree bit-identically), and
+pooled mining over stratum-lite JSON-lines with PPLNS accounting (windowed
+split, pool fee, dust carry, payouts recorded before they are paid). New coins
+are immature before they become ordinary UTXOs. Every profile starts at
+difficulty 1 and retargets every block toward its target spacing, so launch is
+CPU-fair; difficulty hardens the chain, not special hardware.
 
 \subsection{Difficulty adjustment}
 
@@ -695,9 +728,10 @@ deliberate separation --- Layer 2 inherits Layer 1's ordering and immutability
 without inheriting Layer 1's latency, and the failure mode of a malformed
 Layer-2 payload is a skipped payload rather than a halted chain.
 
-The vocabulary of the task economy is six transaction types.
+The vocabulary of the task economy is thirteen transaction types: six for the
+task economy and exits, seven for authority and credit.
 
-\begin{table}[t]
+\begin{table}[htbp]
 \centering
 \begin{tabular}{cll}
 \toprule
@@ -712,14 +746,43 @@ The vocabulary of the task economy is six transaction types.
   and a deposit \\
 \texttt{0x14} & Settle & Committee applies the decision: pay, refund or slash \\
 \texttt{0x15} & ExitQueue & Owner starts withdrawing value back to Layer 1 \\
+\texttt{0x16} & Policy & Owner publishes a spending grant (agent authority) \\
+\texttt{0x17} & PolicyRevoke & Owner kills a grant; descendants die with it \\
+\texttt{0x18} & AgentSpend & Spender spends under a published grant \\
+\texttt{0x19} & CreditOpen & Lender opens a loan; principal moves \\
+\texttt{0x1A} & CreditCollateral & Borrower adds collateral \\
+\texttt{0x1B} & CreditRepay & Borrower repays, interest first \\
+\texttt{0x1C} & CreditDefault & Anyone settles an overdue position \\
 \bottomrule
 \end{tabular}
-\caption{The six Layer-2 transaction types. A task moves through
+\caption{The thirteen Layer-2 transaction types. A task moves through
 $\text{Open} \rightarrow \text{InProgress} \rightarrow \text{ResultSubmitted}
 \rightarrow \text{Disputed?} \rightarrow \text{Settled}$, with $\text{Expired}$
-as the timeout branch.}
+as the timeout branch; a loan moves through open $\rightarrow$ repay and either
+repay-in-full or default.}
 \label{tab:l2types}
 \end{table}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[node distance=9mm, state/.style={draw, rounded corners, text width=21mm, minimum height=9mm, align=center, font=\footnotesize}, >=stealth]
+\node[state] (open) {Open};
+\node[state, right=of open] (prog) {InProgress};
+\node[state, right=of prog] (sub) {Result Submitted};
+\node[state, right=of sub] (disp) {Disputed?};
+\node[state, right=of disp] (set) {Settled};
+\node[state, below=13mm of sub] (exp) {Expired};
+\draw[->] (open) -- node[above=1mm, font=\scriptsize] {claim} (prog);
+\draw[->] (prog) -- node[above=1mm, font=\scriptsize] {submit} (sub);
+\draw[->] (sub) -- node[above=1mm, font=\scriptsize] {dispute} (disp);
+\draw[->] (disp) -- node[above=1mm, font=\scriptsize] {settle} (set);
+\draw[->] (sub) -- node[left=1mm, font=\scriptsize] {timeout} (exp);
+\draw[->, dashed] (disp.south) to[bend right=25] node[below=1mm, font=\scriptsize] {lapse} (set.south);
+\end{tikzpicture}
+\caption{Task lifecycle. Every transition is a Layer-2 transaction; a skipped
+payload never halts the chain. Inconclusive disputes settle nothing.}
+\label{fig:taskflow}
+\end{figure}
 
 \subsection{Value conservation}
 
@@ -831,7 +894,7 @@ matching identifier, and its encoding is byte-unique.
 
 Two kinds exist, and the difference between them is load-bearing:
 
-\begin{table}[t]
+\begin{table}[htbp]
 \centering
 \begin{tabular}{@{}p{0.16\textwidth}p{0.55\textwidth}p{0.22\textwidth}@{}}
 \toprule
@@ -1202,11 +1265,13 @@ state is defined by a Layer-1 fact rather than by a local one.
 
 \subsection{Fee schedule}
 
-Layer-2 fees use their own path and never consult the Layer-1 base fee, with
-the flat fees shown below and a settlement fee proportional to the value
-released (one tenth of one per cent, with a floor).
+Layer-2 fees use their own path and never consult the Layer-1 base fee. Task
+fees are flat and settlement is proportional, so a proportional cost follows the
+value released while a floor keeps small settlements from being free to spam. The
+authority and credit transactions each pay a flat 2\,000 subunits, routed through
+the same 50/50 burn/reserve split as every other Layer-2 fee.
 
-\begin{table}[t]
+\begin{table}[htbp]
 \centering
 \begin{tabular}{lr}
 \toprule
@@ -1218,13 +1283,14 @@ Submit result & 2\,000 subunits \\
 Raise dispute & 10\,000 subunits \\
 Settle & $\max(0.1\% \times \text{value},\ 1\,000)$ subunits \\
 Queue exit & 2\,000 subunits \\
+Policy / revoke / agent-spend & 2\,000 subunits each \\
+Credit open / collateral / repay / default & 2\,000 subunits each \\
 Exit fee floor & 1\,000 subunits \\
 Layer-2 deposit floor & 1\,000\,000 subunits per sink output \\
 \bottomrule
 \end{tabular}
-\caption{Layer-2 fee schedule. A proportional settlement fee means that a
-proportional cost follows the value released, while a floor keeps small
-settlements from being free to spam.}
+\caption{Layer-2 fee schedule. L2 fees split 50/50 between burn and the
+protocol reserve; the miner tip is zero.}
 \label{tab:fees}
 \end{table}
 
@@ -1248,7 +1314,7 @@ can read the node's data directory.
 The trust model is best stated as a table, because the interesting entries are
 the negative ones.
 
-\begin{table}[t]
+\begin{table}[htbp]
 \centering
 \begin{tabular}{@{}p{0.22\textwidth}p{0.11\textwidth}p{0.58\textwidth}@{}}
 \toprule
@@ -1286,7 +1352,7 @@ mean the operator had trusted something they never chose.
 
 \subsection{Cryptographic mechanisms}
 
-\begin{table}[t]
+\begin{table}[htbp]
 \centering
 \begin{tabular}{@{}p{0.19\textwidth}p{0.27\textwidth}p{0.45\textwidth}@{}}
 \toprule
@@ -1367,7 +1433,7 @@ address, with IPv6 addresses grouped by prefix.
 
 \subsection{Replay protection and fail-closed behaviour}
 
-\begin{table}[t]
+\begin{table}[htbp]
 \centering
 \begin{tabular}{lll}
 \toprule
@@ -1483,10 +1549,12 @@ noting honestly that the corresponding public key is not yet published, so the
 channel is not yet operational. We consider stating that plainly to be more
 useful than presenting the policy as if it were complete.
 
-\subsection{Known gaps}
+\subsection{Known gaps (temporary)}
 \label{sec:gaps}
 
-The following are known and are stated rather than concealed.
+This is a temporary section. It lists items to be addressed and resolved later,
+and will be removed once they are closed. The following are known and are stated
+rather than concealed.
 
 \begin{itemize}
 \item No independent third-party security audit has been completed. The
@@ -1571,6 +1639,23 @@ a spend, a revocation, and the credit operations --- each of which checks the
 transaction against the state the chain will replay and refuses with the
 chain's own reason, rather than mining a block the replay would skip.
 
+\paragraph{Agent helpers.} The worker binary carries single-purpose
+commands that need only a node URL, not local chain data, and touch no
+consensus rule: \texttt{verify-cert} answers quorum-backed or merely
+unchallenged with an exit code (0 verified, 2 paid-not-verified, 3 no
+certificate); \texttt{grant} publishes a bounded grant and prints its
+\texttt{policy\_hex}; \texttt{claim} and \texttt{submit-result} are the two
+signing steps a plug-and-play framework template drives
+(\texttt{templates/srct\_agent.py} turns any Python function into an earning
+agent in two lines); \texttt{pay} runs the x402 challenge/response against a
+client-side budget and refuses an over-budget challenge before any key is
+used; \texttt{stream-open}, \texttt{stream-voucher} and
+\texttt{stream-status} manage pay-as-you-use channels; \texttt{batch-quote}
+prices one shared settlement for many payments; \texttt{trial-request},
+\texttt{trial-fund}, \texttt{trial-status} and \texttt{trial-repay} run the
+usage-based-credit trial from the agent's side. Section~\ref{sec:usage} shows
+each one from the terminal.
+
 \subsection{Concrete scenarios}
 
 \paragraph{A research pipeline buys a computation.} A submitter posts a task
@@ -1598,41 +1683,194 @@ to distinguish a paying human from a paying robot other than by the identity
 they present.
 
 
+\section{Programmable payments: x402, micro-payments and wallet safety}
+\label{sec:payments-infra}
+
+Authority answers \emph{may this agent spend?} Payments answer \emph{did the
+coins move?} This section is the machinery between them.
+
+\paragraph{x402 for machines.} SRCT speaks the x402 challenge/response shape with
+no second payment system: a client calls a paid resource, receives
+\texttt{402 Payment Required} with a \texttt{PAYMENT-REQUIRED} envelope, and
+retries with a \texttt{PAYMENT-SIGNATURE}. The node verifies by reusing the
+ordinary payment admission path, so there is no consensus change. Scheme is
+\texttt{exact} only; network is CAIP-2 \texttt{srct:\textless reference\textgreater};
+amount is a decimal satoshi string. A client-side budget (max amount, allowed
+recipients, allowed services) is enforced \emph{before} signing, and a short
+guard window (challenge height precedes expiry, capped at 30 blocks) fronts every
+signature. Beside SRCT the node may advertise EVM rails (Base, Base Sepolia) for
+discovery, but it settles SRCT options only; EVM settlement stays the external
+facilitator's job under the same budget.
+
+\paragraph{Micro-payments without a transaction per call.} Three primitives reuse
+\texttt{MachinePayment}, \texttt{SpendPolicy} and the credit path and change no
+consensus rule. \emph{Batch quotes} merge N payments by one payer to one
+provider into one \texttt{PaymentBatch}: one base fee instead of ten, with gas,
+required fee, per-payment cost and savings quoted read-only before broadcast.
+\emph{Stream channels} are pay-as-you-use: open once (rate per block, window,
+hard cap), mint an off-chain voucher per unit of work, settle only the final
+voucher on chain as a \texttt{MachinePayment} whose reference is the stream id;
+the \texttt{StreamBook} is fail-closed (exact, ordered, in-cap, no future
+settlements) and persists across restarts. \emph{Sponsored intents} let a sponsor
+sign fee coverage bound to sponsor, batch hash, fee and expiry: an auditable
+fee-attribution record, deliberately not a consensus fee-payer, so a sponsor can
+cover a priced quote but never mint authority.
+
+\paragraph{A safer wallet by construction.} A spend policy (per-tx cap, tumbling
+window, allow-lists, strict nonce, owner revocation) is the first layer. A
+session budget aggregates across rotated policies so spend cannot be split over
+N grants. Risk checks enforce high-value human approval: at or above the
+threshold the node answers \texttt{403 human\_approval\_required} until a listed
+approver co-signs (mainnet gates at 10 SRCT by default; \texttt{0} is the
+documented opt-out), plus per-payer velocity caps and a test-mode guard that
+refuses mainnet spends. Idempotency (exact-payment tracker, receipt book,
+strictly increasing nonces), receipts plus reconciliation (unsettled payments
+listed for retry, orphan receipts listed for investigation), and a bounded
+hash-chained audit log (exportable as auditor-readable JSON and re-verifiable)
+complete the picture. Short-lived exact-transaction grants bind owner, grant
+hash, expiry and the exact transaction hash with a 30-block cap: a stolen
+authorization re-aimed at another payment, or replayed past its window, is
+refused by name.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[node distance=14mm, paystep/.style={draw, rounded corners, text width=28mm, minimum height=10mm, align=center, font=\footnotesize}, >=stealth]
+\node[paystep] (grant) {grant + policy};
+\node[paystep, right=of grant] (guard) {wallet guard};
+\node[paystep, right=of guard] (pay) {402 $\rightarrow$ sign $\rightarrow$ submit};
+\node[paystep, right=of pay] (recv) {receipt + settle link};
+\draw[->] (grant) -- (guard);
+\draw[->] (guard) -- (pay);
+\draw[->] (pay) -- (recv);
+\node[below=6mm of guard, font=\scriptsize, align=center] {batch quote / stream voucher / sponsored intent \\ reuse the same path};
+\end{tikzpicture}
+\caption{Agent payment path. Authorisation, guarded signing, admission, and
+settlement are separate steps; the settlement must pay the recipient or it is
+refused.}
+\label{fig:payflow}
+\end{figure}
+
+\section{The agent economy: reputation, jobs, pricing, ramps and lending}
+\label{sec:agent-economy}
+
+\paragraph{Portable reputation and tiered wallets.} History travels with the
+agent: receipts record task completions and payments, credit positions record
+repayments and defaults, and an issuer that verified the events signs a
+\texttt{PassportBatch} the node re-verifies against its own books before
+storing. Any service scores it (\texttt{Deny} to \texttt{Preferred}). Sybil
+resistance is economic: every positive event is backed by a real payment or
+collateral; repeat business with one counterparty counts as its square root;
+stake-backed events weigh more; negatives are sticky (dispute lost $-4$,
+default $-8$; any default zeroes the suggested credit limit). Wallet age and raw
+transaction count are deliberately unused. One funding splits into narrowed child
+policies (tiers): a tier can never exceed its parent, tiers nest, revoking the
+root stops the whole tree, and the \texttt{DelegationProof} carries the lineage
+any service verifies.
+
+\paragraph{Agent-to-agent job escrow.} A hirer locks payment, a worker commits,
+delivers a result hash, and the release pays for \emph{this} dataset: the
+resolve signature binds job id, direction and result hash to the arbitrator key
+named at open. Dispute locks are node-enforced and persist across restarts:
+release, settlement binding and auto-refund all refuse while disputed.
+\texttt{GET /v1/payments/\{id\}/receipt\_status} reports recorded, receipt
+present and settlement transaction, so treating a payment as complete before its
+receipt appears is a client bug.
+
+\paragraph{Dollar prices, SRCT settlement.} SRCT is a mined coin, not a peg.
+Services quote in USD (or a supported stablecoin) and settle in SRCT at a
+transparent locked rate: issuer-signed rates from a configured whitelist, live
+rate lists, locked quotes stating amount, satoshis due, fee, slippage, rate and
+expiry, and swap intents whose custody never touches the node. An unsupported
+promise that an algorithm will maintain a peg is not a model and will not ship
+under that name: until then, quote dollars, settle SRCT, show every fee.
+
+\paragraph{Entering and exiting SRCT.} The node is the auditable registry for
+entry and exit; custody and compliance live with the ramp provider off protocol.
+Provider-signed quotes (either direction), intents, and provider-closed fills or
+refunds form a signed trail: a lying provider leaves evidence, though nothing
+here prevents the lie. Quotes expire; intents are terminal.
+
+\paragraph{Productive lending.} Lenders publish standard terms (rate capped at
+10\% per window, full-collateral terms), borrowers discover cheapest-first and
+accept with their own signature over offer, amount, bond and deadline. History
+prices risk (repayments, on-time rate, defaults, suggested ceiling; advisory
+only, any default zeroes it), dashboards track exposure and coverage, and
+borrowers may authorize automatic repayment from revenue (revocable, capped,
+expiring). Underneath is the collateralized on-chain primitive of
+Section~\ref{sec:authority}: lender signs, principal really moves, borrower's
+own collateral locks before principal arrives, interest is simple per whole
+window and paid first, overpayment is refused, default is permissionless at the
+deadline, and the loss order is collateral, then bond, then lender --- never
+minted.
+
+\paragraph{First tasks without upfront capital.} A new agent with no coins
+cannot post the claim deposit a task requires, and an on-chain loan cannot
+help because collateral must be the borrower's own money. The trial faucet
+closes that gap as pure service-layer bookkeeping: the node records one trial
+per agent, the operator's sponsor drips a fixed amount over ordinary rails,
+the node confirms the receipt against its own chain before the agent may
+proceed, and the agent repays the same way later. Every trial is real SRCT the
+sponsor spent; the node never signs and never mints. Combined with portable
+sub-grants, this is how credits circulate instead of stranding: a funded agent
+delegates a narrowed slice downward, a trial agent earns its first payment,
+and no vendor holds anyone's balance in between.
+
+\section{Why this matters: industries and use}
+\label{sec:industries}
+
+Programmable money for machines is not a faster payment button. It is the
+missing enforcement point for an economy in which software already spends on
+somebody's behalf.
+
+\paragraph{AI compute markets.} A research pipeline posts an escrowed task, a
+GPU worker claims and submits an attested result, challengers keep it honest,
+and the chain pays the winner. The payer need not re-run the work and need not
+trust the worker; the worker need not trust the payer. Verified-work
+certificates distinguish quorum-verified results from unchallenged ones, so
+downstream buyers can price proof.
+
+\paragraph{Robotics and fleets.} A warehouse or delivery fleet operates under one
+grant per purpose: per-transaction caps, tumbling windows, named recipients and
+services, nonces that make authorizations unreplayable, and a kill switch that
+reaches every descendant. The operator goes offline; every node still enforces
+the envelope. Energy, tolls, and data purchases become auditable machine
+expenses rather than shared corporate cards.
+
+\paragraph{API and data economy.} Metered APIs, dataset queries and inference
+endpoints charge per call through x402 challenges, batched settlements and
+stream vouchers instead of manual invoices. Sponsored intents let an employer or
+platform subsidize onboarding without granting mint authority.
+
+\paragraph{Supply chain and IoT.} Devices with bounded policies pay each other
+for measurements, transport legs, or storage slots; receipts and settlement
+links prove the coins moved, not merely that a message was sent. Conditional
+escrow with contract-selected arbitrators handles non-compute deliverables, with
+oracle conditions refused rather than promised.
+
+\paragraph{Finance for agents.} Agents with verifiable histories borrow working
+capital against collateral, build portable reputation that cannot be bought, and
+repay automatically from revenue. Credit stays collateralized on chain; scores
+price risk but never guarantee repayment.
+
+The common thread is verifiability without re-execution and delegation without
+loss of control. That is what makes the technology applicable wherever a machine
+can produce a result anyone else can check, and wherever a principal must bound
+what its software may spend.
+
+
 \section{Openness, governance and control of information}
 \label{sec:governance}
 
 \subsection{Licence and ownership}
 
-The code is released under a standard permissive Rust dual licence,
-\texttt{MIT OR Apache-2.0}, with both texts at the repository root
+The project is fully open source under the MIT licence, with the licence text
+at the repository root
 \cite{srct-repo}. Anyone may run it, study it, modify it, audit it,
 redistribute it, run a public node or a fork, use it as a dependency, write
-about it, and report vulnerabilities against it. Commercial use is permitted by
-the licence; the trademark document asks for a short written permission for
-\emph>commercial use of the marks themselves\}, which is a different question
-from commercial use of the code.
-
-The project states that it is community-owned in the Bitcoin sense, and that no
-single person holds it. One inconsistency should be disclosed: the MIT licence
-text names an individual copyright holder, while the project's own
-documentation asserts community ownership. Reconciling those two statements is
-an open administrative task.
-
-\subsection{Trademark separation}
-
-The name, the ticker and the logos are community marks. Permitted without
-asking: running the software on any network, forking it, using the marks
-factually to refer to the project (``built on Solar Cyber Unit'', in a compatibility list,
-in an article). Not permitted without asking: naming a product, company, chain
-or service ``Solar Cyber Unit'' or ``SRCT''; using the logos in one's own branding;
-publishing a fork under the name or implying official affiliation; selling
-something under the name; registering the marks as one's own.
-
-The reasoning is worth stating because it is a general principle about
-permissively licensed infrastructure: a permissive code licence cannot protect
-a brand, and pretending otherwise fails. The code stays open; the name stays
-with the community; a fork takes a new name because two chains both displaying
-\texttt{SRCT} is exactly the confusion that harms users.
+about it, and report vulnerabilities against it. Commercial use is permitted.
+There are no trademark restrictions: anyone is free to use
+the name, the ticker and the logos, including in products, companies, chains
+and services.
 
 \subsection{Governance after launch}
 
@@ -1646,7 +1884,7 @@ a committee.
 
 \subsection{Who holds and controls the information}
 
-\begin{table}[t]
+\begin{table}[htbp]
 \centering
 \begin{tabular}{@{}p{0.24\textwidth}p{0.29\textwidth}p{0.38\textwidth}@{}}
 \toprule
@@ -1739,7 +1977,7 @@ srct-node serve --network testnet --data-dir ./chain --api-listen 0.0.0.0:8080
 
 \subsection{Command surface}
 
-\begin{table}[t]
+\begin{table}[htbp]
 \centering
 \begin{tabular}{ll}
 \toprule
@@ -1804,12 +2042,65 @@ Every one of these commands checks the transaction against the state the chain
 will replay and refuses with the chain's own reason, rather than mining a block
 the replay would skip.
 
+\subsection{Agent helpers, from the terminal}
+
+The worker binary needs only a node URL. A grant, a paid API call, and a
+micro-payment channel, end to end:
+
+\begin{verbatim}
+# A bounded grant from the owner's key, published through a node.
+# Prints policy_hex: feed it to pay.
+srct-worker grant --from-file owner.json --node http://127.0.0.1:8080 \
+  --spender <agent-address> --per-tx 1000 --cumulative 5000 --window 50 \
+  --recipients <recipient> --network mini
+
+# Quorum-backed or merely unchallenged? Exit 0 verified, 2 paid-not-verified.
+srct-worker verify-cert --node http://127.0.0.1:8080 --task <task-id>
+
+# Pay a paid resource against a client-side budget. An over-budget
+# challenge is refused before any key is used.
+srct-worker pay --node http://127.0.0.1:8080 --resource /v1/paid/weather \
+  --from-file owner.json --policy-hex <policy-hex> \
+  --max-amount 600 --recipients <recipient> --service-name weather
+
+# Claim a task, run the framework elsewhere, submit its result bytes.
+srct-worker claim --node http://127.0.0.1:8080 \
+  --from-file agent.json --task <task-id>
+srct-worker submit-result --node http://127.0.0.1:8080 \
+  --from-file agent.json --task <task-id> --result <hex|@file>
+\end{verbatim}
+
+\begin{verbatim}
+# A pay-as-you-use channel: open once, file exact vouchers, read accounting.
+srct-worker stream-open --node http://127.0.0.1:8080 \
+  --from-file payer.json --to <recipient> --rate 10 --cap 1000 \
+  --expires 100 --policy-hash <policy-hex>
+srct-worker stream-voucher --node http://127.0.0.1:8080 \
+  --from-file payer.json --stream-hex <stream-hex> --through 8
+srct-worker stream-status --node http://127.0.0.1:8080 --stream <stream-id>
+
+# Price one shared settlement for N recorded payments (read-only).
+srct-worker batch-quote --node http://127.0.0.1:8080 --payments <id,...>
+
+# A sponsored first task for a broke agent (usage-based credit).
+srct-worker trial-request --node http://127.0.0.1:8080 --agent <agent-id>
+srct-worker trial-fund --node http://127.0.0.1:8080 \
+  --agent <agent-id> --txid <sponsor-l1-txid>
+srct-worker trial-repay --node http://127.0.0.1:8080 \
+  --agent <agent-id> --txid <repay-l1-txid>
+\end{verbatim}
+
+\texttt{verify-cert} and \texttt{batch-quote} are read-only: no wallet is
+loaded and nothing is signed. \texttt{grant}, \texttt{pay} and the stream
+verbs sign locally and broadcast; every refusal names its cause, and a
+refusal before signing costs nothing.
+
 \subsection{Profiles}
 
 The three profiles differ only in numbers, and the \texttt{mini} profile is
 the same code path as production.
 
-\begin{table}[t]
+\begin{table}[htbp]
 \centering
 \begin{tabular}{llll}
 \toprule
@@ -1820,24 +2111,25 @@ Halving period & 262\,800 & 2\,000 & 2\,000 \\
 Start reward & 76 SRCT & 76 SRCT & 76 SRCT \\
 Finality depth & 100 & 20 & 20 \\
 Coinbase maturity & 100 & 10 & 10 \\
-Genesis validators & none & 4 & 4 \\
-Binding finality & height 100 & height 20 & off \\
+Genesis validators & 21 public bootstrap (quorum 15) & 4 & 4 \\
+L2 settlement validators & 21 bootstrap, then bonded TopN & 4 & 4 \\
+Binding finality & height 100 & height 20 & off (observation only) \\
 Exits & height 1 & height 1 & height 1 \\
 Post-quantum requirement & off & off & off \\
+Mining puzzle & hybrid-v1 (id 1) & hybrid-v1 (id 1) & hybrid-v1 (id 1) \\
 \bottomrule
 \end{tabular}
-\caption{Network profiles. The mainnet profile deliberately ships with no
-genesis committee, so that every checkpoint fails closed until the
-stake-weighted committee derives from the bond ledger --- the protocol never
-verifies against nothing.}
+\caption{Network profiles. Mainnet cold-starts on 21 public deterministic keys so
+binding finality can activate at height 100 before any stake exists; the first
+bond replaces them with the stake-weighted TopN committee. L2 settlement
+resolves the live L1 committee per height, so bootstrap authority ends at the
+first bond.}
 \label{tab:profiles}
 \end{table}
 
 
-\section{Limitations and future work}
+\section{Limitations}
 \label{sec:future}
-
-\subsection{Limitations}
 
 The limitations of the present system are structural rather than incidental,
 and it is better to state them than to let a reader infer them.
@@ -1874,25 +2166,16 @@ under load, or against an adversarial peer-to-peer network. The verification
 record's benchmarks are single-machine measurements on modest hardware, and the
 fuzzing campaign is bounded rather than exhaustive.
 
-\subsection{Future work}
-
-In rough dependency order: an independent third-party security review and a
-published disclosure key; a peer-to-peer layer with node identity, peer
-authentication and a discovery mechanism; a larger committee with staggered
-rotation; a richer proof-of-work registry in which a memory-hard puzzle can be
-enabled by consensus rule rather than by configuration; a formal verification
-effort on the consensus transition function and the proof-of-work forward
-pass; and a long-horizon economic study of the issuance schedule under
-realistic fee activity, which would test the claim that net supply can fall.
-
 
 \section{Conclusion}
 \label{sec:conclusion}
 
-Solar Cyber Unit is an attempt to build a settlement primitive that general-purpose
-cryptocurrencies do not provide: a way for a machine to be paid for work that a
-third party can verify without re-running it, and for a principal to delegate
-spending authority to such a machine without losing the ability to bound it.
+Solar Cyber Unit is programmable money for machines: a cryptocurrency that enforces
+spend policies at admission the way it refuses a double-spend, holds escrow for
+verifiable work, and makes micro-payments economical without custodians. It gives
+a machine a way to be paid for work a third party can verify without re-running
+it, and gives a principal a way to delegate spending authority without losing
+the ability to bound it.
 
 The design is not exotic. It uses a linear UTXO chain with cumulative-work
 fork choice, a quorum certificate over a stake-weighted committee, a
@@ -1929,9 +2212,12 @@ on the accuracy of its self-assessment.
 
 The vision is a chain that does useful work with the energy it consumes, and
 that treats an autonomous agent as a first-class economic participant rather
-than as an account to be impersonated. Whether that vision survives contact
-with adversarial use is an open question, and the correct next step is the one
-that has not yet been taken.
+than as an account to be impersonated: agents that earn, spend under bounds,
+lend, borrow, and price services in dollars while settling in SRCT, across
+compute markets, robot fleets, APIs, supply chains and IoT. Whether that vision
+survives contact with adversarial use is an open question, and the correct next
+step is the one that has not yet been taken: independent review, then
+deployment with real value.
 
 
 \section*{Acknowledgments}
@@ -1953,7 +2239,7 @@ srct-fuzz}.
 \section{Key protocol constants}
 \label{app:constants}
 
-\begin{table}[t]
+\begin{table}[htbp]
 \centering
 \begin{tabular}{llr}
 \toprule

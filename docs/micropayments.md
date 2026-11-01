@@ -59,7 +59,7 @@ the recipient — a stream-bound payment must pay the stream's recipient, so
 the voucher accounting and the coin cannot diverge. The `StreamBook`
 (single writer: the node) enforces exact, ordered, in-cap settlement —
 over/ under-claims and replays are refused by name, and accounting persists
-in `state.bin` (currently envelope v8) so a restart cannot double-withdraw.
+in `state.bin` (currently envelope v9) so a restart cannot double-withdraw.
 
 ```bash
 curl -X POST $NODE/v1/streams/open   -d '{"stream_hex":"..."}'

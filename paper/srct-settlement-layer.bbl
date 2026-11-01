@@ -72,33 +72,37 @@ Joseph Bonneau, Alex Corrigan-Gibbs, Benjamin Kroll, Mary Maller, Andrew
 
 \bibitem{srct-repo}
 Swamy Gadila.
-\newblock Solar Cyber Unit ({SRCT}) protocol implementation.
+\newblock Solar cyber unit ({SRCT}) protocol implementation.
 \newblock \url{https://github.com/swamy18/Solar-Cyber-Unit}, 2026.
 \newblock Rust workspace; MIT OR Apache-2.0.
 
 \bibitem{srct-spec}
 Swamy Gadila.
-\newblock Solar Cyber Unit protocol specification.
-\newblock \url{https://github.com/swamy18/Solar-Cyber-Unit/blob/main/SPEC.md}, 2026.
+\newblock Solar cyber unit protocol specification.
+\newblock \url{https://github.com/swamy18/Solar-Cyber-Unit/blob/main/SPEC.md},
+  2026.
 \newblock Normative protocol document.
 
 \bibitem{srct-readiness}
 Swamy Gadila.
-\newblock Solar Cyber Unit mainnet operational readiness record.
+\newblock Solar cyber unit mainnet operational readiness record.
 \newblock
   \url{https://github.com/swamy18/Solar-Cyber-Unit/blob/main/docs/mainnet-readiness.md},
   2026.
 
 \bibitem{srct-status}
 Swamy Gadila.
-\newblock Solar Cyber Unit verification record.
-\newblock \url{https://github.com/swamy18/Solar-Cyber-Unit/blob/main/docs/status.md},
+\newblock Solar cyber unit verification record.
+\newblock
+  \url{https://github.com/swamy18/Solar-Cyber-Unit/blob/main/docs/status.md},
   2026.
 
 \bibitem{srct-fuzz}
 Swamy Gadila.
-\newblock Solar Cyber Unit fuzzing campaign report.
-\newblock \url{https://github.com/swamy18/Solar-Cyber-Unit/blob/main/docs/fuzz.md}, 2026.
+\newblock Solar cyber unit fuzzing campaign report.
+\newblock
+  \url{https://github.com/swamy18/Solar-Cyber-Unit/blob/main/docs/fuzz.md},
+  2026.
 
 \bibitem{antonopoulos2017mastering}
 Andreas~M. Antonopoulos.
@@ -107,8 +111,9 @@ Andreas~M. Antonopoulos.
 
 \bibitem{srct-decisions}
 Swamy Gadila.
-\newblock Solar Cyber Unit design decisions log.
-\newblock \url{https://github.com/swamy18/Solar-Cyber-Unit/blob/main/docs/decisions.md},
+\newblock Solar cyber unit design decisions log.
+\newblock
+  \url{https://github.com/swamy18/Solar-Cyber-Unit/blob/main/docs/decisions.md},
   2026.
 \newblock Decisions D1--D24, P1--P6 and M-A--M-E.
 
@@ -157,7 +162,7 @@ Vitalik Buterin.
 
 \bibitem{srct-monetary}
 Swamy Gadila.
-\newblock Solar Cyber Unit monetary policy.
+\newblock Solar cyber unit monetary policy.
 \newblock
   \url{https://github.com/swamy18/Solar-Cyber-Unit/blob/main/docs/monetary-policy.md},
   2026.

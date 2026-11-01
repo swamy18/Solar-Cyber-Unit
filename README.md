@@ -371,6 +371,59 @@ grant, and `audit.verify` checks an exported audit chain. `inspect.policy`,
 `inspect.agent_spend` and `inspect.credit` read the terms an agent is about
 to sign and the hash to sign.
 
+**Agent helpers (`srct-worker`).** Seven single-purpose commands over a node
+URL — no local chain data needed, no consensus touched:
+
+| Command | What it does |
+|---|---|
+| `verify-cert --task <id>` | Quorum-backed or merely unchallenged? Exits `0` verified, `2` paid-not-verified, `3` no certificate. Read-only. |
+| `grant` | Owner key → bounded grant (per-tx + window caps, recipient/service allow-lists), published through the node. Prints `policy_hex` for the next two. |
+| `claim` / `submit-result` | Claim an open task, submit the framework's result bytes. The two signing steps a plug-and-play template drives (`templates/srct_agent.py`). |
+| `pay` | x402 challenge/response with a client-side budget (`--max-amount`, `--recipients`, `--service-name`). Refuses over-budget challenges before any key is used. |
+| `stream-open` / `stream-voucher` / `stream-status` | Pay-as-you-use channels: open once, file exact off-chain vouchers, read accounting. |
+| `batch-quote` | Price one shared settlement for N recorded payments (read-only). |
+| `trial-request` / `trial-fund` / `trial-status` / `trial-repay` | Usage-based credits: a sponsored first task for a broke agent, confirmed against the chain, repaid the same way. One trial per agent, ever. |
+
+`grant` → `pay` is the intended chain: the grant prints `policy_hex`, `pay`
+takes it with `--policy-hex` and enforces the budget the owner wrote.
+`claim` → `submit-result` is the template chain
+(`templates/srct_agent.py`). Pay-as-you-go pricing, no-expiry balances,
+circulating sub-grants and the trial faucet are documented together in
+[`docs/agent-credits.md`](docs/agent-credits.md).
+
+**Plug-and-play template.** Any Python function becomes an earning agent in
+two lines — no cryptography to learn, the key never leaves `srct-worker`:
+
+```python
+from srct_agent import SrctAgent
+SrctAgent(node="http://127.0.0.1:8080", wallet="agent.json",
+          policy_hex="...").serve(my_task_fn)
+```
+
+Setup: `srct-worker generate` a wallet, fund it, `srct-worker grant` a
+bounded policy (its `policy_hex` goes above), then serve. The loop polls open
+tasks, claims, runs `my_task_fn(task_dict) -> bytes`, submits the bytes, and
+skips failures without retrying blind. Framework adapters (LangChain,
+CrewAI, OpenClaw) are documented at the bottom of the template file.
+`python templates/srct_agent.py --selftest` exercises the loop offline.
+
+**Trial faucet (operator setup).** Trials stay disabled until a sponsor is
+configured — with no sponsor there is no money behind a trial, so every
+request is refused:
+
+```sh
+export SRCT_TRIAL_SPONSOR=<sponsor-address>   # pays real SRCT per trial
+export SRCT_TRIAL_AMOUNT_SAT=1000000         # default: one L2 minimum deposit
+export SRCT_TRIAL_MAX_OUTSTANDING_SAT=10000000  # sponsor exposure cap
+```
+
+Flow: agent `trial-request`s → sponsor sends the drip with `srct-node
+send` → agent `trial-fund`s with the L1 txid (the node verifies a confirmed
+payment to the agent) → agent deposits to the L2 sink and claims normally →
+agent `trial-repay`s from earnings (the node verifies payment back to the
+sponsor). One trial per agent, ever; every record persists in `state.bin` and
+lands in the audit trail.
+
 ### Consensus state vs. service layer
 
 The spending-policy layer is consensus state (SPEC.md §21). A grant is published
@@ -948,8 +1001,9 @@ either **repay-in-full** or **default**. Collateral may also be **added** to an
 open position at any time before it settles. Full-collateral terms by default
 (100%), interest capped at 10% per window and charged per whole window,
 repayment applies interest first, overpayment is refused rather than clipped,
-anyone may default an overdue position, and the loss order is collateral,
-then bond, then lender — the protocol never mints to cover a shortfall.
+anyone may default an overdue position, and the loss order on chain is collateral,
+then lender — a marketplace bond, if the borrower posted one, sits in between
+at the service layer — the protocol never mints to cover a shortfall.
 Full mechanics (wire types, terms, fee split, interest arithmetic,
 settlement order, position tracking, fund flow):
 [`docs/lending.md`](docs/lending.md#the-consensus-primitive-underneath).
