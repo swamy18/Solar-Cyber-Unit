@@ -34,8 +34,8 @@
 //! budget overrun, or recipient/service outside the allow-list is refused by
 //! name. Base64 errors are `Malformed`, never panics.
 
-use crate::hash::Address;
 use crate::hash::address_from_hex;
+use crate::hash::Address;
 use serde::{Deserialize, Serialize};
 
 /// x402 protocol version this adapter speaks (x402 v2).

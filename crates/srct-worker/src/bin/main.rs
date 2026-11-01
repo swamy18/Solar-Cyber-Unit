@@ -314,8 +314,7 @@ fn run_one_pass(client: &mut CliClient, max_tasks: u64, pass: u64) -> Result<(),
         // for this task" so the daemon claims out of the box; an explicit
         // value is the operator's insurance override.
         if client.config.worker_deposit_sat == 0 {
-            client.config.worker_deposit_sat =
-                srct_core::l2::settle_fee_sat(task.payment_sat);
+            client.config.worker_deposit_sat = srct_core::l2::settle_fee_sat(task.payment_sat);
         }
         match client.claim(id) {
             Ok(_) => println!(

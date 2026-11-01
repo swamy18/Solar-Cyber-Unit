@@ -147,10 +147,13 @@ fn parse_url(base: &str) -> WorkerResult<Endpoint> {
             let h = &rest[..end];
             let tail = &rest[end + 1..];
             let port: u16 = if let Some(p) = tail.strip_prefix(':') {
-                p.parse()
-                    .map_err(|_| WorkerError::ObservationMalformed("node URL port is not a number"))?
+                p.parse().map_err(|_| {
+                    WorkerError::ObservationMalformed("node URL port is not a number")
+                })?
             } else if !tail.is_empty() {
-                return Err(WorkerError::ObservationMalformed("node URL has a bad IPv6 host"));
+                return Err(WorkerError::ObservationMalformed(
+                    "node URL has a bad IPv6 host",
+                ));
             } else {
                 80
             };
