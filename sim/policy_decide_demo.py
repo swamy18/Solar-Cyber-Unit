@@ -91,11 +91,11 @@ def decide_live(args: argparse.Namespace) -> int:
     """The guard loop: intent in, allow/deny/approval-needed out."""
     policy_json = Path(args.policy).read_text(encoding="utf-8")
     # Structural read first (routing without trusting); the node verifies.
-    parse_portable_policy(policy_json)
+    # The grant's network is authoritative for the rail: a grant for another
+    # network is never re-framed, so the rail names itself from the grant.
+    grant = parse_portable_policy(policy_json)
+    rail_network = grant["network_id"]
     client = PolicyClient.for_node(args.node)
-    # Rail identity for the call shape; the node backend ignores it on the
-    # wire and frames the intent in its own network.
-    rail_network = "srct/mini"
     intent = PaymentIntent(
         agent_id=args.agent_id,
         recipient=args.recipient,

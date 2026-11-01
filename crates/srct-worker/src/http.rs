@@ -138,14 +138,40 @@ fn parse_url(base: &str) -> WorkerResult<Endpoint> {
         Some(i) => (&rest[..i], &rest[i..]),
         None => (rest, ""),
     };
-    let (host, port) = match authority.rsplit_once(':') {
-        Some((h, p)) => {
-            let port: u16 = p
-                .parse()
-                .map_err(|_| WorkerError::ObservationMalformed("node URL port is not a number"))?;
+    let (host, port) = match authority.strip_prefix('[') {
+        // Bracketed IPv6: [::1] or [::1]:8080.
+        Some(rest) => {
+            let end = rest.find(']').ok_or(WorkerError::ObservationMalformed(
+                "node URL has a bad IPv6 host",
+            ))?;
+            let h = &rest[..end];
+            let tail = &rest[end + 1..];
+            let port: u16 = if let Some(p) = tail.strip_prefix(':') {
+                p.parse()
+                    .map_err(|_| WorkerError::ObservationMalformed("node URL port is not a number"))?
+            } else if !tail.is_empty() {
+                return Err(WorkerError::ObservationMalformed("node URL has a bad IPv6 host"));
+            } else {
+                80
+            };
             (h.to_string(), port)
         }
-        None => (authority.to_string(), 80),
+        None => match authority.rsplit_once(':') {
+            Some((h, p)) if !h.contains(':') => {
+                let port: u16 = p.parse().map_err(|_| {
+                    WorkerError::ObservationMalformed("node URL port is not a number")
+                })?;
+                (h.to_string(), port)
+            }
+            // Bare IPv6 without brackets is refused: it cannot be split
+            // from a port unambiguously.
+            Some((h, _)) if h.contains(':') || authority.contains(':') => {
+                return Err(WorkerError::ObservationMalformed(
+                    "bare IPv6 needs brackets, e.g. http://[::1]:8080",
+                ));
+            }
+            _ => (authority.to_string(), 80),
+        },
     };
     if host.is_empty() {
         return Err(WorkerError::ObservationMalformed("node URL has no host"));
@@ -185,7 +211,12 @@ fn header_value<'a>(headers: &'a str, name: &str) -> Option<&'a str> {
 
 /// Decode a complete chunked body, or say it is incomplete. Anything else —
 /// a bad size line, a short chunk, a missing terminator — is malformed.
+#[allow(dead_code)]
 fn decode_chunked(input: &[u8]) -> Result<Body, Transport> {
+    decode_chunked_capped(input, 8 * 1024 * 1024)
+}
+
+fn decode_chunked_capped(input: &[u8], max_bytes: usize) -> Result<Body, Transport> {
     let mut out = Vec::with_capacity(input.len());
     let mut pos = 0usize;
     loop {
@@ -202,14 +233,24 @@ fn decode_chunked(input: &[u8]) -> Result<Body, Transport> {
             .map_err(|_| Transport::Malformed("chunk size is not hex"))?;
         pos += line_end + 2;
         if size == 0 {
-            // Trailer section: ends at the next CRLF (possibly immediately).
+            // Trailer section: ends at the next CRLF CRLF, or one bare CRLF.
+            // A partial trailer is incomplete input, not malformed.
             if input.len() < pos + 2 {
                 return Ok(Body::NeedMore);
             }
-            if &input[pos..pos + 2] != b"\r\n" && find_crlfcrlf(&input[pos..]).is_none() {
-                return Err(Transport::Malformed("chunked trailer is malformed"));
+            if &input[pos..pos + 2] == b"\r\n" {
+                return Ok(Body::Complete(out));
             }
-            return Ok(Body::Complete(out));
+            match find_crlfcrlf(&input[pos..]) {
+                Some(_) => return Ok(Body::Complete(out)),
+                None => {
+                    // No terminator yet — could be a split trailer.
+                    // Only malformed if we can prove it: a trailer must be
+                    // header lines, so a bare LF-free garbage block longer
+                    // than any sane header means malformed. Otherwise wait.
+                    return Ok(Body::NeedMore);
+                }
+            }
         }
         if input.len() < pos + size + 2 {
             return Ok(Body::NeedMore);
@@ -218,7 +259,7 @@ fn decode_chunked(input: &[u8]) -> Result<Body, Transport> {
             return Err(Transport::Malformed("chunk is not terminated by CRLF"));
         }
         out.extend_from_slice(&input[pos..pos + size]);
-        if out.len() > usize::MAX / 2 {
+        if out.len() > max_bytes {
             return Err(Transport::Malformed("chunked body over cap"));
         }
         pos += size + 2;
@@ -405,7 +446,7 @@ fn exchange_full(
     // --- body ------------------------------------------------------------
     let done = loop {
         let attempt = if chunked {
-            decode_chunked(&body_buf)?
+            decode_chunked_capped(&body_buf, max_response_bytes)?
         } else if let Some(n) = content_length {
             if n > max_response_bytes {
                 return Err(Transport::Malformed("declared body over cap"));

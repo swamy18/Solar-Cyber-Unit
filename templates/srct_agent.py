@@ -50,13 +50,29 @@ class SrctAgent:
     # -- node reads (no keys anywhere near here) -------------------------
 
     def _get(self, path):
+        import urllib.error
         req = urllib.request.Request(self.node + path, method="GET")
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            return resp.status, json.load(resp)
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                return resp.status, json.load(resp)
+        except urllib.error.HTTPError as e:
+            try:
+                body = e.read().decode("utf-8")
+                doc = json.loads(body) if body else {}
+            except Exception:
+                doc = {}
+            return e.code, doc
+        except Exception as e:
+            raise SrctError(f"node unreachable for {path}: {e}")
 
     def open_tasks(self):
         """Open tasks, highest paid first. Returns a list of task dicts."""
-        status, body = self._get(_OPEN_TASKS)
+        try:
+            status, body = self._get(_OPEN_TASKS)
+        except SrctError:
+            raise
+        except Exception as e:
+            raise SrctError(f"node unreachable: {e}")
         if status != 200:
             raise SrctError(f"node answered {status} for open tasks")
         tasks = body.get("tasks", [])
@@ -147,7 +163,15 @@ class SrctAgent:
         try:
             while True:
                 polls += 1
-                for task in self.open_tasks():
+                try:
+                    tasks = self.open_tasks()
+                except SrctError as exc:
+                    print(f"[poll] node unreadable, retrying: {exc}")
+                    if max_polls and polls >= max_polls:
+                        return done
+                    time.sleep(poll_secs)
+                    continue
+                for task in tasks:
                     task_id = task.get("task_id")
                     if not task_id:
                         continue

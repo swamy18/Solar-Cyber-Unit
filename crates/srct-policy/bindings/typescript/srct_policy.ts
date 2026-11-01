@@ -104,12 +104,20 @@ export class NodeHttpBackend implements PolicyBackend {
     intentJson: string,
     approvalThresholdSat?: number | null,
   ): Promise<string> {
-    // The node frames the intent in its own network and height, so the
-    // caller's networkId never travels: it exists so direct-Rust backends
-    // and this backend share one call shape, and the rail cannot forget
-    // to name itself.
-    void networkId;
+    // Fail-closed on a malformed rail id, matching the Rust backend.
+    if (!networkId || networkId.length > 64 || networkId.trim() !== networkId) {
+      throw new Error("malformed rail network id");
+    }
     const intent = JSON.parse(intentJson) as PaymentIntent;
+    // The rail owns its identity: an intent for another network is a deny
+    // here, so this backend matches direct-Rust instead of asking the node
+    // (which would answer for its own network).
+    if (intent.network_id !== networkId) {
+      return JSON.stringify({
+        decision: "deny",
+        reason: `intent is for network ${intent.network_id}, asked on ${networkId}`,
+      });
+    }
     const doc = await this.post("/v1/policy/decide", {
       policy_portable_json: policyPortableJson,
       agent_id_hex: intent.agent_id,
@@ -149,6 +157,9 @@ export function encodeIntent(intent: PaymentIntent): string {
   }
   if (!Number.isInteger(intent.amount_sat) || intent.amount_sat < 0) {
     throw new Error("amount_sat must be a non-negative integer");
+  }
+  if (!intent.network_id || intent.network_id.length > 64 || intent.network_id.trim() !== intent.network_id) {
+    throw new Error("network_id is malformed");
   }
   return JSON.stringify(intent);
 }

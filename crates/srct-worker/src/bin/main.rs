@@ -309,6 +309,14 @@ fn run_one_pass(client: &mut CliClient, max_tasks: u64, pass: u64) -> Result<(),
 
     for task in tasks.iter().take(max_tasks as usize) {
         let id = task.task_id;
+        // A zero deposit never claims: the protocol refuses anything below
+        // the settle fee. Treat `--deposit-sat 0` as "the on-chain minimum
+        // for this task" so the daemon claims out of the box; an explicit
+        // value is the operator's insurance override.
+        if client.config.worker_deposit_sat == 0 {
+            client.config.worker_deposit_sat =
+                srct_core::l2::settle_fee_sat(task.payment_sat);
+        }
         match client.claim(id) {
             Ok(_) => println!(
                 "  claim   {} net={} sat",
@@ -575,17 +583,15 @@ fn cmd_claim(args: &[String]) -> Result<i32, String> {
     let deposit = match num_arg(args, "--deposit", 0)? {
         0 => {
             // The chain refuses a deposit below the settle fee, so the
-            // default is the on-chain minimum for *this* task — read, not
-            // guessed. An explicit --deposit is the operator overriding that
-            // minimum with a larger insurance deposit.
-            let task = view
-                .task(&task_id)
-                .map_err(|e| format!("could not read task: {e}"))?;
-            let payment = task
-                .get("payment_sat")
-                .and_then(serde_json::Value::as_u64)
-                .ok_or("task has no payment_sat")?;
-            srct_core::l2::settle_fee_sat(payment)
+            // default is the on-chain minimum for *this* task — read from
+            // the canonical observed state (codec + conservation checked),
+            // not the rendered task JSON. An explicit --deposit overrides
+            // that minimum with a larger insurance deposit.
+            let obs = view
+                .observe()
+                .map_err(|e| format!("could not read state: {e}"))?;
+            let contract = obs.state.task(&task_id).ok_or("unknown task")?;
+            srct_core::l2::settle_fee_sat(contract.payment_sat)
         }
         n => n,
     };

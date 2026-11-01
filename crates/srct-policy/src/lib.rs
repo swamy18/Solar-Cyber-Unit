@@ -61,6 +61,15 @@ pub fn decide(
     intent_json: &str,
     approval_threshold_sat: Option<u64>,
 ) -> Result<String, String> {
+    // The rail must name itself: an empty, over-long or padded id is a
+    // caller bug, not a routing answer. Reject it as malformed so a
+    // `decide("", …)` cannot read as a confusing deny.
+    if network_id.is_empty() || network_id.len() > 64 {
+        return Err("malformed rail network id".to_string());
+    }
+    if network_id.trim() != network_id {
+        return Err("malformed rail network id".to_string());
+    }
     let signed = SignedPolicy::from_json(policy_portable_json).map_err(|e| e.to_string())?;
     let intent: PaymentIntent =
         serde_json::from_str(intent_json).map_err(|_| "malformed intent json".to_string())?;

@@ -41,6 +41,8 @@ class PaymentIntent:
     def to_json(self) -> str:
         if self.amount_sat < 0:
             raise ValueError("amount_sat must be non-negative")
+        if not self.network_id or len(self.network_id) > 64 or self.network_id.strip() != self.network_id:
+            raise ValueError("network_id is malformed")
         return json.dumps(
             {
                 "agent_id": self.agent_id,
@@ -188,23 +190,38 @@ class NodeHttpBackend:
         intent_json: str,
         approval_threshold_sat: Optional[int] = None,
     ) -> str:
-        # The node frames the intent in its own network and height, so the
-        # caller's network_id never travels: it exists so direct-Rust backends
-        # and this backend share one call shape, and the rail cannot forget
-        # to name itself.
-        _ = network_id
-        intent = json.loads(intent_json)
+        # Fail-closed on a malformed rail id, matching the Rust backend:
+        # an empty or padded network is a caller bug, not a deny.
+        if not network_id or len(network_id) > 64 or network_id.strip() != network_id:
+            raise RuntimeError("malformed rail network id")
+        try:
+            intent = json.loads(intent_json)
+            agent_id = intent["agent_id"]
+            recipient = intent["recipient"]
+            amount_sat = intent["amount_sat"]
+            intent_network = intent.get("network_id", "")
+        except (ValueError, KeyError, TypeError) as e:
+            raise RuntimeError(f"malformed intent json: {e}") from e
+        # The rail owns its identity: an intent for another network is a
+        # deny here, so this backend matches direct-Rust instead of asking
+        # the node (which would answer for its own network).
+        if intent_network != network_id:
+            return json.dumps(
+                {"decision": "deny", "reason": f"intent is for network {intent_network}, asked on {network_id}"}
+            )
         doc = self._post(
             "/v1/policy/decide",
             {
                 "policy_portable_json": policy_portable_json,
-                "agent_id_hex": intent["agent_id"],
-                "recipient_hex": intent["recipient"],
-                "amount_sat": intent["amount_sat"],
+                "agent_id_hex": agent_id,
+                "recipient_hex": recipient,
+                "amount_sat": amount_sat,
                 "service_hex": intent.get("service"),
                 "approval_threshold_sat": approval_threshold_sat,
             },
         )
+        if doc.get("decision") not in ("allow", "deny", "needs_approval"):
+            raise RuntimeError("malformed policy decision from node")
         return json.dumps(
             {"decision": doc["decision"], "reason": doc.get("reason", "")}
         )

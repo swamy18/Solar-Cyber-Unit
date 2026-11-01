@@ -35,6 +35,7 @@
 //! name. Base64 errors are `Malformed`, never panics.
 
 use crate::hash::Address;
+use crate::hash::address_from_hex;
 use serde::{Deserialize, Serialize};
 
 /// x402 protocol version this adapter speaks (x402 v2).
@@ -327,8 +328,17 @@ pub fn select_accept<'a>(
         if parse_srct_network(&accept.network).is_err() {
             continue;
         }
-        let amount = parse_sat_amount(&accept.amount)?;
+        // One malformed amount must not poison the whole challenge: skip it
+        // so a server can advertise a bad option beside good ones.
+        let Ok(amount) = parse_sat_amount(&accept.amount) else {
+            continue;
+        };
         if amount == 0 {
+            continue;
+        }
+        // The choice must be for this recipient: budget is per-payee, and a
+        // global cheapest across payees would route to the wrong guard.
+        if address_from_hex(&accept.pay_to).ok() != Some(*recipient) {
             continue;
         }
         budget.check(amount, recipient, service)?;
@@ -743,7 +753,7 @@ mod tests {
         let required = build_required_with_evm(
             "srct/testnet",
             500,
-            "42".to_string(),
+            "0101010101010101010101010101010101010101".to_string(),
             "/v1/paid/weather".to_string(),
             "weather".to_string(),
             evm,

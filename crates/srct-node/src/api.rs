@@ -1461,14 +1461,31 @@ impl SharedNode {
                 let requested_height = sr.u64le().map_err(|e| format!("trials: {e}"))?;
                 // A funded trial without its funding proof, or a repaid trial
                 // without its repayment proof, is a half-written record: refuse
-                // the file rather than trusting a bare flag.
-                if (state == TrialState::Funded || state == TrialState::Repaid)
-                    && fund_txid.is_none()
-                {
-                    return Err("trials: funded without fund txid".into());
+                // the file rather than trusting a bare flag. The reverse is
+                // also refused: Requested carries no proofs, Funded carries
+                // no repayment yet, and one txid can never be both sides.
+                if amount_sat == 0 {
+                    return Err("trials: zero amount".into());
                 }
-                if state == TrialState::Repaid && repay_txid.is_none() {
-                    return Err("trials: repaid without repay txid".into());
+                match state {
+                    TrialState::Requested => {
+                        if fund_txid.is_some() || repay_txid.is_some() {
+                            return Err("trials: requested with txids".into());
+                        }
+                    }
+                    TrialState::Funded => {
+                        if fund_txid.is_none() || repay_txid.is_some() {
+                            return Err("trials: funded shape".into());
+                        }
+                    }
+                    TrialState::Repaid => {
+                        if fund_txid.is_none() || repay_txid.is_none() {
+                            return Err("trials: repaid shape".into());
+                        }
+                        if fund_txid == repay_txid {
+                            return Err("trials: fund and repay share a txid".into());
+                        }
+                    }
                 }
                 if map
                     .insert(
@@ -8333,6 +8350,18 @@ async fn trial_fund(State(state): State<ApiState>, Json(req): Json<TrialTxReq>) 
                 ));
             }
         }
+        // One txid is single-use: it cannot already be either side of this
+        // trial, nor either side of any other trial. The `except` in the
+        // book scan skips this agent for cross-trial checks, so check the
+        // same-record reuse here — a tx that pays both agent and sponsor
+        // cannot fund and repay with no net movement.
+        if trial.fund_txid == Some(txid) || trial.repay_txid == Some(txid) {
+            return Err(fail(
+                StatusCode::CONFLICT,
+                "txid_reused",
+                "one L1 payment funds at most one trial",
+            ));
+        }
         if trial_txid_used(&sh.trials, Some(&agent), &txid) {
             return Err(fail(
                 StatusCode::CONFLICT,
@@ -8398,25 +8427,62 @@ async fn trial_repay(State(state): State<ApiState>, Json(req): Json<TrialTxReq>)
                 "no trial recorded for this agent — request one first",
             )
         })?;
-        if trial.state != TrialState::Funded {
+        // One txid can never be both sides of the same trial.
+        if trial.fund_txid == Some(txid) {
             return Err(fail(
                 StatusCode::CONFLICT,
-                "trial_not_due",
-                "only a funded trial can be repaid",
+                "txid_reused",
+                "one L1 payment cannot fund and repay the same trial",
             ));
         }
-        if let Some(old) = trial.repay_txid {
-            if old == txid
-                && confirmed_payment_to(&sh.chain, &txid, &trial.sponsor, trial.amount_sat)
-            {
-                return Ok(Json(trial_json(&trial)));
-            }
-            if confirmed_payment_to(&sh.chain, &old, &trial.sponsor, trial.amount_sat) {
+        match trial.state {
+            TrialState::Requested => {
                 return Err(fail(
                     StatusCode::CONFLICT,
-                    "trial_repaid",
-                    "this trial already has a confirmed repayment",
+                    "trial_not_due",
+                    "only a funded trial can be repaid",
                 ));
+            }
+            TrialState::Repaid => {
+                // Idempotent re-confirm after restart, or replacement after
+                // the recorded repayment orphaned. Matches `trial_fund`.
+                if trial.repay_txid == Some(txid)
+                    && confirmed_payment_to(&sh.chain, &txid, &trial.sponsor, trial.amount_sat)
+                {
+                    return Ok(Json(trial_json(&trial)));
+                }
+                if let Some(old) = trial.repay_txid {
+                    if confirmed_payment_to(&sh.chain, &old, &trial.sponsor, trial.amount_sat) {
+                        return Err(fail(
+                            StatusCode::CONFLICT,
+                            "trial_closed",
+                            "this trial is repaid and closed",
+                        ));
+                    }
+                    // Old repayment orphaned: fall through and replace it.
+                } else {
+                    return Err(fail(
+                        StatusCode::CONFLICT,
+                        "trial_closed",
+                        "this trial is repaid and closed",
+                    ));
+                }
+            }
+            TrialState::Funded => {
+                if let Some(old) = trial.repay_txid {
+                    if old == txid
+                        && confirmed_payment_to(&sh.chain, &txid, &trial.sponsor, trial.amount_sat)
+                    {
+                        return Ok(Json(trial_json(&trial)));
+                    }
+                    if confirmed_payment_to(&sh.chain, &old, &trial.sponsor, trial.amount_sat) {
+                        return Err(fail(
+                            StatusCode::CONFLICT,
+                            "trial_repaid",
+                            "this trial already has a confirmed repayment",
+                        ));
+                    }
+                }
             }
         }
         if trial_txid_used(&sh.trials, Some(&agent), &txid) {
