@@ -27,7 +27,14 @@ DATA_ROOT="./localnet"
 NETWORK="mini"
 BIN=""
 NO_MINE=0
-PASSPHRASE="${SRCT_WALLET_PASSPHRASE:-localnet-dev-passphrase}"
+# No baked default: an unset passphrase fails closed so dev keys are never
+# silently encrypted with a well-known password.
+if [ -z "${SRCT_WALLET_PASSPHRASE:-}" ]; then
+    echo "SRCT_WALLET_PASSPHRASE is not set; refusing to start with a default" >&2
+    echo "export SRCT_WALLET_PASSPHRASE=<dev-secret> and retry" >&2
+    exit 1
+fi
+PASSPHRASE="$SRCT_WALLET_PASSPHRASE"
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -66,6 +73,16 @@ if [ -z "$BIN" ] || [ ! -f "$BIN" ]; then
         echo "Build it first with: cargo build --release" >&2
         exit 1
     fi
+fi
+# Never execute an unvalidated path: it must exist and be executable, and
+# --binary must stay inside the repo or PATH (no /tmp hijack).
+case "$BIN" in
+    "$REPO_ROOT"/*|/usr/local/bin/*|/usr/bin/*) ;;
+    *) BIN="$(command -v "$BIN" 2>/dev/null || true)";;
+esac
+if [ -z "$BIN" ] || [ ! -x "$BIN" ]; then
+    echo "refusing to execute non-executable binary: $BIN" >&2
+    exit 1
 fi
 
 if [ "$NODES" -lt 1 ]; then

@@ -203,10 +203,35 @@ impl RoundTracker {
     /// whose block left canon pays nobody — keeping it would unlock orphan
     /// money at maturity. Entries are keyed by release height
     /// (`finalize_height + maturity`), so the orphaned one is exact.
+    /// The operator fee for the voided round is reversed too, and dust
+    /// carried from exactly that round is returned (when no later round
+    /// has consumed it).
     pub fn void_round(&mut self, block_height: u64) {
+        let mut void_fee = 0u64;
+        let mut void_dust = 0u64;
+        let mut void_count = 0usize;
+        let mut was_latest = false;
+        if let Some(last) = self.rounds.last() {
+            was_latest = last.block_height == block_height;
+        }
+        for r in self
+            .rounds
+            .iter()
+            .filter(|r| r.block_height == block_height)
+        {
+            void_fee = void_fee.saturating_add(r.fee_sat);
+            void_dust = void_dust.saturating_add(r.dust_sat);
+            void_count += 1;
+        }
         self.rounds.retain(|r| r.block_height != block_height);
         let release = block_height.saturating_add(self.coinbase_maturity);
         self.immature.retain(|(r, _)| *r != release);
+        self.operator_earned_sat = self.operator_earned_sat.saturating_sub(void_fee);
+        // Only the latest round's dust is still sitting in `carry_sat`:
+        // later rounds would have consumed it into their own pots.
+        if void_count == 1 && was_latest && self.carry_sat == void_dust {
+            self.carry_sat = 0;
+        }
     }
 
     /// Record one accepted share for `miner` at the tail of the window.

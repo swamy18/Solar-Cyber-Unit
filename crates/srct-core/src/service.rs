@@ -700,11 +700,14 @@ pub fn admit_payment(
     //    payment (consuming real coin) is a later step (roadmap item 10/§19.4).
     //    But a policy that authorizes a spend must still be backed by *something*
     //    that will pay it, and that is the credit book's job: confirm the payer's
-    //    free balance or live position can cover `amount_sat`, and reserve it so
-    //    the later settlement cannot overdraw. A book that has wired nothing in
-    //    gets `NoCreditGate` and this step is a no-op — pre-credit behavior.
+    //    free balance or live position can cover `amount + fee`, and reserve it
+    //    so the later settlement cannot overdraw. A book that has wired nothing
+    //    in gets `NoCreditGate` and this step is a no-op — pre-credit behavior.
+    let total = payment.total_sat().ok_or(SessionError::InsufficientCredit(
+        crate::error::Error::Malformed("payment amount + fee overflows"),
+    ))?;
     let reservation = gate
-        .reserve(&payment.payer, payment.amount_sat, height)
+        .reserve(&payment.payer, total, height)
         .map_err(SessionError::InsufficientCredit)?;
 
     Ok(reservation)
