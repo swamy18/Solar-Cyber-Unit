@@ -26,6 +26,7 @@
 pub mod agent;
 pub mod arbitration;
 pub mod block;
+pub mod bsaver;
 pub mod bls;
 pub mod bls_checkpoint;
 pub mod bond;

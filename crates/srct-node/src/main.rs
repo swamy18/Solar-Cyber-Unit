@@ -1444,8 +1444,12 @@ fn cmd_status(args: &Args) -> Result<(), String> {
         );
     }
     println!(
-        "removed        {} SRCT (base fees burned + PSCB, all usage ever)",
+        "removed        {} SRCT (base fees burned + PSCB + B-Saver, all usage ever)",
         srct(report.removed_sat)
+    );
+    println!(
+        "bsaver         {} SRCT (5% of fee PSCB leg, floor reserve)",
+        srct(chain.bsaver_reserve())
     );
     println!(
         "net supply     {} SRCT (issued minus removed)",

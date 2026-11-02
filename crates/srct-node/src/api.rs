@@ -1864,6 +1864,7 @@ async fn status(State(state): State<ApiState>) -> ApiResult {
             "base_fee_sat": sh.chain.expected_base_fee_for_next_block(),
             "total_supply_sat": sh.chain.total_supply_sat(),
             "pscb_reserve_sat": sh.chain.pscb_reserve(),
+            "bsaver_reserve_sat": sh.chain.bsaver_reserve(),
             "finalized_height": sh.chain.finalized_height(),
             "finality_activation_height": p.finality_activation_height,
             "finality_depth": p.finality_depth,
@@ -1916,6 +1917,9 @@ async fn conservation(State(state): State<ApiState>) -> ApiResult {
             "l1_live_sat": report.supply.l1_live_sat,
             "l2_held_sat": report.supply.l2_held_sat,
             "sink_held_sat": report.supply.sink_held_sat,
+            "pscb_reserve_sat": sh.chain.pscb_reserve(),
+            "bsaver_reserve_sat": sh.chain.bsaver_reserve(),
+            "burned_fees_sat": sh.chain.burned_fees_total(),
             // Exit-outflow watch (lesson: the sink is a honeypot). An operator
             // alerts when the window fills faster than legitimate use: the
             // window total and its reset height say how much can still leave
@@ -2118,6 +2122,13 @@ async fn metrics(
             "PSCB reserve counter, in satoshi (non-spendable; never re-enters supply).",
             &net,
             sh.chain.pscb_reserve(),
+        );
+        gauge(
+            &mut out,
+            "srct_bsaver_reserve_sat",
+            "B-Saver floor reserve, in satoshi (5% of fee PSCB leg, cap 10%; non-spendable sub-ledger).",
+            &net,
+            sh.chain.bsaver_reserve(),
         );
         gauge(
             &mut out,
