@@ -218,6 +218,13 @@ const STATE_ENVELOPE_VERSION: u8 = 9;
 /// by `srct-store`, so this is a lying-count guard, not a target.
 const MAX_STATE_ENTRIES: usize = 1 << 20;
 
+/// Live-insert caps for trustee-curated books: decode allows up to
+/// `MAX_STATE_ENTRIES` (lying-count guard), but live inserts refuse when full
+/// so one writer cannot grow `state.bin` until the 64 MB save fails.
+const MAX_FX_RATES: usize = 512;
+const MAX_RAMP_QUOTES: usize = 1024;
+const MAX_RAMP_INTENTS: usize = 1024;
+
 /// Length-prefix one section into the state envelope.
 fn put_section(w: &mut Writer, bytes: &[u8]) {
     w.u32le(bytes.len() as u32).raw(bytes);
@@ -884,9 +891,11 @@ impl SharedNode {
     pub fn decode_state(&mut self, bytes: &[u8]) -> Result<(), String> {
         let mut r = Reader::new(bytes);
         let version = r.u8().map_err(|e| format!("state envelope: {e}"))?;
-        if version != STATE_ENVELOPE_VERSION {
+        // v8 files lack the trailing trials section: migrate them by
+        // starting with an empty trial book instead of refusing to boot.
+        if version != STATE_ENVELOPE_VERSION && version != 8 {
             return Err(format!(
-                "state envelope version {version}, this build reads {STATE_ENVELOPE_VERSION}"
+                "state envelope version {version}, this build reads {STATE_ENVELOPE_VERSION} (and migrates 8)"
             ));
         }
 
@@ -1434,81 +1443,88 @@ impl SharedNode {
             }
             Ok(map)
         })?;
-        let trials = decode_section(&mut r, "trials", |sr| {
-            let count = sr.u32le().map_err(|e| format!("trials: {e}"))? as usize;
-            if count > MAX_STATE_ENTRIES {
-                return Err(format!(
-                    "trials: {count} entries over the {MAX_STATE_ENTRIES} cap"
-                ));
-            }
-            let mut map = BTreeMap::new();
-            for _ in 0..count {
-                let agent: Address = sr.fixed().map_err(|e| format!("trials: {e}"))?;
-                let amount_sat = sr.u64le().map_err(|e| format!("trials: {e}"))?;
-                let sponsor: Address = sr.fixed().map_err(|e| format!("trials: {e}"))?;
-                let state = TrialState::from_u8(sr.u8().map_err(|e| format!("trials: {e}"))?)
-                    .ok_or("trials: unknown state")?;
-                let fund_txid = match sr.u8().map_err(|e| format!("trials: {e}"))? {
-                    0 => None,
-                    1 => Some(sr.fixed().map_err(|e| format!("trials: {e}"))?),
-                    _ => return Err("trials: bad fund flag".into()),
-                };
-                let repay_txid = match sr.u8().map_err(|e| format!("trials: {e}"))? {
-                    0 => None,
-                    1 => Some(sr.fixed().map_err(|e| format!("trials: {e}"))?),
-                    _ => return Err("trials: bad repay flag".into()),
-                };
-                let requested_height = sr.u64le().map_err(|e| format!("trials: {e}"))?;
-                // A funded trial without its funding proof, or a repaid trial
-                // without its repayment proof, is a half-written record: refuse
-                // the file rather than trusting a bare flag. The reverse is
-                // also refused: Requested carries no proofs, Funded carries
-                // no repayment yet, and one txid can never be both sides.
-                if amount_sat == 0 {
-                    return Err("trials: zero amount".into());
+        // v8 files end here: no trials section. v9 appends it last.
+        let trials = if version == 8 {
+            r.expect_end().map_err(|e| format!("state envelope: {e}"))?;
+            BTreeMap::new()
+        } else {
+            let t = decode_section(&mut r, "trials", |sr| {
+                let count = sr.u32le().map_err(|e| format!("trials: {e}"))? as usize;
+                if count > MAX_STATE_ENTRIES {
+                    return Err(format!(
+                        "trials: {count} entries over the {MAX_STATE_ENTRIES} cap"
+                    ));
                 }
-                match state {
-                    TrialState::Requested => {
-                        if fund_txid.is_some() || repay_txid.is_some() {
-                            return Err("trials: requested with txids".into());
+                let mut map = BTreeMap::new();
+                for _ in 0..count {
+                    let agent: Address = sr.fixed().map_err(|e| format!("trials: {e}"))?;
+                    let amount_sat = sr.u64le().map_err(|e| format!("trials: {e}"))?;
+                    let sponsor: Address = sr.fixed().map_err(|e| format!("trials: {e}"))?;
+                    let state = TrialState::from_u8(sr.u8().map_err(|e| format!("trials: {e}"))?)
+                        .ok_or("trials: unknown state")?;
+                    let fund_txid = match sr.u8().map_err(|e| format!("trials: {e}"))? {
+                        0 => None,
+                        1 => Some(sr.fixed().map_err(|e| format!("trials: {e}"))?),
+                        _ => return Err("trials: bad fund flag".into()),
+                    };
+                    let repay_txid = match sr.u8().map_err(|e| format!("trials: {e}"))? {
+                        0 => None,
+                        1 => Some(sr.fixed().map_err(|e| format!("trials: {e}"))?),
+                        _ => return Err("trials: bad repay flag".into()),
+                    };
+                    let requested_height = sr.u64le().map_err(|e| format!("trials: {e}"))?;
+                    // A funded trial without its funding proof, or a repaid trial
+                    // without its repayment proof, is a half-written record: refuse
+                    // the file rather than trusting a bare flag. The reverse is
+                    // also refused: Requested carries no proofs, Funded carries
+                    // no repayment yet, and one txid can never be both sides.
+                    if amount_sat == 0 {
+                        return Err("trials: zero amount".into());
+                    }
+                    match state {
+                        TrialState::Requested => {
+                            if fund_txid.is_some() || repay_txid.is_some() {
+                                return Err("trials: requested with txids".into());
+                            }
+                        }
+                        TrialState::Funded => {
+                            if fund_txid.is_none() || repay_txid.is_some() {
+                                return Err("trials: funded shape".into());
+                            }
+                        }
+                        TrialState::Repaid => {
+                            if fund_txid.is_none() || repay_txid.is_none() {
+                                return Err("trials: repaid shape".into());
+                            }
+                            if fund_txid == repay_txid {
+                                return Err("trials: fund and repay share a txid".into());
+                            }
                         }
                     }
-                    TrialState::Funded => {
-                        if fund_txid.is_none() || repay_txid.is_some() {
-                            return Err("trials: funded shape".into());
-                        }
-                    }
-                    TrialState::Repaid => {
-                        if fund_txid.is_none() || repay_txid.is_none() {
-                            return Err("trials: repaid shape".into());
-                        }
-                        if fund_txid == repay_txid {
-                            return Err("trials: fund and repay share a txid".into());
-                        }
-                    }
-                }
-                if map
-                    .insert(
-                        agent,
-                        TrialRecord {
+                    if map
+                        .insert(
                             agent,
-                            amount_sat,
-                            sponsor,
-                            state,
-                            fund_txid,
-                            repay_txid,
-                            requested_height,
-                        },
-                    )
-                    .is_some()
-                {
-                    return Err("trials: duplicate agent".into());
+                            TrialRecord {
+                                agent,
+                                amount_sat,
+                                sponsor,
+                                state,
+                                fund_txid,
+                                repay_txid,
+                                requested_height,
+                            },
+                        )
+                        .is_some()
+                    {
+                        return Err("trials: duplicate agent".into());
+                    }
                 }
-            }
-            Ok(map)
-        })?;
-        // Anything after the last section means the envelope is malformed.
-        r.expect_end().map_err(|e| format!("state envelope: {e}"))?;
+                Ok(map)
+            })?;
+            // Anything after the last section means the envelope is malformed.
+            r.expect_end().map_err(|e| format!("state envelope: {e}"))?;
+            t
+        };
 
         self.receipts = receipts;
         self.payment_tracker = payment_tracker;
@@ -2891,22 +2907,39 @@ async fn tx_build(State(state): State<ApiState>, Json(req): Json<TxBuildReq>) ->
         for (op, value) in candidates {
             let gas = GAS_TX_BASE + GAS_PER_INPUT * (chosen.len() as u64 + 1) + GAS_PER_OUTPUT * 2;
             let fee = fees::required_fee(base_fee, gas).saturating_add(1_000);
-            if total >= req.amount_sat.saturating_add(fee) {
+            let need = req.amount_sat.checked_add(fee).ok_or_else(|| {
+                fail(
+                    StatusCode::BAD_REQUEST,
+                    "amount_overflow",
+                    "amount + fee overflows",
+                )
+            })?;
+            if total >= need {
                 break;
             }
-            total = total.saturating_add(value);
+            total = total.checked_add(value).ok_or_else(|| {
+                fail(
+                    StatusCode::BAD_REQUEST,
+                    "amount_overflow",
+                    "input total overflows",
+                )
+            })?;
             chosen.push(op);
         }
         let gas = GAS_TX_BASE + GAS_PER_INPUT * chosen.len() as u64 + GAS_PER_OUTPUT * 2;
         let fee = fees::required_fee(base_fee, gas).saturating_add(1_000);
-        if total < req.amount_sat.saturating_add(fee) {
+        let need = req.amount_sat.checked_add(fee).ok_or_else(|| {
+            fail(
+                StatusCode::BAD_REQUEST,
+                "amount_overflow",
+                "amount + fee overflows",
+            )
+        })?;
+        if total < need {
             return Err(fail(
                 StatusCode::BAD_REQUEST,
                 "insufficient_funds",
-                format!(
-                    "have {total} sat, need {} sat",
-                    req.amount_sat.saturating_add(fee)
-                ),
+                format!("have {total} sat, need {need} sat"),
             ));
         }
         if fee > req.max_fee_sat {
@@ -7091,6 +7124,19 @@ async fn fx_rate_register(State(state): State<ApiState>, Json(req): Json<Value>)
                 "rate issuer is not trusted by this node",
             ));
         }
+        // Live cap + prune expired: decode allows 1M (lying-count guard),
+        // but live inserts must stay tiny or `state.bin` grows to the 64 MB
+        // save cap. Replacing an existing base never counts as growth.
+        if !sh.fx_rates.contains_key(&rate.base) {
+            sh.fx_rates.retain(|_, r| r.valid_until_height >= from);
+            if sh.fx_rates.len() >= MAX_FX_RATES {
+                return Err(fail(
+                    StatusCode::CONFLICT,
+                    "fx_full",
+                    "rate book is full; prune expired rates first",
+                ));
+            }
+        }
         sh.fx_rates.insert(rate.base.clone(), rate.clone());
         audit_push(
             sh,
@@ -7346,6 +7392,13 @@ async fn ramp_quote(State(state): State<ApiState>, Json(req): Json<RampQuoteReq>
                 json!({ "quote_id": hash_to_hex(&id), "duplicate": true }),
             ));
         }
+        if sh.ramp_quotes.len() >= MAX_RAMP_QUOTES {
+            return Err(fail(
+                StatusCode::CONFLICT,
+                "ramp_full",
+                "quote book is full",
+            ));
+        }
         sh.ramp_quotes.insert(id, (quote, sigs, keys));
         audit_push(
             sh,
@@ -7440,6 +7493,13 @@ async fn ramp_intent(State(state): State<ApiState>, Json(req): Json<RampIntentRe
         if sh.ramp_intents.contains_key(&id) {
             return Ok(Json(
                 json!({ "intent_id": hash_to_hex(&id), "duplicate": true }),
+            ));
+        }
+        if sh.ramp_intents.len() >= MAX_RAMP_INTENTS {
+            return Err(fail(
+                StatusCode::CONFLICT,
+                "ramp_full",
+                "intent book is full",
             ));
         }
         sh.ramp_intents.insert(id, intent);

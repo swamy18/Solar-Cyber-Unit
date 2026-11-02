@@ -370,6 +370,20 @@ impl Pool {
                 self.share_difficulty, block.header.difficulty
             )));
         }
+        // Fail fast on an unusable template difficulty: 0 can never be met
+        // and an overflow difficulty burns miner CPU on an unsatisfiable bar.
+        // `proof_meets` maps overflow to Ok(false); refuse here with a name.
+        if block.header.difficulty == 0 {
+            return Err(Error::BadPuzzleSpec(
+                "template difficulty is zero".to_string(),
+            ));
+        }
+        if srct_core::u256::target_for_difficulty(block.header.difficulty).is_err() {
+            return Err(Error::BadPuzzleSpec(format!(
+                "template difficulty {} overflows the target",
+                block.header.difficulty
+            )));
+        }
         // The template names the current height: unlock whatever matured.
         // Without this a round's earnings would sit in `immature` forever.
         if let Ok(mut payouts) = self.payouts.lock() {
@@ -427,6 +441,18 @@ impl Pool {
         }
         if block.txs != template.txs {
             return Err(Error::Malformed("share transactions differ from its job"));
+        }
+        // The body is consensus: l2 payload, exit claims and the block
+        // signature all feed the merkle root / chain validation. A share
+        // with a valid PoW but a mutated body would earn PPLNS weight for
+        // a block the node must refuse, diluting honest miners.
+        if block.l2_txs != template.l2_txs
+            || block.l2_state_root != template.l2_state_root
+            || block.exit_claims != template.exit_claims
+            || block.signature != template.signature
+            || block.signer_pubkey != template.signer_pubkey
+        {
+            return Err(Error::Malformed("share body differs from its job"));
         }
         // Miner-table bound before any accounting or forwarding: a fresh
         // address per share would otherwise grow `stats`, the payout

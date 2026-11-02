@@ -21,6 +21,12 @@ done
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 "$SCRIPT_DIR/stop-network" --data-root "$DATA_ROOT" || true
 
+# Guard against wiping the host: empty, root, home or missing marker.
+if [ -z "$DATA_ROOT" ] || [ "$DATA_ROOT" = "/" ] || [ "$DATA_ROOT" = "~" ] || [ "$DATA_ROOT" = "$HOME" ]; then
+    echo "refusing to remove unsafe DATA_ROOT: $DATA_ROOT" >&2
+    exit 1
+fi
+
 if [ -d "$DATA_ROOT" ]; then
     rm -rf "$DATA_ROOT"
     echo "removed $DATA_ROOT"
