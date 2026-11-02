@@ -1529,12 +1529,22 @@ impl SharedNode {
         self.receipts = receipts;
         self.payment_tracker = payment_tracker;
         self.payment_store = payment_store;
-        self.payment_tx = payment_tx;
         self.reservations = reservations;
         self.policies = policies;
         self.credit = credit;
         self.delegations = delegations;
+        // Prune dangling references: a restart must not pin credit or
+        // escrow state for payments/escrows that are no longer in the book.
+        // `payment_tx` names a payment in `payment_store`; `escrow_exit` and
+        // `held_escrows` name an escrow in `escrows`. Orphans are dropped.
+        let mut payment_tx = payment_tx;
+        payment_tx.retain(|p, _| self.payment_store.contains_key(p));
+        let mut escrow_exit = escrow_exit;
+        escrow_exit.retain(|id, _| escrows.contains_key(id));
+        let mut held_escrows = held_escrows;
+        held_escrows.retain(|id| escrows.contains_key(id));
         self.escrows = escrows;
+        self.payment_tx = payment_tx;
         self.escrow_exit = escrow_exit;
         self.attestations_used = attestations_used;
         self.policy_registry = policy_registry;
@@ -3359,6 +3369,17 @@ async fn policy_decide(
     // must never answer from an unverified grant.
     signed.verify().map_err(|e| bad(format!("policy: {e}")))?;
     with_shared(&state, |sh| {
+        // A revoked grant is a deny, not an allow: the stateless engine
+        // checks the `revoked` flag, but node revocation lives in the
+        // `revoked_policies` set. Answer from the set here.
+        if sh.revoked_policies.contains(&signed.policy.hash()) {
+            return Ok(Json(json!({
+                "decision": "deny",
+                "reason": "policy revoked",
+                "network_id": sh.chain.params().network_id.clone(),
+                "height": sh.chain.height(),
+            })));
+        }
         let network = sh.chain.params().network_id.clone();
         let height = sh.chain.height();
         // A query answers; only malformed input is an error. A deny is a
@@ -8332,6 +8353,17 @@ async fn trial_request(State(state): State<ApiState>, Json(req): Json<TrialAgent
                 StatusCode::CONFLICT,
                 "trial_exists",
                 "one trial per agent, ever — this agent already has one",
+            ));
+        }
+        // Live book cap: decode allows 1M (lying-count guard), but an
+        // unbounded distinct-agent spam would grow `state.bin` to the 64 MB
+        // save cap. Repaid trials stay for audit; refuse new ones when full.
+        const MAX_TRIALS: usize = 10_000;
+        if sh.trials.len() >= MAX_TRIALS {
+            return Err(fail(
+                StatusCode::CONFLICT,
+                "trial_book_full",
+                "trial book is full",
             ));
         }
         let amount = trial_amount_sat();

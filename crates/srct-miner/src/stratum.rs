@@ -454,6 +454,18 @@ impl Pool {
         {
             return Err(Error::Malformed("share body differs from its job"));
         }
+        // Timestamp is a proof field (miners grind it), but an unbounded one
+        // is a dilution primitive: a far-future/ancient share passes the
+        // share bar yet the node would refuse it by median/future rules.
+        // Bound drift from the issued template to one day either way.
+        {
+            let t = template.header.timestamp_ms;
+            let bts = block.header.timestamp_ms;
+            const DAY_MS: u64 = 86_400_000;
+            if bts.saturating_sub(t) > DAY_MS || t.saturating_sub(bts) > DAY_MS {
+                return Err(Error::Malformed("share timestamp drifts too far"));
+            }
+        }
         // Miner-table bound before any accounting or forwarding: a fresh
         // address per share would otherwise grow `stats`, the payout
         // tracker's lifetime map and pending balances without bound. New
@@ -519,6 +531,12 @@ impl Pool {
             .and_then(|tx| tx.outputs.first())
             .map(|o| o.value)
             .unwrap_or(0);
+        // The template's coinbase is real-money accounting: refuse absurd
+        // values before they enter the payout ledger. Zero pays nobody and
+        // a value above 1000 BTC is never a real mainnet/mini reward.
+        if coinbase_sat == 0 || coinbase_sat > 100_000_000_000 {
+            return Err(Error::Malformed("template coinbase out of range"));
+        }
         let block_height = b.height;
         // Copied before `block` moves into the submit callback below.
         let template_difficulty = b.difficulty;
