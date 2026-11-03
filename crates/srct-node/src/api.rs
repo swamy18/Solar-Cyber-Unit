@@ -3429,6 +3429,105 @@ async fn policy_decide(
     })?
 }
 
+/// `POST /v1/guard/decide` — stateless Smart Gate pre-check over HTTP.
+/// Read-only: verifies grant shape, network binding, validity, capability
+/// hash equality, expiry and lifetime. Window counts and nonce replay need the
+/// stateful `GuardBook` (MCP `guard.authorize`); this route commits nothing.
+#[derive(Deserialize)]
+struct GuardDecideReq {
+    policy_hex: String,
+    cap_hex: String,
+    agent_id_hex: String,
+    action_hash_hex: String,
+    workload_id_hex: String,
+    high_risk: Option<bool>,
+}
+
+async fn guard_decide(
+    State(state): State<ApiState>,
+    Json(req): Json<GuardDecideReq>,
+) -> ApiResult {
+    if req.policy_hex.len() > 8 * 1024 || req.cap_hex.len() > 1024 {
+        return Err(bad("guard input over cap"));
+    }
+    with_shared(&state, |sh| {
+        use srct_core::guard::{derive_context_hash, Capability, InfraPolicy, MAX_CAP_LIFETIME};
+        let network = sh.chain.params().network_id.clone();
+        let height = sh.chain.height();
+        let policy_bytes =
+            hex::decode(req.policy_hex.trim().trim_start_matches("0x")).map_err(|_| bad("malformed policy hex"))?;
+        let policy = InfraPolicy::deserialize(&policy_bytes).map_err(|e| bad(format!("policy: {e}")))?;
+        let cap_bytes =
+            hex::decode(req.cap_hex.trim().trim_start_matches("0x")).map_err(|_| bad("malformed capability hex"))?;
+        let cap = Capability::deserialize(&cap_bytes).map_err(|e| bad(format!("capability: {e}")))?;
+        let agent_raw = hex::decode(req.agent_id_hex.trim().trim_start_matches("0x"))
+            .map_err(|_| bad("malformed agent id hex"))?;
+        if agent_raw.len() != 20 {
+            return Err(bad("agent_id_hex must be 20 bytes"));
+        }
+        let mut agent_id = [0u8; 20];
+        agent_id.copy_from_slice(&agent_raw);
+        let action_hash = srct_core::hash::hash_from_hex(req.action_hash_hex.trim())
+            .map_err(|_| bad("malformed action hash"))?;
+        let workload_id = srct_core::hash::hash_from_hex(req.workload_id_hex.trim())
+            .map_err(|_| bad("malformed workload id"))?;
+        let expected_ctx = derive_context_hash(&workload_id, height);
+        let deny = |reason: &str| {
+            Ok(Json(json!({
+                "decision": "deny",
+                "reason": reason,
+                "network_id": network,
+                "height": height,
+            })))
+        };
+        if policy.network_id != network {
+            return deny("grant is for another network");
+        }
+        if policy.revoked {
+            return deny("grant revoked");
+        }
+        if height < policy.valid_from_height {
+            return deny("grant not yet valid");
+        }
+        if height >= policy.valid_until_height {
+            return deny("grant expired");
+        }
+        if policy.agent_id != agent_id {
+            return deny("cross-principal capability");
+        }
+        if cap.policy_hash != policy.hash() {
+            return deny("capability does not name this grant");
+        }
+        if cap.action_hash != action_hash {
+            return deny("action hash mismatch");
+        }
+        if cap.context_hash != expected_ctx {
+            return deny("context hash mismatch");
+        }
+        if height >= cap.expiry_height {
+            return deny("capability expired");
+        }
+        if cap.expiry_height.saturating_sub(height) > MAX_CAP_LIFETIME {
+            return deny("capability lifetime exceeds cap");
+        }
+        if req.high_risk.unwrap_or(false) {
+            return Ok(Json(json!({
+                "decision": "needs_approval",
+                "reason": "high-risk action needs second-channel approval",
+                "network_id": network,
+                "height": height,
+                "policy_hash": srct_core::hash::hash_to_hex(&policy.hash()),
+            })));
+        }
+        Ok(Json(json!({
+            "decision": "allow",
+            "network_id": network,
+            "height": height,
+            "policy_hash": srct_core::hash::hash_to_hex(&policy.hash()),
+        })))
+    })?
+}
+
 /// `POST /v1/delegation/verify` — verify a delegation proof from any rail.
 /// Read-only: an ancestry that parses but does not verify is refused, never
 /// acted on. This is the HTTP backend for the bindings' `verifyProof`.
@@ -8660,6 +8759,7 @@ pub fn router(state: ApiState, cfg: &ApiConfig) -> Router {
         .route("/v1/reputation/{id}", get(reputation_get))
         .route("/v1/authorize", post(authorize))
         .route("/v1/policy/decide", post(policy_decide))
+        .route("/v1/guard/decide", post(guard_decide))
         .route("/v1/delegation/verify", post(delegation_verify))
         .route("/v1/audit/verify", post(audit_verify_route))
         .route("/v1/delegation/link", post(delegation_link))

@@ -32,6 +32,10 @@
 //! [`BoundAuthorization`]: portable::BoundAuthorization
 //! [`AuditExport`]: safety::AuditExport
 
+pub use srct_core::guard::{
+    derive_context_hash, Capability, Decision as GuardDecision, GuardBook, GuardError, InfraPolicy,
+    GUARD_POLICY_VERSION, MAX_CAP_LIFETIME,
+};
 pub use srct_core::portable::{
     evaluate_policy, BoundAuthorization, DecodedIntent, DelegationProof, PaymentIntent,
     PolicyDecision, SignedPolicy, MAX_BOUND_LIFETIME_BLOCKS, MAX_PORTABLE_JSON_LEN,
@@ -96,6 +100,99 @@ pub fn decide(
         approval_threshold_sat,
     );
     serde_json::to_string(&decision).map_err(|_| "decision json".to_string())
+}
+
+/// Stateless Smart Gate check over hex inputs. No book, no commit: verifies
+/// grant shape, network binding, validity window, capability hash equality,
+/// expiry and lifetime cap. Window counts and nonce replay need the stateful
+/// `GuardBook::authorize` on the settling side; this is the pre-check every
+/// rail runs before that.
+#[allow(clippy::too_many_arguments)]
+pub fn guard_verify(
+    network_id: &str,
+    policy_hex: &str,
+    cap_hex: &str,
+    agent_id_hex: &str,
+    action_hash_hex: &str,
+    workload_id_hex: &str,
+    height: u64,
+    high_risk: bool,
+) -> Result<String, String> {
+    use srct_core::guard::{Capability, InfraPolicy};
+    use srct_core::hash::{hash_from_hex, hash_to_hex};
+    if network_id.is_empty() || network_id.len() > 64 {
+        return Err("malformed rail network id".to_string());
+    }
+    if network_id.trim() != network_id {
+        return Err("malformed rail network id".to_string());
+    }
+    let policy_bytes = hex::decode(policy_hex.trim().trim_start_matches("0x"))
+        .map_err(|_| "malformed policy hex".to_string())?;
+    let policy = InfraPolicy::deserialize(&policy_bytes).map_err(|e| e.to_string())?;
+    let cap_bytes = hex::decode(cap_hex.trim().trim_start_matches("0x"))
+        .map_err(|_| "malformed capability hex".to_string())?;
+    let cap = Capability::deserialize(&cap_bytes).map_err(|e| e.to_string())?;
+    let agent_bytes = hex::decode(agent_id_hex.trim().trim_start_matches("0x"))
+        .map_err(|_| "malformed agent id hex".to_string())?;
+    if agent_bytes.len() != 20 {
+        return Err("malformed agent id hex".to_string());
+    }
+    let mut agent_id = [0u8; 20];
+    agent_bytes.iter().enumerate().for_each(|(i, b)| agent_id[i] = *b);
+    let action_hash = hash_from_hex(action_hash_hex).map_err(|_| "malformed action hash".to_string())?;
+    let workload_id = hash_from_hex(workload_id_hex).map_err(|_| "malformed workload id".to_string())?;
+    let expected_context = derive_context_hash(&workload_id, height);
+    if policy.version != GUARD_POLICY_VERSION {
+        return Err(format!("unsupported guard version {}", policy.version));
+    }
+    if policy.network_id != network_id {
+        return Ok(json_deny("grant is for another network", network_id, height));
+    }
+    if policy.revoked {
+        return Ok(json_deny("grant revoked", network_id, height));
+    }
+    if height < policy.valid_from_height {
+        return Ok(json_deny("grant not yet valid", network_id, height));
+    }
+    if height >= policy.valid_until_height {
+        return Ok(json_deny("grant expired", network_id, height));
+    }
+    if policy.agent_id != agent_id {
+        return Ok(json_deny("cross-principal capability", network_id, height));
+    }
+    if cap.policy_hash != policy.hash() {
+        return Ok(json_deny("capability does not name this grant", network_id, height));
+    }
+    if cap.action_hash != action_hash {
+        return Ok(json_deny("action hash mismatch", network_id, height));
+    }
+    if cap.context_hash != expected_context {
+        return Ok(json_deny(
+            "context hash mismatch",
+            network_id,
+            height,
+        ));
+    }
+    if height >= cap.expiry_height {
+        return Ok(json_deny("capability expired", network_id, height));
+    }
+    if cap.expiry_height.saturating_sub(height) > MAX_CAP_LIFETIME {
+        return Ok(json_deny("capability lifetime exceeds cap", network_id, height));
+    }
+    if high_risk {
+        return Ok(format!(
+            "{{\"decision\":\"needs_approval\",\"reason\":\"high-risk action needs second-channel approval\",\"network_id\":\"{network_id}\",\"height\":{height},\"policy_hash\":\"{}\"}}",
+            hash_to_hex(&policy.hash())
+        ));
+    }
+    Ok(format!(
+        "{{\"decision\":\"allow\",\"network_id\":\"{network_id}\",\"height\":{height},\"policy_hash\":\"{}\"}}",
+        hash_to_hex(&policy.hash())
+    ))
+}
+
+fn json_deny(reason: &str, network_id: &str, height: u64) -> String {
+    format!("{{\"decision\":\"deny\",\"reason\":\"{reason}\",\"network_id\":\"{network_id}\",\"height\":{height}}}")
 }
 
 /// Verify a delegation proof from JSON. Returns `leaf_agent/leaf_policy_hash`
@@ -363,5 +460,72 @@ mod tests {
             .is_err());
         let denied = decide_parsed(NETWORK, &policy_json, &intent_for(&policy, 50_000), None);
         assert!(matches!(denied, PolicyDecision::Deny { .. }), "{denied:?}");
+    }
+
+    #[test]
+    fn guard_verify_allows_exact_and_denies_drift() {
+        use srct_core::guard::{derive_context_hash, Capability, InfraPolicy, GUARD_POLICY_VERSION};
+        let agent_id = derive_agent_id(NETWORK, AgentRole::Machine, &[9u8; 20]);
+        let policy = InfraPolicy {
+            version: GUARD_POLICY_VERSION,
+            network_id: NETWORK.to_string(),
+            agent_id,
+            owner: [9u8; 20],
+            max_calls_per_window: 5,
+            window_blocks: 100,
+            valid_from_height: 10,
+            valid_until_height: 1000,
+            revoked: false,
+            parent_agent_id: None,
+        };
+        let action_hash = [1u8; 32];
+        let workload = [2u8; 32];
+        let height = 50u64;
+        let ctx = derive_context_hash(&workload, height);
+        let cap = Capability {
+            policy_hash: policy.hash(),
+            action_hash,
+            context_hash: ctx,
+            expiry_height: height + 10,
+            nonce: 1,
+        };
+        let policy_hex = hex::encode(policy.serialize());
+        let cap_hex = hex::encode(cap.serialize());
+        let out = guard_verify(
+            NETWORK,
+            &policy_hex,
+            &cap_hex,
+            &hex::encode(agent_id),
+            &srct_core::hash::hash_to_hex(&action_hash),
+            &srct_core::hash::hash_to_hex(&workload),
+            height,
+            false,
+        )
+        .expect("well-formed guard inputs must answer");
+        assert!(out.contains("\"allow\""), "{out}");
+        let drifted = guard_verify(
+            NETWORK,
+            &policy_hex,
+            &cap_hex,
+            &hex::encode(agent_id),
+            &srct_core::hash::hash_to_hex(&[0xFFu8; 32]),
+            &srct_core::hash::hash_to_hex(&workload),
+            height,
+            false,
+        )
+        .expect("drift must answer deny, not error");
+        assert!(drifted.contains("action hash mismatch"), "{drifted}");
+        let gated = guard_verify(
+            NETWORK,
+            &policy_hex,
+            &cap_hex,
+            &hex::encode(agent_id),
+            &srct_core::hash::hash_to_hex(&action_hash),
+            &srct_core::hash::hash_to_hex(&workload),
+            height,
+            true,
+        )
+        .expect("high-risk must answer");
+        assert!(gated.contains("needs_approval"), "{gated}");
     }
 }

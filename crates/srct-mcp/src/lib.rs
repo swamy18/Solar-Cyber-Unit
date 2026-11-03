@@ -42,6 +42,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use srct_core::agent::{verify_authorization, PolicyBook, SpendPolicy};
+use srct_core::guard::{derive_context_hash, Capability, Decision as GuardDecision, GuardBook, InfraPolicy};
 use srct_core::hash::{address_from_hex, hash_from_hex, hash_to_hex};
 use srct_core::payment::MachinePayment;
 use srct_core::receipt::{ReceiptBook, ServiceReceipt};
@@ -92,6 +93,7 @@ impl std::error::Error for McpError {}
 /// material.
 pub struct SolarCyberUnitMcp {
     policies: PolicyBook,
+    guards: GuardBook,
 }
 
 impl Default for SolarCyberUnitMcp {
@@ -104,6 +106,7 @@ impl SolarCyberUnitMcp {
     pub fn new() -> Self {
         SolarCyberUnitMcp {
             policies: PolicyBook::default(),
+            guards: GuardBook::default(),
         }
     }
 
@@ -113,6 +116,8 @@ impl SolarCyberUnitMcp {
         vec![
             "authorize",
             "wallet.guard",
+            "guard.check",
+            "guard.authorize",
             "policy.decide",
             "policy.export",
             "policy.verify",
@@ -144,6 +149,8 @@ impl SolarCyberUnitMcp {
         match op {
             "authorize" => self.authorize(request),
             "wallet.guard" => self.wallet_guard(request),
+            "guard.check" => self.guard_check(request),
+            "guard.authorize" => self.guard_authorize(request),
             "policy.decide" => self.policy_decide(request),
             "policy.export" => self.policy_export(request),
             "policy.verify" => self.policy_verify(request),
@@ -248,6 +255,109 @@ impl SolarCyberUnitMcp {
                 }))
             }
             Err(e) => Err(McpError::refused("guard_refused", e.to_string())),
+        }
+    }
+
+    /// `guard.check` — stateless Smart Gate pre-check. No book, no commit.
+    /// Verifies grant shape, network binding, validity, capability equality,
+    /// expiry and lifetime. Answers allow / needs_approval, refuses by name.
+    fn guard_check(&self, request: &Value) -> Result<Value, McpError> {
+        let network_id = str_field(request, "network_id")?;
+        let height = u64_field(request, "height")?;
+        let policy_bytes = hex_field(request, "policy_hex")?;
+        let policy = InfraPolicy::deserialize(&policy_bytes)
+            .map_err(|e| McpError::bad(format!("policy: {e}")))?;
+        let cap_bytes = hex_field(request, "cap_hex")?;
+        let cap = Capability::deserialize(&cap_bytes)
+            .map_err(|e| McpError::bad(format!("capability: {e}")))?;
+        let agent_raw = hex_field(request, "agent_id_hex")?;
+        if agent_raw.len() != 20 {
+            return Err(McpError::bad("agent_id_hex must be 20 bytes"));
+        }
+        let mut agent_id = [0u8; 20];
+        agent_id.copy_from_slice(&agent_raw);
+        let action_hash = hash_from_hex(str_field(request, "action_hash_hex")?.trim())
+            .map_err(|e| McpError::bad(format!("action_hash: {e}")))?;
+        let workload_id = hash_from_hex(str_field(request, "workload_id_hex")?.trim())
+            .map_err(|e| McpError::bad(format!("workload_id: {e}")))?;
+        let expected_ctx = derive_context_hash(&workload_id, height);
+        let high_risk = request.get("high_risk").and_then(Value::as_bool).unwrap_or(false);
+        if policy.network_id != network_id {
+            return Err(McpError::refused("guard_refused", "grant is for another network"));
+        }
+        if policy.revoked {
+            return Err(McpError::refused("guard_refused", "grant revoked"));
+        }
+        if height < policy.valid_from_height {
+            return Err(McpError::refused("guard_refused", "grant not yet valid"));
+        }
+        if height >= policy.valid_until_height {
+            return Err(McpError::refused("guard_refused", "grant expired"));
+        }
+        if policy.agent_id != agent_id {
+            return Err(McpError::refused("guard_refused", "cross-principal capability"));
+        }
+        if cap.policy_hash != policy.hash() {
+            return Err(McpError::refused("guard_refused", "capability does not name this grant"));
+        }
+        if cap.action_hash != action_hash {
+            return Err(McpError::refused("guard_refused", "action hash mismatch"));
+        }
+        if cap.context_hash != expected_ctx {
+            return Err(McpError::refused("guard_refused", "context hash mismatch"));
+        }
+        if height >= cap.expiry_height {
+            return Err(McpError::refused("guard_refused", "capability expired"));
+        }
+        if cap.expiry_height.saturating_sub(height) > srct_core::guard::MAX_CAP_LIFETIME {
+            return Err(McpError::refused("guard_refused", "capability lifetime exceeds cap"));
+        }
+        if high_risk {
+            return Ok(json!({"decision": "needs_approval", "reason": "high-risk action needs second-channel approval"}));
+        }
+        Ok(json!({"decision": "allow", "policy_hash": hash_to_hex(&policy.hash())}))
+    }
+
+    /// `guard.authorize` — stateful Smart Gate admission. Same checks as
+    /// `guard.check` plus tumbling-window budget and strictly increasing nonce
+    /// via `GuardBook`. On allow the state commits; on deny or approval-needed
+    /// nothing mutates.
+    fn guard_authorize(&mut self, request: &Value) -> Result<Value, McpError> {
+        let network_id = str_field(request, "network_id")?;
+        let height = u64_field(request, "height")?;
+        let policy_bytes = hex_field(request, "policy_hex")?;
+        let policy = InfraPolicy::deserialize(&policy_bytes)
+            .map_err(|e| McpError::bad(format!("policy: {e}")))?;
+        let cap_bytes = hex_field(request, "cap_hex")?;
+        let cap = Capability::deserialize(&cap_bytes)
+            .map_err(|e| McpError::bad(format!("capability: {e}")))?;
+        let agent_raw = hex_field(request, "agent_id_hex")?;
+        if agent_raw.len() != 20 {
+            return Err(McpError::bad("agent_id_hex must be 20 bytes"));
+        }
+        let mut agent_id = [0u8; 20];
+        agent_id.copy_from_slice(&agent_raw);
+        let action_hash = hash_from_hex(str_field(request, "action_hash_hex")?.trim())
+            .map_err(|e| McpError::bad(format!("action_hash: {e}")))?;
+        let workload_id = hash_from_hex(str_field(request, "workload_id_hex")?.trim())
+            .map_err(|e| McpError::bad(format!("workload_id: {e}")))?;
+        let expected_ctx = derive_context_hash(&workload_id, height);
+        let high_risk = request.get("high_risk").and_then(Value::as_bool).unwrap_or(false);
+        let approved = request.get("approved").and_then(Value::as_bool).unwrap_or(false);
+        match self.guards.authorize(
+            &policy,
+            &cap,
+            &agent_id,
+            network_id,
+            height,
+            &action_hash,
+            &expected_ctx,
+            high_risk,
+            approved,
+        ) {
+            GuardDecision::Allow => Ok(json!({"decision": "allow", "policy_hash": hash_to_hex(&policy.hash())})),
+            GuardDecision::NeedsApproval => Ok(json!({"decision": "needs_approval", "reason": "high-risk action needs second-channel approval"})),
+            GuardDecision::Deny(e) => Err(McpError::refused("guard_refused", e.to_string())),
         }
     }
 

@@ -42,6 +42,7 @@ pub mod exit;
 pub mod fees;
 pub mod finality;
 pub mod fx;
+pub mod guard;
 pub mod hash;
 pub mod hbm_pow;
 pub mod hexserde;
