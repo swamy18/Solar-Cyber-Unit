@@ -2045,3 +2045,44 @@ mint or settlement-rule change:
   admission gate) are still node-local. They are gates, not sources of
   spendable balance - a settlement still needs a real transaction - but they
   are a second kind of state, and the honest thing is to say so.
+
+### 2026-11-05 Smart Gate security pass (no consensus change)
+
+Five holes closed as structural rules in `srct-core/src/guard.rs`, with the
+same rule enforced in `srct-policy`, `srct-mcp` and the node API:
+
+- **Signed capabilities** (`SignedCapability`): the owner's hybrid signature
+  over the capability hash (policy + action + context + expiry + nonce
+  together). Bare/unsigned envelopes are refused on every boundary; forgeries
+  and tampered fields deny as `UnsignedCapability`.
+- **Signed approvals** (`GuardApproval`): owner-signed, bound to the exact
+  capability instance with its own 30-height lifetime cap. Missing approval
+  gates (`needs_approval`); forged approval denies; the boolean form is
+  rejected everywhere.
+- **Action recomputation**: `derive_action_hash(preimage)` is recomputed from
+  the bytes the boundary observes (`action_preimage_hex` required at
+  `guard.authorize` / `POST /v1/guard/authorize`); drift denies and commits
+  nothing.
+- **Replay/revocation**: nonce 0 refused, strictly increasing nonces persisted
+  in `state.bin`, revocation kills registered descendants, the stateless
+  pre-check consults the same revocation set, registry/book caps (1024) refuse
+  rather than evict, window arithmetic overflow-safe.
+- **MCP endpoint trust**: `host:port` only; bearer token to loopback only;
+  remote needs `SRCT_MCP_TRUSTED_ENDPOINTS` + `SRCT_MCP_ALLOW_REMOTE=1` and
+  still never receives the token; redirects refused; no credentials in errors.
+- Docs updated to match: `README.md` (Smart Gate + honest limits),
+  `docs/smart-gate-architecture.md` (full rewrite: protocol, trust
+  boundaries, authoritative-state model, implemented/partial/planned),
+  `docs/portable-policy.md` (Smart Gate pointer + rules), white paper
+  (§Security model: new `Smart Gate: the execution boundary` subsection,
+  replay table, domain tags, MCP paragraph, constants, invariants,
+  limitations).
+- Verification: clippy clean, `cargo fmt --check` clean; new negative tests
+  for forgery, fake approval, action swap, zero nonce, unsigned MCP/node
+  admission, untrusted endpoints; `api` guard round-trip extended (unsigned
+  refused, swap denied, replay denied, revoke kills).
+- Residuals: `srct-node --test api` carries 8 pre-existing credit-admission
+  failures (e.g. `a_payment_is_admitted_only_when_the_payers_credit_covers_it`:
+  admission needs 2400, the test funds 700) that reproduce on the clean tree
+  and are unrelated to this pass. The README workspace test count was left
+  untouched pending a full green `scripts/test_count.sh` run.

@@ -816,7 +816,8 @@ fn authorize_grants_then_refuses_a_replayed_nonce() {
 #[test]
 fn guard_grant_authorize_replay_revoke_round_trip() {
     use srct_core::guard::{
-        derive_context_hash, Capability, InfraPolicy, GUARD_POLICY_VERSION,
+        derive_action_hash, derive_context_hash, Capability, InfraPolicy, SignedCapability,
+        GUARD_POLICY_VERSION,
     };
     let node = start();
     let h = node_height(&node);
@@ -847,32 +848,72 @@ fn guard_grant_authorize_replay_revoke_round_trip() {
     assert_eq!(granted["policy_hash"], hash_to_hex(&policy.hash()));
 
     let workload = [2u8; 32];
-    let action = [1u8; 32];
-    let cap = |nonce: u64| Capability {
-        policy_hash: policy.hash(),
-        action_hash: action,
-        context_hash: derive_context_hash(&workload, h),
-        expiry_height: h + 10,
-        nonce,
+    let preimage = b"deploy-42";
+    let action = derive_action_hash(preimage);
+    let signed_cap_hex = |nonce: u64| {
+        let cap = Capability {
+            policy_hash: policy.hash(),
+            action_hash: action,
+            context_hash: derive_context_hash(&workload, h),
+            expiry_height: h + 10,
+            nonce,
+        };
+        hex::encode(SignedCapability::issue(&owner, &cap).unwrap().serialize())
     };
-    let authorize = |cap: &Capability| {
+    let authorize = |cap_hex: &str| {
         post(
             &node,
             "/v1/guard/authorize",
             &serde_json::json!({
-                "cap_hex": hex::encode(cap.serialize()),
+                "cap_hex": cap_hex,
                 "agent_id_hex": hex::encode(policy.agent_id),
                 "action_hash_hex": hash_to_hex(&action),
+                "action_preimage_hex": hex::encode(preimage),
                 "workload_id_hex": hash_to_hex(&workload),
             }),
         )
     };
-    let (s, first) = authorize(&cap(1));
+    // An unsigned capability any observer could write down is refused outright.
+    let raw = Capability {
+        policy_hash: policy.hash(),
+        action_hash: action,
+        context_hash: derive_context_hash(&workload, h),
+        expiry_height: h + 10,
+        nonce: 9,
+    };
+    let (s, forged) = post(
+        &node,
+        "/v1/guard/authorize",
+        &serde_json::json!({
+            "cap_hex": hex::encode(raw.serialize()),
+            "agent_id_hex": hex::encode(policy.agent_id),
+            "action_preimage_hex": hex::encode(preimage),
+            "workload_id_hex": hash_to_hex(&workload),
+        }),
+    );
+    assert!(
+        s == 400 || forged["decision"] == "deny",
+        "unsigned cap refused: {forged}"
+    );
+    // A swapped preimage (authorized deploy-42, executing deploy-43) is denied.
+    let (s, swapped) = post(
+        &node,
+        "/v1/guard/authorize",
+        &serde_json::json!({
+            "cap_hex": signed_cap_hex(7),
+            "agent_id_hex": hex::encode(policy.agent_id),
+            "action_preimage_hex": hex::encode(b"deploy-43"),
+            "workload_id_hex": hash_to_hex(&workload),
+        }),
+    );
+    assert_eq!(s, 200, "{swapped}");
+    assert_eq!(swapped["decision"], "deny");
+    let (s, first) = authorize(&signed_cap_hex(1));
     assert_eq!(s, 200, "{first}");
     assert_eq!(first["decision"], "allow");
 
     // Replay: the same nonce again is a named deny, not a second admission.
-    let (s, replay) = authorize(&cap(1));
+    let (s, replay) = authorize(&signed_cap_hex(1));
     assert_eq!(s, 200, "{replay}");
     assert_eq!(replay["decision"], "deny");
 
@@ -892,7 +933,7 @@ fn guard_grant_authorize_replay_revoke_round_trip() {
     assert_eq!(body["revoked"], true);
 
     // The live grant is dead: even a fresh nonce is refused by name.
-    let (s, dead) = authorize(&cap(2));
+    let (s, dead) = authorize(&signed_cap_hex(2));
     assert_eq!(s, 200, "{dead}");
     assert_eq!(dead["decision"], "deny");
     assert_eq!(dead["reason"], "grant revoked");

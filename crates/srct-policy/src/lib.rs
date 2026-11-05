@@ -33,8 +33,9 @@
 //! [`AuditExport`]: safety::AuditExport
 
 pub use srct_core::guard::{
-    derive_context_hash, Capability, Decision as GuardDecision, GuardBook, GuardError, InfraPolicy,
-    GUARD_POLICY_VERSION, MAX_CAP_LIFETIME,
+    derive_action_hash, derive_context_hash, Capability, Decision as GuardDecision, GuardApproval,
+    GuardBook, GuardError, InfraPolicy, SignedCapability, GUARD_POLICY_VERSION,
+    MAX_APPROVAL_LIFETIME, MAX_CAP_LIFETIME, MAX_GUARD_REGISTRY,
 };
 pub use srct_core::portable::{
     evaluate_policy, BoundAuthorization, DecodedIntent, DelegationProof, PaymentIntent,
@@ -103,10 +104,16 @@ pub fn decide(
 }
 
 /// Stateless Smart Gate check over hex inputs. No book, no commit: verifies
-/// grant shape, network binding, validity window, capability hash equality,
-/// expiry and lifetime cap. Window counts and nonce replay need the stateful
-/// `GuardBook::authorize` on the settling side; this is the pre-check every
-/// rail runs before that.
+/// the owner's signature over the capability, then grant shape, network
+/// binding, validity window, capability hash equality, expiry and lifetime
+/// cap. `cap_hex` MUST be a signed [`SignedCapability`] envelope — a bare
+/// capability (policy hash + action + context + expiry + nonce) is public
+/// bytes anyone can write down, so an unsigned envelope is denied as
+/// `UnsignedCapability`, never allowed. Window counts and nonce replay need
+/// the stateful `GuardBook::authorize_signed` on the settling side; this is
+/// the pre-check every rail runs before that. It is NOT execution
+/// authorization: the execution boundary recomputes the action hash from the
+/// preimage it observes (see `GuardBook::authorize_signed`).
 #[allow(clippy::too_many_arguments)]
 pub fn guard_verify(
     network_id: &str,
@@ -118,7 +125,7 @@ pub fn guard_verify(
     height: u64,
     high_risk: bool,
 ) -> Result<String, String> {
-    use srct_core::guard::{Capability, InfraPolicy};
+    use srct_core::guard::{InfraPolicy, SignedCapability};
     use srct_core::hash::{hash_from_hex, hash_to_hex};
     if network_id.is_empty() || network_id.len() > 64 {
         return Err("malformed rail network id".to_string());
@@ -131,22 +138,34 @@ pub fn guard_verify(
     let policy = InfraPolicy::deserialize(&policy_bytes).map_err(|e| e.to_string())?;
     let cap_bytes = hex::decode(cap_hex.trim().trim_start_matches("0x"))
         .map_err(|_| "malformed capability hex".to_string())?;
-    let cap = Capability::deserialize(&cap_bytes).map_err(|e| e.to_string())?;
+    let signed = SignedCapability::deserialize(&cap_bytes)
+        .map_err(|_| "capability is not signed".to_string())?;
+    signed.verify(&policy).map_err(|e| e.to_string())?;
+    let cap = &signed.cap;
     let agent_bytes = hex::decode(agent_id_hex.trim().trim_start_matches("0x"))
         .map_err(|_| "malformed agent id hex".to_string())?;
     if agent_bytes.len() != 20 {
         return Err("malformed agent id hex".to_string());
     }
     let mut agent_id = [0u8; 20];
-    agent_bytes.iter().enumerate().for_each(|(i, b)| agent_id[i] = *b);
-    let action_hash = hash_from_hex(action_hash_hex).map_err(|_| "malformed action hash".to_string())?;
-    let workload_id = hash_from_hex(workload_id_hex).map_err(|_| "malformed workload id".to_string())?;
+    agent_bytes
+        .iter()
+        .enumerate()
+        .for_each(|(i, b)| agent_id[i] = *b);
+    let action_hash =
+        hash_from_hex(action_hash_hex).map_err(|_| "malformed action hash".to_string())?;
+    let workload_id =
+        hash_from_hex(workload_id_hex).map_err(|_| "malformed workload id".to_string())?;
     let expected_context = derive_context_hash(&workload_id, height);
     if policy.version != GUARD_POLICY_VERSION {
         return Err(format!("unsupported guard version {}", policy.version));
     }
     if policy.network_id != network_id {
-        return Ok(json_deny("grant is for another network", network_id, height));
+        return Ok(json_deny(
+            "grant is for another network",
+            network_id,
+            height,
+        ));
     }
     if policy.revoked {
         return Ok(json_deny("grant revoked", network_id, height));
@@ -160,24 +179,31 @@ pub fn guard_verify(
     if policy.agent_id != agent_id {
         return Ok(json_deny("cross-principal capability", network_id, height));
     }
+    if cap.nonce == 0 {
+        return Ok(json_deny("capability nonce is zero", network_id, height));
+    }
     if cap.policy_hash != policy.hash() {
-        return Ok(json_deny("capability does not name this grant", network_id, height));
+        return Ok(json_deny(
+            "capability does not name this grant",
+            network_id,
+            height,
+        ));
     }
     if cap.action_hash != action_hash {
         return Ok(json_deny("action hash mismatch", network_id, height));
     }
     if cap.context_hash != expected_context {
-        return Ok(json_deny(
-            "context hash mismatch",
-            network_id,
-            height,
-        ));
+        return Ok(json_deny("context hash mismatch", network_id, height));
     }
     if height >= cap.expiry_height {
         return Ok(json_deny("capability expired", network_id, height));
     }
     if cap.expiry_height.saturating_sub(height) > MAX_CAP_LIFETIME {
-        return Ok(json_deny("capability lifetime exceeds cap", network_id, height));
+        return Ok(json_deny(
+            "capability lifetime exceeds cap",
+            network_id,
+            height,
+        ));
     }
     if high_risk {
         return Ok(format!(
@@ -464,13 +490,17 @@ mod tests {
 
     #[test]
     fn guard_verify_allows_exact_and_denies_drift() {
-        use srct_core::guard::{derive_context_hash, Capability, InfraPolicy, GUARD_POLICY_VERSION};
-        let agent_id = derive_agent_id(NETWORK, AgentRole::Machine, &[9u8; 20]);
+        use srct_core::guard::{
+            derive_context_hash, Capability, InfraPolicy, SignedCapability, GUARD_POLICY_VERSION,
+        };
+        let owner_wallet = Wallet::new_random("guard-owner");
+        let owner_addr = owner_wallet.address().unwrap();
+        let agent_id = derive_agent_id(NETWORK, AgentRole::Machine, &owner_addr);
         let policy = InfraPolicy {
             version: GUARD_POLICY_VERSION,
             network_id: NETWORK.to_string(),
             agent_id,
-            owner: [9u8; 20],
+            owner: owner_addr,
             max_calls_per_window: 5,
             window_blocks: 100,
             valid_from_height: 10,
@@ -489,8 +519,9 @@ mod tests {
             expiry_height: height + 10,
             nonce: 1,
         };
+        let signed = SignedCapability::issue(&owner_wallet, &cap).unwrap();
         let policy_hex = hex::encode(policy.serialize());
-        let cap_hex = hex::encode(cap.serialize());
+        let cap_hex = hex::encode(signed.serialize());
         let out = guard_verify(
             NETWORK,
             &policy_hex,
@@ -527,5 +558,50 @@ mod tests {
         )
         .expect("high-risk must answer");
         assert!(gated.contains("needs_approval"), "{gated}");
+    }
+
+    #[test]
+    fn guard_verify_refuses_an_unsigned_capability() {
+        use srct_core::guard::{
+            derive_context_hash, Capability, InfraPolicy, GUARD_POLICY_VERSION,
+        };
+        let owner_wallet = Wallet::new_random("guard-owner-2");
+        let owner_addr = owner_wallet.address().unwrap();
+        let agent_id = derive_agent_id(NETWORK, AgentRole::Machine, &owner_addr);
+        let policy = InfraPolicy {
+            version: GUARD_POLICY_VERSION,
+            network_id: NETWORK.to_string(),
+            agent_id,
+            owner: owner_addr,
+            max_calls_per_window: 5,
+            window_blocks: 100,
+            valid_from_height: 10,
+            valid_until_height: 1000,
+            revoked: false,
+            parent_agent_id: None,
+        };
+        let workload = [2u8; 32];
+        let height = 50u64;
+        let raw = Capability {
+            policy_hash: policy.hash(),
+            action_hash: [1u8; 32],
+            context_hash: derive_context_hash(&workload, height),
+            expiry_height: height + 10,
+            nonce: 1,
+        };
+        let policy_hex = hex::encode(policy.serialize());
+        // A bare capability any observer could write down: denied, never allowed.
+        let err = guard_verify(
+            NETWORK,
+            &policy_hex,
+            &hex::encode(raw.serialize()),
+            &hex::encode(agent_id),
+            &srct_core::hash::hash_to_hex(&[1u8; 32]),
+            &srct_core::hash::hash_to_hex(&workload),
+            height,
+            false,
+        )
+        .expect_err("an unsigned capability must not verify");
+        assert!(err.contains("not signed"), "{err}");
     }
 }

@@ -1386,6 +1386,16 @@ lattice signatures accompanying the checkpoint. A signer bitmap that holds a
 registered lattice key but presents no sidecar entry is refused --- a sidecar
 stripped in transit lands as ``missing'', never as ``valid without''.
 
+Domain separation is enforced per construction, not per convention. Spending
+grants, bound authorisations, guard grants, guard capabilities
+(\texttt{srct/guard-cap/v1}), canonical guard actions
+(\texttt{srct/guard-action/v1}), guard approvals
+(\texttt{srct/guard-approval/v1}) and guard contexts each hash under their own
+tag, so a signature or commitment minted for one purpose verifies for no
+other. Guard capabilities and high-risk approvals reuse the wallet's hybrid
+signature bundles, with the approver keys required to bind to the grant
+owner's address.
+
 \subsection{Consensus-level security}
 
 \paragraph{Integer-only arithmetic.} Every consensus computation is integral.
@@ -1444,6 +1454,9 @@ Receipt & receipt book, contradiction detection & refuse by name \\
 Credit attestation & consumed-attestation set, persisted & refuse as reuse \\
 Credit reservation & reservation log, idempotent & no second reservation \\
 Policy authorisation & strictly increasing nonce & refuse \\
+Smart Gate capability & owner-signed envelope, nonzero strictly increasing nonce & refuse (unsigned, forged, or replayed) \\
+Smart Gate approval & owner-signed approval bound to the exact instance & gate when missing, refuse when forged \\
+Smart Gate action & canonical hash recomputed from the executed preimage & refuse on any drift \\
 Settlement link & one payment, one transaction & refuse as already settled \\
 Escrow-to-exit binding & one escrow, one exit & refuse as already settled \\
 Exit identity & $(\text{owner},\text{nonce})$ consumed set & release exactly
@@ -1455,6 +1468,57 @@ State file & SHA-256 digest, fail-closed load & refuse to start \\
 dropping the oldest entry would silently re-open an old replay window.}
 \label{tab:replay}
 \end{table}
+
+\subsection{Smart Gate: the execution boundary}
+\label{sec:smartgate}
+
+Spend policies govern payments; the Smart Gate governs \emph{any exact action}
+a workload is about to take --- deploying a container, invoking a signing
+service, executing a tool --- under the same owner-signs-once discipline. It
+is deliberately \emph{not} consensus state: the gate is enforced by the
+trusted execution boundary (the node or the runtime that observes the bytes),
+and other platforms verify offline. That separation is load-bearing. A
+stateless pre-check (\texttt{guard.check}, \texttt{guard\_verify},
+\texttt{POST /v1/guard/decide}) verifies signatures and equalities and commits
+nothing; only the stateful admission (\texttt{guard.authorize},
+\texttt{POST /v1/guard/authorize}, \texttt{GuardBook::authorize\_signed})
+enforces the window, consumes the nonce, and writes the audit entry. A
+pre-check answer is never treated as an admission.
+
+Five holes were closed as structural rules rather than as wording. First, a
+bare capability is public bytes anyone can write down (grant hash, action,
+context, expiry, nonce are all observable or guessable), so every boundary
+requires an \emph{owner-signed} capability envelope and verifies the signature
+before anything else; forgeries and tampered fields are refused by name.
+Second, high-risk authorisation no longer accepts a caller-supplied boolean:
+a missing signed approval answers \texttt{needs\_approval} while a forged one
+denies, and the approval itself binds the exact capability instance (grant and
+capability hashes, agent, action, context, expiry) under its own domain tag
+with its own 30-height lifetime cap. Third, the boundary recomputes the
+canonical action hash from the preimage it observes and refuses on any drift,
+so a permission granted for one operation cannot be executed as another; the
+preimage is required input at admission, not an optional hint. Fourth,
+replay and revocation state is strict: nonces are nonzero and strictly
+increasing per grant, persisted across restarts, and refusals commit nothing;
+revocation kills the grant and every registered descendant, the stateless
+pre-check consults the same revocation set as the stateful admission, and
+registry and book capacities refuse rather than evict. Fifth, the MCP
+transport cannot be aimed at an attacker: endpoints are \texttt{host:port}
+only, loopback is the only target that ever receives the API bearer token,
+anything else needs an explicit allow-list plus an opt-in flag and still never
+receives the token over the plaintext transport, redirects are errors rather
+than followed hops, and credentials never enter error strings or logs.
+
+The authority model is honest about its limits. The node's grant registry,
+revocation set and capability book are authoritative \emph{per node}; MCP-local
+gate state is a non-authoritative cache. Nodes converge by registering the
+same owner-signed bytes and replicating revocations, not by a cross-node
+lock --- the same capability must not be aimed at two enforcing nodes. Gate
+audit entries are node-local, bounded, hash-chained and export-verifiable for
+auditors and insurers; they are not anchored to the chain, and the
+documentation no longer claims otherwise. Capability and approval lifetimes
+are measured in heights throughout: the gate is deterministic and clock-free,
+so any ``minutes'' phrasing in earlier drafts was a gloss, not the rule.
 
 \subsection{The lying-root rule}
 \label{sec:lyingroot}
@@ -1622,15 +1686,25 @@ locally and then broadcast, like every other path in the SDK.
 \paragraph{Model Context Protocol surface.} The MCP crate is a keyless
 dispatcher over agent identity, payments, receipts and reputation, and over the
 authority and credit layer: an operation reads a published grant, a spend under
-a grant, or a loan, and returns the terms and the hash to sign. It is
-explicitly \emph{not} a trust authority: it verifies using the same public
-functions every other verifier uses, and it cannot mint an authorisation, a
-payment or a receipt. It is explicitly \emph{not} a key holder: no operation
-accepts, returns or stores a private key; where a signature is needed it
-returns the bytes and the signing hash, and the client signs. It holds an
-authorisation book so that anti-replay counters survive across calls, because
-a fresh book per call would silently reset every counter. Its transport is a
-small dependency-free HTTP client.
+a grant, or a loan, and returns the terms and the hash to sign. It carries
+the Smart Gate as keyless pre-check and admission: \texttt{guard.check} is the
+stateless signature-and-equality pre-check over owner-signed capabilities,
+while \texttt{guard.authorize} is the execution boundary --- it recomputes the
+canonical action hash from the supplied preimage, requires a signed approval
+envelope for high-risk calls (the boolean form is refused), and commits window
+and nonce state only on allow. It is explicitly \emph{not} a trust authority:
+it verifies using the same public functions every other verifier uses, and it
+cannot mint an authorisation, a payment, a capability, an approval or a
+receipt. It is explicitly \emph{not} a key holder: no operation accepts,
+returns or stores a private key; where a signature is needed it returns the
+bytes and the signing hash, and the client signs. It holds an authorisation
+book so that anti-replay counters survive across calls, because a fresh book
+per call would silently reset every counter; that local gate state is a
+non-authoritative cache, and the node's registry plus revocation set is the
+authority. Its transport is a small dependency-free HTTP client that dials
+\texttt{host:port} only, sends the API bearer token to loopback targets only,
+refuses unlisted remote endpoints before any socket opens, never follows
+redirects, and never logs credentials.
 
 \paragraph{The command line.} The node's own command line carries the same
 flows, because an operator should not have to write a program to grant an
@@ -2166,6 +2240,18 @@ under load, or against an adversarial peer-to-peer network. The verification
 record's benchmarks are single-machine measurements on modest hardware, and the
 fuzzing campaign is bounded rather than exhaustive.
 
+\paragraph{The Smart Gate is per-node authority over a plaintext loopback
+transport.} Gate decisions are enforced by whichever node or runtime observes
+the bytes; there is no cross-node capability lock, and multi-node deployments
+converge by registering the same owner-signed grants and replicating
+revocations. The worker and MCP HTTP clients are plaintext
+\texttt{host:port} transports with no TLS: loopback is the supported shape,
+remote endpoints need an explicit allow-list and still never receive the bearer
+token, so production remote use requires a TLS-terminating proxy and a
+revisited bearer model. Gate audit receipts are node-local and
+export-verifiable, not chain-anchored; worker orchestration shims for managed
+platforms are designed but not implemented.
+
 
 \section{Conclusion}
 \label{sec:conclusion}
@@ -2278,7 +2364,8 @@ Agent spend fee & parameters & 2\,000 \\
 Credit open / collateral / repay / default fee & parameters & 2\,000 each \\
 Maximum credit rate per window & parameters & 1\,000 bps \\
 Maximum frame payload & network & 4\,100\,000 bytes \\
-Maximum frame payload & network & 4\,100\,000 bytes \\
+Smart Gate capability / approval lifetime & guard & 30 heights \\
+Smart Gate registry / book capacity & guard & 1\,024 grants each \\
 Maximum peers (total / inbound) & network & 125 / 32 \\
 Maximum API connections / concurrency & API & 128 / 64 \\
 API request timeout / header timeout & API & 10 s / 30 s \\
@@ -2319,6 +2406,15 @@ both.
   restart.
 \item A spending authorisation cannot be replayed: the nonce must strictly
   increase.
+\item A Smart Gate capability is authority only with its owner's signature:
+  unsigned, forged, tampered, zero-nonce, or replayed capabilities are
+  refused; a high-risk call without a verified owner-signed approval gates
+  rather than allows, and a forged approval denies.
+\item A Smart Gate admission authorises the recomputed action, not a claimed
+  hash: the boundary re-derives the canonical hash from the executed preimage
+  and refuses on any drift; a refusal commits no window or nonce state.
+\item A revoked Smart Gate grant stays dead, with its descendants, across
+  restarts and on the stateless pre-check as well as the stateful admission.
 \item A destroyed state file is a refusal to start, never an empty book.
 \item A lying layer-2 root is accepted at layer 1 but arms no exit.
 \item The API never signs, never holds a private key, and never reaches the

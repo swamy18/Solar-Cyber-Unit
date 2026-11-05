@@ -42,7 +42,10 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use srct_core::agent::{verify_authorization, PolicyBook, SpendPolicy};
-use srct_core::guard::{derive_context_hash, Capability, Decision as GuardDecision, GuardBook, InfraPolicy};
+use srct_core::guard::{
+    derive_action_hash, derive_context_hash, Decision as GuardDecision, GuardApproval, GuardBook,
+    InfraPolicy, SignedCapability,
+};
 use srct_core::hash::{address_from_hex, hash_from_hex, hash_to_hex};
 use srct_core::payment::MachinePayment;
 use srct_core::receipt::{ReceiptBook, ServiceReceipt};
@@ -259,8 +262,13 @@ impl SolarCyberUnitMcp {
     }
 
     /// `guard.check` — stateless Smart Gate pre-check. No book, no commit.
-    /// Verifies grant shape, network binding, validity, capability equality,
-    /// expiry and lifetime. Answers allow / needs_approval, refuses by name.
+    /// Verifies the owner's signature over the capability, then grant shape,
+    /// network binding, validity, capability equality, expiry and lifetime.
+    /// `cap_hex` MUST be a signed [`SignedCapability`] envelope; a bare
+    /// capability is refused as `unsigned_capability`. Answers allow /
+    /// needs_approval, refuses by name. This is a pre-check only: execution
+    /// authorization recomputes the action hash from the observed preimage in
+    /// `guard.authorize`.
     fn guard_check(&self, request: &Value) -> Result<Value, McpError> {
         let network_id = str_field(request, "network_id")?;
         let height = u64_field(request, "height")?;
@@ -268,8 +276,16 @@ impl SolarCyberUnitMcp {
         let policy = InfraPolicy::deserialize(&policy_bytes)
             .map_err(|e| McpError::bad(format!("policy: {e}")))?;
         let cap_bytes = hex_field(request, "cap_hex")?;
-        let cap = Capability::deserialize(&cap_bytes)
-            .map_err(|e| McpError::bad(format!("capability: {e}")))?;
+        let signed = SignedCapability::deserialize(&cap_bytes).map_err(|_| {
+            McpError::refused(
+                "unsigned_capability",
+                "capability is not signed by the grant owner",
+            )
+        })?;
+        signed
+            .verify(&policy)
+            .map_err(|e| McpError::refused("guard_refused", e.to_string()))?;
+        let cap = &signed.cap;
         let agent_raw = hex_field(request, "agent_id_hex")?;
         if agent_raw.len() != 20 {
             return Err(McpError::bad("agent_id_hex must be 20 bytes"));
@@ -281,9 +297,15 @@ impl SolarCyberUnitMcp {
         let workload_id = hash_from_hex(str_field(request, "workload_id_hex")?.trim())
             .map_err(|e| McpError::bad(format!("workload_id: {e}")))?;
         let expected_ctx = derive_context_hash(&workload_id, height);
-        let high_risk = request.get("high_risk").and_then(Value::as_bool).unwrap_or(false);
+        let high_risk = request
+            .get("high_risk")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         if policy.network_id != network_id {
-            return Err(McpError::refused("guard_refused", "grant is for another network"));
+            return Err(McpError::refused(
+                "guard_refused",
+                "grant is for another network",
+            ));
         }
         if policy.revoked {
             return Err(McpError::refused("guard_refused", "grant revoked"));
@@ -295,10 +317,22 @@ impl SolarCyberUnitMcp {
             return Err(McpError::refused("guard_refused", "grant expired"));
         }
         if policy.agent_id != agent_id {
-            return Err(McpError::refused("guard_refused", "cross-principal capability"));
+            return Err(McpError::refused(
+                "guard_refused",
+                "cross-principal capability",
+            ));
+        }
+        if cap.nonce == 0 {
+            return Err(McpError::refused(
+                "guard_refused",
+                "capability nonce is zero",
+            ));
         }
         if cap.policy_hash != policy.hash() {
-            return Err(McpError::refused("guard_refused", "capability does not name this grant"));
+            return Err(McpError::refused(
+                "guard_refused",
+                "capability does not name this grant",
+            ));
         }
         if cap.action_hash != action_hash {
             return Err(McpError::refused("guard_refused", "action hash mismatch"));
@@ -310,18 +344,30 @@ impl SolarCyberUnitMcp {
             return Err(McpError::refused("guard_refused", "capability expired"));
         }
         if cap.expiry_height.saturating_sub(height) > srct_core::guard::MAX_CAP_LIFETIME {
-            return Err(McpError::refused("guard_refused", "capability lifetime exceeds cap"));
+            return Err(McpError::refused(
+                "guard_refused",
+                "capability lifetime exceeds cap",
+            ));
         }
         if high_risk {
-            return Ok(json!({"decision": "needs_approval", "reason": "high-risk action needs second-channel approval"}));
+            return Ok(
+                json!({"decision": "needs_approval", "reason": "high-risk action needs a signed approval, not a boolean"}),
+            );
         }
         Ok(json!({"decision": "allow", "policy_hash": hash_to_hex(&policy.hash())}))
     }
 
-    /// `guard.authorize` — stateful Smart Gate admission. Same checks as
-    /// `guard.check` plus tumbling-window budget and strictly increasing nonce
-    /// via `GuardBook`. On allow the state commits; on deny or approval-needed
-    /// nothing mutates.
+    /// `guard.authorize` — stateful execution-boundary admission. Same checks
+    /// as `guard.check` plus tumbling-window budget and strictly increasing
+    /// nonce via `GuardBook::authorize_signed`. The caller MUST supply
+    /// `action_preimage_hex`: the boundary recomputes
+    /// `derive_action_hash(preimage)` from what it is about to execute and
+    /// refuses unless it equals the capability's action (action-swap fix).
+    /// High-risk calls MUST supply `approval_hex` (a signed [`GuardApproval`]
+    /// envelope); the old `approved: true` boolean is no longer accepted. On
+    /// allow the state commits; on deny or approval-needed nothing mutates.
+    /// Local MCP state is a non-authoritative cache: the node's registry +
+    /// revocation set is authoritative (see the Smart Gate architecture doc).
     fn guard_authorize(&mut self, request: &Value) -> Result<Value, McpError> {
         let network_id = str_field(request, "network_id")?;
         let height = u64_field(request, "height")?;
@@ -329,34 +375,86 @@ impl SolarCyberUnitMcp {
         let policy = InfraPolicy::deserialize(&policy_bytes)
             .map_err(|e| McpError::bad(format!("policy: {e}")))?;
         let cap_bytes = hex_field(request, "cap_hex")?;
-        let cap = Capability::deserialize(&cap_bytes)
-            .map_err(|e| McpError::bad(format!("capability: {e}")))?;
+        let signed = SignedCapability::deserialize(&cap_bytes).map_err(|_| {
+            McpError::refused(
+                "unsigned_capability",
+                "capability is not signed by the grant owner",
+            )
+        })?;
         let agent_raw = hex_field(request, "agent_id_hex")?;
         if agent_raw.len() != 20 {
             return Err(McpError::bad("agent_id_hex must be 20 bytes"));
         }
         let mut agent_id = [0u8; 20];
         agent_id.copy_from_slice(&agent_raw);
-        let action_hash = hash_from_hex(str_field(request, "action_hash_hex")?.trim())
-            .map_err(|e| McpError::bad(format!("action_hash: {e}")))?;
+        let preimage = hex_field(request, "action_preimage_hex")?;
+        if preimage.is_empty() || preimage.len() > 64 * 1024 {
+            return Err(McpError::bad(
+                "action_preimage_hex must name the executed bytes",
+            ));
+        }
+        let recomputed = derive_action_hash(&preimage);
+        if let Some(claimed) = request.get("action_hash_hex").and_then(Value::as_str) {
+            let claimed_hash = hash_from_hex(claimed.trim())
+                .map_err(|e| McpError::bad(format!("action_hash: {e}")))?;
+            if claimed_hash != recomputed {
+                return Err(McpError::refused(
+                    "guard_refused",
+                    "claimed action hash does not match the executed bytes",
+                ));
+            }
+        }
         let workload_id = hash_from_hex(str_field(request, "workload_id_hex")?.trim())
             .map_err(|e| McpError::bad(format!("workload_id: {e}")))?;
         let expected_ctx = derive_context_hash(&workload_id, height);
-        let high_risk = request.get("high_risk").and_then(Value::as_bool).unwrap_or(false);
-        let approved = request.get("approved").and_then(Value::as_bool).unwrap_or(false);
-        match self.guards.authorize(
+        let high_risk = request
+            .get("high_risk")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if request
+            .get("approved")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            return Err(McpError::refused(
+                "approval_invalid",
+                "approved:true is no longer accepted; supply a signed approval_hex",
+            ));
+        }
+        let approval_bytes = match request.get("approval_hex").and_then(Value::as_str) {
+            None => None,
+            Some(s) => {
+                let raw = s.trim().trim_start_matches("0x");
+                if raw.len() > MAX_HEX_FIELD_CHARS {
+                    return Err(McpError::bad("approval_hex over the hex cap"));
+                }
+                Some(hex::decode(raw).map_err(|e| McpError::bad(format!("approval_hex: {e}")))?)
+            }
+        };
+        let approval = match approval_bytes {
+            None => None,
+            Some(b) => Some(
+                GuardApproval::deserialize(&b)
+                    .map_err(|e| McpError::refused("approval_invalid", e.to_string()))?,
+            ),
+        };
+        match self.guards.authorize_signed(
             &policy,
-            &cap,
+            &signed,
             &agent_id,
             network_id,
             height,
-            &action_hash,
+            &preimage,
             &expected_ctx,
             high_risk,
-            approved,
+            approval.as_ref(),
         ) {
-            GuardDecision::Allow => Ok(json!({"decision": "allow", "policy_hash": hash_to_hex(&policy.hash())})),
-            GuardDecision::NeedsApproval => Ok(json!({"decision": "needs_approval", "reason": "high-risk action needs second-channel approval"})),
+            GuardDecision::Allow => {
+                Ok(json!({"decision": "allow", "policy_hash": hash_to_hex(&policy.hash())}))
+            }
+            GuardDecision::NeedsApproval => Ok(
+                json!({"decision": "needs_approval", "reason": "high-risk action needs a signed approval_hex"}),
+            ),
             GuardDecision::Deny(e) => Err(McpError::refused("guard_refused", e.to_string())),
         }
     }
@@ -971,33 +1069,123 @@ fn bundle_from_bytes(bytes: &[u8]) -> Result<srct_core::sig::Bundle, McpError> {
 /// Cap for a single node response body (same 16 MiB as the miner reader).
 const MAX_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
 
+/// Is this IP a loopback address (v4 127/8 or v6 ::1)? Only loopback targets
+/// receive the API bearer token and need no allow-list entry.
+fn is_loopback_ip(ip: &std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.octets()[0] == 127,
+        std::net::IpAddr::V6(v6) => v6.is_loopback(),
+    }
+}
+
+/// MCP endpoint trust gate (token-theft fix). The bearer token is a credential:
+/// it MUST NOT follow a caller-supplied URL to an untrusted host. Rules:
+///
+/// - The endpoint MUST be `host:port` (no scheme, no userinfo, no path); any
+///   `http(s)://` prefix, `@`, or `/` is refused before resolution.
+/// - Loopback (`127/8`, `::1`, or a hostname that resolves ONLY to loopback)
+///   is trusted by default and is the only target that ever receives the
+///   bearer token.
+/// - Anything else is refused as `untrusted_endpoint` unless the exact
+///   `host:port` appears in `SRCT_MCP_TRUSTED_ENDPOINTS` (comma-separated)
+///   AND `SRCT_MCP_ALLOW_REMOTE=1` is set. Even then the bearer token is
+///   NEVER sent (this client is plain HTTP with no TLS): remote calls go
+///   out unauthenticated and fail closed at the node if it requires a token.
+/// - Every resolved address must be identical-trusted: if DNS returns a mix
+///   of loopback and non-loopback (rebinding), the endpoint is refused.
+/// - Redirects are never followed (single request/response exchange); a 3xx
+///   with a `Location` is a transport error, so a token can never be
+///   re-sent to the redirect target.
+/// - Endpoint values and tokens never appear in error strings.
+fn check_endpoint_trust(host: &str, port: u16, addrs: &[SocketAddr]) -> Result<bool, McpError> {
+    if addrs.is_empty() {
+        return Err(McpError::bad("endpoint resolves to nothing"));
+    }
+    let all_loopback = addrs.iter().all(|a| is_loopback_ip(&a.ip()));
+    let any_loopback = addrs.iter().any(|a| is_loopback_ip(&a.ip()));
+    if all_loopback {
+        return Ok(true);
+    }
+    if any_loopback {
+        // Mixed resolution: classic DNS-rebinding shape. Refuse.
+        return Err(McpError::refused(
+            "untrusted_endpoint",
+            "endpoint resolves to mixed loopback and non-loopback addresses",
+        ));
+    }
+    let allow_remote = matches!(
+        std::env::var("SRCT_MCP_ALLOW_REMOTE").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE")
+    );
+    let allowlisted = std::env::var("SRCT_MCP_TRUSTED_ENDPOINTS")
+        .map(|list| {
+            list.split(',')
+                .map(|e| e.trim().to_lowercase())
+                .any(|e| e == format!("{}:{port}", host.to_lowercase()))
+        })
+        .unwrap_or(false);
+    if allow_remote && allowlisted {
+        return Ok(false);
+    }
+    Err(McpError::refused(
+        "untrusted_endpoint",
+        "endpoint is not loopback and is not in SRCT_MCP_TRUSTED_ENDPOINTS with SRCT_MCP_ALLOW_REMOTE=1",
+    ))
+}
+
 /// A minimal `host:port` HTTP/1.1 client, so this crate stays dependency-free
 /// and never reaches an address the caller did not name. Loopback is the
 /// expected endpoint (the node API is loopback by default). When the operator
-/// has set `SRCT_API_TOKEN`, it is sent as a bearer header — an exposed bind
-/// requires it (SPEC.md §19.2); a loopback node ignores it. The token goes
-/// out over whatever transport the operator configured: point this client at
-/// a loopback node, or accept that the bearer is visible on the wire.
+/// has set `SRCT_API_TOKEN`, it is sent as a bearer header ONLY to loopback
+/// targets (see `check_endpoint_trust`): an exposed bind requires it
+/// (SPEC.md §19.2); a loopback node ignores it. Non-loopback targets never
+/// receive the token over this plaintext transport — a compromised or
+/// malicious endpoint can therefore never harvest it. The token never appears
+/// in error strings or logs.
 fn http_json(
     endpoint: &str,
     method: &str,
     path: &str,
     body: Option<&str>,
 ) -> Result<Value, McpError> {
+    let trimmed = endpoint.trim();
+    if trimmed.is_empty() || trimmed.len() > 256 {
+        return Err(McpError::bad("malformed endpoint"));
+    }
+    if trimmed.contains("://") || trimmed.contains('@') || trimmed.contains('/') {
+        return Err(McpError::refused(
+            "untrusted_endpoint",
+            "endpoint must be host:port with no scheme, userinfo, or path",
+        ));
+    }
     // Hostnames resolve via the system resolver (a plain IP:port parses as
-    // before): operators behind DNS no longer hand-edit an IP in.
-    let mut addrs = endpoint
-        .trim()
-        .trim_start_matches("http://")
+    // before): operators behind DNS no longer hand-edit an IP in. The trust
+    // gate below checks every resolved address, so a rebinding hostname that
+    // flips between loopback and public between calls is refused.
+    let mut addrs_iter = trimmed
         .to_socket_addrs()
-        .map_err(|e| McpError::bad(format!("endpoint `{endpoint}`: {e}")))?;
-    let addr: SocketAddr = addrs
-        .next()
-        .ok_or_else(|| McpError::bad(format!("endpoint `{endpoint}` resolves to nothing")))?;
+        .map_err(|_| McpError::bad("malformed endpoint"))?;
+    let addrs: Vec<SocketAddr> = addrs_iter.by_ref().take(16).collect();
+    if addrs.is_empty() {
+        return Err(McpError::bad("malformed endpoint"));
+    }
+    let (host, port) = match trimmed.rsplit_once(':') {
+        Some((h, p)) if !h.is_empty() => {
+            let port: u16 = p.parse().map_err(|_| McpError::bad("malformed endpoint"))?;
+            (h.to_string(), port)
+        }
+        _ => return Err(McpError::bad("malformed endpoint")),
+    };
+    let send_token = check_endpoint_trust(&host, port, &addrs)?;
+    let addr: SocketAddr = addrs[0];
     let body = body.unwrap_or("");
-    let auth = match std::env::var("SRCT_API_TOKEN") {
-        Ok(token) if !token.is_empty() => format!("Authorization: Bearer {token}\r\n"),
-        _ => String::new(),
+    let auth = if send_token {
+        match std::env::var("SRCT_API_TOKEN") {
+            Ok(token) if !token.is_empty() => format!("Authorization: Bearer {token}\r\n"),
+            _ => String::new(),
+        }
+    } else {
+        String::new()
     };
     let request = format!(
         "{method} {path} HTTP/1.1\r\n\
@@ -1051,6 +1239,13 @@ fn http_json(
     let value: Value = serde_json::from_str(payload)
         .map_err(|e| McpError::transport(format!("node reply was not JSON: {e}")))?;
 
+    if (300..400).contains(&status) {
+        // Redirects are never followed: a malicious endpoint must not be able
+        // to bounce this client (and its bearer header) to a second host.
+        return Err(McpError::transport(
+            "node sent a redirect, which is refused",
+        ));
+    }
     if status >= 400 {
         let code = value
             .get("error")

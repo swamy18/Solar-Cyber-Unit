@@ -19,12 +19,11 @@
 use srct_core::agent::{
     derive_agent_id, AgentRole, AuthorizationRequest, SpendPolicy, POLICY_VERSION,
 };
-use srct_core::guard::{
-    derive_context_hash, Capability, Decision as GuardDecision, InfraPolicy,
-    GUARD_POLICY_VERSION,
-};
 use srct_core::chain::Chain;
 use srct_core::credit::Reservation;
+use srct_core::guard::{
+    derive_context_hash, Capability, Decision as GuardDecision, InfraPolicy, GUARD_POLICY_VERSION,
+};
 use srct_core::hash::Hash;
 use srct_core::params::NetworkParams;
 use srct_core::payment::{MachinePayment, PAYMENT_VERSION};
@@ -214,10 +213,17 @@ fn populate(node: &mut SharedNode) {
         expiry_height: 40,
         nonce: 1,
     };
-    match node
-        .guards
-        .authorize(&gp, &cap, &gp.agent_id, NET, 10, &action, &ctx, false, false)
-    {
+    match node.guards.authorize(
+        &gp,
+        &cap,
+        &gp.agent_id,
+        NET,
+        10,
+        &action,
+        &ctx,
+        false,
+        false,
+    ) {
         GuardDecision::Allow => {}
         other => panic!("guard allow: {other:?}"),
     }

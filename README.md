@@ -216,6 +216,16 @@ trusting any number in it:
 - **The exit window is shared, and one share is capped.** Mainnet lets one
   owner queue 100 SRCT per 144-block window: a genuinely large exit waits
   across windows. Refusals delay, never destroy — but plan around it.
+- **The Smart Gate is per-node authority over a plaintext loopback transport.**
+  Gate decisions are enforced by whichever node or runtime observes the bytes —
+  there is no cross-node capability lock, and multi-node deployments converge
+  by registering the same owner-signed grants and replicating revocations.
+  The worker/MCP HTTP clients are plaintext `host:port` transports: loopback
+  is the supported shape, remote endpoints need an explicit allow-list and
+  still never receive the bearer token, so remote production use needs a
+  TLS-terminating proxy. Gate audit receipts are node-local and
+  export-verifiable, not chain-anchored; managed-platform shims are designed
+  but not implemented.
 
 ---
 
@@ -727,34 +737,62 @@ The wallet around them is safer than a normal crypto wallet by construction
 ## Smart Gate
 
 Universal security layer for the AI-agent era: one question — *may this
-workload do this exact action at this exact moment?* — answered as
-`allow / deny / needs_approval` anywhere, settled as trust on Solar.
+workload do this exact action at this exact moment under this grant?* —
+answered as `allow / deny / needs_approval` anywhere, settled as trust on Solar.
 
-- **What it is:** a context-bound capability
-  `cap = H(policy_hash || action_hash || context_hash || expiry || nonce)`.
-  The grant bounds rate and validity only and names no tools, images, or APIs.
-  Exactness comes from hash equality: the runtime re-derives `action_hash`
-  and `context_hash` from what it is about to execute. One bit of drift denies.
-  Short-lived by construction (max 30 heights), single-use nonce, tumbling
-  window, cross-principal deny. Fail-closed, deterministic, integer-only.
-- **How it works:** owner signs a narrow `InfraPolicy` once (`srct-core::guard`).
-  Before any key or long-lived token is used, the workload calls the gate.
-  The gate mints a 2-minute capability bound to the exact action. The runtime,
-  container broker, cloud broker, or wallet signing service verifies offline
-  and executes only on `allow`. High-risk actions return `needs_approval` until
-  a second-channel approver co-signs. Refusals consume no budget and are named
-  (`action_mismatch`, `context_mismatch`, `expired`, `nonce_reuse`,
-  `cross_principal`, `window_exhausted`).
+- **What it is:** an owner-signed, context-bound capability
+  (`SignedCapability`: owner signature over
+  `policy_hash || action_hash || context_hash || expiry || nonce`, where
+  `action_hash` is the canonical hash of the exact bytes about to execute).
+  A bare capability is public bytes anyone can write down — only the owner's
+  signature turns it into authority, and every boundary verifies it. The grant
+  bounds rate and validity only and names no tools, images, or APIs. Exactness
+  comes from recomputation: the execution boundary re-derives `action_hash`
+  from the preimage it observes and `context_hash` from workload + height.
+  One bit of drift denies. Short-lived by construction (max 30 heights, no
+  wall-clock), nonzero strictly increasing nonce, tumbling window,
+  cross-principal deny. Fail-closed, deterministic, integer-only.
+- **How it works:** owner signs a narrow `InfraPolicy` once (`srct-core::guard`)
+  and registers it (`guard/grant`, signature mandatory). Before any key or
+  long-lived token is used, the workload calls the gate. The owner signs a
+  capability bound to the exact action preimage. The runtime, container broker,
+  cloud broker, or wallet signing service verifies the owner signature offline
+  and executes only on `allow`. High-risk actions return `needs_approval`
+  until a signed `GuardApproval` from the grant owner — bound to the exact
+  capability instance, agent, action, context and expiry — is presented; a
+  missing approval gates, a forged one denies, and the old `approved: true`
+  boolean is rejected everywhere. Stateless pre-checks (`guard.check`,
+  `/v1/guard/decide`) commit nothing; stateful admission (`guard.authorize`,
+  `/v1/guard/authorize`) enforces window + nonce and is the execution boundary.
+  Refusals consume no budget and are named (`action_mismatch`,
+  `context_mismatch`, `expired`, `nonce_reuse`, `zero_nonce`,
+  `unsigned_capability`, `bad_approval`, `cross_principal`,
+  `window_exhausted`).
+- **Replay, revocation, state:** nonces are nonzero and strictly increasing per
+  grant, persisted in the node's `GuardBook` across restarts (`state.bin`);
+  revocation kills the grant and every registered descendant and persists in a
+  revocation set the stateless pre-check also consults. The node's registry +
+  revocation set + book is authoritative per node; MCP-local gate state is a
+  non-authoritative cache. Registry (1024 grants) and book (1024 grants) refuse
+  when full rather than evicting.
+- **MCP credential rule:** the MCP client dials `host:port` only; loopback is
+  trusted and is the only target that ever receives the API bearer token.
+  Anything else needs `SRCT_MCP_TRUSTED_ENDPOINTS` + `SRCT_MCP_ALLOW_REMOTE=1`
+  and still never receives the token over this plaintext transport; redirects
+  are refused, never followed.
 - **How others use it:** free verify, paid trust. Any platform calls
-  `srct-policy::guard_verify`, MCP `guard.check` (stateless) /
-  `guard.authorize` (stateful `GuardBook`), or the node routes
+  `srct-policy::guard_verify`, MCP `guard.check` (stateless, `cap_hex` signed,
+  `action_hash_hex`) / `guard.authorize` (stateful, plus
+  `action_preimage_hex` and `approval_hex`), or the node routes
   `POST /v1/guard/decide` (stateless pre-check), `POST /v1/guard/grant`
   (owner-signed registration), `POST /v1/guard/revoke` (owner-signed kill
-  switch), `POST /v1/guard/authorize` (stateful admission with audit) with
-  `policy_hex`, `cap_hex`, `agent_id_hex`, `action_hash_hex`,
-  `workload_id_hex`. Verification needs no Solar node; enforcement and audit
-  settle on Solar, which is what drives SRCT demand (fee burn + PSCB
-  accounting).
+  switch with descendant propagation), `POST /v1/guard/authorize` (stateful
+  admission with audit) with `policy_hex`, `cap_hex` (signed envelope),
+  `agent_id_hex`, `action_preimage_hex`, `workload_id_hex`. Verification needs
+  no Solar node; enforcement and audit settle on the enforcing Solar node,
+  which is what drives SRCT demand (fee burn + PSCB accounting). Audit is
+  node-local and export-verifiable, not chain-anchored. Full design:
+  [`docs/smart-gate-architecture.md`](docs/smart-gate-architecture.md).
 - **Why copy does not transfer trust:** verification code is open by design;
   the trust root is not copyable. Grants are network-bound, decisions anchor
   to the canonical tip, and audit receipts are accepted because of the

@@ -3582,23 +3582,28 @@ struct GuardDecideReq {
     high_risk: Option<bool>,
 }
 
-async fn guard_decide(
-    State(state): State<ApiState>,
-    Json(req): Json<GuardDecideReq>,
-) -> ApiResult {
-    if req.policy_hex.len() > 8 * 1024 || req.cap_hex.len() > 1024 {
+async fn guard_decide(State(state): State<ApiState>, Json(req): Json<GuardDecideReq>) -> ApiResult {
+    if req.policy_hex.len() > 8 * 1024 || req.cap_hex.len() > 64 * 1024 {
         return Err(bad("guard input over cap"));
     }
     with_shared(&state, |sh| {
-        use srct_core::guard::{derive_context_hash, Capability, InfraPolicy, MAX_CAP_LIFETIME};
+        use srct_core::guard::{
+            derive_context_hash, InfraPolicy, SignedCapability, MAX_CAP_LIFETIME,
+        };
         let network = sh.chain.params().network_id.clone();
         let height = sh.chain.height();
-        let policy_bytes =
-            hex::decode(req.policy_hex.trim().trim_start_matches("0x")).map_err(|_| bad("malformed policy hex"))?;
-        let policy = InfraPolicy::deserialize(&policy_bytes).map_err(|e| bad(format!("policy: {e}")))?;
-        let cap_bytes =
-            hex::decode(req.cap_hex.trim().trim_start_matches("0x")).map_err(|_| bad("malformed capability hex"))?;
-        let cap = Capability::deserialize(&cap_bytes).map_err(|e| bad(format!("capability: {e}")))?;
+        let policy_bytes = hex::decode(req.policy_hex.trim().trim_start_matches("0x"))
+            .map_err(|_| bad("malformed policy hex"))?;
+        let policy =
+            InfraPolicy::deserialize(&policy_bytes).map_err(|e| bad(format!("policy: {e}")))?;
+        let cap_bytes = hex::decode(req.cap_hex.trim().trim_start_matches("0x"))
+            .map_err(|_| bad("malformed capability hex"))?;
+        let signed = SignedCapability::deserialize(&cap_bytes)
+            .map_err(|_| bad("capability is not signed"))?;
+        if let Err(e) = signed.verify(&policy) {
+            return Err(bad(format!("capability: {e}")));
+        }
+        let cap = &signed.cap;
         let agent_raw = hex::decode(req.agent_id_hex.trim().trim_start_matches("0x"))
             .map_err(|_| bad("malformed agent id hex"))?;
         if agent_raw.len() != 20 {
@@ -3622,8 +3627,11 @@ async fn guard_decide(
         if policy.network_id != network {
             return deny("grant is for another network");
         }
-        if policy.revoked {
+        if policy.revoked || sh.guard_revoked.contains(&cap.policy_hash) {
             return deny("grant revoked");
+        }
+        if cap.nonce == 0 {
+            return deny("capability nonce is zero");
         }
         if height < policy.valid_from_height {
             return deny("grant not yet valid");
@@ -3708,10 +3716,7 @@ struct GuardGrantReq {
     policy_keys_hex: String,
 }
 
-async fn guard_grant(
-    State(state): State<ApiState>,
-    Json(req): Json<GuardGrantReq>,
-) -> ApiResult {
+async fn guard_grant(State(state): State<ApiState>, Json(req): Json<GuardGrantReq>) -> ApiResult {
     if req.policy_hex.len() > 8 * 1024 {
         return Err(bad("guard grant over cap"));
     }
@@ -3731,6 +3736,15 @@ async fn guard_grant(
                 StatusCode::CONFLICT,
                 "guard_refused",
                 "grant was revoked on this node",
+            ));
+        }
+        if !sh.guard_registry.contains_key(&hash)
+            && sh.guard_registry.len() >= srct_core::guard::MAX_GUARD_REGISTRY
+        {
+            return Err(fail(
+                StatusCode::CONFLICT,
+                "guard_refused",
+                "grant registry is full",
             ));
         }
         sh.guard_registry.insert(hash, policy);
@@ -3762,10 +3776,7 @@ struct GuardRevokeReq {
     keys_hex: String,
 }
 
-async fn guard_revoke(
-    State(state): State<ApiState>,
-    Json(req): Json<GuardRevokeReq>,
-) -> ApiResult {
+async fn guard_revoke(State(state): State<ApiState>, Json(req): Json<GuardRevokeReq>) -> ApiResult {
     let bytes = decode_hex_bytes(&req.policy_hex, "policy")?;
     let variant = srct_core::guard::InfraPolicy::deserialize(&bytes)
         .map_err(|e| bad(format!("policy: {e}")))?;
@@ -3791,8 +3802,48 @@ async fn guard_revoke(
                 "this node never enforced the grant being revoked",
             ));
         }
-        let was_new = sh.guard_revoked.insert(original.hash());
-        sh.guards.forget(&original.hash());
+        // Revocation propagates: any registered grant whose parent chain
+        // leads to this grant dies with it, so a delegated leaf cannot
+        // outlive the root that authorized it (delegation narrowing +
+        // kill-switch rule, enforced here at the authoritative registry).
+        let target = original.hash();
+        let mut agent_of: std::collections::BTreeMap<[u8; 20], [u8; 32]> =
+            std::collections::BTreeMap::new();
+        for (h, p) in sh.guard_registry.iter() {
+            agent_of.insert(p.agent_id, *h);
+        }
+        let mut dead: Vec<[u8; 32]> = vec![target];
+        for (h, p) in sh.guard_registry.iter() {
+            let mut cursor = p.parent_agent_id;
+            let mut hops = 0usize;
+            while let Some(parent_agent) = cursor {
+                hops += 1;
+                if hops > 64 {
+                    break;
+                }
+                match agent_of.get(&parent_agent) {
+                    None => break,
+                    Some(parent_hash) => {
+                        if *parent_hash == target {
+                            dead.push(*h);
+                            break;
+                        }
+                        cursor = sh
+                            .guard_registry
+                            .get(parent_hash)
+                            .and_then(|pp| pp.parent_agent_id);
+                    }
+                }
+            }
+        }
+        let mut newly = 0usize;
+        for h in dead {
+            if sh.guard_revoked.insert(h) {
+                newly += 1;
+            }
+            sh.guards.forget(&h);
+        }
+        let was_new = newly > 0;
         audit_push(
             sh,
             "guard_revoke",
@@ -3820,26 +3871,37 @@ async fn guard_revoke(
 struct GuardAuthorizeReq {
     cap_hex: String,
     agent_id_hex: String,
-    action_hash_hex: String,
+    action_hash_hex: Option<String>,
+    action_preimage_hex: Option<String>,
     workload_id_hex: String,
     high_risk: Option<bool>,
-    approved: Option<bool>,
+    approval_hex: Option<String>,
 }
 
 async fn guard_authorize(
     State(state): State<ApiState>,
     Json(req): Json<GuardAuthorizeReq>,
 ) -> ApiResult {
-    if req.cap_hex.len() > 1024 {
+    if req.cap_hex.len() > 64 * 1024 {
         return Err(bad("capability over cap"));
     }
+    if let Some(p) = req.action_preimage_hex.as_ref() {
+        if p.len() > 128 * 1024 {
+            return Err(bad("action preimage over cap"));
+        }
+    }
     with_shared(&state, |sh| {
-        use srct_core::guard::{derive_context_hash, Capability, Decision as GuardDecision};
+        use srct_core::guard::{
+            derive_action_hash, derive_context_hash, Decision as GuardDecision, GuardApproval,
+            SignedCapability,
+        };
         let network = sh.chain.params().network_id.clone();
         let height = sh.chain.height();
-        let cap_bytes =
-            hex::decode(req.cap_hex.trim().trim_start_matches("0x")).map_err(|_| bad("malformed capability hex"))?;
-        let cap = Capability::deserialize(&cap_bytes).map_err(|e| bad(format!("capability: {e}")))?;
+        let cap_bytes = hex::decode(req.cap_hex.trim().trim_start_matches("0x"))
+            .map_err(|_| bad("malformed capability hex"))?;
+        let signed = SignedCapability::deserialize(&cap_bytes)
+            .map_err(|_| bad("capability is not signed"))?;
+        let cap = signed.cap.clone();
         let policy = sh
             .guard_registry
             .get(&cap.policy_hash)
@@ -3873,23 +3935,70 @@ async fn guard_authorize(
         }
         let mut agent_id = [0u8; 20];
         agent_id.copy_from_slice(&agent_raw);
-        let action_hash = srct_core::hash::hash_from_hex(req.action_hash_hex.trim())
-            .map_err(|_| bad("malformed action hash"))?;
+        // Execution-boundary rule (action-swap fix): the caller MUST name the
+        // exact bytes about to execute. The boundary recomputes the canonical
+        // hash from those bytes; a caller-supplied hash alone is never
+        // trusted. The optional `action_hash_hex` is cross-checked when
+        // present, so a client that cached a hash learns of drift by name.
+        let preimage_hex = req
+            .action_preimage_hex
+            .as_ref()
+            .ok_or_else(|| bad("action preimage required at the execution boundary"))?;
+        let preimage = hex::decode(preimage_hex.trim().trim_start_matches("0x"))
+            .map_err(|_| bad("malformed action preimage"))?;
+        if preimage.is_empty() || preimage.len() > 64 * 1024 {
+            return Err(bad("action preimage over cap"));
+        }
+        let recomputed = derive_action_hash(&preimage);
+        if recomputed != cap.action_hash {
+            audit_push(
+                sh,
+                "guard_refused",
+                Some(cap.policy_hash),
+                None,
+                "authorized action does not match the executed bytes".to_string(),
+            );
+            return Ok(Json(json!({
+                "decision": "deny",
+                "reason": "authorized action does not match the executed bytes",
+                "network_id": network,
+                "height": height,
+            })));
+        }
+        if let Some(claimed) = req.action_hash_hex.as_ref() {
+            let claimed_hash = srct_core::hash::hash_from_hex(claimed.trim())
+                .map_err(|_| bad("malformed action hash"))?;
+            if claimed_hash != recomputed {
+                return Err(bad("claimed action hash does not match the executed bytes"));
+            }
+        }
         let workload_id = srct_core::hash::hash_from_hex(req.workload_id_hex.trim())
             .map_err(|_| bad("malformed workload id"))?;
         let expected_ctx = derive_context_hash(&workload_id, height);
         let high_risk = req.high_risk.unwrap_or(false);
-        let approved = req.approved.unwrap_or(false);
-        match sh.guards.authorize(
+        // Boolean approvals are dead: a high-risk call without a signed
+        // approval envelope answers needs_approval; a forged envelope denies.
+        let approval = match req.approval_hex.as_ref() {
+            None => None,
+            Some(hex_str) => {
+                let bytes = hex::decode(hex_str.trim().trim_start_matches("0x"))
+                    .map_err(|_| bad("malformed approval"))?;
+                Some(
+                    GuardApproval::deserialize(&bytes)
+                        .map_err(|e| bad(format!("approval: {e}")))?,
+                )
+            }
+        };
+        match sh.guards.authorize_signed(
             &policy,
-            &cap,
+            &signed,
             &agent_id,
             &network,
             height,
-            &action_hash,
+            &preimage,
             &expected_ctx,
             high_risk,
-            approved,
+            approval.as_ref(),
         ) {
             GuardDecision::Allow => {
                 audit_push(
@@ -3897,7 +4006,11 @@ async fn guard_authorize(
                     "guard_allow",
                     Some(cap.policy_hash),
                     None,
-                    format!("grant {} nonce {}", hash_to_hex(&cap.policy_hash), cap.nonce),
+                    format!(
+                        "grant {} nonce {}",
+                        hash_to_hex(&cap.policy_hash),
+                        cap.nonce
+                    ),
                 );
                 Ok(Json(json!({
                     "decision": "allow",
@@ -3913,7 +4026,11 @@ async fn guard_authorize(
                     "guard_needs_approval",
                     Some(cap.policy_hash),
                     None,
-                    format!("grant {} nonce {}", hash_to_hex(&cap.policy_hash), cap.nonce),
+                    format!(
+                        "grant {} nonce {}",
+                        hash_to_hex(&cap.policy_hash),
+                        cap.nonce
+                    ),
                 );
                 Ok(Json(json!({
                     "decision": "needs_approval",

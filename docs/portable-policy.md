@@ -137,6 +137,22 @@ owner-signed grant.) Vendoring the `srct-policy` Rust crate instead still
 compiles all of `srct-core` (BLS, ML-DSA and all) — see the crate docs for
 the honest weight note. For outsiders, HTTP or the bindings are the way in.
 
+## Smart Gate (companion surface)
+
+Spend policies govern *payments*; the Smart Gate governs *any exact action*
+(deploys, signing-service use, container execution) under the same
+owner-signs-once discipline. The shapes rhyme on purpose: an owner-signed
+`InfraPolicy` grant, a signed capability (`SignedCapability`, the only form
+`cap_hex` takes — raw capabilities are refused as unsigned), a short lifetime
+(30 heights), strictly increasing nonzero nonces, and a signed high-risk
+approval (`GuardApproval`) instead of a boolean. The execution boundary
+recomputes the canonical action hash from the preimage it observes
+(`action_preimage_hex` is required at `guard.authorize` /
+`POST /v1/guard/authorize`); a caller-supplied hash alone is never trusted.
+Full architecture, threat model, and the authoritative-state rule (node
+registry + revocation set authoritative per node; MCP-local gate state a
+non-authoritative cache): [`smart-gate-architecture.md`](smart-gate-architecture.md).
+
 ## Rules the interface keeps
 
 - One engine: `PolicyBook` commits, `dominates` narrows, `verify_*` checks.
@@ -145,3 +161,7 @@ the honest weight note. For outsiders, HTTP or the bindings are the way in.
   signatures come in.
 - Fail-closed and named: every refusal names its clause; hostile bytes are
   refused before any allocation they dictate.
+- Signed authority: grants, capabilities and high-risk approvals are
+  owner-signed envelopes; booleans never stand in for signatures.
+- Boundary recomputation: the exact action is re-derived from observed bytes
+  at admission, not accepted as a caller claim.

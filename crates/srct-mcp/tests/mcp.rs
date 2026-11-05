@@ -710,6 +710,233 @@ fn auth_bind_and_verify_bound_enforce_expiry_and_tx() {
 }
 
 #[test]
+fn guard_check_requires_a_signed_capability() {
+    use srct_core::guard::{
+        derive_context_hash, Capability, InfraPolicy, SignedCapability, GUARD_POLICY_VERSION,
+    };
+    let owner = wallet(11);
+    let owner_addr = owner.address().unwrap();
+    let agent_id = derive_agent_id(NET, AgentRole::Machine, &owner_addr);
+    let policy = InfraPolicy {
+        version: GUARD_POLICY_VERSION,
+        network_id: NET.to_string(),
+        agent_id,
+        owner: owner_addr,
+        max_calls_per_window: 5,
+        window_blocks: 100,
+        valid_from_height: 0,
+        valid_until_height: 10_000,
+        revoked: false,
+        parent_agent_id: None,
+    };
+    let workload = [2u8; 32];
+    let action = [1u8; 32];
+    let ctx = derive_context_hash(&workload, HEIGHT);
+    let mut mcp = SolarCyberUnitMcp::new();
+
+    // Unsigned bytes any observer could write down: refused, never allowed.
+    let raw = Capability {
+        policy_hash: policy.hash(),
+        action_hash: action,
+        context_hash: ctx,
+        expiry_height: HEIGHT + 10,
+        nonce: 1,
+    };
+    let err = mcp
+        .handle(&json!({
+            "op": "guard.check",
+            "network_id": NET,
+            "height": HEIGHT,
+            "policy_hex": hex::encode(policy.serialize()),
+            "cap_hex": hex::encode(raw.serialize()),
+            "agent_id_hex": hex::encode(agent_id),
+            "action_hash_hex": hash_to_hex(&action),
+            "workload_id_hex": hash_to_hex(&workload),
+        }))
+        .expect_err("an unsigned capability must be refused");
+    assert_eq!(err.code, "unsigned_capability");
+
+    // Signed by a stranger: same bytes, no authority.
+    let stranger = wallet(12);
+    let forged = SignedCapability::issue(&stranger, &raw).unwrap();
+    let err = mcp
+        .handle(&json!({
+            "op": "guard.check",
+            "network_id": NET,
+            "height": HEIGHT,
+            "policy_hex": hex::encode(policy.serialize()),
+            "cap_hex": hex::encode(forged.serialize()),
+            "agent_id_hex": hex::encode(agent_id),
+            "action_hash_hex": hash_to_hex(&action),
+            "workload_id_hex": hash_to_hex(&workload),
+        }))
+        .expect_err("a forged capability must be refused");
+    assert_eq!(err.code, "guard_refused");
+
+    // Honest owner signature: allowed.
+    let signed = SignedCapability::issue(&owner, &raw).unwrap();
+    let out = mcp
+        .handle(&json!({
+            "op": "guard.check",
+            "network_id": NET,
+            "height": HEIGHT,
+            "policy_hex": hex::encode(policy.serialize()),
+            "cap_hex": hex::encode(signed.serialize()),
+            "agent_id_hex": hex::encode(agent_id),
+            "action_hash_hex": hash_to_hex(&action),
+            "workload_id_hex": hash_to_hex(&workload),
+        }))
+        .expect("an owner-signed capability passes the pre-check");
+    assert_eq!(out["decision"], "allow");
+}
+
+#[test]
+fn guard_authorize_recomputes_the_action_and_rejects_boolean_approval() {
+    use srct_core::guard::{
+        derive_action_hash, derive_context_hash, Capability, GuardApproval, InfraPolicy,
+        SignedCapability, GUARD_POLICY_VERSION,
+    };
+    let owner = wallet(21);
+    let owner_addr = owner.address().unwrap();
+    let agent_id = derive_agent_id(NET, AgentRole::Machine, &owner_addr);
+    let policy = InfraPolicy {
+        version: GUARD_POLICY_VERSION,
+        network_id: NET.to_string(),
+        agent_id,
+        owner: owner_addr,
+        max_calls_per_window: 5,
+        window_blocks: 100,
+        valid_from_height: 0,
+        valid_until_height: 10_000,
+        revoked: false,
+        parent_agent_id: None,
+    };
+    let workload = [4u8; 32];
+    let preimage = b"deploy-42";
+    let action = derive_action_hash(preimage);
+    let ctx = derive_context_hash(&workload, HEIGHT);
+    let cap = Capability {
+        policy_hash: policy.hash(),
+        action_hash: action,
+        context_hash: ctx,
+        expiry_height: HEIGHT + 10,
+        nonce: 1,
+    };
+    let signed = SignedCapability::issue(&owner, &cap).unwrap();
+    let base = || {
+        json!({
+            "op": "guard.authorize",
+            "network_id": NET,
+            "height": HEIGHT,
+            "policy_hex": hex::encode(policy.serialize()),
+            "cap_hex": hex::encode(signed.serialize()),
+            "agent_id_hex": hex::encode(agent_id),
+            "action_preimage_hex": hex::encode(preimage),
+            "workload_id_hex": hex::encode(workload),
+        })
+    };
+    let mut mcp = SolarCyberUnitMcp::new();
+    let out = mcp.handle(&base()).expect("exact preimage authorizes");
+    assert_eq!(out["decision"], "allow");
+
+    // Action swap: authorized deploy-42, executing deploy-43.
+    let mut mcp2 = SolarCyberUnitMcp::new();
+    let mut swapped = base();
+    swapped["action_preimage_hex"] = json!(hex::encode(b"deploy-43"));
+    swapped["cap_hex"] = json!(hex::encode(
+        SignedCapability::issue(&owner, &cap).unwrap().serialize()
+    ));
+    let err = mcp2
+        .handle(&swapped)
+        .expect_err("a swapped action must be refused");
+    assert_eq!(err.code, "guard_refused");
+
+    // Boolean approval is dead: high-risk + approved:true refuses.
+    let mut mcp3 = SolarCyberUnitMcp::new();
+    let mut boolean = base();
+    boolean["high_risk"] = json!(true);
+    boolean["approved"] = json!(true);
+    let err = mcp3
+        .handle(&boolean)
+        .expect_err("boolean approval must be refused");
+    assert_eq!(err.code, "approval_invalid");
+
+    // High-risk without any approval gates instead of allowing.
+    let mut mcp4 = SolarCyberUnitMcp::new();
+    let mut gated = base();
+    gated["high_risk"] = json!(true);
+    let out = mcp4.handle(&gated).expect("missing approval gates");
+    assert_eq!(out["decision"], "needs_approval");
+
+    // Signed approval from a stranger denies.
+    let stranger = wallet(22);
+    let draft = GuardApproval {
+        version: GUARD_POLICY_VERSION,
+        policy_hash: policy.hash(),
+        cap_hash: cap.signing_hash(),
+        agent_id,
+        action_hash: action,
+        context_hash: ctx,
+        expiry_height: HEIGHT + 5,
+        sigs: srct_core::sig::Bundle::default(),
+        keys: srct_core::sig::Bundle::default(),
+    };
+    let fake = GuardApproval {
+        sigs: srct_core::l2::Auth::sigs_for(&stranger, &draft.signing_hash()).unwrap(),
+        keys: srct_core::l2::Auth::keys_for(&stranger).unwrap(),
+        ..draft.clone()
+    };
+    let mut mcp5 = SolarCyberUnitMcp::new();
+    let mut forged = base();
+    forged["high_risk"] = json!(true);
+    forged["approval_hex"] = json!(hex::encode(fake.serialize()));
+    let err = mcp5.handle(&forged).expect_err("a fake approval must deny");
+    assert_eq!(err.code, "guard_refused");
+
+    // Honest owner approval allows.
+    let honest = GuardApproval {
+        sigs: srct_core::l2::Auth::sigs_for(&owner, &draft.signing_hash()).unwrap(),
+        keys: srct_core::l2::Auth::keys_for(&owner).unwrap(),
+        ..draft
+    };
+    let mut mcp6 = SolarCyberUnitMcp::new();
+    let mut ok = base();
+    ok["high_risk"] = json!(true);
+    ok["approval_hex"] = json!(hex::encode(honest.serialize()));
+    let out = mcp6.handle(&ok).expect("an owner-signed approval allows");
+    assert_eq!(out["decision"], "allow");
+}
+
+#[test]
+fn mcp_transport_refuses_untrusted_endpoints() {
+    let mut mcp = SolarCyberUnitMcp::new();
+    // A caller-supplied public URL must not receive the bearer token: refused
+    // before any socket opens (no SRCT_MCP_ALLOW_REMOTE in this test env).
+    let err = mcp
+        .handle(&json!({
+            "op": "node.status",
+            "endpoint": "203.0.113.7:8080",
+        }))
+        .expect_err("a public endpoint must be refused");
+    assert_eq!(err.code, "untrusted_endpoint");
+    // Scheme/userinfo/path shapes are refused, never parsed into a dial.
+    for endpoint in [
+        "http://127.0.0.1:8080",
+        "user:pass@127.0.0.1:8080",
+        "127.0.0.1:8080/v1/status",
+    ] {
+        let err = mcp
+            .handle(&json!({ "op": "node.status", "endpoint": endpoint }))
+            .expect_err("a non host:port endpoint must be refused");
+        assert!(
+            err.code == "untrusted_endpoint" || err.code == "bad_request",
+            "unexpected code for {endpoint}: {}",
+            err.code
+        );
+    }
+}
+
+#[test]
 fn audit_verify_checks_the_exported_chain() {
     use srct_core::safety::AuditLog;
 

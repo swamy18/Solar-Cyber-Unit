@@ -27,6 +27,10 @@ pub const MAX_GUARD_NETWORK_LEN: usize = 64;
 pub const DEFAULT_MAX_GUARDS: usize = 1024;
 /// Longest a capability may live, in heights, from the check height.
 pub const MAX_CAP_LIFETIME: u64 = 30;
+/// Longest an approval may live, in heights, from the check height.
+pub const MAX_APPROVAL_LIFETIME: u64 = 30;
+/// Most grants tracked in one node's registry, cap-with-refusal like the book.
+pub const MAX_GUARD_REGISTRY: usize = 1024;
 
 /// Domain tag for the grant signing hash.
 pub const DOM_GUARD_POLICY: &[u8] = b"srct/guard-policy/v1";
@@ -34,6 +38,10 @@ pub const DOM_GUARD_POLICY: &[u8] = b"srct/guard-policy/v1";
 pub const DOM_GUARD_CAP: &[u8] = b"srct/guard-cap/v1";
 /// Domain tag for context derivation (workload || height).
 pub const DOM_GUARD_CTX: &[u8] = b"srct/guard-ctx/v1";
+/// Domain tag for the canonical action hash (action preimage bytes).
+pub const DOM_GUARD_ACTION: &[u8] = b"srct/guard-action/v1";
+/// Domain tag for the high-risk approval signing hash.
+pub const DOM_GUARD_APPROVAL: &[u8] = b"srct/guard-approval/v1";
 
 /// Why the gate refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,6 +60,10 @@ pub enum GuardError {
     ActionMismatch,
     ContextMismatch,
     CrossPrincipal,
+    ZeroNonce,
+    UnsignedCapability,
+    BadApproval(&'static str),
+    ActionUnverified,
     NonceNotIncreasing { nonce: u64, last_nonce: u64 },
     HeightRewind { height: u64, window_start: u64 },
     WindowExhausted { calls: u64, max: u64 },
@@ -71,7 +83,10 @@ impl std::fmt::Display for GuardError {
             GuardError::NotYetValid { height, valid_from } => {
                 write!(f, "not yet valid: height {height} before {valid_from}")
             }
-            GuardError::ExpiredGrant { height, valid_until } => {
+            GuardError::ExpiredGrant {
+                height,
+                valid_until,
+            } => {
                 write!(f, "grant expired: height {height} at {valid_until}")
             }
             GuardError::ExpiredCap { height, expiry } => {
@@ -84,10 +99,21 @@ impl std::fmt::Display for GuardError {
             GuardError::ActionMismatch => write!(f, "action hash mismatch"),
             GuardError::ContextMismatch => write!(f, "context hash mismatch"),
             GuardError::CrossPrincipal => write!(f, "capability principal is not this agent"),
+            GuardError::ZeroNonce => write!(f, "capability nonce is zero"),
+            GuardError::UnsignedCapability => {
+                write!(f, "capability is not signed by the grant owner")
+            }
+            GuardError::BadApproval(w) => write!(f, "approval invalid: {w}"),
+            GuardError::ActionUnverified => {
+                write!(f, "action preimage required at the execution boundary")
+            }
             GuardError::NonceNotIncreasing { nonce, last_nonce } => {
                 write!(f, "nonce {nonce} is not greater than last {last_nonce}")
             }
-            GuardError::HeightRewind { height, window_start } => {
+            GuardError::HeightRewind {
+                height,
+                window_start,
+            } => {
                 write!(f, "height {height} precedes window start {window_start}")
             }
             GuardError::WindowExhausted { calls, max } => {
@@ -156,7 +182,9 @@ impl InfraPolicy {
         if version != GUARD_POLICY_VERSION {
             return Err(GuardError::UnsupportedVersion(version));
         }
-        let net_len = r.u16le().map_err(|_| GuardError::Malformed("network len"))? as usize;
+        let net_len = r
+            .u16le()
+            .map_err(|_| GuardError::Malformed("network len"))? as usize;
         if net_len == 0 {
             return Err(GuardError::EmptyNetworkId);
         }
@@ -169,8 +197,12 @@ impl InfraPolicy {
         let network_id = std::str::from_utf8(net_bytes)
             .map_err(|_| GuardError::Malformed("network id utf-8"))?
             .to_string();
-        let agent_id = r.fixed::<20>().map_err(|_| GuardError::Malformed("agent"))?;
-        let owner = r.fixed::<20>().map_err(|_| GuardError::Malformed("owner"))?;
+        let agent_id = r
+            .fixed::<20>()
+            .map_err(|_| GuardError::Malformed("agent"))?;
+        let owner = r
+            .fixed::<20>()
+            .map_err(|_| GuardError::Malformed("owner"))?;
         let max_calls_per_window = r.u64le().map_err(|_| GuardError::Malformed("max calls"))?;
         let window_blocks = r.u64le().map_err(|_| GuardError::Malformed("window"))?;
         if window_blocks == 0 {
@@ -180,7 +212,9 @@ impl InfraPolicy {
             return Err(GuardError::Malformed("max calls is zero"));
         }
         let valid_from_height = r.u64le().map_err(|_| GuardError::Malformed("valid from"))?;
-        let valid_until_height = r.u64le().map_err(|_| GuardError::Malformed("valid until"))?;
+        let valid_until_height = r
+            .u64le()
+            .map_err(|_| GuardError::Malformed("valid until"))?;
         if valid_until_height <= valid_from_height {
             return Err(GuardError::Malformed("empty validity range"));
         }
@@ -191,7 +225,10 @@ impl InfraPolicy {
         let link = r.u8().map_err(|_| GuardError::Malformed("parent link"))?;
         let parent_agent_id = match link {
             0 => None,
-            1 => Some(r.fixed::<20>().map_err(|_| GuardError::Malformed("parent"))?),
+            1 => Some(
+                r.fixed::<20>()
+                    .map_err(|_| GuardError::Malformed("parent"))?,
+            ),
             _ => return Err(GuardError::Malformed("parent link out of range")),
         };
         if r.remaining() != 0 {
@@ -239,9 +276,15 @@ impl Capability {
 
     pub fn deserialize(bytes: &[u8]) -> Result<Self, GuardError> {
         let mut r = Reader::new(bytes);
-        let policy_hash = r.fixed::<32>().map_err(|_| GuardError::Malformed("policy hash"))?;
-        let action_hash = r.fixed::<32>().map_err(|_| GuardError::Malformed("action hash"))?;
-        let context_hash = r.fixed::<32>().map_err(|_| GuardError::Malformed("context hash"))?;
+        let policy_hash = r
+            .fixed::<32>()
+            .map_err(|_| GuardError::Malformed("policy hash"))?;
+        let action_hash = r
+            .fixed::<32>()
+            .map_err(|_| GuardError::Malformed("action hash"))?;
+        let context_hash = r
+            .fixed::<32>()
+            .map_err(|_| GuardError::Malformed("context hash"))?;
         let expiry_height = r.u64le().map_err(|_| GuardError::Malformed("expiry"))?;
         let nonce = r.u64le().map_err(|_| GuardError::Malformed("nonce"))?;
         if r.remaining() != 0 {
@@ -254,6 +297,241 @@ impl Capability {
             expiry_height,
             nonce,
         })
+    }
+}
+
+/// Canonical action hash: SHA-256 over the domain tag and the exact bytes
+/// the runtime is about to execute. The execution boundary MUST recompute
+/// this from the preimage it observes and compare it to the capability's
+/// `action_hash`; comparing two caller-supplied hashes proves nothing, which
+/// is the action-swap hole this closes.
+pub fn derive_action_hash(preimage: &[u8]) -> Hash {
+    sha256_dom(DOM_GUARD_ACTION, &[preimage])
+}
+
+/// An owner-signed capability: the exact-action grant plus the owner's
+/// signature over it. A bare [`Capability`] is bytes anyone can write down
+/// (policy hash + action + context + expiry + nonce are all public or
+/// guessable); only the owner's signature turns it into authority. Every
+/// admission boundary MUST verify this signature before anything else.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignedCapability {
+    pub version: u8,
+    pub cap: Capability,
+    pub sigs: crate::sig::Bundle,
+    pub keys: crate::sig::Bundle,
+}
+
+impl SignedCapability {
+    /// Sign a capability with the grant owner's wallet. The wallet is borrowed
+    /// and never stored.
+    pub fn issue(
+        owner: &crate::wallet::Wallet,
+        cap: &Capability,
+    ) -> Result<Self, crate::error::Error> {
+        let keys = crate::l2::Auth::keys_for(owner)?;
+        let sigs = crate::l2::Auth::sigs_for(owner, &cap.signing_hash())?;
+        Ok(SignedCapability {
+            version: GUARD_POLICY_VERSION,
+            cap: cap.clone(),
+            sigs,
+            keys,
+        })
+    }
+
+    /// Verify the envelope: version, owner binding, and signature over the
+    /// capability's signing hash (which covers policy, action, context,
+    /// expiry and nonce together, so none of the five can be swapped).
+    pub fn verify(&self, policy: &InfraPolicy) -> Result<(), GuardError> {
+        if self.version != GUARD_POLICY_VERSION {
+            return Err(GuardError::UnsupportedVersion(self.version));
+        }
+        let addr = self
+            .keys
+            .address()
+            .map_err(|_| GuardError::UnsignedCapability)?;
+        if addr != policy.owner {
+            return Err(GuardError::UnsignedCapability);
+        }
+        crate::sig::verify_bundle(&self.sigs, &self.keys, &self.cap.signing_hash())
+            .map_err(|_| GuardError::UnsignedCapability)?;
+        if self.cap.policy_hash != policy.hash() {
+            return Err(GuardError::PolicyMismatch);
+        }
+        Ok(())
+    }
+
+    pub fn serialize(&self) -> Vec<u8> {
+        let cap = self.cap.serialize();
+        let sigs = self.sigs.to_bytes();
+        let keys = self.keys.to_bytes();
+        let mut w = Writer::with_capacity(1 + cap.len() + sigs.len() + keys.len());
+        w.u8(self.version).raw(&cap).raw(&sigs).raw(&keys);
+        w.into_vec()
+    }
+
+    pub fn deserialize(bytes: &[u8]) -> Result<Self, GuardError> {
+        let mut r = Reader::new(bytes);
+        let version = r.u8().map_err(|_| GuardError::Malformed("version"))?;
+        if version != GUARD_POLICY_VERSION {
+            return Err(GuardError::UnsupportedVersion(version));
+        }
+        let cap_bytes = r
+            .fixed_slice(112)
+            .map_err(|_| GuardError::Malformed("capability bytes"))?;
+        let cap = Capability::deserialize(cap_bytes)?;
+        let sigs = crate::sig::Bundle::from_reader(&mut r)
+            .map_err(|_| GuardError::Malformed("sigs bundle"))?;
+        let keys = crate::sig::Bundle::from_reader(&mut r)
+            .map_err(|_| GuardError::Malformed("keys bundle"))?;
+        if r.remaining() != 0 {
+            return Err(GuardError::Malformed("trailing bytes"));
+        }
+        Ok(SignedCapability {
+            version,
+            cap,
+            sigs,
+            keys,
+        })
+    }
+}
+
+/// A cryptographically verifiable high-risk approval. Replaces the old
+/// `approved: bool` flag, which let any caller claim approval without proof.
+/// The approver signs the exact capability instance (grant + capability hash +
+/// agent + action + context + expiry) under [`DOM_GUARD_APPROVAL`], so an
+/// approval cannot be moved to another action, another agent, another nonce,
+/// or a later height. Authority: the approver MUST be the grant owner — the
+/// second channel is a second signature, not a second boolean.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuardApproval {
+    pub version: u8,
+    pub policy_hash: Hash,
+    pub cap_hash: Hash,
+    pub agent_id: AgentId,
+    pub action_hash: Hash,
+    pub context_hash: Hash,
+    pub expiry_height: u64,
+    pub sigs: crate::sig::Bundle,
+    pub keys: crate::sig::Bundle,
+}
+
+impl GuardApproval {
+    pub fn signing_hash(&self) -> Hash {
+        let mut w = Writer::with_capacity(32 * 4 + 20 + 8 + 1);
+        w.u8(self.version)
+            .fixed(&self.policy_hash)
+            .fixed(&self.cap_hash)
+            .fixed(&self.agent_id)
+            .fixed(&self.action_hash)
+            .fixed(&self.context_hash)
+            .u64le(self.expiry_height);
+        sha256_dom(DOM_GUARD_APPROVAL, &[&w.into_vec()])
+    }
+
+    pub fn serialize(&self) -> Vec<u8> {
+        let sigs = self.sigs.to_bytes();
+        let keys = self.keys.to_bytes();
+        let mut w = Writer::with_capacity(1 + 32 * 4 + 20 + 8 + sigs.len() + keys.len());
+        w.u8(self.version)
+            .fixed(&self.policy_hash)
+            .fixed(&self.cap_hash)
+            .fixed(&self.agent_id)
+            .fixed(&self.action_hash)
+            .fixed(&self.context_hash)
+            .u64le(self.expiry_height)
+            .raw(&sigs)
+            .raw(&keys);
+        w.into_vec()
+    }
+
+    pub fn deserialize(bytes: &[u8]) -> Result<Self, GuardError> {
+        let mut r = Reader::new(bytes);
+        let version = r.u8().map_err(|_| GuardError::Malformed("version"))?;
+        if version != GUARD_POLICY_VERSION {
+            return Err(GuardError::UnsupportedVersion(version));
+        }
+        let policy_hash = r
+            .fixed::<32>()
+            .map_err(|_| GuardError::Malformed("policy hash"))?;
+        let cap_hash = r
+            .fixed::<32>()
+            .map_err(|_| GuardError::Malformed("cap hash"))?;
+        let agent_id = r
+            .fixed::<20>()
+            .map_err(|_| GuardError::Malformed("agent"))?;
+        let action_hash = r
+            .fixed::<32>()
+            .map_err(|_| GuardError::Malformed("action hash"))?;
+        let context_hash = r
+            .fixed::<32>()
+            .map_err(|_| GuardError::Malformed("context hash"))?;
+        let expiry_height = r.u64le().map_err(|_| GuardError::Malformed("expiry"))?;
+        let sigs = crate::sig::Bundle::from_reader(&mut r)
+            .map_err(|_| GuardError::Malformed("sigs bundle"))?;
+        let keys = crate::sig::Bundle::from_reader(&mut r)
+            .map_err(|_| GuardError::Malformed("keys bundle"))?;
+        if r.remaining() != 0 {
+            return Err(GuardError::Malformed("trailing bytes"));
+        }
+        Ok(GuardApproval {
+            version,
+            policy_hash,
+            cap_hash,
+            agent_id,
+            action_hash,
+            context_hash,
+            expiry_height,
+            sigs,
+            keys,
+        })
+    }
+
+    /// Verify against the live grant, the capability being approved, and the
+    /// values the boundary recomputed. Every mismatch is a named refusal.
+    pub fn verify(
+        &self,
+        policy: &InfraPolicy,
+        cap: &Capability,
+        agent_id: &AgentId,
+        action_hash: &Hash,
+        context_hash: &Hash,
+        height: u64,
+    ) -> Result<(), GuardError> {
+        if self.version != GUARD_POLICY_VERSION {
+            return Err(GuardError::UnsupportedVersion(self.version));
+        }
+        let addr = self
+            .keys
+            .address()
+            .map_err(|_| GuardError::BadApproval("keys do not form an address"))?;
+        if addr != policy.owner {
+            return Err(GuardError::BadApproval("approver is not the grant owner"));
+        }
+        crate::sig::verify_bundle(&self.sigs, &self.keys, &self.signing_hash())
+            .map_err(|_| GuardError::BadApproval("approval signature invalid"))?;
+        if self.policy_hash != policy.hash() {
+            return Err(GuardError::BadApproval("approval names another grant"));
+        }
+        if self.cap_hash != cap.signing_hash() {
+            return Err(GuardError::BadApproval("approval names another capability"));
+        }
+        if self.agent_id != *agent_id {
+            return Err(GuardError::BadApproval("approval names another agent"));
+        }
+        if self.action_hash != *action_hash {
+            return Err(GuardError::BadApproval("approval names another action"));
+        }
+        if self.context_hash != *context_hash {
+            return Err(GuardError::BadApproval("approval names another context"));
+        }
+        if height >= self.expiry_height {
+            return Err(GuardError::BadApproval("approval expired"));
+        }
+        if self.expiry_height.saturating_sub(height) > MAX_APPROVAL_LIFETIME {
+            return Err(GuardError::BadApproval("approval lifetime exceeds cap"));
+        }
+        Ok(())
     }
 }
 
@@ -328,16 +606,14 @@ impl GuardBook {
 
     /// Restore one grant's accounting (restart recovery only). Refuses a
     /// duplicate grant or a full book.
-    pub fn restore(
-        &mut self,
-        grant_hash: Hash,
-        state: GuardState,
-    ) -> Result<(), GuardError> {
+    pub fn restore(&mut self, grant_hash: Hash, state: GuardState) -> Result<(), GuardError> {
         if self.states.contains_key(&grant_hash) {
             return Err(GuardError::Malformed("duplicate guard grant"));
         }
         if self.states.len() >= self.max_grants {
-            return Err(GuardError::BookFull { cap: self.max_grants });
+            return Err(GuardError::BookFull {
+                cap: self.max_grants,
+            });
         }
         self.states.insert(grant_hash, state);
         Ok(())
@@ -455,6 +731,9 @@ impl GuardBook {
         if policy.agent_id != *agent_id {
             return Err(GuardError::CrossPrincipal);
         }
+        if cap.nonce == 0 {
+            return Err(GuardError::ZeroNonce);
+        }
         if cap.policy_hash != policy.hash() {
             return Err(GuardError::PolicyMismatch);
         }
@@ -490,13 +769,17 @@ impl GuardBook {
                 window_start: state.window_start_height,
             });
         }
-        if cap.nonce <= state.last_nonce && state.total_calls > 0 {
+        if cap.nonce <= state.last_nonce {
             return Err(GuardError::NonceNotIncreasing {
                 nonce: cap.nonce,
                 last_nonce: state.last_nonce,
             });
         }
-        let (window_start, calls) = if height >= state.window_start_height + policy.window_blocks {
+        let window_end = state
+            .window_start_height
+            .checked_add(policy.window_blocks)
+            .ok_or(GuardError::Overflow)?;
+        let (window_start, calls) = if height >= window_end {
             (height, 0)
         } else {
             (state.window_start_height, state.calls_in_window)
@@ -511,10 +794,15 @@ impl GuardBook {
             return Ok(Decision::NeedsApproval);
         }
         if !self.states.contains_key(&key) && self.states.len() >= self.max_grants {
-            return Err(GuardError::BookFull { cap: self.max_grants });
+            return Err(GuardError::BookFull {
+                cap: self.max_grants,
+            });
         }
         let next_calls = calls.checked_add(1).ok_or(GuardError::Overflow)?;
-        let next_total = state.total_calls.checked_add(1).ok_or(GuardError::Overflow)?;
+        let next_total = state
+            .total_calls
+            .checked_add(1)
+            .ok_or(GuardError::Overflow)?;
         self.states.insert(
             key,
             GuardState {
@@ -525,6 +813,70 @@ impl GuardBook {
             },
         );
         Ok(Decision::Allow)
+    }
+
+    /// Execution-boundary admission: the signed-capability + recomputed-action
+    /// + cryptographic-approval path every trust boundary MUST use.
+    ///
+    /// - Verifies the owner's signature over the capability (Issue 1).
+    /// - Recomputes the canonical action hash from the `action_preimage` the
+    ///   boundary observes, and refuses unless it equals the capability's
+    ///   action (Issue 3). There is no hash-only overload here: a boundary
+    ///   that cannot name the preimage cannot authorize.
+    /// - For high-risk operations requires a verified [`GuardApproval`]
+    ///   (Issue 2). A missing approval answers `NeedsApproval`; a present
+    ///   but invalid one denies, so a forged approval is never silent.
+    #[allow(clippy::too_many_arguments)]
+    pub fn authorize_signed(
+        &mut self,
+        policy: &InfraPolicy,
+        signed: &SignedCapability,
+        agent_id: &AgentId,
+        network_id: &str,
+        height: u64,
+        action_preimage: &[u8],
+        expected_context: &Hash,
+        high_risk: bool,
+        approval: Option<&GuardApproval>,
+    ) -> Decision {
+        if let Err(e) = signed.verify(policy) {
+            return Decision::Deny(e);
+        }
+        let recomputed = derive_action_hash(action_preimage);
+        if recomputed != signed.cap.action_hash {
+            return Decision::Deny(GuardError::ActionMismatch);
+        }
+        if high_risk {
+            match approval {
+                None => return Decision::NeedsApproval,
+                Some(ap) => {
+                    if let Err(e) = ap.verify(
+                        policy,
+                        &signed.cap,
+                        agent_id,
+                        &recomputed,
+                        expected_context,
+                        height,
+                    ) {
+                        return Decision::Deny(e);
+                    }
+                }
+            }
+        }
+        match self.authorize_inner(
+            policy,
+            &signed.cap,
+            agent_id,
+            network_id,
+            height,
+            &recomputed,
+            expected_context,
+            false,
+            true,
+        ) {
+            Ok(d) => d,
+            Err(e) => Decision::Deny(e),
+        }
     }
 }
 
@@ -566,7 +918,17 @@ mod tests {
         let policy = test_policy();
         let mut book = GuardBook::default();
         let (cap, action, ctx) = test_cap(&policy, 1, 50);
-        let d = book.authorize(&policy, &cap, &[7u8; 20], "srct/testnet", 50, &action, &ctx, false, false);
+        let d = book.authorize(
+            &policy,
+            &cap,
+            &[7u8; 20],
+            "srct/testnet",
+            50,
+            &action,
+            &ctx,
+            false,
+            false,
+        );
         assert_eq!(d, Decision::Allow);
     }
 
@@ -576,11 +938,31 @@ mod tests {
         let mut book = GuardBook::default();
         let (cap, action, ctx) = test_cap(&policy, 1, 50);
         assert_eq!(
-            book.authorize(&policy, &cap, &[7u8; 20], "srct/testnet", 50, &action, &ctx, false, false),
+            book.authorize(
+                &policy,
+                &cap,
+                &[7u8; 20],
+                "srct/testnet",
+                50,
+                &action,
+                &ctx,
+                false,
+                false
+            ),
             Decision::Allow
         );
         let (cap2, action2, ctx2) = test_cap(&policy, 1, 51);
-        match book.authorize(&policy, &cap2, &[7u8; 20], "srct/testnet", 51, &action2, &ctx2, false, false) {
+        match book.authorize(
+            &policy,
+            &cap2,
+            &[7u8; 20],
+            "srct/testnet",
+            51,
+            &action2,
+            &ctx2,
+            false,
+            false,
+        ) {
             Decision::Deny(GuardError::NonceNotIncreasing { .. }) => {}
             other => panic!("expected replay deny, got {other:?}"),
         }
@@ -592,7 +974,17 @@ mod tests {
         let mut book = GuardBook::default();
         let (cap, _, ctx) = test_cap(&policy, 1, 50);
         let wrong_action: Hash = [0xFFu8; 32];
-        match book.authorize(&policy, &cap, &[7u8; 20], "srct/testnet", 50, &wrong_action, &ctx, false, false) {
+        match book.authorize(
+            &policy,
+            &cap,
+            &[7u8; 20],
+            "srct/testnet",
+            50,
+            &wrong_action,
+            &ctx,
+            false,
+            false,
+        ) {
             Decision::Deny(GuardError::ActionMismatch) => {}
             other => panic!("expected action mismatch, got {other:?}"),
         }
@@ -603,7 +995,17 @@ mod tests {
         let policy = test_policy();
         let mut book = GuardBook::default();
         let (cap, action, ctx) = test_cap(&policy, 1, 50);
-        match book.authorize(&policy, &cap, &[8u8; 20], "srct/testnet", 50, &action, &ctx, false, false) {
+        match book.authorize(
+            &policy,
+            &cap,
+            &[8u8; 20],
+            "srct/testnet",
+            50,
+            &action,
+            &ctx,
+            false,
+            false,
+        ) {
             Decision::Deny(GuardError::CrossPrincipal) => {}
             other => panic!("expected cross principal deny, got {other:?}"),
         }
@@ -615,11 +1017,31 @@ mod tests {
         let mut book = GuardBook::default();
         let (cap, action, ctx) = test_cap(&policy, 1, 50);
         assert_eq!(
-            book.authorize(&policy, &cap, &[7u8; 20], "srct/testnet", 50, &action, &ctx, true, false),
+            book.authorize(
+                &policy,
+                &cap,
+                &[7u8; 20],
+                "srct/testnet",
+                50,
+                &action,
+                &ctx,
+                true,
+                false
+            ),
             Decision::NeedsApproval
         );
         assert_eq!(
-            book.authorize(&policy, &cap, &[7u8; 20], "srct/testnet", 50, &action, &ctx, true, true),
+            book.authorize(
+                &policy,
+                &cap,
+                &[7u8; 20],
+                "srct/testnet",
+                50,
+                &action,
+                &ctx,
+                true,
+                true
+            ),
             Decision::Allow
         );
     }
@@ -642,7 +1064,17 @@ mod tests {
         let mut book = GuardBook::default();
         let (cap, action, ctx) = test_cap(&policy, 1, 50);
         assert_eq!(
-            book.authorize(&policy, &cap, &[7u8; 20], "srct/testnet", 50, &action, &ctx, false, false),
+            book.authorize(
+                &policy,
+                &cap,
+                &[7u8; 20],
+                "srct/testnet",
+                50,
+                &action,
+                &ctx,
+                false,
+                false
+            ),
             Decision::Allow
         );
         let bytes = book.encode();
@@ -651,5 +1083,280 @@ mod tests {
         assert_eq!(back.encode(), bytes, "decoded book re-encodes identically");
         assert_eq!(back.len(), 1);
         assert_eq!(back.state(&policy.hash()).map(|s| s.last_nonce), Some(1));
+    }
+
+    fn owned_policy() -> (crate::wallet::Wallet, InfraPolicy) {
+        use crate::agent::{derive_agent_id, AgentRole};
+        let owner = crate::wallet::Wallet::new_random("guard-owner");
+        let addr = owner.address().unwrap();
+        let policy = InfraPolicy {
+            version: GUARD_POLICY_VERSION,
+            network_id: "srct/testnet".to_string(),
+            agent_id: derive_agent_id("srct/testnet", AgentRole::Machine, &addr),
+            owner: addr,
+            max_calls_per_window: 5,
+            window_blocks: 100,
+            valid_from_height: 10,
+            valid_until_height: 1000,
+            revoked: false,
+            parent_agent_id: None,
+        };
+        (owner, policy)
+    }
+
+    fn owned_cap(
+        policy: &InfraPolicy,
+        preimage: &[u8],
+        workload: &Hash,
+        height: u64,
+        nonce: u64,
+    ) -> Capability {
+        Capability {
+            policy_hash: policy.hash(),
+            action_hash: derive_action_hash(preimage),
+            context_hash: derive_context_hash(workload, height),
+            expiry_height: height + 10,
+            nonce,
+        }
+    }
+
+    #[test]
+    fn signed_capability_allows_and_forgery_denies() {
+        let (owner, policy) = owned_policy();
+        let workload = [2u8; 32];
+        let height = 50u64;
+        let ctx = derive_context_hash(&workload, height);
+        let cap = owned_cap(&policy, b"deploy-42", &workload, height, 1);
+        let signed = SignedCapability::issue(&owner, &cap).unwrap();
+        signed.verify(&policy).unwrap();
+        let back = SignedCapability::deserialize(&signed.serialize()).unwrap();
+        assert_eq!(back, signed);
+
+        let mut book = GuardBook::default();
+        assert_eq!(
+            book.authorize_signed(
+                &policy,
+                &signed,
+                &policy.agent_id,
+                "srct/testnet",
+                height,
+                b"deploy-42",
+                &ctx,
+                false,
+                None
+            ),
+            Decision::Allow
+        );
+
+        // Forgery: same bytes, signature from a stranger's key.
+        let stranger = crate::wallet::Wallet::new_random("stranger");
+        let forged = SignedCapability::issue(&stranger, &cap).unwrap();
+        assert!(matches!(
+            forged.verify(&policy),
+            Err(GuardError::UnsignedCapability)
+        ));
+        let mut book2 = GuardBook::default();
+        assert!(matches!(
+            book2.authorize_signed(
+                &policy,
+                &forged,
+                &policy.agent_id,
+                "srct/testnet",
+                height,
+                b"deploy-42",
+                &ctx,
+                false,
+                None
+            ),
+            Decision::Deny(GuardError::UnsignedCapability)
+        ));
+
+        // Tampering: valid signature over a modified action is a mismatch,
+        // because the signature covers all five fields together.
+        let mut tampered_cap = cap.clone();
+        tampered_cap.expiry_height += 1;
+        let tampered = SignedCapability {
+            version: GUARD_POLICY_VERSION,
+            cap: tampered_cap,
+            sigs: signed.sigs.clone(),
+            keys: signed.keys.clone(),
+        };
+        assert!(matches!(
+            tampered.verify(&policy),
+            Err(GuardError::UnsignedCapability)
+        ));
+    }
+
+    #[test]
+    fn zero_nonce_is_refused() {
+        let policy = test_policy();
+        let mut book = GuardBook::default();
+        let (mut cap, action, ctx) = test_cap(&policy, 1, 50);
+        cap.nonce = 0;
+        assert_eq!(
+            book.authorize(
+                &policy,
+                &cap,
+                &[7u8; 20],
+                "srct/testnet",
+                50,
+                &action,
+                &ctx,
+                false,
+                false
+            ),
+            Decision::Deny(GuardError::ZeroNonce)
+        );
+    }
+
+    #[test]
+    fn approval_missing_gates_but_forged_denies() {
+        use crate::sig::Bundle;
+        let (owner, policy) = owned_policy();
+        let workload = [2u8; 32];
+        let height = 50u64;
+        let ctx = derive_context_hash(&workload, height);
+        let preimage = b"transfer-1M";
+        let cap = owned_cap(&policy, preimage, &workload, height, 1);
+        let signed = SignedCapability::issue(&owner, &cap).unwrap();
+        let action = derive_action_hash(preimage);
+
+        // No approval on a high-risk call: gated, commits nothing.
+        let mut book = GuardBook::default();
+        assert_eq!(
+            book.authorize_signed(
+                &policy,
+                &signed,
+                &policy.agent_id,
+                "srct/testnet",
+                height,
+                preimage,
+                &ctx,
+                true,
+                None
+            ),
+            Decision::NeedsApproval
+        );
+        assert!(book.is_empty(), "a gated call commits no nonce");
+
+        // Honest approval from the owner allows.
+        let approval = GuardApproval {
+            version: GUARD_POLICY_VERSION,
+            policy_hash: policy.hash(),
+            cap_hash: cap.signing_hash(),
+            agent_id: policy.agent_id,
+            action_hash: action,
+            context_hash: ctx,
+            expiry_height: height + 5,
+            sigs: crate::l2::Auth::sigs_for(
+                &owner,
+                &GuardApproval {
+                    version: GUARD_POLICY_VERSION,
+                    policy_hash: policy.hash(),
+                    cap_hash: cap.signing_hash(),
+                    agent_id: policy.agent_id,
+                    action_hash: action,
+                    context_hash: ctx,
+                    expiry_height: height + 5,
+                    sigs: Bundle::default(),
+                    keys: Bundle::default(),
+                }
+                .signing_hash(),
+            )
+            .unwrap(),
+            keys: crate::l2::Auth::keys_for(&owner).unwrap(),
+        };
+        approval
+            .verify(&policy, &cap, &policy.agent_id, &action, &ctx, height)
+            .unwrap();
+        assert_eq!(
+            book.authorize_signed(
+                &policy,
+                &signed,
+                &policy.agent_id,
+                "srct/testnet",
+                height,
+                preimage,
+                &ctx,
+                true,
+                Some(&approval)
+            ),
+            Decision::Allow
+        );
+
+        // Fake approval: boolean-style claim with no valid signature denies.
+        let stranger = crate::wallet::Wallet::new_random("stranger");
+        let fake = GuardApproval {
+            version: GUARD_POLICY_VERSION,
+            policy_hash: policy.hash(),
+            cap_hash: cap.signing_hash(),
+            agent_id: policy.agent_id,
+            action_hash: action,
+            context_hash: ctx,
+            expiry_height: height + 5,
+            sigs: crate::l2::Auth::sigs_for(&stranger, &approval.signing_hash()).unwrap(),
+            keys: crate::l2::Auth::keys_for(&stranger).unwrap(),
+        };
+        let mut book2 = GuardBook::default();
+        assert!(matches!(
+            book2.authorize_signed(
+                &policy,
+                &signed,
+                &policy.agent_id,
+                "srct/testnet",
+                height,
+                preimage,
+                &ctx,
+                true,
+                Some(&fake)
+            ),
+            Decision::Deny(GuardError::BadApproval(_))
+        ));
+
+        // Reused approval on a different action denies by name.
+        let other_cap = owned_cap(&policy, b"transfer-2M", &workload, height, 2);
+        let other_signed = SignedCapability::issue(&owner, &other_cap).unwrap();
+        let mut book3 = GuardBook::default();
+        assert!(matches!(
+            book3.authorize_signed(
+                &policy,
+                &other_signed,
+                &policy.agent_id,
+                "srct/testnet",
+                height,
+                b"transfer-2M",
+                &ctx,
+                true,
+                Some(&approval)
+            ),
+            Decision::Deny(GuardError::BadApproval(_))
+        ));
+    }
+
+    #[test]
+    fn action_swap_is_refused_at_the_boundary() {
+        let (owner, policy) = owned_policy();
+        let workload = [2u8; 32];
+        let height = 50u64;
+        let ctx = derive_context_hash(&workload, height);
+        // The owner approved "deploy-42"; the runtime is about to run "deploy-43".
+        let cap = owned_cap(&policy, b"deploy-42", &workload, height, 1);
+        let signed = SignedCapability::issue(&owner, &cap).unwrap();
+        let mut book = GuardBook::default();
+        assert_eq!(
+            book.authorize_signed(
+                &policy,
+                &signed,
+                &policy.agent_id,
+                "srct/testnet",
+                height,
+                b"deploy-43",
+                &ctx,
+                false,
+                None
+            ),
+            Decision::Deny(GuardError::ActionMismatch)
+        );
+        assert!(book.is_empty(), "a swapped action commits no nonce");
     }
 }
