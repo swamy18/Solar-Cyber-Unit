@@ -154,10 +154,13 @@ execution boundary recomputes the canonical action hash from the preimage it
 observes (`action_preimage_hex` is required at `guard.authorize` /
 `POST /v1/guard/authorize`); a caller-supplied hash alone is never trusted,
 and a caller-supplied `high_risk: false` never de-escalates a high-assurance
-grant. The worker boundary asks its authority first (revoked or unreachable
-never executes). Full architecture, threat model, and the authoritative-state
-rule (node registry + revocation set authoritative per node; MCP-local gate
-state a non-authoritative cache):
+grant. The worker boundary admits statefully through its authority (the
+single commit point for nonce + window; revoked or unreachable never
+executes), proves possession fresh with the credential in the request, and
+re-verifies locally at the authoritative height the authority returns. Full
+architecture, threat model, and the authoritative-state rule (node registry
++ revocation set authoritative per node; MCP-local gate state a
+non-authoritative cache):
 [`smart-gate-architecture.md`](smart-gate-architecture.md).
 
 ## Rules the interface keeps

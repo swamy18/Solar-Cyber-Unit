@@ -1525,11 +1525,16 @@ book capacities refuse rather than evict; owners scope high-value capabilities
 to one enforcing node by audience, which denies mis-scoped replay by name;
 and the worker execution boundary proves possession fresh and then admits
 statefully through the authority on every run, credential included --- the
-authority is the single commit point, so a restarted worker or a sibling
-worker replaying a nonce is denied there whichever local book it carries,
-while the local book only ever trails as a mirror. A deny forgets local
-state; an unreachable authority refuses outright; there is no offline
-fallback and no cached-allow. Fifth, the MCP transport cannot be aimed
+authority commits nonce and window at its live height and reports that
+height, and local re-verification runs at exactly the returned height, never
+at the worker's own possibly stale clock (an allow answer without a usable
+height is an error, not an admission). A restarted worker or a sibling worker
+replaying a nonce is denied at the single commit point whichever local book
+it carries, while the local book only ever trails as a mirror. A deny forgets
+local state; an unreachable authority refuses outright; there is no offline
+fallback and no cached-allow. If the authority commits but local verification
+fails, the nonce stays consumed and the failure is reported, never retried
+into a duplicate. Fifth, the MCP transport cannot be aimed
 at an attacker: endpoints are \texttt{host:port} only, loopback is the only
 target that ever receives the API bearer token, anything else needs an
 explicit allow-list plus an opt-in flag and still never receives the token
@@ -1544,9 +1549,14 @@ lock. The residual multi-node replay is mitigated, not eliminated, by
 audience scoping: a capability scoped to one node denies elsewhere by name,
 while unscoped capabilities remain independently admittable everywhere ---
 which is why high-value capabilities should be scoped. The worker narrows the
-window further by checking the authority on every execution, but a revocation
-that lands between that check and the executor stops the \emph{next}
-execution, not the current one; no lock is claimed. Workload identity is
+window further by admitting statefully through the authority on every
+execution and re-verifying locally at the returned height, but admission and
+execution are still two steps: a revocation landing between them stops the
+\emph{next} execution, not the current one, and a local-verification failure
+after a commit leaves the nonce consumed (reported, never retried); no lock
+is claimed. The worker's own height is an input for building the request,
+never the verification clock --- an operator MUST sync it from the node, and
+a stale possession proof denies with no commit. Workload identity is
 bound \emph{and} proved, not trusted: when a grant names a workload, every
 boundary recomputes the context from the bound id and ignores any
 caller-supplied id, and when it pins a workload key only a fresh
@@ -2468,8 +2478,9 @@ both.
   worker proves possession fresh and admits statefully through the authority
   on every run (revoked or unreachable never executes; restarts and siblings
   cannot replay a nonce past the single commit point) and, on key-bound
-  grants, the proof travels with the admission request; the raw unsigned path
-  does not exist.
+  grants, the proof travels with the admission request; local re-verification
+  runs at the returned authoritative height, and an allow without one is an
+  error; the raw unsigned path does not exist.
 \item A revoked Smart Gate grant stays dead, with its descendants, across
   restarts and on the stateless pre-check as well as the stateful admission.
 \item A destroyed state file is a refusal to start, never an empty book.

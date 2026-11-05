@@ -59,8 +59,8 @@ pub use executor::{
 };
 pub use exit::{queue_exit, queue_exit_plan, ExitPlan};
 pub use guard::{
-    guard_action_hash, guard_action_preimage, Admission, AdmissionRequest, GateAuthority,
-    GuardGate, NodeGateAuthority,
+    guard_action_hash, guard_action_preimage, parse_authorize_answer, Admission, AdmissionRequest,
+    GateAuthority, GuardGate, NodeGateAuthority,
 };
 pub use http::{ConservationReport, HttpNode};
 pub use node::{BroadcastError, L2Broadcaster, L2NodeView};

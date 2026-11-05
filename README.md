@@ -781,7 +781,8 @@ answered as `allow / deny / needs_approval` anywhere, settled as trust on Solar.
   possession fresh, admits statefully through the authority (revoked or
   unreachable means no execution — no offline fallback; the authority is the
   single commit point, so restarts and sibling workers cannot replay a nonce),
-  re-verifies locally, and only then invokes the executor.
+  re-verifies locally at the authoritative height the authority returns, and
+  only then invokes the executor.
   Refusals consume no budget and are named (`action_mismatch`,
   `context_mismatch`, `expired`, `nonce_reuse`, `zero_nonce`,
   `unsigned_capability`, `bad_approval`, `bad_credential`, `self_approval`,

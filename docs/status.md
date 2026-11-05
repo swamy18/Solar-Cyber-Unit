@@ -2183,3 +2183,35 @@ Two review findings on the hardening pass, both confirmed and fixed:
   the authority and commits nothing locally.
 - Verification (working tree): worker guard 6, node api 52, core guard 21,
   policy 10, MCP 24, state_persist 3; clippy and fmt clean.
+
+### 2026-11-05 Smart Gate authority–worker height sync (no consensus change)
+
+Root cause confirmed: the node commits nonce + window at its live chain
+height, but the worker re-verified locally at its own possibly stale
+`GuardGate.height` — so the authority could allow (and consume a nonce)
+while local verification denied on context mismatch, with no execution.
+
+- **Authoritative height carried through.** `Admission::Allow` now carries
+  the `height` the node admitted at; `NodeGateAuthority` parses it from
+  the `POST /v1/guard/authorize` answer via the pure, unit-tested
+  `parse_authorize_answer`. Local `authorize_signed` runs at that height,
+  never the worker's clock.
+- **Fail closed on missing/malformed height.** An `allow` without a usable
+  height is an error, not an admission — the nonce may already be
+  committed, so the worker reports instead of guessing.
+- **Credential validity unchanged.** Possession proofs are still built at
+  the worker-observed height and height-bound exactly; no lifetimes
+  extended. The operator sync contract stands: set `GuardGate.height`
+  from the node before executing. A stale proof denies at the authority
+  with no commit.
+- **Nonce-without-execution is possible and reported.** If the authority
+  commits but local verification then fails (e.g. a stale local policy
+  copy), the nonce stays consumed; the failure surfaces as `GuardDenied`
+  and is never retried into a duplicate — a retry would deny as a replay
+  at the authority. Proven by test, documented in the architecture doc.
+- Tests: worker behind/ahead/equal heights execute at the authoritative
+  height; missing/malformed height answers error; local-deny-after-allow
+  executes nothing twice; key-bound HTTP test asserts the node reports
+  its admission height; replay/possession/approval suites unchanged.
+- Verification (working tree): worker guard 10, node api 52, core guard 21,
+  policy 10, MCP 24, state_persist 3; clippy and fmt clean.

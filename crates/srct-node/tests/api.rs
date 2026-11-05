@@ -1192,8 +1192,11 @@ fn guard_keybound_grant_requires_workload_credential_over_http() {
     let (s, out) = authorize(Some(hex::encode(cred.serialize())));
     assert_eq!(s, 200, "{out}");
     assert_eq!(out["decision"], "allow");
+    // The worker synchronizes on this height: it is the authoritative height
+    // the admission committed at, and the only height local verification
+    // may run at.
+    assert_eq!(out["height"], h, "node must report its admission height");
 }
-
 /// `POST /v1/policy/decide` answers the engine without committing: allow for
 /// a fitting intent, a named refusal for a forbidden one, approval-needed
 /// above the threshold. Deciding twice decides twice identically — the route

@@ -50,28 +50,62 @@ pub fn guard_action_preimage(work: &ExecutionWork) -> Vec<u8> {
 
 /// What the authority said about one admission, right now. `Allow` means the
 /// authority admitted *and committed* (nonce consumed, window spent) at its
-/// live state; `NeedsApproval` means the authority gates on a designated
-/// approval the local gate still enforces; `Deny` carries the authority's
-/// named reason. Transport or decode failures are not a variant: they surface
-/// as `Err`, and `Err` never executes.
+/// live state, and carries the authoritative height it admitted at — the
+/// worker MUST run its local re-verification at exactly this height, never
+/// at its own possibly stale clock. `NeedsApproval` means the authority gates
+/// on an approval the local gate still enforces; `Deny` carries the
+/// authority's named reason. Transport or decode failures are not a variant:
+/// they surface as `Err`, and `Err` never executes. An `allow` answer with a
+/// missing or malformed `height` is an `Err`: the nonce may already be
+/// committed, and executing against an unverifiable height would split the
+/// two commit points — so the worker reports instead of guessing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Admission {
-    Allow,
+    Allow { height: u64 },
     NeedsApproval,
     Deny(String),
 }
 
 /// One admission request to the authority: everything the enforcing node needs
-/// to admit statefully, including the optional possession proof.
+/// to admit statefully, including the optional possession proof. `height` is
+/// the worker-observed height the request material (context, credential) was
+/// built at; the node admits at its own chain height and returns it — the
+/// response height, not this one, governs local verification.
 pub struct AdmissionRequest<'a> {
     pub policy: &'a InfraPolicy,
     pub signed: &'a SignedCapability,
     pub agent_id: &'a [u8; 20],
     pub action_preimage: &'a [u8],
     pub workload_id: &'a Hash,
+    pub height: u64,
     pub escalate_to_approval: bool,
     pub approval_hex: Option<String>,
     pub workload_cred_hex: Option<String>,
+}
+
+/// Decode a node `POST /v1/guard/authorize` answer into an [`Admission`].
+/// Pure and unit-tested: `allow` without a usable `height` is an error, not
+/// an admission — fail closed, never assume.
+pub fn parse_authorize_answer(answer: &serde_json::Value) -> WorkerResult<Admission> {
+    match answer.get("decision").and_then(|d| d.as_str()) {
+        Some("allow") => match answer.get("height").and_then(|h| h.as_u64()) {
+            Some(height) => Ok(Admission::Allow { height }),
+            None => Err(WorkerError::ObservationMalformed(
+                "authority allow answer has no height",
+            )),
+        },
+        Some("needs_approval") => Ok(Admission::NeedsApproval),
+        Some("deny") => Ok(Admission::Deny(
+            answer
+                .get("reason")
+                .and_then(|r| r.as_str())
+                .unwrap_or("denied at authority")
+                .to_string(),
+        )),
+        _ => Err(WorkerError::ObservationMalformed(
+            "authority answer has no decision",
+        )),
+    }
 }
 
 /// The authoritative admission source consulted at the execution boundary.
@@ -120,20 +154,7 @@ impl GateAuthority for NodeGateAuthority {
             "workload_cred_hex": req.workload_cred_hex,
         });
         let answer = self.http.post_json("/v1/guard/authorize", &body)?;
-        match answer.get("decision").and_then(|d| d.as_str()) {
-            Some("allow") => Ok(Admission::Allow),
-            Some("needs_approval") => Ok(Admission::NeedsApproval),
-            Some("deny") => Ok(Admission::Deny(
-                answer
-                    .get("reason")
-                    .and_then(|r| r.as_str())
-                    .unwrap_or("denied at authority")
-                    .to_string(),
-            )),
-            _ => Err(WorkerError::ObservationMalformed(
-                "authority answer has no decision",
-            )),
-        }
+        parse_authorize_answer(&answer)
     }
 }
 
@@ -186,18 +207,26 @@ impl GuardGate {
     ///
     /// 1. Recompute the action preimage (and context) from the work about
     ///    to run, and build the fresh possession proof when the grant binds
-    ///    a workload key. A missing or mismatched provisioned key fails
-    ///    HERE — loudly and before any nonce is consumed — not deep inside
-    ///    admission.
+    ///    a workload key. The proof is built at the worker-observed height —
+    ///    the operator MUST sync `GuardGate.height` from the node (e.g. the
+    ///    `height` field of any guard answer) before executing; a missing
+    ///    or mismatched provisioned key fails HERE — loudly and before any
+    ///    nonce is consumed — not deep inside admission. Credential
+    ///    lifetimes are never extended to paper over skew: a stale proof
+    ///    denies at the authority with no commit.
     /// 2. Ask the authority to admit statefully. The authority commits
     ///    nonce + window at its live state, so this is where replays die: a
     ///    restarted worker or a sibling worker replaying the same nonce gets
     ///    a named deny from the single commit point. A deny forgets the
     ///    grant's local accounting (so stale state can never be replayed
     ///    back); an unreachable authority denies without touching anything.
-    /// 3. Re-verify locally through `authorize_signed` (signature, binding,
-    ///    possession, approval) and mirror the commit in the local book.
-    ///    Nothing commits on refusal, locally or remotely.
+    /// 3. Re-verify locally through `authorize_signed` at the AUTHORITATIVE
+    ///    height the authority returned — never at the worker's own possibly
+    ///    stale height — and mirror the commit in the local book. Nothing
+    ///    commits on refusal, locally or remotely. A missing or malformed
+    ///    height on an allow answer is an error, not an admission: the nonce
+    ///    may already be committed, and executing against an unverifiable
+    ///    height would split the two commit points.
     /// 4. Only on `Allow`, run the executor.
     ///
     /// The local book is a monotonic mirror plus independent cryptographic
@@ -248,12 +277,13 @@ impl GuardGate {
         let workload_cred_hex = workload_cred
             .as_ref()
             .map(|cred| hex::encode(cred.serialize()));
-        match self.authority.admit(&AdmissionRequest {
+        let authority_height = match self.authority.admit(&AdmissionRequest {
             policy: &self.policy,
             signed: &self.signed,
             agent_id: &self.agent_id,
             action_preimage: &preimage,
             workload_id: &self.workload_id,
+            height: self.height,
             escalate_to_approval: self.escalate_to_approval,
             approval_hex,
             workload_cred_hex,
@@ -265,14 +295,17 @@ impl GuardGate {
                 )));
             }
             Admission::NeedsApproval => return Err(WorkerError::GuardApprovalNeeded),
-            Admission::Allow => {}
-        }
+            Admission::Allow { height } => height,
+        };
+        // Authoritative height governs local verification. A stale worker
+        // height that the authority tolerated (unbound, hash-only drift the
+        // authority already ruled on) cannot fail execution here.
         match self.book.authorize_signed(
             &self.policy,
             &self.signed,
             &self.agent_id,
             &self.network_id,
-            self.height,
+            authority_height,
             &preimage,
             &self.workload_id,
             &self.node_audience,
@@ -314,19 +347,32 @@ mod tests {
         }
     }
 
-    /// Test authorities: allow-all, deny-with-reason, unreachable, and a
-    /// shared ledger that mimics the node's authoritative book: nonces commit
-    /// once per grant hash, so a replayed nonce denies no matter which local
-    /// book presents it.
+    /// Test authorities: allow-with-height, deny-with-reason, unreachable, and
+    /// a shared ledger that mimics the node's authoritative book: nonces
+    /// commit once per grant hash at the ledger's height, so a replayed nonce
+    /// denies by name no matter which local book presents it.
+    ///
+    /// `EchoHeight` returns the worker-observed height back as authoritative:
+    /// the in-sync case. `SkewedHeight(h)` returns a fixed authoritative
+    /// height regardless of what the worker observed: the behind/ahead cases.
     struct AllowAll;
+    struct SkewedHeight(u64);
     struct DenyAs(&'static str);
     struct Unreachable;
     struct SharedLedger {
         last_nonce: std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<Hash, u64>>>,
     }
     impl GateAuthority for AllowAll {
+        fn admit(&self, req: &AdmissionRequest) -> WorkerResult<Admission> {
+            // Echoes the observed height: the synchronized case.
+            Ok(Admission::Allow { height: req.height })
+        }
+    }
+    impl GateAuthority for SkewedHeight {
         fn admit(&self, _req: &AdmissionRequest) -> WorkerResult<Admission> {
-            Ok(Admission::Allow)
+            // Fixed authoritative height, independent of what the worker
+            // observed: the behind/ahead cases.
+            Ok(Admission::Allow { height: self.0 })
         }
     }
     impl GateAuthority for DenyAs {
@@ -354,7 +400,7 @@ mod tests {
                 return Ok(Admission::Deny("replayed nonce at authority".to_string()));
             }
             ledger.insert(req.policy.hash(), req.signed.cap.nonce);
-            Ok(Admission::Allow)
+            Ok(Admission::Allow { height: req.height })
         }
     }
 
@@ -701,6 +747,144 @@ mod tests {
         let err = keyless
             .execute(&CpuExecutor::default(), &work)
             .expect_err("a missing workload key must not admit");
+        assert!(
+            matches!(err, WorkerError::GuardDenied(_)),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn skewed_worker_height_executes_at_authoritative_height() {
+        use crate::executor::CpuExecutor;
+        // The capability and context below are built for height 50 — the
+        // authority's height. The worker's own clock is off in both
+        // directions; execution still succeeds because local verification
+        // runs at the authoritative height, not the worker's.
+        for worker_height in [49u64, 51u64] {
+            let (owner, approver, policy) = owner_and_policy(false);
+            let work = test_work();
+            let preimage = guard_action_preimage(&work);
+            let mut gate = gate_for(
+                &owner,
+                &approver,
+                &policy,
+                &preimage,
+                false,
+                Box::new(SkewedHeight(50)),
+            );
+            gate.height = worker_height;
+            gate.execute(&CpuExecutor::default(), &work)
+                .expect("authoritative height governs local verification");
+        }
+    }
+
+    #[test]
+    fn parse_authorize_answer_fails_closed_without_height() {
+        use serde_json::json;
+        // Allow with height: admission at that height.
+        assert_eq!(
+            parse_authorize_answer(&json!({"decision": "allow", "height": 50u64})),
+            Ok(Admission::Allow { height: 50 })
+        );
+        // Allow without height: error, never admission — the nonce may
+        // already be committed, so guessing a height is forbidden.
+        assert!(matches!(
+            parse_authorize_answer(&json!({"decision": "allow"})),
+            Err(WorkerError::ObservationMalformed(_))
+        ));
+        // Allow with a malformed height: same fail-closed rule.
+        assert!(matches!(
+            parse_authorize_answer(&json!({"decision": "allow", "height": "fifty"})),
+            Err(WorkerError::ObservationMalformed(_))
+        ));
+        assert_eq!(
+            parse_authorize_answer(
+                &json!({"decision": "needs_approval", "reason": "x", "height": 50u64})
+            ),
+            Ok(Admission::NeedsApproval)
+        );
+        assert_eq!(
+            parse_authorize_answer(&json!({"decision": "deny", "reason": "grant revoked"})),
+            Ok(Admission::Deny("grant revoked".to_string()))
+        );
+        assert!(matches!(
+            parse_authorize_answer(&json!({"decision": "melt"})),
+            Err(WorkerError::ObservationMalformed(_))
+        ));
+        assert!(matches!(
+            parse_authorize_answer(&json!({})),
+            Err(WorkerError::ObservationMalformed(_))
+        ));
+    }
+
+    #[test]
+    fn local_deny_after_authority_allow_executes_nothing_twice() {
+        use crate::executor::CpuExecutor;
+        // The authority commits (SharedLedger) but the local copy disagrees
+        // (stale audience scope): the nonce IS consumed at the authority while
+        // nothing executes. That split is reported, not hidden — and a retry
+        // denies at the authority (replay), so the consumed nonce can never
+        // turn into a duplicate execution.
+        let (owner, approver, policy) = owner_and_policy(false);
+        let work = test_work();
+        let preimage = guard_action_preimage(&work);
+        let ledger = std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
+        let mut gate = gate_for(
+            &owner,
+            &approver,
+            &policy,
+            &preimage,
+            false,
+            Box::new(SharedLedger {
+                last_nonce: ledger.clone(),
+            }),
+        );
+        gate.node_audience = [0xBBu8; 32];
+        let err = gate
+            .execute(&CpuExecutor::default(), &work)
+            .expect_err("local audience mismatch must not execute");
+        assert!(
+            matches!(err, WorkerError::GuardDenied(_)),
+            "unexpected: {err}"
+        );
+        // The authority committed nonce 1; the retry is a replay there.
+        let err = gate
+            .execute(&CpuExecutor::default(), &work)
+            .expect_err("a consumed nonce must not execute on retry");
+        assert!(
+            matches!(err, WorkerError::GuardDenied(_)),
+            "unexpected: {err}"
+        );
+        assert!(
+            gate.book.is_empty(),
+            "a locally denied admission commits no local state"
+        );
+    }
+
+    #[test]
+    fn skewed_authority_height_denies_context_drift_locally() {
+        use crate::executor::CpuExecutor;
+        // A lax authority that allows at a height the capability was never
+        // built for does not save the execution: local verification runs at
+        // the authoritative height and the recomputed context refuses.
+        let (owner, approver, policy) = owner_and_policy(false);
+        let work = test_work();
+        let preimage = guard_action_preimage(&work);
+        let mut gate = gate_for(
+            &owner,
+            &approver,
+            &policy,
+            &preimage,
+            false,
+            Box::new(AllowAll),
+        );
+        gate.height = 49;
+        // Skew the authority forward: local verification at 60 recomputes a
+        // context the capability was never built for.
+        gate.authority = Box::new(SkewedHeight(60));
+        let err = gate
+            .execute(&CpuExecutor::default(), &work)
+            .expect_err("a height-skewed admission must not execute");
         assert!(
             matches!(err, WorkerError::GuardDenied(_)),
             "unexpected: {err}"
