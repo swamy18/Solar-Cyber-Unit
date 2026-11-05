@@ -2081,8 +2081,11 @@ same rule enforced in `srct-policy`, `srct-mcp` and the node API:
   for forgery, fake approval, action swap, zero nonce, unsigned MCP/node
   admission, untrusted endpoints; `api` guard round-trip extended (unsigned
   refused, swap denied, replay denied, revoke kills).
-- Residuals: `srct-node --test api` carries 8 pre-existing credit-admission
-  failures (e.g. `a_payment_is_admitted_only_when_the_payers_credit_covers_it`:
-  admission needs 2400, the test funds 700) that reproduce on the clean tree
-  and are unrelated to this pass. The README workspace test count was left
-  untouched pending a full green `scripts/test_count.sh` run.
+- Follow-up fix (same day): `srct-node --test api` showed 8 credit-admission
+  failures in CI (`test and vectors`) and locally. Root cause predates this
+  pass: commit `0064108` made admission reserve `amount + fee` (2400 for the
+  bridge payment) but the api tests still funded only the amount (400-700).
+  Fixed by funding `BRIDGE_TOTAL_SAT` in the 8 tests
+  (`crates/srct-node/tests/api.rs`); `run_bridge` now uses the named
+  `BRIDGE_FEE_SAT`. Full `api` suite green (50 passed), plus `micro_safety`,
+  `agent_economy`, `x402` green; clippy and fmt clean.

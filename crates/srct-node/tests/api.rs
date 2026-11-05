@@ -55,6 +55,11 @@ const EXPIRES: u64 = 9_000;
 /// The amount `run_bridge` opens a grant for ? the credit gate must cover this
 /// for admission to succeed.
 const BRIDGE_AMOUNT_SAT: u64 = 400;
+/// The fee `run_bridge` builds its payment with. Admission reserves
+/// `amount + fee`, so a funded line needs the total, not just the amount.
+const BRIDGE_FEE_SAT: u64 = 2_000;
+/// What the credit gate must cover for a bridge payment to be admitted.
+const BRIDGE_TOTAL_SAT: u64 = BRIDGE_AMOUNT_SAT + BRIDGE_FEE_SAT;
 
 // ---------------------------------------------------------------------------
 // Harness
@@ -709,7 +714,7 @@ fn run_bridge(
         &auth,
         NET,
         AgentRole::Machine,
-        2_000,
+        BRIDGE_FEE_SAT,
         EXPIRES,
         request.request_id(),
         &[],
@@ -1135,7 +1140,7 @@ fn a_malformed_policy_is_a_client_error() {
 #[test]
 fn a_verified_payment_is_recorded_once_and_readable() {
     let node = start();
-    let (payment, _receipt, auth, sigs, keys) = run_bridge(&node, BRIDGE_AMOUNT_SAT);
+    let (payment, _receipt, auth, sigs, keys) = run_bridge(&node, BRIDGE_TOTAL_SAT);
 
     let (s, body) = submit_payment(&node, &payment, &auth, &sigs, &keys);
     assert_eq!(s, 200, "payment refused: {body}");
@@ -1220,7 +1225,7 @@ fn a_payment_for_another_network_is_refused() {
 #[test]
 fn a_receipt_records_once_and_a_contradicting_one_is_refused() {
     let node = start();
-    let (payment, receipt, auth, sigs, keys) = run_bridge(&node, BRIDGE_AMOUNT_SAT);
+    let (payment, receipt, auth, sigs, keys) = run_bridge(&node, BRIDGE_TOTAL_SAT);
 
     let (s, body) = submit_payment(&node, &payment, &auth, &sigs, &keys);
     assert_eq!(s, 200, "{body}");
@@ -1346,7 +1351,7 @@ fn a_payment_is_admitted_only_when_the_payers_credit_covers_it() {
     let payer_addr = wallet(61, "api-payer").address().unwrap();
     assert_eq!(payment.amount_sat, 400);
 
-    // Funding short: 300 < 400 -> refused before the tracker sees it.
+    // Funding short: 300 < amount + fee -> refused before the tracker sees it.
     let (s, b) = post(
         &node,
         "/v1/credit/deposit",
@@ -1362,17 +1367,17 @@ fn a_payment_is_admitted_only_when_the_payers_credit_covers_it() {
     assert_eq!(s, 400, "underfunded credit must refuse, not record: {body}");
     assert_eq!(body["error"], "bad_request");
 
-    // Top up so the line covers the payment, then the same payment is admitted.
+    // Top up so the line covers amount + fee, then the same payment is admitted.
     let (s, b) = post(
         &node,
         "/v1/credit/deposit",
         &serde_json::json!({
             "address_hex": address_to_hex(&payer_addr),
-            "amount_sat": 400,
+            "amount_sat": BRIDGE_TOTAL_SAT - 300,
         }),
     );
     assert_eq!(s, 200, "top-up refused: {b}");
-    assert_eq!(b["balance"], 700);
+    assert_eq!(b["balance"], BRIDGE_TOTAL_SAT);
 
     let (s, body) = submit_payment(&node, &payment, &auth, &sigs, &keys);
     assert_eq!(s, 200, "funded credit must admit: {body}");
@@ -1386,7 +1391,7 @@ fn a_settled_receipt_commits_the_credit_debit() {
     // commits, so the encumbrance moves to settled and the spendable line is
     // already down.
     let node = start();
-    let (payment, receipt, auth, sigs, keys) = run_bridge(&node, BRIDGE_AMOUNT_SAT);
+    let (payment, receipt, auth, sigs, keys) = run_bridge(&node, BRIDGE_TOTAL_SAT);
     let payer_addr = wallet(61, "api-payer").address().unwrap();
     let balance_path = format!("/v1/credit/balance/{}", address_to_hex(&payer_addr));
 
@@ -1394,11 +1399,11 @@ fn a_settled_receipt_commits_the_credit_debit() {
     assert_eq!(s, 200, "{body}");
 
     // Admission is an encumbrance, not a debit: spendable capacity is gone, but
-    // the value has not been settled.
+    // the value has not been settled. The reservation covers amount + fee.
     let (s, b) = get(&node, &balance_path);
     assert_eq!(s, 200);
     assert_eq!(
-        b["reserved"], BRIDGE_AMOUNT_SAT,
+        b["reserved"], BRIDGE_TOTAL_SAT,
         "the reservation encumbers the line at admission"
     );
     assert_eq!(b["available"], 0, "so the capacity is exact, not advisory");
@@ -1439,16 +1444,16 @@ fn a_reserved_line_cannot_back_two_admitted_payments() {
     // payment. A second payment naming the same balance is refused by the
     // capacity check rather than admitted against value already promised.
     let node = start();
-    let (payment, receipt, auth, sigs, keys) = run_bridge(&node, BRIDGE_AMOUNT_SAT);
+    let (payment, receipt, auth, sigs, keys) = run_bridge(&node, BRIDGE_TOTAL_SAT);
     let payer_addr = wallet(61, "api-payer").address().unwrap();
 
-    // Fund the line with exactly one payment's worth.
+    // Fund the line with exactly one payment's worth (amount + fee).
     let (s, body) = post(
         &node,
         "/v1/credit/deposit",
         &serde_json::json!({
             "address_hex": address_to_hex(&payer_addr),
-            "amount_sat": BRIDGE_AMOUNT_SAT,
+            "amount_sat": BRIDGE_TOTAL_SAT,
         }),
     );
     assert_eq!(s, 200, "{body}");
@@ -1467,14 +1472,14 @@ fn a_reserved_line_cannot_back_two_admitted_payments() {
     // A second, independently built payment from the same payer now has no
     // capacity behind it: the line was encumbered and then settled.
     let node2 = start();
-    let (payment2, _receipt2, auth2, sigs2, keys2) = run_bridge(&node2, BRIDGE_AMOUNT_SAT);
+    let (payment2, _receipt2, auth2, sigs2, keys2) = run_bridge(&node2, BRIDGE_TOTAL_SAT);
     let payer2 = wallet(61, "api-payer").address().unwrap();
     let (s, _b) = post(
         &node2,
         "/v1/credit/deposit",
         &serde_json::json!({
             "address_hex": address_to_hex(&payer2),
-            "amount_sat": BRIDGE_AMOUNT_SAT,
+            "amount_sat": BRIDGE_TOTAL_SAT,
         }),
     );
     assert_eq!(s, 200);
@@ -1547,11 +1552,11 @@ fn a_position_backed_payment_is_refused_up_front_not_locked_forever() {
     assert_eq!(b["reserved"], 0, "the refused admission holds nothing");
     assert_eq!(b["available"], 0);
 
-    // And the payer is not wedged: funding free admits the same payment.
+    // And the payer is not wedged: funding free (amount + fee) admits the same payment.
     let (s, b) = post(
         &node,
         "/v1/credit/deposit",
-        &json!({ "address_hex": addr_hex, "amount_sat": 400u64 }),
+        &serde_json::json!({ "address_hex": addr_hex, "amount_sat": BRIDGE_TOTAL_SAT }),
     );
     assert_eq!(s, 200, "{b}");
     let (s, body) = submit_payment(&node, &payment, &auth, &sigs, &keys);
@@ -2798,7 +2803,7 @@ fn pay_tx(node: &Node, from: &Wallet, to: &[u8; 20], amount_sat: u64) -> String 
 
 #[test]
 fn a_settlement_refuses_a_tx_that_never_pays_the_recipient() {
-    let (node, payment, payer) = bridge_then_fund(BRIDGE_AMOUNT_SAT + 100, 12);
+    let (node, payment, payer) = bridge_then_fund(BRIDGE_TOTAL_SAT, 12);
     let id_hex = hash_to_hex(&payment.signing_hash());
     let stranger = wallet(63, "stranger").address().unwrap();
 
@@ -2837,7 +2842,7 @@ fn a_settlement_refuses_a_tx_that_never_pays_the_recipient() {
 
 #[test]
 fn a_settlement_link_survives_confirmation_and_refuses_a_second_tx() {
-    let (node, payment, payer) = bridge_then_fund(BRIDGE_AMOUNT_SAT + 100, 12);
+    let (node, payment, payer) = bridge_then_fund(BRIDGE_TOTAL_SAT, 12);
     let id_hex = hash_to_hex(&payment.signing_hash());
     let recipient = payment.recipient;
 
