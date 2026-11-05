@@ -777,10 +777,11 @@ answered as `allow / deny / needs_approval` anywhere, settled as trust on Solar.
   entry point. Stateless pre-checks (`guard.check`, `/v1/guard/decide`)
   commit nothing; stateful admission (`guard.authorize`,
   `/v1/guard/authorize`) enforces window + nonce and is the execution boundary,
-  as is the worker SDK's `GuardGate::execute`, which asks the authority first
-  (revoked or unreachable means no execution — no offline fallback), proves
-  workload possession fresh, recomputes the action hash from the exact work
-  about to run, and only then invokes the executor.
+  as is the worker SDK's `GuardGate::execute`, which proves workload
+  possession fresh, admits statefully through the authority (revoked or
+  unreachable means no execution — no offline fallback; the authority is the
+  single commit point, so restarts and sibling workers cannot replay a nonce),
+  re-verifies locally, and only then invokes the executor.
   Refusals consume no budget and are named (`action_mismatch`,
   `context_mismatch`, `expired`, `nonce_reuse`, `zero_nonce`,
   `unsigned_capability`, `bad_approval`, `bad_credential`, `self_approval`,
@@ -790,13 +791,14 @@ answered as `allow / deny / needs_approval` anywhere, settled as trust on Solar.
   revocation kills the grant and every registered descendant and persists in a
   revocation set the stateless pre-check also consults. The node's registry +
   revocation set + book is authoritative per node; MCP-local gate state is a
-  non-authoritative cache. The worker execution boundary asks the authority on
-  every run before executing — revoked denies and forgets local state,
-  unreachable denies without touching it. There is no cross-node nonce lock:
-  scope high-value capabilities to one node via `audience` (mis-scoped use
-  denies by name); unscoped capabilities stay independently admittable
-  everywhere. A revocation landing between the authority check and execution
-  stops the next execution, not the current one. Registry (1024 grants) and
+  non-authoritative cache. The worker execution boundary admits statefully
+  through the authority on every run — revoked denies and forgets local
+  state, unreachable denies without touching it, and the authority's single
+  commit point stops restarts and sibling workers replaying a nonce. There
+  is no cross-node nonce lock: scope high-value capabilities to one node via
+  `audience` (mis-scoped use denies by name); unscoped capabilities stay
+  independently admittable everywhere. A revocation landing between admission
+  and execution stops the next execution, not the current one. Registry (1024 grants) and
   book (1024 grants) refuse when full rather than evicting. v1 grants decode
   and authorize with legacy semantics; unknown versions refuse loudly.
 - **MCP credential rule:** the MCP client dials `host:port` only; loopback is

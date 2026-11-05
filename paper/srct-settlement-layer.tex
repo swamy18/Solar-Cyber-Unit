@@ -1523,10 +1523,13 @@ kills the grant and every registered descendant, the stateless pre-check
 consults the same revocation set as the stateful admission, and registry and
 book capacities refuse rather than evict; owners scope high-value capabilities
 to one enforcing node by audience, which denies mis-scoped replay by name;
-and the worker execution boundary asks its authority on every run before the
-local book and before the executor, forgetting local state on a stale answer
-and refusing outright when the authority is unreachable --- there is no
-offline fallback and no cached-allow. Fifth, the MCP transport cannot be aimed
+and the worker execution boundary proves possession fresh and then admits
+statefully through the authority on every run, credential included --- the
+authority is the single commit point, so a restarted worker or a sibling
+worker replaying a nonce is denied there whichever local book it carries,
+while the local book only ever trails as a mirror. A deny forgets local
+state; an unreachable authority refuses outright; there is no offline
+fallback and no cached-allow. Fifth, the MCP transport cannot be aimed
 at an attacker: endpoints are \texttt{host:port} only, loopback is the only
 target that ever receives the API bearer token, anything else needs an
 explicit allow-list plus an opt-in flag and still never receives the token
@@ -2284,10 +2287,12 @@ transport.} Gate decisions are enforced by whichever node or runtime observes th
 bytes; there is no cross-node capability lock, and multi-node deployments
 converge by registering the same owner-signed grants, replicating revocations,
 and scoping high-value capabilities to one node by audience. Unscoped
-capabilities remain independently admittable everywhere. The worker checks its
-authority on every execution, but that check and the execution are two steps:
-a revocation landing between them stops the next execution, not the current
-one. The worker and MCP HTTP clients are plaintext \texttt{host:port}
+capabilities remain independently admittable everywhere. The worker admits
+statefully through its authority on every execution --- the authority commits
+nonce and window, so restarts and sibling workers cannot replay a nonce ---
+but admission and local execution are still two steps: a revocation landing
+between them stops the next execution, not the current one. The worker and
+MCP HTTP clients are plaintext \texttt{host:port}
 transports with no TLS: loopback is the supported shape, remote endpoints need
 an explicit allow-list and still never receive the bearer token, so production
 remote use requires a TLS-terminating proxy and a revisited bearer model.
@@ -2459,10 +2464,12 @@ both.
 \item A Smart Gate admission authorises the recomputed action, not a claimed
   hash: the boundary re-derives the canonical hash from the executed preimage
   and refuses on any drift; a refusal commits no window or nonce state.
-\item A Smart Gate execution is fresh and proved: the worker asks its
-  authority on every run (revoked or unreachable never executes) and, on
-  key-bound grants, only a fresh proof of possession of the pinned workload
-  key admits; the raw unsigned path does not exist.
+\item A Smart Gate execution is fresh, proved, and singly committed: the
+  worker proves possession fresh and admits statefully through the authority
+  on every run (revoked or unreachable never executes; restarts and siblings
+  cannot replay a nonce past the single commit point) and, on key-bound
+  grants, the proof travels with the admission request; the raw unsigned path
+  does not exist.
 \item A revoked Smart Gate grant stays dead, with its descendants, across
   restarts and on the stateless pre-check as well as the stateful admission.
 \item A destroyed state file is a refusal to start, never an empty book.

@@ -48,80 +48,82 @@ pub fn guard_action_preimage(work: &ExecutionWork) -> Vec<u8> {
     out
 }
 
-/// What the authority said about one admission, right now. `Fresh` means the
-/// grant is live at the authority (or needs an approval the local gate will
-/// still enforce); `Stale` carries the authority's named reason. Transport or
-/// decode failures are not a variant: they surface as `Err`, and `Err` never
-/// executes.
+/// What the authority said about one admission, right now. `Allow` means the
+/// authority admitted *and committed* (nonce consumed, window spent) at its
+/// live state; `NeedsApproval` means the authority gates on a designated
+/// approval the local gate still enforces; `Deny` carries the authority's
+/// named reason. Transport or decode failures are not a variant: they surface
+/// as `Err`, and `Err` never executes.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Freshness {
-    Fresh,
-    Stale(String),
+pub enum Admission {
+    Allow,
+    NeedsApproval,
+    Deny(String),
 }
 
-/// The authoritative revocation source consulted at the execution boundary.
-/// The local book stops replays it has seen; only the authority knows about
-/// revocations issued elsewhere. Implementations MUST fail closed: `Err`
-/// means "unknown", and unknown never executes. There is deliberately no
-/// "allow on unreachable" mode and no cached-allow fallback — a worker cut
-/// off from its authority stops executing gated work instead of running on
-/// stale permission.
-pub trait RevocationAuthority {
-    #[allow(clippy::too_many_arguments)]
-    fn check(
-        &self,
-        policy: &InfraPolicy,
-        signed: &SignedCapability,
-        agent_id: &[u8; 20],
-        network_id: &str,
-        height: u64,
-        action_hash: &Hash,
-        workload_id: &Hash,
-        escalate_to_approval: bool,
-    ) -> WorkerResult<Freshness>;
+/// One admission request to the authority: everything the enforcing node needs
+/// to admit statefully, including the optional possession proof.
+pub struct AdmissionRequest<'a> {
+    pub policy: &'a InfraPolicy,
+    pub signed: &'a SignedCapability,
+    pub agent_id: &'a [u8; 20],
+    pub action_preimage: &'a [u8],
+    pub workload_id: &'a Hash,
+    pub escalate_to_approval: bool,
+    pub approval_hex: Option<String>,
+    pub workload_cred_hex: Option<String>,
 }
 
-/// Freshness via the enforcing node's stateless `POST /v1/guard/decide`: one
-/// round trip that re-verifies signature, risk model, revocation set,
-/// validity, binding and audience at the authority's current height. No new
-/// endpoint, no new trust root — the same read path operators already use.
-pub struct NodeDecideAuthority {
+/// The authoritative admission source consulted at the execution boundary.
+/// Nonce and window accounting live HERE — not in the worker's local book —
+/// so restarts and sibling workers cannot independently accept the same
+/// nonce: the authority commits once, and a replayed nonce denies by name.
+/// The local book is a monotonic mirror plus an independent cryptographic
+/// re-verification, never the source of truth.
+///
+/// Implementations MUST fail closed: `Err` means "unknown", and unknown never
+/// executes. There is deliberately no "allow on unreachable" mode and no
+/// cached-allow fallback — a worker cut off from its authority stops
+/// executing gated work instead of running on stale permission.
+pub trait GateAuthority {
+    fn admit(&self, req: &AdmissionRequest) -> WorkerResult<Admission>;
+}
+
+/// Admission via the enforcing node's stateful `POST /v1/guard/authorize`:
+/// one round trip that verifies signature, risk model, possession,
+/// revocation set, validity, binding and audience, approves, and commits
+/// nonce + window at the authority's live state. No new endpoint, no new
+/// trust root — the same admission path operators already use.
+pub struct NodeGateAuthority {
     /// Node HTTP client (loopback by default; see [`HttpNode`]).
     pub http: HttpNode,
 }
 
-impl NodeDecideAuthority {
+impl NodeGateAuthority {
     pub fn new(http: HttpNode) -> Self {
-        NodeDecideAuthority { http }
+        NodeGateAuthority { http }
     }
 }
 
-impl RevocationAuthority for NodeDecideAuthority {
-    #[allow(clippy::too_many_arguments)]
-    fn check(
-        &self,
-        policy: &InfraPolicy,
-        signed: &SignedCapability,
-        agent_id: &[u8; 20],
-        _network_id: &str,
-        _height: u64,
-        action_hash: &Hash,
-        workload_id: &Hash,
-        escalate_to_approval: bool,
-    ) -> WorkerResult<Freshness> {
+impl GateAuthority for NodeGateAuthority {
+    fn admit(&self, req: &AdmissionRequest) -> WorkerResult<Admission> {
         use serde_json::json;
+        let action = derive_action_hash(req.action_preimage);
         let body = json!({
-            "policy_hex": hex::encode(policy.serialize()),
-            "cap_hex": hex::encode(signed.serialize()),
-            "agent_id_hex": hex::encode(agent_id),
-            "action_hash_hex": hash_to_hex(action_hash),
-            "workload_id_hex": hash_to_hex(workload_id),
-            "high_risk": escalate_to_approval,
+            "cap_hex": hex::encode(req.signed.serialize()),
+            "agent_id_hex": hex::encode(req.agent_id),
+            "action_hash_hex": hash_to_hex(&action),
+            "action_preimage_hex": hex::encode(req.action_preimage),
+            "workload_id_hex": hash_to_hex(req.workload_id),
+            "high_risk": req.escalate_to_approval,
+            "approval_hex": req.approval_hex,
+            "workload_cred_hex": req.workload_cred_hex,
         });
-        let answer = self.http.post_json("/v1/guard/decide", &body)?;
+        let answer = self.http.post_json("/v1/guard/authorize", &body)?;
         match answer.get("decision").and_then(|d| d.as_str()) {
-            Some("allow") | Some("needs_approval") => Ok(Freshness::Fresh),
-            Some("deny") => Ok(Freshness::Stale(
+            Some("allow") => Ok(Admission::Allow),
+            Some("needs_approval") => Ok(Admission::NeedsApproval),
+            Some("deny") => Ok(Admission::Deny(
                 answer
                     .get("reason")
                     .and_then(|r| r.as_str())
@@ -152,10 +154,12 @@ pub struct GuardGate {
     /// Local capability book: window budget and consumed nonces.
     /// Non-authoritative: a cache, never the source of truth.
     pub book: GuardBook,
-    /// Mandatory freshness source. Consulted on EVERY execution, before the
-    /// local book and before the executor. Unreachable means unknown, and
+    /// Mandatory admission authority. Consulted on EVERY execution, before the
+    /// local book and before the executor: the authority commits nonce +
+    /// window at its live state, so restarts and sibling workers cannot
+    /// independently accept the same nonce. Unreachable means unknown, and
     /// unknown never executes — there is no offline fallback.
-    pub authority: Box<dyn RevocationAuthority>,
+    pub authority: Box<dyn GateAuthority>,
     /// Workload identity key that signs the per-execution possession proof.
     /// Required when the grant binds a workload key; ignored otherwise.
     pub workload_wallet: Option<srct_core::wallet::Wallet>,
@@ -180,19 +184,26 @@ pub struct GuardGate {
 impl GuardGate {
     /// Admit `work` through the gate, then run it, in this order:
     ///
-    /// 1. Recompute the action preimage from the work about to run.
-    /// 2. Ask the authority whether the grant is still good. A `Stale`
-    ///    answer forgets the grant's local accounting (so stale state can
-    ///    never be replayed back) and denies. An unreachable authority
-    ///    denies without touching local state.
-    /// 3. Enforce the local book (nonce/window) plus possession proof and
-    ///    approval through `authorize_signed`. Nothing commits on refusal.
+    /// 1. Recompute the action preimage (and context) from the work about
+    ///    to run, and build the fresh possession proof when the grant binds
+    ///    a workload key. A missing or mismatched provisioned key fails
+    ///    HERE — loudly and before any nonce is consumed — not deep inside
+    ///    admission.
+    /// 2. Ask the authority to admit statefully. The authority commits
+    ///    nonce + window at its live state, so this is where replays die: a
+    ///    restarted worker or a sibling worker replaying the same nonce gets
+    ///    a named deny from the single commit point. A deny forgets the
+    ///    grant's local accounting (so stale state can never be replayed
+    ///    back); an unreachable authority denies without touching anything.
+    /// 3. Re-verify locally through `authorize_signed` (signature, binding,
+    ///    possession, approval) and mirror the commit in the local book.
+    ///    Nothing commits on refusal, locally or remotely.
     /// 4. Only on `Allow`, run the executor.
     ///
-    /// The executor is never called before all mandatory checks pass; step 2
-    /// and 3 both deny fail-closed, so a revocation that lands between them
-    /// at worst stops this execution at the next one (documented residual:
-    /// no cross-node lock).
+    /// The local book is a monotonic mirror plus independent cryptographic
+    /// re-verification — it can only ever trail the authority, because it
+    /// commits solely after the authority allowed. The executor is never
+    /// called before all mandatory checks pass.
     pub fn execute<E: Executor>(
         &mut self,
         executor: &E,
@@ -200,30 +211,16 @@ impl GuardGate {
     ) -> WorkerResult<ExecutionOutput> {
         let preimage = guard_action_preimage(work);
         let action = derive_action_hash(&preimage);
-        match self.authority.check(
-            &self.policy,
-            &self.signed,
-            &self.agent_id,
-            &self.network_id,
+        let effective_ctx = srct_core::guard::derive_context_hash(
+            &self.policy.effective_workload(&self.workload_id),
             self.height,
-            &action,
-            &self.workload_id,
-            self.escalate_to_approval,
-        )? {
-            Freshness::Stale(reason) => {
-                self.book.forget(&self.policy.hash());
-                return Err(WorkerError::GuardDenied(format!(
-                    "grant revoked at authority: {reason}"
-                )));
-            }
-            Freshness::Fresh => {}
-        }
+        );
+        // Possession is proved BEFORE the authority is asked, so the proof
+        // travels with the admission request: a key-bound grant that reaches
+        // a credential-requiring authority without proof denies there — not
+        // silently, and not later.
         let workload_cred = match &self.workload_wallet {
             Some(wallet) if self.policy.workload_key != [0u8; 32] => {
-                let effective_ctx = srct_core::guard::derive_context_hash(
-                    &self.policy.effective_workload(&self.workload_id),
-                    self.height,
-                );
                 Some(WorkloadCredential::issue(
                     wallet,
                     &self.policy.hash(),
@@ -235,9 +232,6 @@ impl GuardGate {
             }
             _ => None,
         };
-        // A fingerprint sanity check before the gate runs: proving with the
-        // wrong key is a configuration error, and it must fail here — loudly
-        // and before any nonce is consumed — not deep inside admission.
         if self.policy.workload_key != [0u8; 32] {
             let cred = workload_cred.as_ref().ok_or_else(|| {
                 WorkerError::GuardDenied(
@@ -249,6 +243,29 @@ impl GuardGate {
                     "provisioned workload key does not match the grant".to_string(),
                 ));
             }
+        }
+        let approval_hex = self.approval.as_ref().map(|ap| hex::encode(ap.serialize()));
+        let workload_cred_hex = workload_cred
+            .as_ref()
+            .map(|cred| hex::encode(cred.serialize()));
+        match self.authority.admit(&AdmissionRequest {
+            policy: &self.policy,
+            signed: &self.signed,
+            agent_id: &self.agent_id,
+            action_preimage: &preimage,
+            workload_id: &self.workload_id,
+            escalate_to_approval: self.escalate_to_approval,
+            approval_hex,
+            workload_cred_hex,
+        })? {
+            Admission::Deny(reason) => {
+                self.book.forget(&self.policy.hash());
+                return Err(WorkerError::GuardDenied(format!(
+                    "denied at authority: {reason}"
+                )));
+            }
+            Admission::NeedsApproval => return Err(WorkerError::GuardApprovalNeeded),
+            Admission::Allow => {}
         }
         match self.book.authorize_signed(
             &self.policy,
@@ -297,56 +314,47 @@ mod tests {
         }
     }
 
-    /// Test freshness sources: allow-all, revoked, and unreachable.
+    /// Test authorities: allow-all, deny-with-reason, unreachable, and a
+    /// shared ledger that mimics the node's authoritative book: nonces commit
+    /// once per grant hash, so a replayed nonce denies no matter which local
+    /// book presents it.
     struct AllowAll;
-    struct RevokedAs(&'static str);
+    struct DenyAs(&'static str);
     struct Unreachable;
-    impl RevocationAuthority for AllowAll {
-        #[allow(clippy::too_many_arguments)]
-        fn check(
-            &self,
-            _policy: &InfraPolicy,
-            _signed: &SignedCapability,
-            _agent_id: &[u8; 20],
-            _network_id: &str,
-            _height: u64,
-            _action_hash: &Hash,
-            _workload_id: &Hash,
-            _escalate_to_approval: bool,
-        ) -> WorkerResult<Freshness> {
-            Ok(Freshness::Fresh)
+    struct SharedLedger {
+        last_nonce: std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<Hash, u64>>>,
+    }
+    impl GateAuthority for AllowAll {
+        fn admit(&self, _req: &AdmissionRequest) -> WorkerResult<Admission> {
+            Ok(Admission::Allow)
         }
     }
-    impl RevocationAuthority for RevokedAs {
-        #[allow(clippy::too_many_arguments)]
-        fn check(
-            &self,
-            _policy: &InfraPolicy,
-            _signed: &SignedCapability,
-            _agent_id: &[u8; 20],
-            _network_id: &str,
-            _height: u64,
-            _action_hash: &Hash,
-            _workload_id: &Hash,
-            _escalate_to_approval: bool,
-        ) -> WorkerResult<Freshness> {
-            Ok(Freshness::Stale(self.0.to_string()))
+    impl GateAuthority for DenyAs {
+        fn admit(&self, _req: &AdmissionRequest) -> WorkerResult<Admission> {
+            Ok(Admission::Deny(self.0.to_string()))
         }
     }
-    impl RevocationAuthority for Unreachable {
-        #[allow(clippy::too_many_arguments)]
-        fn check(
-            &self,
-            _policy: &InfraPolicy,
-            _signed: &SignedCapability,
-            _agent_id: &[u8; 20],
-            _network_id: &str,
-            _height: u64,
-            _action_hash: &Hash,
-            _workload_id: &Hash,
-            _escalate_to_approval: bool,
-        ) -> WorkerResult<Freshness> {
+    impl GateAuthority for Unreachable {
+        fn admit(&self, _req: &AdmissionRequest) -> WorkerResult<Admission> {
             Err(WorkerError::ObservationUnavailable("authority unreachable"))
+        }
+    }
+    impl GateAuthority for SharedLedger {
+        fn admit(&self, req: &AdmissionRequest) -> WorkerResult<Admission> {
+            // The credential travels with the request now: a key-bound grant
+            // without proof denies at the authority, not just locally.
+            if req.policy.workload_key != [0u8; 32] && req.workload_cred_hex.is_none() {
+                return Ok(Admission::Deny(
+                    "grant requires a workload credential".to_string(),
+                ));
+            }
+            let mut ledger = self.last_nonce.lock().unwrap();
+            let last = ledger.get(&req.policy.hash()).copied().unwrap_or(0);
+            if req.signed.cap.nonce <= last {
+                return Ok(Admission::Deny("replayed nonce at authority".to_string()));
+            }
+            ledger.insert(req.policy.hash(), req.signed.cap.nonce);
+            Ok(Admission::Allow)
         }
     }
 
@@ -386,7 +394,7 @@ mod tests {
         policy: &InfraPolicy,
         preimage_sign: &[u8],
         approval: bool,
-        authority: Box<dyn RevocationAuthority>,
+        authority: Box<dyn GateAuthority>,
     ) -> GuardGate {
         let workload = [4u8; 32];
         let cap = Capability {
@@ -530,8 +538,8 @@ mod tests {
         assert!(!gate.book.is_empty(), "an admission commits nonce state");
 
         // The grant is revoked elsewhere. The next execution asks first: the
-        // authority says stale, local accounting is forgotten, nothing runs.
-        gate.authority = Box::new(RevokedAs("grant revoked"));
+        // authority denies, local accounting is forgotten, nothing runs.
+        gate.authority = Box::new(DenyAs("grant revoked"));
         let err = gate
             .execute(&CpuExecutor::default(), &work)
             .expect_err("a revoked grant must not execute");
@@ -540,6 +548,53 @@ mod tests {
             "unexpected: {err}"
         );
         assert!(gate.book.is_empty(), "revocation forgets stale local state");
+    }
+
+    #[test]
+    fn replay_across_workers_dies_at_the_authority() {
+        use crate::executor::CpuExecutor;
+        // Two workers, two fresh local books, one shared authority ledger:
+        // the same capability (same nonce) can only ever execute once.
+        let (owner, approver, policy) = owner_and_policy(false);
+        let work = test_work();
+        let preimage = guard_action_preimage(&work);
+        let ledger = std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
+        let mut first = gate_for(
+            &owner,
+            &approver,
+            &policy,
+            &preimage,
+            false,
+            Box::new(SharedLedger {
+                last_nonce: ledger.clone(),
+            }),
+        );
+        first
+            .execute(&CpuExecutor::default(), &work)
+            .expect("first worker admits");
+        // A restarted worker (empty local book) replaying the same nonce, and
+        // a sibling worker with its own book, both deny at the authority.
+        let mut restarted = gate_for(
+            &owner,
+            &approver,
+            &policy,
+            &preimage,
+            false,
+            Box::new(SharedLedger {
+                last_nonce: ledger.clone(),
+            }),
+        );
+        let err = restarted
+            .execute(&CpuExecutor::default(), &work)
+            .expect_err("a replayed nonce must not execute twice");
+        assert!(
+            matches!(err, WorkerError::GuardDenied(_)),
+            "unexpected: {err}"
+        );
+        assert!(
+            restarted.book.is_empty(),
+            "an authority-denied replay commits no local state"
+        );
     }
 
     #[test]
@@ -607,12 +662,18 @@ mod tests {
             audience: [0u8; 32],
         };
         let signed = SignedCapability::issue(&owner, &cap).unwrap();
+        // The shared ledger stands in for the node: it also requires the
+        // credential to travel with the request, so this test proves the
+        // proof reaches the authority — not just the local book.
+        let ledger = std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
         let mut gate = GuardGate {
             policy: policy.clone(),
             signed,
             approval: None,
             book: GuardBook::default(),
-            authority: Box::new(AllowAll),
+            authority: Box::new(SharedLedger {
+                last_nonce: ledger.clone(),
+            }),
             workload_wallet: Some(workload_wallet),
             agent_id: policy.agent_id,
             network_id: "srct/testnet".to_string(),

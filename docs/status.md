@@ -2160,3 +2160,26 @@ committed — verification below is on the working tree:
   next run, not the current one (no cross-node lock); workload identity is
   software keys (hardware TPM/TEE attestation planned); k8s admission
   webhooks planned; worker/node HTTP stays plaintext loopback-oriented.
+
+### 2026-11-05 Smart Gate authority fixes (no consensus change)
+
+Two review findings on the hardening pass, both confirmed and fixed:
+
+- **Credential never reached the authority.** The gate asked first and
+  proved after; the pre-check refuses key-bound grants without proof, so
+  key-bound capabilities could never execute via the worker. Fixed order:
+  recompute → prove fresh → admit statefully with the credential in the
+  request (`AdmissionRequest.workload_cred_hex`, verified at the node) →
+  local re-verification → execute. A test authority that requires the
+  credential on bound grants proves the proof now travels.
+- **Nonce enforcement was not authoritative.** The worker consulted a
+  read-only pre-check and committed nonces in its own local book, so
+  restarts and sibling workers could independently accept the same nonce.
+  Fixed: `GateAuthority::admit` goes through stateful node
+  `POST /v1/guard/authorize` (`NodeGateAuthority`), which is the single
+  commit point. The local book is now a trailing mirror plus independent
+  cryptographic re-verification. New test: two workers sharing one
+  authority ledger — the same nonce executes once, the replay denies at
+  the authority and commits nothing locally.
+- Verification (working tree): worker guard 6, node api 52, core guard 21,
+  policy 10, MCP 24, state_persist 3; clippy and fmt clean.
