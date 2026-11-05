@@ -1532,9 +1532,12 @@ height is an error, not an admission). A restarted worker or a sibling worker
 replaying a nonce is denied at the single commit point whichever local book
 it carries, while the local book only ever trails as a mirror. A deny forgets
 local state; an unreachable authority refuses outright; there is no offline
-fallback and no cached-allow. If the authority commits but local verification
-fails, the nonce stays consumed and the failure is reported, never retried
-into a duplicate. Fifth, the MCP transport cannot be aimed
+fallback and no cached-allow. A key-bound admission the authority denies as
+height-stale rebuilds its proof at the reported height and retries, bounded
+and commit-free, since denies never consume a nonce; every other deny fails
+immediately. If the authority commits but local verification fails, the nonce
+stays consumed and the failure is reported, never retried into a duplicate.
+Fifth, the MCP transport cannot be aimed
 at an attacker: endpoints are \texttt{host:port} only, loopback is the only
 target that ever receives the API bearer token, anything else needs an
 explicit allow-list plus an opt-in flag and still never receives the token

@@ -723,6 +723,26 @@ pub fn check_workload_credential(
     }
 }
 
+/// Whether a gate refusal reason means "the request was built for a different
+/// height than the authority's". Only refusals that name a height-bound value
+/// qualify, exactly as the node serializes them over HTTP (credential errors
+/// carry the `workload credential invalid: ` prefix from the `Display` impl;
+/// the raw capability context check does not). Everything else (revocation,
+/// replay, forgery, expiry, unsigned, bad approval, wrong audience, depleted
+/// window) is height-independent and must never be retried — retrying those
+/// would at best waste a round trip. Callers match on the reason *string*
+/// because it crosses the HTTP boundary; the strings are pinned by
+/// `height_drift_reasons_are_stable` so a rename fails the test instead of
+/// silently changing retry behavior.
+pub fn is_height_drift_deny(reason: &str) -> bool {
+    matches!(
+        reason,
+        "workload credential invalid: credential is stale"
+            | "workload credential invalid: credential names another context"
+            | "context hash mismatch"
+    )
+}
+
 /// Derive the context a verifier recomputes from what it observes.
 pub fn derive_context_hash(workload_id: &Hash, height: u64) -> Hash {
     let mut hb = [0u8; 8];
@@ -2154,6 +2174,43 @@ mod tests {
 
     fn policy_hash_of(bytes: &[u8]) -> Hash {
         sha256_dom(DOM_GUARD_POLICY, &[bytes])
+    }
+
+    #[test]
+    fn height_drift_reasons_are_stable() {
+        // The worker matches these reason strings across HTTP to decide
+        // whether a bounded retry is safe. Pin the exact wire forms here so a
+        // rename breaks this test instead of silently changing retry behavior.
+        // NOTE: `check_workload_credential` failures surface through the
+        // `BadCredential` Display, hence the `workload credential invalid: `
+        // prefix; the raw capability context check has no prefix.
+        assert_eq!(
+            GuardError::BadCredential("credential is stale").to_string(),
+            "workload credential invalid: credential is stale"
+        );
+        assert_eq!(
+            GuardError::BadCredential("credential names another context").to_string(),
+            "workload credential invalid: credential names another context"
+        );
+        assert_eq!(
+            GuardError::ContextMismatch.to_string(),
+            "context hash mismatch"
+        );
+        assert!(is_height_drift_deny(
+            "workload credential invalid: credential is stale"
+        ));
+        assert!(is_height_drift_deny(
+            "workload credential invalid: credential names another context"
+        ));
+        assert!(is_height_drift_deny("context hash mismatch"));
+        assert!(!is_height_drift_deny(
+            "workload credential invalid: grant requires a workload credential"
+        ));
+        assert!(!is_height_drift_deny("grant revoked"));
+        assert!(!is_height_drift_deny("nonce 1 is not greater than last 1"));
+        assert!(!is_height_drift_deny(
+            "approval is not from the designated approver"
+        ));
     }
 
     #[test]

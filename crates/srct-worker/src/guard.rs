@@ -33,6 +33,11 @@ use crate::http::HttpNode;
 /// owner must sign capabilities over exactly these bytes.
 const DOM_WORKER_ACTION: &[u8] = b"srct/worker-action/v1";
 
+/// Admission attempts per execution: one initial try plus bounded rebuilds
+/// while the authority keeps moving. Denies never commit, so a retry only
+/// ever rebuilds height-bound material — it can never double-spend a nonce.
+const MAX_ADMIT_ATTEMPTS: u32 = 3;
+
 /// Canonical preimage of the work about to execute. Deterministic in the
 /// inputs — no height, no clock, no RNG — so the owner's signed capability
 /// and the boundary's recomputation agree bit-for-bit, and any drift in
@@ -51,19 +56,21 @@ pub fn guard_action_preimage(work: &ExecutionWork) -> Vec<u8> {
 /// What the authority said about one admission, right now. `Allow` means the
 /// authority admitted *and committed* (nonce consumed, window spent) at its
 /// live state, and carries the authoritative height it admitted at — the
-/// worker MUST run its local re-verification at exactly this height, never
+/// worker MUST run its local re-verification at exactly that height, never
 /// at its own possibly stale clock. `NeedsApproval` means the authority gates
 /// on an approval the local gate still enforces; `Deny` carries the
-/// authority's named reason. Transport or decode failures are not a variant:
-/// they surface as `Err`, and `Err` never executes. An `allow` answer with a
-/// missing or malformed `height` is an `Err`: the nonce may already be
-/// committed, and executing against an unverifiable height would split the
-/// two commit points — so the worker reports instead of guessing.
+/// authority's named reason plus the height it refused at (when present — a
+/// bounded retry uses it to rebuild height-bound material instead of
+/// guessing). Transport or decode failures are not a variant: they surface as
+/// `Err`, and `Err` never executes. An `allow` without a usable `height` is
+/// an `Err`: the nonce may already be committed, and executing against an
+/// unverifiable height would split the two commit points — so the worker
+/// reports instead of guessing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Admission {
     Allow { height: u64 },
     NeedsApproval,
-    Deny(String),
+    Deny { reason: String, height: Option<u64> },
 }
 
 /// One admission request to the authority: everything the enforcing node needs
@@ -95,13 +102,14 @@ pub fn parse_authorize_answer(answer: &serde_json::Value) -> WorkerResult<Admiss
             )),
         },
         Some("needs_approval") => Ok(Admission::NeedsApproval),
-        Some("deny") => Ok(Admission::Deny(
-            answer
+        Some("deny") => Ok(Admission::Deny {
+            reason: answer
                 .get("reason")
                 .and_then(|r| r.as_str())
                 .unwrap_or("denied at authority")
                 .to_string(),
-        )),
+            height: answer.get("height").and_then(|h| h.as_u64()),
+        }),
         _ => Err(WorkerError::ObservationMalformed(
             "authority answer has no decision",
         )),
@@ -205,21 +213,25 @@ pub struct GuardGate {
 impl GuardGate {
     /// Admit `work` through the gate, then run it, in this order:
     ///
-    /// 1. Recompute the action preimage (and context) from the work about
-    ///    to run, and build the fresh possession proof when the grant binds
-    ///    a workload key. The proof is built at the worker-observed height —
-    ///    the operator MUST sync `GuardGate.height` from the node (e.g. the
-    ///    `height` field of any guard answer) before executing; a missing
-    ///    or mismatched provisioned key fails HERE — loudly and before any
-    ///    nonce is consumed — not deep inside admission. Credential
-    ///    lifetimes are never extended to paper over skew: a stale proof
-    ///    denies at the authority with no commit.
-    /// 2. Ask the authority to admit statefully. The authority commits
-    ///    nonce + window at its live state, so this is where replays die: a
-    ///    restarted worker or a sibling worker replaying the same nonce gets
-    ///    a named deny from the single commit point. A deny forgets the
-    ///    grant's local accounting (so stale state can never be replayed
-    ///    back); an unreachable authority denies without touching anything.
+    /// 1. Recompute the action preimage from the work about to run, then —
+    ///    for key-bound grants — rebuild the possession proof and context at
+    ///    the attempt height, starting from the worker-observed height. The
+    ///    operator SHOULD sync `GuardGate.height` from the node, but drift no
+    ///    longer kills execution: a missing or mismatched provisioned key
+    ///    fails HERE — loudly and before any nonce is consumed — not deep
+    ///    inside admission, and credential lifetimes are never extended to
+    ///    paper over skew: a stale proof denies at the authority with no
+    ///    commit.
+    /// 2. Ask the authority to admit statefully at the attempt height. The
+    ///    authority commits nonce + window at its live state, so this is
+    ///    where replays die: a restarted worker or a sibling worker replaying
+    ///    the same nonce gets a named deny from the single commit point. A
+    ///    deny forgets the grant's local accounting (so stale state can never
+    ///    be replayed back); an unreachable authority denies without touching
+    ///    anything. On a key-bound grant, a height-plausible deny (stale
+    ///    credential or context drift) that reports a *different* height
+    ///    rebuilds at that height and retries, bounded by
+    ///    `MAX_ADMIT_ATTEMPTS`; every other deny fails immediately.
     /// 3. Re-verify locally through `authorize_signed` at the AUTHORITATIVE
     ///    height the authority returned — never at the worker's own possibly
     ///    stale height — and mirror the commit in the local book. Nothing
@@ -240,83 +252,105 @@ impl GuardGate {
     ) -> WorkerResult<ExecutionOutput> {
         let preimage = guard_action_preimage(work);
         let action = derive_action_hash(&preimage);
-        let effective_ctx = srct_core::guard::derive_context_hash(
-            &self.policy.effective_workload(&self.workload_id),
-            self.height,
-        );
-        // Possession is proved BEFORE the authority is asked, so the proof
-        // travels with the admission request: a key-bound grant that reaches
-        // a credential-requiring authority without proof denies there — not
-        // silently, and not later.
-        let workload_cred = match &self.workload_wallet {
-            Some(wallet) if self.policy.workload_key != [0u8; 32] => {
-                Some(WorkloadCredential::issue(
+        let bound = self.policy.workload_key != [0u8; 32];
+        // Attempts are bounded: one initial try at the worker-observed height,
+        // then rebuild-and-retry only while the authority keeps reporting a
+        // *different* height with a height-plausible reason. Any other deny —
+        // revocation, replay, forgery, expiry, unsigned, depleted window —
+        // fails immediately: retrying those could never admit, and a replayed
+        // nonce must never be re-driven.
+        let mut attempt_height = self.height;
+        for _ in 0..MAX_ADMIT_ATTEMPTS {
+            let effective_ctx = srct_core::guard::derive_context_hash(
+                &self.policy.effective_workload(&self.workload_id),
+                attempt_height,
+            );
+            // Possession is proved BEFORE the authority is asked, so the proof
+            // travels with the admission request: a key-bound grant that reaches
+            // a credential-requiring authority without proof denies there — not
+            // silently, and not later. Lifetimes are never extended to paper
+            // over drift: the proof names exactly the attempt height.
+            let workload_cred = match &self.workload_wallet {
+                Some(wallet) if bound => Some(WorkloadCredential::issue(
                     wallet,
                     &self.policy.hash(),
                     &self.signed.cap,
                     &action,
                     &effective_ctx,
-                    self.height,
-                )?)
+                    attempt_height,
+                )?),
+                _ => None,
+            };
+            if bound {
+                let cred = workload_cred.as_ref().ok_or_else(|| {
+                    WorkerError::GuardDenied(
+                        "grant binds a workload key but no workload key is provisioned".to_string(),
+                    )
+                })?;
+                if workload_key_fingerprint(&cred.keys) != self.policy.workload_key {
+                    return Err(WorkerError::GuardDenied(
+                        "provisioned workload key does not match the grant".to_string(),
+                    ));
+                }
             }
-            _ => None,
-        };
-        if self.policy.workload_key != [0u8; 32] {
-            let cred = workload_cred.as_ref().ok_or_else(|| {
-                WorkerError::GuardDenied(
-                    "grant binds a workload key but no workload key is provisioned".to_string(),
-                )
-            })?;
-            if workload_key_fingerprint(&cred.keys) != self.policy.workload_key {
-                return Err(WorkerError::GuardDenied(
-                    "provisioned workload key does not match the grant".to_string(),
-                ));
+            let approval_hex = self.approval.as_ref().map(|ap| hex::encode(ap.serialize()));
+            let workload_cred_hex = workload_cred
+                .as_ref()
+                .map(|cred| hex::encode(cred.serialize()));
+            let authority_height = match self.authority.admit(&AdmissionRequest {
+                policy: &self.policy,
+                signed: &self.signed,
+                agent_id: &self.agent_id,
+                action_preimage: &preimage,
+                workload_id: &self.workload_id,
+                height: attempt_height,
+                escalate_to_approval: self.escalate_to_approval,
+                approval_hex,
+                workload_cred_hex,
+            })? {
+                Admission::Deny { reason, height } => {
+                    self.book.forget(&self.policy.hash());
+                    // Retry only a height race on a bound grant: the authority
+                    // moved while we proved, so rebuild at its height. Denies
+                    // carry no commit, so retrying cannot double-spend.
+                    if bound
+                        && height.is_some_and(|h| h != attempt_height)
+                        && srct_core::guard::is_height_drift_deny(&reason)
+                    {
+                        attempt_height = height.expect("checked above");
+                        continue;
+                    }
+                    return Err(WorkerError::GuardDenied(format!(
+                        "denied at authority: {reason}"
+                    )));
+                }
+                Admission::NeedsApproval => return Err(WorkerError::GuardApprovalNeeded),
+                Admission::Allow { height } => height,
+            };
+            // Authoritative height governs local verification. A stale worker
+            // height that the authority tolerated (unbound, hash-only drift the
+            // authority already ruled on) cannot fail execution here.
+            match self.book.authorize_signed(
+                &self.policy,
+                &self.signed,
+                &self.agent_id,
+                &self.network_id,
+                authority_height,
+                &preimage,
+                &self.workload_id,
+                &self.node_audience,
+                self.escalate_to_approval,
+                self.approval.as_ref(),
+                workload_cred.as_ref(),
+            ) {
+                GuardDecision::Allow => return execute_task(executor, work),
+                GuardDecision::NeedsApproval => return Err(WorkerError::GuardApprovalNeeded),
+                GuardDecision::Deny(e) => return Err(WorkerError::GuardDenied(e.to_string())),
             }
         }
-        let approval_hex = self.approval.as_ref().map(|ap| hex::encode(ap.serialize()));
-        let workload_cred_hex = workload_cred
-            .as_ref()
-            .map(|cred| hex::encode(cred.serialize()));
-        let authority_height = match self.authority.admit(&AdmissionRequest {
-            policy: &self.policy,
-            signed: &self.signed,
-            agent_id: &self.agent_id,
-            action_preimage: &preimage,
-            workload_id: &self.workload_id,
-            height: self.height,
-            escalate_to_approval: self.escalate_to_approval,
-            approval_hex,
-            workload_cred_hex,
-        })? {
-            Admission::Deny(reason) => {
-                self.book.forget(&self.policy.hash());
-                return Err(WorkerError::GuardDenied(format!(
-                    "denied at authority: {reason}"
-                )));
-            }
-            Admission::NeedsApproval => return Err(WorkerError::GuardApprovalNeeded),
-            Admission::Allow { height } => height,
-        };
-        // Authoritative height governs local verification. A stale worker
-        // height that the authority tolerated (unbound, hash-only drift the
-        // authority already ruled on) cannot fail execution here.
-        match self.book.authorize_signed(
-            &self.policy,
-            &self.signed,
-            &self.agent_id,
-            &self.network_id,
-            authority_height,
-            &preimage,
-            &self.workload_id,
-            &self.node_audience,
-            self.escalate_to_approval,
-            self.approval.as_ref(),
-            workload_cred.as_ref(),
-        ) {
-            GuardDecision::Allow => execute_task(executor, work),
-            GuardDecision::NeedsApproval => Err(WorkerError::GuardApprovalNeeded),
-            GuardDecision::Deny(e) => Err(WorkerError::GuardDenied(e.to_string())),
-        }
+        Err(WorkerError::GuardDenied(
+            "admission retries exhausted".to_string(),
+        ))
     }
 }
 
@@ -376,8 +410,11 @@ mod tests {
         }
     }
     impl GateAuthority for DenyAs {
-        fn admit(&self, _req: &AdmissionRequest) -> WorkerResult<Admission> {
-            Ok(Admission::Deny(self.0.to_string()))
+        fn admit(&self, req: &AdmissionRequest) -> WorkerResult<Admission> {
+            Ok(Admission::Deny {
+                reason: self.0.to_string(),
+                height: Some(req.height),
+            })
         }
     }
     impl GateAuthority for Unreachable {
@@ -385,19 +422,49 @@ mod tests {
             Err(WorkerError::ObservationUnavailable("authority unreachable"))
         }
     }
+    /// Simulates the chain advancing mid-flight: the first admit denies as
+    /// stale at a new height, the retry then admits there.
+    struct FlappingAuthority {
+        calls: std::sync::Mutex<usize>,
+        to_height: u64,
+    }
+    impl GateAuthority for FlappingAuthority {
+        fn admit(&self, _req: &AdmissionRequest) -> WorkerResult<Admission> {
+            let mut calls = self.calls.lock().unwrap();
+            *calls += 1;
+            if *calls == 1 {
+                // Node-style skew deny: the exact wire string, with the new
+                // height that the retry rebuilds at.
+                return Ok(Admission::Deny {
+                    reason: "workload credential invalid: credential names another context"
+                        .to_string(),
+                    height: Some(self.to_height),
+                });
+            }
+            Ok(Admission::Allow {
+                height: self.to_height,
+            })
+        }
+    }
     impl GateAuthority for SharedLedger {
         fn admit(&self, req: &AdmissionRequest) -> WorkerResult<Admission> {
             // The credential travels with the request now: a key-bound grant
-            // without proof denies at the authority, not just locally.
+            // without proof denies at the authority, not just locally. The
+            // ledger answers at the worker's attempted height, like a node
+            // that has not advanced between attempts.
             if req.policy.workload_key != [0u8; 32] && req.workload_cred_hex.is_none() {
-                return Ok(Admission::Deny(
-                    "grant requires a workload credential".to_string(),
-                ));
+                return Ok(Admission::Deny {
+                    reason: "grant requires a workload credential".to_string(),
+                    height: Some(req.height),
+                });
             }
             let mut ledger = self.last_nonce.lock().unwrap();
             let last = ledger.get(&req.policy.hash()).copied().unwrap_or(0);
             if req.signed.cap.nonce <= last {
-                return Ok(Admission::Deny("replayed nonce at authority".to_string()));
+                return Ok(Admission::Deny {
+                    reason: "replayed nonce at authority".to_string(),
+                    height: Some(req.height),
+                });
             }
             ledger.insert(req.policy.hash(), req.signed.cap.nonce);
             Ok(Admission::Allow { height: req.height })
@@ -805,7 +872,19 @@ mod tests {
         );
         assert_eq!(
             parse_authorize_answer(&json!({"decision": "deny", "reason": "grant revoked"})),
-            Ok(Admission::Deny("grant revoked".to_string()))
+            Ok(Admission::Deny {
+                reason: "grant revoked".to_string(),
+                height: None,
+            })
+        );
+        assert_eq!(
+            parse_authorize_answer(
+                &json!({"decision": "deny", "reason": "grant revoked", "height": 50u64})
+            ),
+            Ok(Admission::Deny {
+                reason: "grant revoked".to_string(),
+                height: Some(50),
+            })
         );
         assert!(matches!(
             parse_authorize_answer(&json!({"decision": "melt"})),
@@ -858,6 +937,123 @@ mod tests {
         assert!(
             gate.book.is_empty(),
             "a locally denied admission commits no local state"
+        );
+    }
+
+    #[test]
+    fn retry_rebuilds_proof_at_the_authoritys_height() {
+        use crate::executor::CpuExecutor;
+        use srct_core::guard::workload_key_fingerprint;
+        // The chain advanced between the worker's observation and admission:
+        // first attempt denies stale at the new height, the retry rebuilds
+        // the proof there and admits. One execution, one local commit.
+        let owner = Wallet::new_random("retry-owner");
+        let addr = owner.address().unwrap();
+        let workload_wallet = Wallet::new_random("retry-workload");
+        let workload_keys = srct_core::l2::Auth::keys_for(&workload_wallet).unwrap();
+        let policy = InfraPolicy {
+            version: GUARD_POLICY_VERSION,
+            network_id: "srct/testnet".to_string(),
+            agent_id: derive_agent_id("srct/testnet", AgentRole::Machine, &addr),
+            owner: addr,
+            max_calls_per_window: 5,
+            window_blocks: 100,
+            valid_from_height: 0,
+            valid_until_height: 10_000,
+            revoked: false,
+            parent_agent_id: None,
+            requires_approval: false,
+            approver: [0u8; 20],
+            workload_id: [0u8; 32],
+            workload_key: workload_key_fingerprint(&workload_keys),
+        };
+        let work = test_work();
+        let preimage = guard_action_preimage(&work);
+        // The capability was built for height 50; the worker still believes
+        // 49; the authority has moved to 50.
+        let workload = [4u8; 32];
+        let cap = Capability {
+            policy_hash: policy.hash(),
+            action_hash: derive_action_hash(&preimage),
+            context_hash: derive_context_hash(&workload, 50),
+            expiry_height: 60,
+            nonce: 1,
+            audience: [0u8; 32],
+        };
+        let signed = SignedCapability::issue(&owner, &cap).unwrap();
+        let flap = FlappingAuthority {
+            calls: std::sync::Mutex::new(0),
+            to_height: 50,
+        };
+        let mut gate = GuardGate {
+            policy: policy.clone(),
+            signed,
+            approval: None,
+            book: GuardBook::default(),
+            authority: Box::new(flap),
+            workload_wallet: Some(workload_wallet),
+            agent_id: policy.agent_id,
+            network_id: "srct/testnet".to_string(),
+            height: 49,
+            workload_id: workload,
+            node_audience: [0u8; 32],
+            escalate_to_approval: false,
+        };
+        gate.execute(&CpuExecutor::default(), &work)
+            .expect("a height race heals within the retry bound");
+        assert_eq!(
+            gate.book.state(&policy.hash()).map(|s| s.last_nonce),
+            Some(1),
+            "exactly one local commit for one execution"
+        );
+    }
+
+    #[test]
+    fn non_drift_denies_never_retry() {
+        use crate::executor::CpuExecutor;
+        // A revocation deny must not trigger a retry, even when the deny
+        // carries a height: only height-plausible reasons rebuild.
+        let (owner, approver, policy) = owner_and_policy(false);
+        let work = test_work();
+        let preimage = guard_action_preimage(&work);
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+        struct ArcCountingDeny {
+            calls: std::sync::Arc<std::sync::Mutex<usize>>,
+        }
+        impl GateAuthority for ArcCountingDeny {
+            fn admit(&self, _req: &AdmissionRequest) -> WorkerResult<Admission> {
+                *self.calls.lock().unwrap() += 1;
+                Ok(Admission::Deny {
+                    reason: "grant revoked".to_string(),
+                    height: Some(50),
+                })
+            }
+        }
+        let mut gate2 = gate_for(
+            &owner,
+            &approver,
+            &policy,
+            &preimage,
+            false,
+            Box::new(ArcCountingDeny {
+                calls: calls.clone(),
+            }),
+        );
+        let err = gate2
+            .execute(&CpuExecutor::default(), &work)
+            .expect_err("revocation must not execute");
+        assert!(
+            matches!(err, WorkerError::GuardDenied(_)),
+            "unexpected: {err}"
+        );
+        assert_eq!(
+            *calls.lock().unwrap(),
+            1,
+            "a non-drift deny admits exactly once: no retry"
+        );
+        assert!(
+            gate2.book.is_empty(),
+            "a denied admission commits no local state"
         );
     }
 

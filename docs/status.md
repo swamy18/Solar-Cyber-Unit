@@ -2215,3 +2215,27 @@ while local verification denied on context mismatch, with no execution.
   its admission height; replay/possession/approval suites unchanged.
 - Verification (working tree): worker guard 10, node api 52, core guard 21,
   policy 10, MCP 24, state_persist 3; clippy and fmt clean.
+
+### 2026-11-05 Key-bound credential height sync + bounded retry (no consensus change)
+
+Follow-up gap: the possession proof was built once at the worker-observed
+height, but the node validates it at its live height — a drifting worker
+could never execute key-bound grants. Fixed without extending any lifetime:
+
+- `GuardGate::execute` rebuilds context + credential per attempt and retries
+  a key-bound admission (max 3 attempts) only when the authority denies with
+  a height-plausible reason (`is_height_drift_deny`, pinned wire strings)
+  *and* reports a different height. Every other deny fails immediately;
+  denies commit nothing, so retries can never double-spend a nonce.
+- New `crates/srct-node/tests/guard_worker_http.rs`: real worker
+  (`GuardGate` + `NodeGateAuthority` + `CpuExecutor`) against a real node
+  over HTTP — in-sync admission, behind/ahead self-heal, replay and
+  impersonation denial, approval-gated admission, and the node's reported
+  height asserted on the wire.
+- Unit coverage: retry heals a mid-flight height move; non-drift denies
+  never retry (call-counted); allow-without-height and malformed answers
+  fail closed; wire reason strings pinned in core.
+- Verification (working tree): guard_worker_http 5, worker guard 12,
+  node api 52, core guard 22, policy 10, MCP 24, state_persist 3;
+  `cargo clippy --workspace --all-targets -- -D warnings` clean,
+  `cargo fmt --all --check` clean.
