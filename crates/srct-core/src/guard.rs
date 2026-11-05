@@ -46,6 +46,10 @@ pub const DOM_GUARD_CTX: &[u8] = b"srct/guard-ctx/v1";
 pub const DOM_GUARD_ACTION: &[u8] = b"srct/guard-action/v1";
 /// Domain tag for the high-risk approval signing hash.
 pub const DOM_GUARD_APPROVAL: &[u8] = b"srct/guard-approval/v1";
+/// Domain tag for the workload proof-of-possession credential signing hash.
+pub const DOM_GUARD_WORKLOAD: &[u8] = b"srct/guard-workload/v1";
+/// Domain tag for the workload identity-key fingerprint.
+pub const DOM_GUARD_WORKLOAD_KEY: &[u8] = b"srct/guard-workload-key/v1";
 
 /// Why the gate refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,6 +71,7 @@ pub enum GuardError {
     ZeroNonce,
     UnsignedCapability,
     BadApproval(&'static str),
+    BadCredential(&'static str),
     ActionUnverified,
     SelfApproval,
     WrongAudience,
@@ -116,6 +121,7 @@ impl std::fmt::Display for GuardError {
                 write!(f, "capability is not signed by the grant owner")
             }
             GuardError::BadApproval(w) => write!(f, "approval invalid: {w}"),
+            GuardError::BadCredential(w) => write!(f, "workload credential invalid: {w}"),
             GuardError::ActionUnverified => {
                 write!(f, "action preimage required at the execution boundary")
             }
@@ -153,8 +159,12 @@ impl std::error::Error for GuardError {}
 /// owner-as-approver is refused as [`GuardError::SelfApproval`], because a
 /// second signature from the same authority is not a second channel.
 /// `workload_id` binds the grant to one authenticated workload (zero means
-/// unbound legacy semantics: the presented id is trusted). Capabilities may
-/// additionally scope themselves to one enforcing node via
+/// unbound legacy semantics: the presented id is trusted). `workload_key`
+/// is the fingerprint of the workload identity key that must prove
+/// possession at execution time (zero means no proof required — legacy).
+/// Binding an id without a key stops id-swapping but does not authenticate
+/// the process; binding a key requires a fresh per-execution signature.
+/// Capabilities may additionally scope themselves to one enforcing node via
 /// [`Capability::audience`] (multi-node replay rule, §6 of the architecture
 /// doc).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -172,6 +182,7 @@ pub struct InfraPolicy {
     pub requires_approval: bool,
     pub approver: Address,
     pub workload_id: Hash,
+    pub workload_key: Hash,
 }
 
 impl InfraPolicy {
@@ -208,6 +219,17 @@ impl InfraPolicy {
     /// and at grant registration, so a misconfigured high-assurance grant
     /// fails closed instead of silently degrading to owner self-approval.
     pub fn validate(&self) -> Result<(), GuardError> {
+        if self.version == GUARD_POLICY_VERSION_V1 {
+            // A v1-marked grant carrying v2-model fields would silently drop
+            // them on serialize: refuse instead.
+            if self.requires_approval
+                || self.approver != [0u8; 20]
+                || self.workload_id != [0u8; 32]
+                || self.workload_key != [0u8; 32]
+            {
+                return Err(GuardError::Malformed("v1 grant carries v2 fields"));
+            }
+        }
         if self.max_calls_per_window == 0 {
             return Err(GuardError::Malformed("max calls is zero"));
         }
@@ -228,7 +250,12 @@ impl InfraPolicy {
     }
 
     pub fn serialize(&self) -> Vec<u8> {
-        let mut w = Writer::with_capacity(192);
+        // Version-aware layout: v1 re-serializes to v1 bytes, byte-identical,
+        // so the grant hash — and every owner signature over it — is stable
+        // across decode/re-encode. New-model fields on a v1-marked grant are
+        // refused by `validate`, never silently dropped.
+        let legacy = self.version == GUARD_POLICY_VERSION_V1;
+        let mut w = Writer::with_capacity(if legacy { 96 } else { 224 });
         w.u8(self.version)
             .u16le(self.network_id.len() as u16)
             .raw(self.network_id.as_bytes())
@@ -247,9 +274,12 @@ impl InfraPolicy {
                 w.u8(0);
             }
         }
-        w.u8(u8::from(self.requires_approval))
-            .fixed(&self.approver)
-            .fixed(&self.workload_id);
+        if !legacy {
+            w.u8(u8::from(self.requires_approval))
+                .fixed(&self.approver)
+                .fixed(&self.workload_id)
+                .fixed(&self.workload_key);
+        }
         w.into_vec()
     }
 
@@ -312,27 +342,38 @@ impl InfraPolicy {
             ),
             _ => return Err(GuardError::Malformed("parent link out of range")),
         };
-        let (requires_approval, approver, workload_id) = if version == GUARD_POLICY_VERSION_V1 {
-            if r.remaining() != 0 {
-                return Err(GuardError::Malformed("trailing bytes"));
-            }
-            (false, [0u8; 20], [0u8; 32])
-        } else {
-            let risk_raw = r.u8().map_err(|_| GuardError::Malformed("risk flags"))?;
-            if risk_raw > 1 {
-                return Err(GuardError::Malformed("risk flags out of range"));
-            }
-            let approver = r
-                .fixed::<20>()
-                .map_err(|_| GuardError::Malformed("approver"))?;
-            let workload_id = r
-                .fixed::<32>()
-                .map_err(|_| GuardError::Malformed("workload"))?;
-            if r.remaining() != 0 {
-                return Err(GuardError::Malformed("trailing bytes"));
-            }
-            (risk_raw == 1, approver, workload_id)
-        };
+        // Compatibility rule (explicit): v1 grants decode with the new fields
+        // defaulted to legacy semantics (no mandated approval, owner
+        // approves, unbound workload, no key proof, unscoped audience).
+        // Layout v2 appends the risk model; unknown versions and trailing
+        // bytes are malformed, never reinterpreted. Signed bytes are never
+        // rewritten: a decoded v1 policy re-serializes to identical v1 bytes,
+        // so its hash — and every signature over it — is stable.
+        let (requires_approval, approver, workload_id, workload_key) =
+            if version == GUARD_POLICY_VERSION_V1 {
+                if r.remaining() != 0 {
+                    return Err(GuardError::Malformed("trailing bytes"));
+                }
+                (false, [0u8; 20], [0u8; 32], [0u8; 32])
+            } else {
+                let risk_raw = r.u8().map_err(|_| GuardError::Malformed("risk flags"))?;
+                if risk_raw > 1 {
+                    return Err(GuardError::Malformed("risk flags out of range"));
+                }
+                let approver = r
+                    .fixed::<20>()
+                    .map_err(|_| GuardError::Malformed("approver"))?;
+                let workload_id = r
+                    .fixed::<32>()
+                    .map_err(|_| GuardError::Malformed("workload"))?;
+                let workload_key = r
+                    .fixed::<32>()
+                    .map_err(|_| GuardError::Malformed("workload key"))?;
+                if r.remaining() != 0 {
+                    return Err(GuardError::Malformed("trailing bytes"));
+                }
+                (risk_raw == 1, approver, workload_id, workload_key)
+            };
         Ok(InfraPolicy {
             version,
             network_id,
@@ -347,10 +388,10 @@ impl InfraPolicy {
             requires_approval,
             approver,
             workload_id,
+            workload_key,
         })
     }
 }
-
 /// Short-lived exact-action capability. What the owner signs.
 ///
 /// `audience` scopes the capability to one enforcing node (zero means
@@ -657,11 +698,217 @@ impl GuardApproval {
     }
 }
 
+/// Enforce workload possession for key-bound grants. Every boundary — stateless
+/// pre-check, stateful admission, worker execution — calls this same function,
+/// so there is exactly one rule: a grant that binds a workload identity key
+/// admits only a caller that proves possession of that key for this exact
+/// capability, action, context and height. Unbound (legacy) grants ignore any
+/// presented credential and stay admittable as before.
+pub fn check_workload_credential(
+    policy: &InfraPolicy,
+    cap: &Capability,
+    action_hash: &Hash,
+    context_hash: &Hash,
+    height: u64,
+    cred: Option<&WorkloadCredential>,
+) -> Result<(), GuardError> {
+    if policy.workload_key == [0u8; 32] {
+        return Ok(());
+    }
+    match cred {
+        None => Err(GuardError::BadCredential(
+            "grant requires a workload credential",
+        )),
+        Some(c) => c.verify(policy, cap, action_hash, context_hash, height),
+    }
+}
+
 /// Derive the context a verifier recomputes from what it observes.
 pub fn derive_context_hash(workload_id: &Hash, height: u64) -> Hash {
     let mut hb = [0u8; 8];
     hb.copy_from_slice(&height.to_le_bytes());
     sha256_dom(DOM_GUARD_CTX, &[workload_id, &hb])
+}
+
+/// Fingerprint of a workload identity key bundle. The owner records this hash
+/// in the grant (`InfraPolicy::workload_key`); the executing process proves
+/// possession by signing the admission transcript with the matching key.
+/// The fingerprint binds the canonical key bytes, so a rotated or substituted
+/// key changes the fingerprint and no longer matches the grant.
+pub fn workload_key_fingerprint(keys: &crate::sig::Bundle) -> Hash {
+    sha256_dom(DOM_GUARD_WORKLOAD_KEY, &[&keys.to_bytes()])
+}
+
+/// Proof that the executing process holds the workload identity key bound in
+/// the grant. A bound `workload_id` stops the caller from swapping ids, but
+/// it does not authenticate the process; this credential does. It is built
+/// fresh at execution time over the exact admission values plus the current
+/// height, so it cannot be pre-played for another capability, another action,
+/// or another height. Verified inside `authorize_signed` — never beside it —
+/// so possession is part of the authorization decision itself.
+///
+/// Legacy grants with a zero `workload_key` require no credential
+/// (documented as unauthenticated); callers may still present one, and it is
+/// ignored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkloadCredential {
+    pub version: u8,
+    pub policy_hash: Hash,
+    pub cap_hash: Hash,
+    pub action_hash: Hash,
+    pub context_hash: Hash,
+    pub nonce: u64,
+    pub height: u64,
+    pub sigs: crate::sig::Bundle,
+    pub keys: crate::sig::Bundle,
+}
+
+impl WorkloadCredential {
+    /// Sign the admission transcript with the workload identity key. The
+    /// caller supplies the exact values the boundary recomputed; any drift
+    /// fails verification by name.
+    pub fn issue(
+        workload: &crate::wallet::Wallet,
+        policy_hash: &Hash,
+        cap: &Capability,
+        action_hash: &Hash,
+        context_hash: &Hash,
+        height: u64,
+    ) -> Result<Self, crate::error::Error> {
+        let unsigned = WorkloadCredential {
+            version: GUARD_POLICY_VERSION,
+            policy_hash: *policy_hash,
+            cap_hash: cap.signing_hash(),
+            action_hash: *action_hash,
+            context_hash: *context_hash,
+            nonce: cap.nonce,
+            height,
+            sigs: crate::sig::Bundle::default(),
+            keys: crate::sig::Bundle::default(),
+        };
+        let sigs = crate::l2::Auth::sigs_for(workload, &unsigned.signing_hash())?;
+        let keys = crate::l2::Auth::keys_for(workload)?;
+        Ok(WorkloadCredential {
+            sigs,
+            keys,
+            ..unsigned
+        })
+    }
+
+    pub fn signing_hash(&self) -> Hash {
+        let mut w = Writer::with_capacity(32 * 4 + 8 + 8 + 1);
+        w.u8(self.version)
+            .fixed(&self.policy_hash)
+            .fixed(&self.cap_hash)
+            .fixed(&self.action_hash)
+            .fixed(&self.context_hash)
+            .u64le(self.nonce)
+            .u64le(self.height);
+        sha256_dom(DOM_GUARD_WORKLOAD, &[&w.into_vec()])
+    }
+
+    pub fn serialize(&self) -> Vec<u8> {
+        let sigs = self.sigs.to_bytes();
+        let keys = self.keys.to_bytes();
+        let mut w = Writer::with_capacity(1 + 32 * 4 + 8 + 8 + sigs.len() + keys.len());
+        w.u8(self.version)
+            .fixed(&self.policy_hash)
+            .fixed(&self.cap_hash)
+            .fixed(&self.action_hash)
+            .fixed(&self.context_hash)
+            .u64le(self.nonce)
+            .u64le(self.height)
+            .raw(&sigs)
+            .raw(&keys);
+        w.into_vec()
+    }
+
+    pub fn deserialize(bytes: &[u8]) -> Result<Self, GuardError> {
+        let mut r = Reader::new(bytes);
+        let version = r.u8().map_err(|_| GuardError::Malformed("version"))?;
+        if version != GUARD_POLICY_VERSION {
+            return Err(GuardError::UnsupportedVersion(version));
+        }
+        let policy_hash = r
+            .fixed::<32>()
+            .map_err(|_| GuardError::Malformed("policy hash"))?;
+        let cap_hash = r
+            .fixed::<32>()
+            .map_err(|_| GuardError::Malformed("cap hash"))?;
+        let action_hash = r
+            .fixed::<32>()
+            .map_err(|_| GuardError::Malformed("action hash"))?;
+        let context_hash = r
+            .fixed::<32>()
+            .map_err(|_| GuardError::Malformed("context hash"))?;
+        let nonce = r.u64le().map_err(|_| GuardError::Malformed("nonce"))?;
+        let height = r.u64le().map_err(|_| GuardError::Malformed("height"))?;
+        let sigs = crate::sig::Bundle::from_reader(&mut r)
+            .map_err(|_| GuardError::Malformed("sigs bundle"))?;
+        let keys = crate::sig::Bundle::from_reader(&mut r)
+            .map_err(|_| GuardError::Malformed("keys bundle"))?;
+        if r.remaining() != 0 {
+            return Err(GuardError::Malformed("trailing bytes"));
+        }
+        Ok(WorkloadCredential {
+            version,
+            policy_hash,
+            cap_hash,
+            action_hash,
+            context_hash,
+            nonce,
+            height,
+            sigs,
+            keys,
+        })
+    }
+
+    /// Verify possession against the live grant and the boundary's recomputed
+    /// values. Every mismatch is a named refusal. The credential is only
+    /// valid at the height it names: a credential from another height is
+    /// stale, not merely old.
+    pub fn verify(
+        &self,
+        policy: &InfraPolicy,
+        cap: &Capability,
+        action_hash: &Hash,
+        context_hash: &Hash,
+        height: u64,
+    ) -> Result<(), GuardError> {
+        if self.version != GUARD_POLICY_VERSION {
+            return Err(GuardError::UnsupportedVersion(self.version));
+        }
+        if workload_key_fingerprint(&self.keys) != policy.workload_key {
+            return Err(GuardError::BadCredential(
+                "credential key is not the grant's workload key",
+            ));
+        }
+        crate::sig::verify_bundle(&self.sigs, &self.keys, &self.signing_hash())
+            .map_err(|_| GuardError::BadCredential("workload signature invalid"))?;
+        if self.policy_hash != policy.hash() {
+            return Err(GuardError::BadCredential("credential names another grant"));
+        }
+        if self.cap_hash != cap.signing_hash() {
+            return Err(GuardError::BadCredential(
+                "credential names another capability",
+            ));
+        }
+        if self.nonce != cap.nonce {
+            return Err(GuardError::BadCredential("credential names another nonce"));
+        }
+        if self.action_hash != *action_hash {
+            return Err(GuardError::BadCredential("credential names another action"));
+        }
+        if self.context_hash != *context_hash {
+            return Err(GuardError::BadCredential(
+                "credential names another context",
+            ));
+        }
+        if self.height != height {
+            return Err(GuardError::BadCredential("credential is stale"));
+        }
+        Ok(())
+    }
 }
 
 /// Gate answer. `NeedsApproval` commits nothing.
@@ -785,37 +1032,6 @@ impl GuardBook {
         Ok(book)
     }
 
-    /// Full check. On `Allow` the state commits. On `NeedsApproval` or any
-    /// `Deny` nothing mutates, so a refused burst cannot consume budget.
-    #[allow(clippy::too_many_arguments)]
-    pub fn authorize(
-        &mut self,
-        policy: &InfraPolicy,
-        cap: &Capability,
-        agent_id: &AgentId,
-        network_id: &str,
-        height: u64,
-        expected_action: &Hash,
-        expected_context: &Hash,
-        high_risk: bool,
-        approved: bool,
-    ) -> Decision {
-        match self.authorize_inner(
-            policy,
-            cap,
-            agent_id,
-            network_id,
-            height,
-            expected_action,
-            expected_context,
-            high_risk,
-            approved,
-        ) {
-            Ok(d) => d,
-            Err(e) => Decision::Deny(e),
-        }
-    }
-
     #[allow(clippy::too_many_arguments)]
     fn authorize_inner(
         &mut self,
@@ -829,7 +1045,11 @@ impl GuardBook {
         high_risk: bool,
         approved: bool,
     ) -> Result<Decision, GuardError> {
-        if policy.version != GUARD_POLICY_VERSION {
+        // Explicit compatibility rule: layout v1 and v2 both authorize; v1
+        // decodes with legacy risk defaults (see `InfraPolicy::deserialize`),
+        // so old grants keep working instead of bricking at the boundary.
+        // Unknown versions are refused here, loudly, before any other check.
+        if policy.version != GUARD_POLICY_VERSION && policy.version != GUARD_POLICY_VERSION_V1 {
             return Err(GuardError::UnsupportedVersion(policy.version));
         }
         if policy.network_id != network_id {
@@ -956,6 +1176,13 @@ impl GuardBook {
     ///   `NeedsApproval`, never de-escalate out of it. High-assurance calls
     ///   require a [`GuardApproval`] from the grant's designated approver
     ///   (independent of the owner): missing gates, forged denies.
+    /// - When the grant binds a workload identity key, the boundary requires
+    ///   a fresh [`WorkloadCredential`] proving possession of that key for
+    ///   this exact capability, action, context and height. Missing, forged,
+    ///   mismatched or stale credentials deny — before any nonce is
+    ///   consumed. Unbound (legacy) grants ignore any presented credential.
+    ///   This is the only authorization entry point: the raw unsigned path
+    ///   was removed, so integrations cannot bypass signature verification.
     #[allow(clippy::too_many_arguments)]
     pub fn authorize_signed(
         &mut self,
@@ -969,8 +1196,15 @@ impl GuardBook {
         node_audience: &Hash,
         high_risk: bool,
         approval: Option<&GuardApproval>,
+        workload_cred: Option<&WorkloadCredential>,
     ) -> Decision {
         if let Err(e) = signed.verify(policy) {
+            return Decision::Deny(e);
+        }
+        // Fail fast on misconfigured grants (e.g. owner-as-approver): the
+        // risk model is validated before any gating, so a bad grant can
+        // never silently degrade into self-approval.
+        if let Err(e) = policy.validate() {
             return Decision::Deny(e);
         }
         if signed.cap.audience != *node_audience {
@@ -983,6 +1217,16 @@ impl GuardBook {
         let effective_ctx = derive_context_hash(&policy.effective_workload(workload_id), height);
         if effective_ctx != signed.cap.context_hash {
             return Decision::Deny(GuardError::ContextMismatch);
+        }
+        if let Err(e) = check_workload_credential(
+            policy,
+            &signed.cap,
+            &recomputed,
+            &effective_ctx,
+            height,
+            workload_cred,
+        ) {
+            return Decision::Deny(e);
         }
         if high_risk || policy.requires_approval {
             match approval {
@@ -1022,12 +1266,16 @@ impl GuardBook {
 mod tests {
     use super::*;
 
+    fn test_owner() -> crate::wallet::Wallet {
+        crate::wallet::Wallet::from_private_key_bytes(&[9u8; 32], "test-owner").unwrap()
+    }
+
     fn test_policy() -> InfraPolicy {
         InfraPolicy {
             version: GUARD_POLICY_VERSION,
             network_id: "srct/testnet".to_string(),
             agent_id: [7u8; 20],
-            owner: [9u8; 20],
+            owner: test_owner().address().unwrap(),
             max_calls_per_window: 5,
             window_blocks: 100,
             valid_from_height: 10,
@@ -1037,11 +1285,21 @@ mod tests {
             requires_approval: false,
             approver: [0u8; 20],
             workload_id: [0u8; 32],
+            workload_key: [0u8; 32],
         }
     }
 
-    fn test_cap(policy: &InfraPolicy, nonce: u64, height: u64) -> (Capability, Hash, Hash) {
-        let action: Hash = [1u8; 32];
+    fn test_preimage() -> Vec<u8> {
+        b"test-action".to_vec()
+    }
+
+    fn test_cap(
+        policy: &InfraPolicy,
+        nonce: u64,
+        height: u64,
+    ) -> (SignedCapability, Vec<u8>, Hash, Hash) {
+        let preimage = test_preimage();
+        let action = derive_action_hash(&preimage);
         let workload: Hash = [2u8; 32];
         let ctx = derive_context_hash(&workload, height);
         let cap = Capability {
@@ -1052,24 +1310,53 @@ mod tests {
             nonce,
             audience: [0u8; 32],
         };
-        (cap, action, ctx)
+        let signed = SignedCapability::issue(&test_owner(), &cap).unwrap();
+        (signed, preimage, workload, ctx)
+    }
+
+    fn test_approval(
+        policy: &InfraPolicy,
+        cap: &Capability,
+        action: &Hash,
+        ctx: &Hash,
+        height: u64,
+    ) -> GuardApproval {
+        let owner = test_owner();
+        let draft = GuardApproval {
+            version: GUARD_POLICY_VERSION,
+            policy_hash: policy.hash(),
+            cap_hash: cap.signing_hash(),
+            agent_id: policy.agent_id,
+            action_hash: *action,
+            context_hash: *ctx,
+            expiry_height: height + 5,
+            sigs: crate::sig::Bundle::default(),
+            keys: crate::sig::Bundle::default(),
+        };
+        GuardApproval {
+            sigs: crate::l2::Auth::sigs_for(&owner, &draft.signing_hash()).unwrap(),
+            keys: crate::l2::Auth::keys_for(&owner).unwrap(),
+            ..draft
+        }
     }
 
     #[test]
     fn guard_allow_happy_path() {
         let policy = test_policy();
         let mut book = GuardBook::default();
-        let (cap, action, ctx) = test_cap(&policy, 1, 50);
-        let d = book.authorize(
+        let (signed, preimage, workload, _) = test_cap(&policy, 1, 50);
+        let d = book.authorize_signed(
             &policy,
-            &cap,
-            &[7u8; 20],
+            &signed,
+            &policy.agent_id,
             "srct/testnet",
             50,
-            &action,
-            &ctx,
+            &preimage,
+            &workload,
+            &[0u8; 32],
             false,
-            false,
+            None,
+            None,
         );
         assert_eq!(d, Decision::Allow);
     }
@@ -1078,32 +1365,36 @@ mod tests {
     fn guard_replay_denied() {
         let policy = test_policy();
         let mut book = GuardBook::default();
-        let (cap, action, ctx) = test_cap(&policy, 1, 50);
+        let (signed, preimage, workload, _) = test_cap(&policy, 1, 50);
         assert_eq!(
-            book.authorize(
+            book.authorize_signed(
                 &policy,
-                &cap,
-                &[7u8; 20],
+                &signed,
+                &policy.agent_id,
                 "srct/testnet",
                 50,
-                &action,
-                &ctx,
+                &preimage,
+                &workload,
+                &[0u8; 32],
                 false,
-                false
+                None,
+                None
             ),
             Decision::Allow
         );
-        let (cap2, action2, ctx2) = test_cap(&policy, 1, 51);
-        match book.authorize(
+        let (signed2, preimage2, workload2, _) = test_cap(&policy, 1, 51);
+        match book.authorize_signed(
             &policy,
-            &cap2,
-            &[7u8; 20],
+            &signed2,
+            &policy.agent_id,
             "srct/testnet",
             51,
-            &action2,
-            &ctx2,
+            &preimage2,
+            &workload2,
+            &[0u8; 32],
             false,
-            false,
+            None,
+            None,
         ) {
             Decision::Deny(GuardError::NonceNotIncreasing { .. }) => {}
             other => panic!("expected replay deny, got {other:?}"),
@@ -1114,18 +1405,19 @@ mod tests {
     fn guard_wrong_action_denied() {
         let policy = test_policy();
         let mut book = GuardBook::default();
-        let (cap, _, ctx) = test_cap(&policy, 1, 50);
-        let wrong_action: Hash = [0xFFu8; 32];
-        match book.authorize(
+        let (signed, _, workload, _) = test_cap(&policy, 1, 50);
+        match book.authorize_signed(
             &policy,
-            &cap,
-            &[7u8; 20],
+            &signed,
+            &policy.agent_id,
             "srct/testnet",
             50,
-            &wrong_action,
-            &ctx,
+            b"another-action",
+            &workload,
+            &[0u8; 32],
             false,
-            false,
+            None,
+            None,
         ) {
             Decision::Deny(GuardError::ActionMismatch) => {}
             other => panic!("expected action mismatch, got {other:?}"),
@@ -1136,17 +1428,19 @@ mod tests {
     fn guard_cross_principal_denied() {
         let policy = test_policy();
         let mut book = GuardBook::default();
-        let (cap, action, ctx) = test_cap(&policy, 1, 50);
-        match book.authorize(
+        let (signed, preimage, workload, _) = test_cap(&policy, 1, 50);
+        match book.authorize_signed(
             &policy,
-            &cap,
+            &signed,
             &[8u8; 20],
             "srct/testnet",
             50,
-            &action,
-            &ctx,
+            &preimage,
+            &workload,
+            &[0u8; 32],
             false,
-            false,
+            None,
+            None,
         ) {
             Decision::Deny(GuardError::CrossPrincipal) => {}
             other => panic!("expected cross principal deny, got {other:?}"),
@@ -1157,32 +1451,39 @@ mod tests {
     fn guard_high_risk_needs_approval() {
         let policy = test_policy();
         let mut book = GuardBook::default();
-        let (cap, action, ctx) = test_cap(&policy, 1, 50);
+        let (signed, preimage, workload, ctx) = test_cap(&policy, 1, 50);
         assert_eq!(
-            book.authorize(
+            book.authorize_signed(
                 &policy,
-                &cap,
-                &[7u8; 20],
+                &signed,
+                &policy.agent_id,
                 "srct/testnet",
                 50,
-                &action,
-                &ctx,
+                &preimage,
+                &workload,
+                &[0u8; 32],
                 true,
-                false
+                None,
+                None
             ),
             Decision::NeedsApproval
         );
+        // The legacy boolean is gone: only a verified owner-signed approval
+        // (legacy grants fall back to the owner) admits.
+        let approval = test_approval(&policy, &signed.cap, &signed.cap.action_hash, &ctx, 50);
         assert_eq!(
-            book.authorize(
+            book.authorize_signed(
                 &policy,
-                &cap,
-                &[7u8; 20],
+                &signed,
+                &policy.agent_id,
                 "srct/testnet",
                 50,
-                &action,
-                &ctx,
+                &preimage,
+                &workload,
+                &[0u8; 32],
                 true,
-                true
+                Some(&approval),
+                None
             ),
             Decision::Allow
         );
@@ -1194,28 +1495,30 @@ mod tests {
         let bytes = policy.serialize();
         let back = InfraPolicy::deserialize(&bytes).expect("roundtrip");
         assert_eq!(policy, back);
-        let (cap, _, _) = test_cap(&policy, 3, 60);
-        let cbytes = cap.serialize();
+        let (signed, _, _, _) = test_cap(&policy, 3, 60);
+        let cbytes = signed.cap.serialize();
         let cback = Capability::deserialize(&cbytes).expect("cap roundtrip");
-        assert_eq!(cap, cback);
+        assert_eq!(signed.cap, cback);
     }
 
     #[test]
     fn guard_book_roundtrip_encode() {
         let policy = test_policy();
         let mut book = GuardBook::default();
-        let (cap, action, ctx) = test_cap(&policy, 1, 50);
+        let (signed, preimage, workload, _) = test_cap(&policy, 1, 50);
         assert_eq!(
-            book.authorize(
+            book.authorize_signed(
                 &policy,
-                &cap,
-                &[7u8; 20],
+                &signed,
+                &policy.agent_id,
                 "srct/testnet",
                 50,
-                &action,
-                &ctx,
+                &preimage,
+                &workload,
+                &[0u8; 32],
                 false,
-                false
+                None,
+                None
             ),
             Decision::Allow
         );
@@ -1245,6 +1548,7 @@ mod tests {
             requires_approval: false,
             approver: [0u8; 20],
             workload_id: [0u8; 32],
+            workload_key: [0u8; 32],
         };
         (owner, policy)
     }
@@ -1270,6 +1574,7 @@ mod tests {
             requires_approval: true,
             approver: approver.address().unwrap(),
             workload_id: [5u8; 32],
+            workload_key: [0u8; 32],
         };
         (owner, approver, policy)
     }
@@ -1314,6 +1619,7 @@ mod tests {
                 &workload,
                 &[0u8; 32],
                 false,
+                None,
                 None
             ),
             Decision::Allow
@@ -1338,6 +1644,7 @@ mod tests {
                 &workload,
                 &[0u8; 32],
                 false,
+                None,
                 None
             ),
             Decision::Deny(GuardError::UnsignedCapability)
@@ -1363,19 +1670,24 @@ mod tests {
     fn zero_nonce_is_refused() {
         let policy = test_policy();
         let mut book = GuardBook::default();
-        let (mut cap, action, ctx) = test_cap(&policy, 1, 50);
-        cap.nonce = 0;
+        let (mut signed, preimage, workload, _) = test_cap(&policy, 1, 50);
+        signed.cap.nonce = 0;
+        // Re-sign: the boundary verifies the signature first, and a zero
+        // nonce must refuse as ZeroNonce — not as a signature failure.
+        signed = SignedCapability::issue(&test_owner(), &signed.cap).unwrap();
         assert_eq!(
-            book.authorize(
+            book.authorize_signed(
                 &policy,
-                &cap,
-                &[7u8; 20],
+                &signed,
+                &policy.agent_id,
                 "srct/testnet",
                 50,
-                &action,
-                &ctx,
+                &preimage,
+                &workload,
+                &[0u8; 32],
                 false,
-                false
+                None,
+                None
             ),
             Decision::Deny(GuardError::ZeroNonce)
         );
@@ -1406,6 +1718,7 @@ mod tests {
                 &workload,
                 &[0u8; 32],
                 true,
+                None,
                 None
             ),
             Decision::NeedsApproval
@@ -1453,7 +1766,8 @@ mod tests {
                 &workload,
                 &[0u8; 32],
                 true,
-                Some(&approval)
+                Some(&approval),
+                None
             ),
             Decision::Allow
         );
@@ -1483,7 +1797,8 @@ mod tests {
                 &workload,
                 &[0u8; 32],
                 true,
-                Some(&fake)
+                Some(&fake),
+                None
             ),
             Decision::Deny(GuardError::BadApproval(_))
         ));
@@ -1503,7 +1818,8 @@ mod tests {
                 &workload,
                 &[0u8; 32],
                 true,
-                Some(&approval)
+                Some(&approval),
+                None
             ),
             Decision::Deny(GuardError::BadApproval(_))
         ));
@@ -1529,6 +1845,7 @@ mod tests {
                 &workload,
                 &[0u8; 32],
                 false,
+                None,
                 None
             ),
             Decision::Deny(GuardError::ActionMismatch)
@@ -1559,6 +1876,7 @@ mod tests {
                 &bound,
                 &[0u8; 32],
                 false,
+                None,
                 None
             ),
             Decision::NeedsApproval
@@ -1598,7 +1916,8 @@ mod tests {
                 &bound,
                 &[0u8; 32],
                 false,
-                Some(&honest)
+                Some(&honest),
+                None
             ),
             Decision::Allow
         );
@@ -1622,7 +1941,8 @@ mod tests {
                 &bound,
                 &[0u8; 32],
                 false,
-                Some(&owner_signed)
+                Some(&owner_signed),
+                None
             ),
             Decision::Deny(GuardError::BadApproval(_))
         ));
@@ -1638,19 +1958,23 @@ mod tests {
         let workload = [2u8; 32];
         let height = 50u64;
         let cap = owned_cap(&policy, b"deploy-42", &workload, height, 1);
+        let signed = SignedCapability::issue(&owner, &cap).unwrap();
         let mut book = GuardBook::default();
-        let ctx = derive_context_hash(&workload, height);
+        // validate() runs inside the admission path, so the misconfigured
+        // grant fails closed here too — never silently self-approves.
         assert_eq!(
-            book.authorize(
+            book.authorize_signed(
                 &policy,
-                &cap,
+                &signed,
                 &policy.agent_id,
                 "srct/testnet",
                 height,
-                &derive_action_hash(b"deploy-42"),
-                &ctx,
+                b"deploy-42",
+                &workload,
+                &[0u8; 32],
                 false,
-                true,
+                None,
+                None,
             ),
             Decision::Deny(GuardError::SelfApproval)
         );
@@ -1681,6 +2005,7 @@ mod tests {
                 &[9u8; 32],
                 &[0u8; 32],
                 true,
+                None,
                 None
             ),
             Decision::NeedsApproval
@@ -1703,6 +2028,7 @@ mod tests {
                 &[9u8; 32],
                 &[0u8; 32],
                 true,
+                None,
                 None
             ),
             Decision::Deny(GuardError::ContextMismatch)
@@ -1733,6 +2059,7 @@ mod tests {
                 &workload,
                 &node_a,
                 false,
+                None,
                 None
             ),
             Decision::Allow
@@ -1750,6 +2077,7 @@ mod tests {
                 &workload,
                 &node_b,
                 false,
+                None,
                 None
             ),
             Decision::Deny(GuardError::WrongAudience)
@@ -1764,12 +2092,302 @@ mod tests {
         let policy = test_policy();
         let mut v2 = policy.serialize();
         assert_eq!(v2[0], GUARD_POLICY_VERSION);
-        v2.truncate(v2.len() - 53);
+        v2.truncate(v2.len() - (1 + 20 + 32 + 32)); // risk + approver + workload + workload key
         v2[0] = 1;
         let back = InfraPolicy::deserialize(&v2).expect("v1 grant decodes");
         assert!(!back.requires_approval);
         assert_eq!(back.approver, [0u8; 20]);
         assert_eq!(back.workload_id, [0u8; 32]);
+        assert_eq!(back.workload_key, [0u8; 32]);
         assert_eq!(back.owner, policy.owner);
+    }
+
+    #[test]
+    fn v1_grant_authorizes_with_legacy_semantics() {
+        // Compatibility rule end to end: a v1 grant decodes AND authorizes —
+        // decode is the migration, and signed bytes are never rewritten, so
+        // the hash (and every signature over it) is stable.
+        let owner = test_owner();
+        let mut policy = test_policy();
+        let mut v2 = policy.serialize();
+        assert_eq!(v2[0], GUARD_POLICY_VERSION);
+        v2.truncate(v2.len() - (1 + 20 + 32 + 32)); // risk + approver + workload + workload key
+        v2[0] = 1;
+        policy = InfraPolicy::deserialize(&v2).expect("v1 grant decodes");
+        assert_eq!(policy.version, 1);
+        assert_eq!(policy.serialize(), v2, "v1 re-serializes byte-identically");
+        let workload = [2u8; 32];
+        let height = 50u64;
+        let preimage = test_preimage();
+        let cap = Capability {
+            policy_hash: policy.hash(),
+            action_hash: derive_action_hash(&preimage),
+            context_hash: derive_context_hash(&workload, height),
+            expiry_height: height + 10,
+            nonce: 1,
+            audience: [0u8; 32],
+        };
+        assert_eq!(
+            cap.policy_hash,
+            policy_hash_of(&v2),
+            "capability names the original signed bytes"
+        );
+        let signed = SignedCapability::issue(&owner, &cap).unwrap();
+        let mut book = GuardBook::default();
+        assert_eq!(
+            book.authorize_signed(
+                &policy,
+                &signed,
+                &policy.agent_id,
+                "srct/testnet",
+                height,
+                &preimage,
+                &workload,
+                &[0u8; 32],
+                false,
+                None,
+                None,
+            ),
+            Decision::Allow
+        );
+    }
+
+    fn policy_hash_of(bytes: &[u8]) -> Hash {
+        sha256_dom(DOM_GUARD_POLICY, &[bytes])
+    }
+
+    #[test]
+    fn unsupported_envelope_versions_are_refused() {
+        let (owner, policy) = owned_policy();
+        let workload = [2u8; 32];
+        let height = 50u64;
+        let cap = owned_cap(&policy, b"deploy-42", &workload, height, 1);
+        let mut bad = SignedCapability::issue(&owner, &cap).unwrap();
+        bad.version = 99;
+        assert!(matches!(
+            SignedCapability::deserialize(&bad.serialize()),
+            Err(GuardError::UnsupportedVersion(99))
+        ));
+        let approval = GuardApproval {
+            version: 99,
+            policy_hash: policy.hash(),
+            cap_hash: cap.signing_hash(),
+            agent_id: policy.agent_id,
+            action_hash: cap.action_hash,
+            context_hash: cap.context_hash,
+            expiry_height: height + 5,
+            sigs: crate::sig::Bundle::default(),
+            keys: crate::sig::Bundle::default(),
+        };
+        // serialize writes the (bad) version byte; deserialize refuses it
+        // before any signature math runs.
+        assert!(matches!(
+            GuardApproval::deserialize(&approval.serialize()),
+            Err(GuardError::UnsupportedVersion(99))
+        ));
+        let cred = WorkloadCredential {
+            version: 99,
+            policy_hash: policy.hash(),
+            cap_hash: cap.signing_hash(),
+            action_hash: cap.action_hash,
+            context_hash: cap.context_hash,
+            nonce: 1,
+            height,
+            sigs: crate::sig::Bundle::default(),
+            keys: crate::sig::Bundle::default(),
+        };
+        assert!(matches!(
+            WorkloadCredential::deserialize(&cred.serialize()),
+            Err(GuardError::UnsupportedVersion(99))
+        ));
+        // Malformed envelopes (truncated, trailing bytes) are malformed,
+        // never reinterpreted.
+        let valid = GuardApproval {
+            version: GUARD_POLICY_VERSION,
+            ..approval.clone()
+        };
+        let mut truncated = valid.serialize();
+        truncated.truncate(truncated.len() - 1);
+        assert!(matches!(
+            GuardApproval::deserialize(&truncated),
+            Err(GuardError::Malformed(_))
+        ));
+        let mut trailed = valid.serialize();
+        trailed.push(0xFF);
+        assert!(matches!(
+            GuardApproval::deserialize(&trailed),
+            Err(GuardError::Malformed(_))
+        ));
+    }
+
+    /// A key-bound grant: the owner pins the workload identity fingerprint.
+    /// Returns owner wallet, workload wallet, policy.
+    fn owned_keybound_policy() -> (crate::wallet::Wallet, crate::wallet::Wallet, InfraPolicy) {
+        use crate::agent::{derive_agent_id, AgentRole};
+        let owner = crate::wallet::Wallet::from_private_key_bytes(&[8u8; 32], "kb-owner").unwrap();
+        let workload = crate::wallet::Wallet::new_random("workload-id-key");
+        let addr = owner.address().unwrap();
+        let workload_keys = crate::l2::Auth::keys_for(&workload).unwrap();
+        let policy = InfraPolicy {
+            version: GUARD_POLICY_VERSION,
+            network_id: "srct/testnet".to_string(),
+            agent_id: derive_agent_id("srct/testnet", AgentRole::Machine, &addr),
+            owner: addr,
+            max_calls_per_window: 5,
+            window_blocks: 100,
+            valid_from_height: 10,
+            valid_until_height: 1000,
+            revoked: false,
+            parent_agent_id: None,
+            requires_approval: false,
+            approver: [0u8; 20],
+            workload_id: [0u8; 32],
+            workload_key: workload_key_fingerprint(&workload_keys),
+        };
+        (owner, workload, policy)
+    }
+
+    #[test]
+    fn workload_credential_allows_and_forgery_denies() {
+        let (owner, workload, policy) = owned_keybound_policy();
+        let height = 50u64;
+        let wid = [3u8; 32];
+        let preimage = b"run-job-7".to_vec();
+        let action = derive_action_hash(&preimage);
+        let ctx = derive_context_hash(&wid, height);
+        let cap = Capability {
+            policy_hash: policy.hash(),
+            action_hash: action,
+            context_hash: ctx,
+            expiry_height: height + 10,
+            nonce: 1,
+            audience: [0u8; 32],
+        };
+        let signed = SignedCapability::issue(&owner, &cap).unwrap();
+        let cred =
+            WorkloadCredential::issue(&workload, &policy.hash(), &cap, &action, &ctx, height)
+                .unwrap();
+        // The grant names exactly the proving key.
+        assert_eq!(
+            workload_key_fingerprint(&cred.keys),
+            policy.workload_key,
+            "grant must name the proving key"
+        );
+        // Roundtrip preserves the credential.
+        assert_eq!(
+            WorkloadCredential::deserialize(&cred.serialize()).unwrap(),
+            cred
+        );
+
+        // Full admission with possession proof: allow.
+        let mut book = GuardBook::default();
+        assert_eq!(
+            book.authorize_signed(
+                &policy,
+                &signed,
+                &policy.agent_id,
+                "srct/testnet",
+                height,
+                &preimage,
+                &wid,
+                &[0u8; 32],
+                false,
+                None,
+                Some(&cred),
+            ),
+            Decision::Allow
+        );
+
+        // Missing credential on a key-bound grant: deny, commits nothing.
+        let mut book2 = GuardBook::default();
+        assert_eq!(
+            book2.authorize_signed(
+                &policy,
+                &signed,
+                &policy.agent_id,
+                "srct/testnet",
+                height,
+                &preimage,
+                &wid,
+                &[0u8; 32],
+                false,
+                None,
+                None,
+            ),
+            Decision::Deny(GuardError::BadCredential(
+                "grant requires a workload credential"
+            ))
+        );
+        assert!(book2.is_empty(), "a credential-less call commits no nonce");
+
+        // Impersonation: a stranger's key proves nothing — fingerprint
+        // mismatch denies before any signature math can pass.
+        let stranger = crate::wallet::Wallet::new_random("stranger-workload");
+        let fake =
+            WorkloadCredential::issue(&stranger, &policy.hash(), &cap, &action, &ctx, height)
+                .unwrap();
+        let mut book3 = GuardBook::default();
+        assert!(matches!(
+            book3.authorize_signed(
+                &policy,
+                &signed,
+                &policy.agent_id,
+                "srct/testnet",
+                height,
+                &preimage,
+                &wid,
+                &[0u8; 32],
+                false,
+                None,
+                Some(&fake),
+            ),
+            Decision::Deny(GuardError::BadCredential(_))
+        ));
+
+        // Stale credential: proved for another height — replayed proof denies.
+        let stale =
+            WorkloadCredential::issue(&workload, &policy.hash(), &cap, &action, &ctx, height + 1)
+                .unwrap();
+        let mut book4 = GuardBook::default();
+        assert!(matches!(
+            book4.authorize_signed(
+                &policy,
+                &signed,
+                &policy.agent_id,
+                "srct/testnet",
+                height,
+                &preimage,
+                &wid,
+                &[0u8; 32],
+                false,
+                None,
+                Some(&stale),
+            ),
+            Decision::Deny(GuardError::BadCredential(_))
+        ));
+
+        // Mismatched binding: credential proved for another capability.
+        let mut other = cap.clone();
+        other.nonce = 2;
+        let wrong =
+            WorkloadCredential::issue(&workload, &policy.hash(), &other, &action, &ctx, height)
+                .unwrap();
+        let mut book5 = GuardBook::default();
+        assert!(matches!(
+            book5.authorize_signed(
+                &policy,
+                &signed,
+                &policy.agent_id,
+                "srct/testnet",
+                height,
+                &preimage,
+                &wid,
+                &[0u8; 32],
+                false,
+                None,
+                Some(&wrong),
+            ),
+            Decision::Deny(GuardError::BadCredential(_))
+        ));
     }
 }

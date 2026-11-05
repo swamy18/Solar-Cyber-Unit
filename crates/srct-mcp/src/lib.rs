@@ -43,8 +43,8 @@ use serde_json::{json, Value};
 
 use srct_core::agent::{verify_authorization, PolicyBook, SpendPolicy};
 use srct_core::guard::{
-    derive_action_hash, derive_context_hash, Decision as GuardDecision, GuardApproval, GuardBook,
-    InfraPolicy, SignedCapability,
+    check_workload_credential, derive_action_hash, derive_context_hash, Decision as GuardDecision,
+    GuardApproval, GuardBook, InfraPolicy, SignedCapability, WorkloadCredential,
 };
 use srct_core::hash::{address_from_hex, hash_from_hex, hash_to_hex};
 use srct_core::payment::MachinePayment;
@@ -348,6 +348,19 @@ impl SolarCyberUnitMcp {
         if cap.context_hash != expected_ctx {
             return Err(McpError::refused("guard_refused", "context hash mismatch"));
         }
+        // Possession: the one shared rule — key-bound grants deny without a
+        // fresh credential for this exact admission.
+        let cred = workload_cred_field(request)?;
+        if let Err(e) = check_workload_credential(
+            &policy,
+            cap,
+            &action_hash,
+            &expected_ctx,
+            height,
+            cred.as_ref(),
+        ) {
+            return Err(McpError::refused("guard_refused", e.to_string()));
+        }
         if height >= cap.expiry_height {
             return Err(McpError::refused("guard_refused", "capability expired"));
         }
@@ -448,6 +461,7 @@ impl SolarCyberUnitMcp {
                     .map_err(|e| McpError::refused("approval_invalid", e.to_string()))?,
             ),
         };
+        let workload_cred = workload_cred_field(request)?;
         match self.guards.authorize_signed(
             &policy,
             &signed,
@@ -459,6 +473,7 @@ impl SolarCyberUnitMcp {
             &[0u8; 32],
             high_risk,
             approval.as_ref(),
+            workload_cred.as_ref(),
         ) {
             GuardDecision::Allow => {
                 Ok(json!({"decision": "allow", "policy_hash": hash_to_hex(&policy.hash())}))
@@ -1065,6 +1080,24 @@ fn hex_field(v: &Value, name: &str) -> Result<Vec<u8>, McpError> {
         return Err(McpError::bad(format!("{name} over the hex cap")));
     }
     hex::decode(s).map_err(|e| McpError::bad(format!("{name}: {e}")))
+}
+
+/// Optional workload proof-of-possession envelope (`workload_cred_hex`).
+/// Absent means no proof presented — which denies on key-bound grants and is
+/// ignored on unbound ones, per the one shared rule. Malformed envelopes are
+/// a bad request; semantically wrong ones refuse at the gate, not here.
+fn workload_cred_field(request: &Value) -> Result<Option<WorkloadCredential>, McpError> {
+    let Some(s) = request.get("workload_cred_hex").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    let raw = s.trim().trim_start_matches("0x");
+    if raw.len() > MAX_HEX_FIELD_CHARS {
+        return Err(McpError::bad("workload_cred_hex over the hex cap"));
+    }
+    let bytes = hex::decode(raw).map_err(|e| McpError::bad(format!("workload_cred_hex: {e}")))?;
+    WorkloadCredential::deserialize(&bytes)
+        .map(Some)
+        .map_err(|e| McpError::refused("credential_invalid", e.to_string()))
 }
 
 fn bundle_from_bytes(bytes: &[u8]) -> Result<srct_core::sig::Bundle, McpError> {

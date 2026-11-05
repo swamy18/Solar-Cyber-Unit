@@ -1458,6 +1458,7 @@ Smart Gate capability & owner-signed envelope, nonzero strictly increasing nonce
 Smart Gate approval & designated-approver signature bound to the exact instance & gate when missing, refuse when forged or undesignated \\
 Smart Gate action & canonical hash recomputed from the executed preimage & refuse on any drift \\
 Smart Gate scope & audience must equal the enforcing node & refuse when scoped elsewhere \\
+Smart Gate workload & fresh proof of the pinned identity key & refuse when missing, forged, mismatched, or stale \\
 Settlement link & one payment, one transaction & refuse as already settled \\
 Escrow-to-exit binding & one escrow, one exit & refuse as already settled \\
 Exit identity & $(\text{owner},\text{nonce})$ consumed set & release exactly
@@ -1490,7 +1491,9 @@ Five holes were closed as structural rules rather than as wording. First, a
 bare capability is public bytes anyone can write down (grant hash, action,
 expiry, nonce are all observable or guessable), so every boundary requires an
 \emph{owner-signed} capability envelope and verifies the signature before
-anything else; forgeries and tampered fields are refused by name. Second,
+anything else; forgeries and tampered fields are refused by name, and the raw
+unsigned admission path was deleted --- \texttt{authorize\_signed} is the
+only entry point, so no integration can bypass verification. Second,
 high-risk authorisation no longer accepts a caller-supplied boolean: risk
 classification lives in the grant itself (a high-assurance bit the owner sets
 at issuance), OR-ed with the caller's flag on every boundary, so a caller
@@ -1501,8 +1504,14 @@ independent of the owner: a grant that names its owner as approver is refused
 at registration and on every admission path, and an owner-signed approval on
 a grant that names someone else denies. The approval itself binds the exact
 capability instance (grant and capability hashes, agent, action, context,
-expiry) under its own domain tag with its own 30-height lifetime cap. Third,
-the boundary recomputes the canonical action hash from the preimage it
+expiry) under its own domain tag with its own 30-height lifetime cap. A bound
+workload identity goes one step further than a bound workload id: the grant
+pins the workload key's fingerprint, and the executing process proves
+possession with a fresh per-execution credential over the exact admission
+transcript, verified \emph{inside} admission on every boundary --- binding an
+id stops id-swapping, but only the key proof authenticates the process, and
+the key proof cannot be replayed for another capability, action, or height.
+Third, the boundary recomputes the canonical action hash from the preimage it
 observes and refuses on any drift, so a permission granted for one operation
 cannot be executed as another; the preimage is required input at admission,
 not an optional hint, and the worker SDK ships the in-process reference
@@ -1513,13 +1522,16 @@ grant, persisted across restarts, and refusals commit nothing; revocation
 kills the grant and every registered descendant, the stateless pre-check
 consults the same revocation set as the stateful admission, and registry and
 book capacities refuse rather than evict; owners scope high-value capabilities
-to one enforcing node by audience, which denies mis-scoped replay by name.
-Fifth, the MCP transport cannot be aimed at an attacker: endpoints are
-\texttt{host:port} only, loopback is the only target that ever receives the
-API bearer token, anything else needs an explicit allow-list plus an opt-in
-flag and still never receives the token over the plaintext transport,
-redirects are errors rather than followed hops, and credentials never enter
-error strings or logs.
+to one enforcing node by audience, which denies mis-scoped replay by name;
+and the worker execution boundary asks its authority on every run before the
+local book and before the executor, forgetting local state on a stale answer
+and refusing outright when the authority is unreachable --- there is no
+offline fallback and no cached-allow. Fifth, the MCP transport cannot be aimed
+at an attacker: endpoints are \texttt{host:port} only, loopback is the only
+target that ever receives the API bearer token, anything else needs an
+explicit allow-list plus an opt-in flag and still never receives the token
+over the plaintext transport, redirects are errors rather than followed hops,
+and credentials never enter error strings or logs.
 
 The authority model is honest about its limits. The node's grant registry,
 revocation set and capability book are authoritative \emph{per node}; MCP-local
@@ -1528,15 +1540,24 @@ same owner-signed bytes and replicating revocations, not by a cross-node
 lock. The residual multi-node replay is mitigated, not eliminated, by
 audience scoping: a capability scoped to one node denies elsewhere by name,
 while unscoped capabilities remain independently admittable everywhere ---
-which is why high-value capabilities should be scoped. Workload identity is
-likewise bound, not trusted: when a grant names a workload, every boundary
-recomputes the context from the bound id and ignores any caller-supplied id;
-only legacy unbound grants trust the presented id. Gate audit entries are
-node-local, bounded, hash-chained and export-verifiable for auditors and
-insurers; they are not anchored to the chain, and the documentation no longer
-claims otherwise. Capability and approval lifetimes are measured in heights
-throughout: the gate is deterministic and clock-free, so any ``minutes''
-phrasing in earlier drafts was a gloss, not the rule.
+which is why high-value capabilities should be scoped. The worker narrows the
+window further by checking the authority on every execution, but a revocation
+that lands between that check and the executor stops the \emph{next}
+execution, not the current one; no lock is claimed. Workload identity is
+bound \emph{and} proved, not trusted: when a grant names a workload, every
+boundary recomputes the context from the bound id and ignores any
+caller-supplied id, and when it pins a workload key only a fresh
+proof-of-possession signature admits --- only legacy keyless grants trust
+without proof, and only legacy unbound grants trust the presented id.
+Compatibility is explicit, not accidental: layout v1 grants decode with
+legacy semantics, authorize, and re-serialize byte-identically (hashes and
+old signatures stay stable), while unknown versions refuse loudly before any
+other check. Gate audit entries are node-local, bounded, hash-chained and
+export-verifiable for auditors and insurers; they are not anchored to the
+chain, and the documentation no longer claims otherwise. Capability and
+approval lifetimes are measured in heights throughout: the gate is
+deterministic and clock-free, so any ``minutes'' phrasing in earlier drafts
+was a gloss, not the rule.
 
 \subsection{The lying-root rule}
 \label{sec:lyingroot}
@@ -2263,14 +2284,18 @@ transport.} Gate decisions are enforced by whichever node or runtime observes th
 bytes; there is no cross-node capability lock, and multi-node deployments
 converge by registering the same owner-signed grants, replicating revocations,
 and scoping high-value capabilities to one node by audience. Unscoped
-capabilities remain independently admittable everywhere. The worker and MCP
-HTTP clients are plaintext \texttt{host:port} transports with no TLS: loopback
-is the supported shape, remote endpoints need an explicit allow-list and still
-never receive the bearer token, so production remote use requires a
-TLS-terminating proxy and a revisited bearer model. Gate audit receipts are
-node-local and export-verifiable, not chain-anchored; the worker SDK's
-in-process \texttt{GuardGate} is the implemented reference boundary, while
-managed-cluster admission webhooks are designed but not implemented.
+capabilities remain independently admittable everywhere. The worker checks its
+authority on every execution, but that check and the execution are two steps:
+a revocation landing between them stops the next execution, not the current
+one. The worker and MCP HTTP clients are plaintext \texttt{host:port}
+transports with no TLS: loopback is the supported shape, remote endpoints need
+an explicit allow-list and still never receive the bearer token, so production
+remote use requires a TLS-terminating proxy and a revisited bearer model.
+Gate audit receipts are node-local and export-verifiable, not chain-anchored;
+the worker SDK's in-process \texttt{GuardGate} is the implemented reference
+boundary, while managed-cluster admission webhooks are designed but not
+implemented. Workload identity is software keys by default; hardware-backed
+attestation (TPM/TEE quotes) is future work, not a claim.
 
 
 \section{Conclusion}
@@ -2434,6 +2459,10 @@ both.
 \item A Smart Gate admission authorises the recomputed action, not a claimed
   hash: the boundary re-derives the canonical hash from the executed preimage
   and refuses on any drift; a refusal commits no window or nonce state.
+\item A Smart Gate execution is fresh and proved: the worker asks its
+  authority on every run (revoked or unreachable never executes) and, on
+  key-bound grants, only a fresh proof of possession of the pinned workload
+  key admits; the raw unsigned path does not exist.
 \item A revoked Smart Gate grant stays dead, with its descendants, across
   restarts and on the stateless pre-check as well as the stateful admission.
 \item A destroyed state file is a refusal to start, never an empty book.

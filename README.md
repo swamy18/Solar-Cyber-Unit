@@ -770,26 +770,35 @@ answered as `allow / deny / needs_approval` anywhere, settled as trust on Solar.
   presented; a missing approval gates, a forged one denies, an owner-signed
   one on a grant that names someone else denies, and the old `approved: true`
   boolean is rejected everywhere. Grants can bind a workload id (caller ids
-  then ignored) and capabilities can scope to one enforcing node
-  (`SRCT_GUARD_AUDIENCE`). Stateless pre-checks (`guard.check`,
-  `/v1/guard/decide`) commit nothing; stateful admission (`guard.authorize`,
+  then ignored) and a workload identity key (only a fresh per-execution
+  possession proof admits — impersonation, replay, or stale proofs deny), and
+  capabilities can scope to one enforcing node (`SRCT_GUARD_AUDIENCE`). The
+  raw unsigned admission path was deleted: `authorize_signed` is the only
+  entry point. Stateless pre-checks (`guard.check`, `/v1/guard/decide`)
+  commit nothing; stateful admission (`guard.authorize`,
   `/v1/guard/authorize`) enforces window + nonce and is the execution boundary,
-  as is the worker SDK's `GuardGate::execute`, which recomputes the action
-  hash from the exact work about to run before invoking the executor.
+  as is the worker SDK's `GuardGate::execute`, which asks the authority first
+  (revoked or unreachable means no execution — no offline fallback), proves
+  workload possession fresh, recomputes the action hash from the exact work
+  about to run, and only then invokes the executor.
   Refusals consume no budget and are named (`action_mismatch`,
   `context_mismatch`, `expired`, `nonce_reuse`, `zero_nonce`,
-  `unsigned_capability`, `bad_approval`, `self_approval`, `wrong_audience`,
-  `cross_principal`, `window_exhausted`).
+  `unsigned_capability`, `bad_approval`, `bad_credential`, `self_approval`,
+  `wrong_audience`, `cross_principal`, `window_exhausted`).
 - **Replay, revocation, state:** nonces are nonzero and strictly increasing per
   grant, persisted in the node's `GuardBook` across restarts (`state.bin`);
   revocation kills the grant and every registered descendant and persists in a
   revocation set the stateless pre-check also consults. The node's registry +
   revocation set + book is authoritative per node; MCP-local gate state is a
-  non-authoritative cache. There is no cross-node nonce lock: scope
-  high-value capabilities to one node via `audience` (mis-scoped use denies
-  by name); unscoped capabilities stay independently admittable everywhere.
-  Registry (1024 grants) and book (1024 grants) refuse when full rather than
-  evicting.
+  non-authoritative cache. The worker execution boundary asks the authority on
+  every run before executing — revoked denies and forgets local state,
+  unreachable denies without touching it. There is no cross-node nonce lock:
+  scope high-value capabilities to one node via `audience` (mis-scoped use
+  denies by name); unscoped capabilities stay independently admittable
+  everywhere. A revocation landing between the authority check and execution
+  stops the next execution, not the current one. Registry (1024 grants) and
+  book (1024 grants) refuse when full rather than evicting. v1 grants decode
+  and authorize with legacy semantics; unknown versions refuse loudly.
 - **MCP credential rule:** the MCP client dials `host:port` only; loopback is
   trusted and is the only target that ever receives the API bearer token.
   Anything else needs `SRCT_MCP_TRUSTED_ENDPOINTS` + `SRCT_MCP_ALLOW_REMOTE=1`

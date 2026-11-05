@@ -731,6 +731,7 @@ fn guard_check_requires_a_signed_capability() {
         requires_approval: false,
         approver: [0u8; 20],
         workload_id: [0u8; 32],
+        workload_key: [0u8; 32],
     };
     let workload = [2u8; 32];
     let action = [1u8; 32];
@@ -817,6 +818,7 @@ fn guard_authorize_recomputes_the_action_and_rejects_boolean_approval() {
         requires_approval: false,
         approver: [0u8; 20],
         workload_id: [0u8; 32],
+        workload_key: [0u8; 32],
     };
     let workload = [4u8; 32];
     let preimage = b"deploy-42";
@@ -969,6 +971,7 @@ fn guard_check_enforces_owner_set_risk_and_scoped_caps_refuse_locally() {
         requires_approval: true,
         approver: approver.address().unwrap(),
         workload_id: [6u8; 32],
+        workload_key: [0u8; 32],
     };
     let preimage = b"deploy-42";
     let cap = Capability {
@@ -1015,6 +1018,90 @@ fn guard_check_enforces_owner_set_risk_and_scoped_caps_refuse_locally() {
         }))
         .expect_err("a scoped capability must not admit locally");
     assert_eq!(err.code, "guard_refused");
+}
+
+#[test]
+fn guard_credential_proves_possession_over_mcp() {
+    use srct_core::guard::{
+        derive_action_hash, derive_context_hash, workload_key_fingerprint, Capability, InfraPolicy,
+        SignedCapability, WorkloadCredential, GUARD_POLICY_VERSION,
+    };
+    let owner = wallet(41);
+    let owner_addr = owner.address().unwrap();
+    let workload_wallet = wallet(42);
+    let workload_keys = srct_core::l2::Auth::keys_for(&workload_wallet).unwrap();
+    let agent_id = derive_agent_id(NET, AgentRole::Machine, &owner_addr);
+    let policy = InfraPolicy {
+        version: GUARD_POLICY_VERSION,
+        network_id: NET.to_string(),
+        agent_id,
+        owner: owner_addr,
+        max_calls_per_window: 5,
+        window_blocks: 100,
+        valid_from_height: 0,
+        valid_until_height: 10_000,
+        revoked: false,
+        parent_agent_id: None,
+        requires_approval: false,
+        approver: [0u8; 20],
+        workload_id: [0u8; 32],
+        workload_key: workload_key_fingerprint(&workload_keys),
+    };
+    let workload = [4u8; 32];
+    let preimage = b"mcp-job-9";
+    let action = derive_action_hash(preimage);
+    let ctx = derive_context_hash(&workload, HEIGHT);
+    let cap = Capability {
+        policy_hash: policy.hash(),
+        action_hash: action,
+        context_hash: ctx,
+        expiry_height: HEIGHT + 10,
+        nonce: 1,
+        audience: [0u8; 32],
+    };
+    let signed = SignedCapability::issue(&owner, &cap).unwrap();
+    let base = || {
+        json!({
+            "op": "guard.authorize",
+            "network_id": NET,
+            "height": HEIGHT,
+            "policy_hex": hex::encode(policy.serialize()),
+            "cap_hex": hex::encode(signed.serialize()),
+            "agent_id_hex": hex::encode(agent_id),
+            "action_preimage_hex": hex::encode(preimage),
+            "workload_id_hex": hex::encode(workload),
+        })
+    };
+    // No proof: the bound grant denies.
+    let mut mcp = SolarCyberUnitMcp::new();
+    let err = mcp
+        .handle(&base())
+        .expect_err("a key-bound grant must deny without proof");
+    assert_eq!(err.code, "guard_refused");
+    // Impersonation: a stranger's key denies.
+    let stranger = wallet(43);
+    let fake =
+        WorkloadCredential::issue(&stranger, &policy.hash(), &cap, &action, &ctx, HEIGHT).unwrap();
+    let mut mcp2 = SolarCyberUnitMcp::new();
+    let mut forged = base();
+    forged["workload_cred_hex"] = json!(hex::encode(fake.serialize()));
+    let err = mcp2.handle(&forged).expect_err("impersonation must deny");
+    assert_eq!(err.code, "guard_refused");
+    // Honest proof of possession: allow.
+    let cred = WorkloadCredential::issue(
+        &workload_wallet,
+        &policy.hash(),
+        &cap,
+        &action,
+        &ctx,
+        HEIGHT,
+    )
+    .unwrap();
+    let mut mcp3 = SolarCyberUnitMcp::new();
+    let mut ok = base();
+    ok["workload_cred_hex"] = json!(hex::encode(cred.serialize()));
+    let out = mcp3.handle(&ok).expect("possession proof admits");
+    assert_eq!(out["decision"], "allow");
 }
 
 #[test]

@@ -22,7 +22,8 @@ use srct_core::agent::{
 use srct_core::chain::Chain;
 use srct_core::credit::Reservation;
 use srct_core::guard::{
-    derive_context_hash, Capability, Decision as GuardDecision, InfraPolicy, GUARD_POLICY_VERSION,
+    derive_action_hash, derive_context_hash, Capability, Decision as GuardDecision, InfraPolicy,
+    SignedCapability, GUARD_POLICY_VERSION,
 };
 use srct_core::hash::Hash;
 use srct_core::params::NetworkParams;
@@ -61,8 +62,14 @@ fn policy() -> SpendPolicy {
     }
 }
 
+fn guard_owner() -> Wallet {
+    // Deterministic: the persisted bytes must be reproducible, so the grant
+    // owner is derived from fixed key material rather than fresh randomness.
+    Wallet::from_private_key_bytes(&[7u8; 32], "persist-guard-owner").unwrap()
+}
+
 fn guard_policy() -> InfraPolicy {
-    let owner = [7u8; 20];
+    let owner = guard_owner().address().unwrap();
     InfraPolicy {
         version: GUARD_POLICY_VERSION,
         network_id: NET.into(),
@@ -77,6 +84,7 @@ fn guard_policy() -> InfraPolicy {
         requires_approval: false,
         approver: [0u8; 20],
         workload_id: [0u8; 32],
+        workload_key: [0u8; 32],
     }
 }
 
@@ -202,13 +210,15 @@ fn populate(node: &mut SharedNode) {
 
     // A Smart Gate grant the node enforces, plus one consumed capability:
     // the window count and nonce must survive the restart, or a replay
-    // would look fresh.
+    // would look fresh. Admission goes through the signed boundary — the
+    // raw unsigned path no longer exists.
     let gp = guard_policy();
     node.guard_registry.insert(gp.hash(), gp.clone());
     node.guard_revoked.insert([5u8; 32]);
     let workload = [2u8; 32];
     let ctx = derive_context_hash(&workload, 10);
-    let action = [1u8; 32];
+    let preimage = b"persist-work";
+    let action = derive_action_hash(preimage);
     let cap = Capability {
         policy_hash: gp.hash(),
         action_hash: action,
@@ -217,16 +227,19 @@ fn populate(node: &mut SharedNode) {
         nonce: 1,
         audience: [0u8; 32],
     };
-    match node.guards.authorize(
+    let signed = SignedCapability::issue(&guard_owner(), &cap).unwrap();
+    match node.guards.authorize_signed(
         &gp,
-        &cap,
+        &signed,
         &gp.agent_id,
         NET,
         10,
-        &action,
-        &ctx,
+        preimage,
+        &workload,
+        &[0u8; 32],
         false,
-        false,
+        None,
+        None,
     ) {
         GuardDecision::Allow => {}
         other => panic!("guard allow: {other:?}"),

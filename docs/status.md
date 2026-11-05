@@ -2119,3 +2119,44 @@ enforced in `srct-policy`, `srct-mcp`, `srct-node` and `srct-worker`:
 - Docs updated in place: architecture doc (§§3-9), README (How it works,
   replay/state, honest limits), portable-policy pointer, white paper
   (Smart Gate subsection, replay table, invariant, limitations).
+
+### 2026-11-05 Smart Gate hardening pass (no consensus change, no commit)
+
+Reviewer-reported gaps closed as code; per instruction this pass is not
+committed — verification below is on the working tree:
+
+- **Worker revocation bypass.** `GuardGate::execute` now takes a mandatory
+  `RevocationAuthority` consulted on every run before the local book and the
+  executor. `NodeDecideAuthority` replays node `POST /v1/guard/decide`
+  against live authority state (no new endpoint, no new trust root).
+  Stale answers forget local accounting and deny; unreachable authorities
+  deny without touching state (no offline fallback, no cached-allow).
+  New tests: revocation-at-authority stops execution and forgets state;
+  unreachable authority never executes.
+- **Raw unsigned path deleted.** `GuardBook::authorize` removed entirely;
+  `authorize_signed` is the only entry point. Core tests and
+  `state_persist` migrated to the signed boundary (deterministic owner
+  wallets). Compile failure is now the proof no integration bypasses
+  signature verification.
+- **Explicit v1/v2 compatibility.** `authorize_inner` accepts layouts v1
+  and v2, refuses unknown versions loudly; `InfraPolicy::serialize` is
+  version-aware so v1 re-serializes byte-identically (hashes and old
+  signatures stable); `validate` refuses v1-marked grants carrying v2
+  fields. Tests: v1 decodes, authorizes with legacy semantics, hash-stable;
+  unsupported envelope versions refuse; truncated/trailing bytes malformed.
+- **Workload proof of possession.** `InfraPolicy.workload_key` pins the
+  workload identity fingerprint; `WorkloadCredential` (fresh per execution,
+  height-bound) is verified inside `authorize_signed` via the single shared
+  `check_workload_credential` rule used by pre-checks, node routes, MCP and
+  the worker (which auto-proves from its provisioned key and sanity-checks
+  the fingerprint before admission). Node/MCP accept optional
+  `workload_cred_hex`. Tests: missing/forged/stale/mismatched credentials
+  deny; honest proof admits (core, policy, MCP, node HTTP, worker).
+- Verification (working tree): core guard 21, policy 10, MCP 24, worker
+  guard 5, node api 52 (incl. new key-bound HTTP test), state_persist 3;
+  `cargo clippy --workspace --all-targets -- -D warnings` clean,
+  `cargo fmt --all --check` clean.
+- Remaining limitations: revocation-between-check-and-execution stops the
+  next run, not the current one (no cross-node lock); workload identity is
+  software keys (hardware TPM/TEE attestation planned); k8s admission
+  webhooks planned; worker/node HTTP stays plaintext loopback-oriented.

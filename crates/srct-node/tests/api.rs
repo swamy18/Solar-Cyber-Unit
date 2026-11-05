@@ -842,6 +842,7 @@ fn guard_grant_authorize_replay_revoke_round_trip() {
         requires_approval: false,
         approver: [0u8; 20],
         workload_id: [0u8; 32],
+        workload_key: [0u8; 32],
     };
     let (s, granted) = post(
         &node,
@@ -976,6 +977,7 @@ fn guard_owner_set_risk_and_independent_approver_are_enforced() {
         requires_approval: true,
         approver: approver.address().unwrap(),
         workload_id: bound,
+        workload_key: [0u8; 32],
     };
     let grant = |policy: &InfraPolicy, signer: &Wallet| {
         post(
@@ -1106,6 +1108,90 @@ fn guard_owner_set_risk_and_independent_approver_are_enforced() {
     );
     assert_eq!(s, 200, "{denied}");
     assert_eq!(denied["decision"], "deny");
+}
+
+#[test]
+fn guard_keybound_grant_requires_workload_credential_over_http() {
+    use srct_core::guard::{
+        derive_action_hash, derive_context_hash, workload_key_fingerprint, Capability, InfraPolicy,
+        SignedCapability, WorkloadCredential, GUARD_POLICY_VERSION,
+    };
+    let node = start();
+    let h = node_height(&node);
+    let owner = wallet(80, "guard-owner-kb");
+    let workload_wallet = wallet(81, "guard-workload-kb");
+    let workload_keys = srct_core::l2::Auth::keys_for(&workload_wallet).unwrap();
+    let owner_addr = owner.address().unwrap();
+    let agent_id = derive_agent_id(NET, AgentRole::Machine, &owner_addr);
+    let presented = [2u8; 32];
+    let policy = InfraPolicy {
+        version: GUARD_POLICY_VERSION,
+        network_id: NET.to_string(),
+        agent_id,
+        owner: owner_addr,
+        max_calls_per_window: 5,
+        window_blocks: 100,
+        valid_from_height: 0,
+        valid_until_height: 10_000,
+        revoked: false,
+        parent_agent_id: None,
+        requires_approval: false,
+        approver: [0u8; 20],
+        workload_id: [0u8; 32],
+        workload_key: workload_key_fingerprint(&workload_keys),
+    };
+    let (s, granted) = post(
+        &node,
+        "/v1/guard/grant",
+        &serde_json::json!({
+            "policy_hex": hex::encode(policy.serialize()),
+            "policy_sigs_hex": hex::encode(Auth::sigs_for(&owner, &policy.signing_hash()).unwrap().to_bytes()),
+            "policy_keys_hex": hex::encode(Auth::keys_for(&owner).unwrap().to_bytes()),
+        }),
+    );
+    assert_eq!(s, 200, "{granted}");
+    let preimage = b"kb-job-1";
+    let action = derive_action_hash(preimage);
+    let ctx = derive_context_hash(&presented, h);
+    let cap = Capability {
+        policy_hash: policy.hash(),
+        action_hash: action,
+        context_hash: ctx,
+        expiry_height: h + 10,
+        nonce: 1,
+        audience: [0u8; 32],
+    };
+    let signed_hex = hex::encode(SignedCapability::issue(&owner, &cap).unwrap().serialize());
+    let authorize = |cred_hex: Option<String>| {
+        post(
+            &node,
+            "/v1/guard/authorize",
+            &serde_json::json!({
+                "cap_hex": signed_hex,
+                "agent_id_hex": hex::encode(agent_id),
+                "action_preimage_hex": hex::encode(preimage),
+                "workload_id_hex": hash_to_hex(&presented),
+                "workload_cred_hex": cred_hex,
+            }),
+        )
+    };
+    // No proof: deny. The grant names a key, and no key proved itself.
+    let (s, out) = authorize(None);
+    assert_eq!(s, 200, "{out}");
+    assert_eq!(out["decision"], "deny");
+    // Stranger's proof: deny.
+    let stranger = wallet(82, "guard-stranger-kb");
+    let fake =
+        WorkloadCredential::issue(&stranger, &policy.hash(), &cap, &action, &ctx, h).unwrap();
+    let (s, out) = authorize(Some(hex::encode(fake.serialize())));
+    assert_eq!(s, 200, "{out}");
+    assert_eq!(out["decision"], "deny");
+    // Honest proof for this exact admission: allow.
+    let cred = WorkloadCredential::issue(&workload_wallet, &policy.hash(), &cap, &action, &ctx, h)
+        .unwrap();
+    let (s, out) = authorize(Some(hex::encode(cred.serialize())));
+    assert_eq!(s, 200, "{out}");
+    assert_eq!(out["decision"], "allow");
 }
 
 /// `POST /v1/policy/decide` answers the engine without committing: allow for

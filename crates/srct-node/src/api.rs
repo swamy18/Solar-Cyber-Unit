@@ -3582,6 +3582,24 @@ fn node_audience() -> [u8; 32] {
     srct_core::hash::hash_from_hex(hex_str).unwrap_or_default()
 }
 
+/// Parse an optional workload proof-of-possession envelope. Absent means no
+/// proof presented (denies on key-bound grants, ignored on unbound ones);
+/// malformed envelopes are a bad request, semantically wrong ones refuse at
+/// the gate with their named reason.
+fn parse_workload_cred(
+    hex_str: Option<&String>,
+) -> Result<Option<srct_core::guard::WorkloadCredential>, (StatusCode, Json<ErrorBody>)> {
+    let Some(s) = hex_str else { return Ok(None) };
+    if s.len() > 64 * 1024 {
+        return Err(bad("workload credential over cap"));
+    }
+    let bytes = hex::decode(s.trim().trim_start_matches("0x"))
+        .map_err(|_| bad("malformed workload credential"))?;
+    srct_core::guard::WorkloadCredential::deserialize(&bytes)
+        .map(Some)
+        .map_err(|e| bad(format!("workload credential: {e}")))
+}
+
 /// `POST /v1/guard/decide` — stateless Smart Gate pre-check over HTTP.
 /// Read-only: verifies the capability signature, the grant's risk-model
 /// validity, grant shape, network binding, validity, capability hash
@@ -3598,6 +3616,7 @@ struct GuardDecideReq {
     action_hash_hex: String,
     workload_id_hex: String,
     high_risk: Option<bool>,
+    workload_cred_hex: Option<String>,
 }
 
 async fn guard_decide(State(state): State<ApiState>, Json(req): Json<GuardDecideReq>) -> ApiResult {
@@ -3606,7 +3625,8 @@ async fn guard_decide(State(state): State<ApiState>, Json(req): Json<GuardDecide
     }
     with_shared(&state, |sh| {
         use srct_core::guard::{
-            derive_context_hash, InfraPolicy, SignedCapability, MAX_CAP_LIFETIME,
+            check_workload_credential, derive_context_hash, InfraPolicy, SignedCapability,
+            MAX_CAP_LIFETIME,
         };
         let network = sh.chain.params().network_id.clone();
         let height = sh.chain.height();
@@ -3624,6 +3644,7 @@ async fn guard_decide(State(state): State<ApiState>, Json(req): Json<GuardDecide
         if let Err(e) = policy.validate() {
             return Err(bad(format!("grant: {e}")));
         }
+        let workload_cred = parse_workload_cred(req.workload_cred_hex.as_ref())?;
         let cap = &signed.cap;
         let agent_raw = hex::decode(req.agent_id_hex.trim().trim_start_matches("0x"))
             .map_err(|_| bad("malformed agent id hex"))?;
@@ -3674,6 +3695,18 @@ async fn guard_decide(State(state): State<ApiState>, Json(req): Json<GuardDecide
         }
         if cap.context_hash != expected_ctx {
             return deny("context hash mismatch");
+        }
+        // Possession: the one shared rule — key-bound grants deny without a
+        // fresh credential for this exact admission.
+        if let Err(e) = check_workload_credential(
+            &policy,
+            cap,
+            &action_hash,
+            &expected_ctx,
+            height,
+            workload_cred.as_ref(),
+        ) {
+            return deny(&e.to_string());
         }
         if height >= cap.expiry_height {
             return deny("capability expired");
@@ -3906,6 +3939,7 @@ struct GuardAuthorizeReq {
     workload_id_hex: String,
     high_risk: Option<bool>,
     approval_hex: Option<String>,
+    workload_cred_hex: Option<String>,
 }
 
 async fn guard_authorize(
@@ -4021,6 +4055,10 @@ async fn guard_authorize(
                 )
             }
         };
+        // Possession travels with the request: key-bound grants deny without
+        // a fresh credential for this exact admission (verified inside
+        // `authorize_signed`, never beside it).
+        let workload_cred = parse_workload_cred(req.workload_cred_hex.as_ref())?;
         match sh.guards.authorize_signed(
             &policy,
             &signed,
@@ -4032,6 +4070,7 @@ async fn guard_authorize(
             &node_audience(),
             high_risk,
             approval.as_ref(),
+            workload_cred.as_ref(),
         ) {
             GuardDecision::Allow => {
                 audit_push(

@@ -58,7 +58,10 @@ pub use executor::{
     ExecutorCapabilities,
 };
 pub use exit::{queue_exit, queue_exit_plan, ExitPlan};
-pub use guard::{guard_action_hash, guard_action_preimage, GuardGate};
+pub use guard::{
+    guard_action_hash, guard_action_preimage, Freshness, GuardGate, NodeDecideAuthority,
+    RevocationAuthority,
+};
 pub use http::{ConservationReport, HttpNode};
 pub use node::{BroadcastError, L2Broadcaster, L2NodeView};
 pub use submit::{reconcile_submitted, submit_plan, submit_result, SubmitPlan, SubmittedState};

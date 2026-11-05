@@ -33,9 +33,10 @@
 //! [`AuditExport`]: safety::AuditExport
 
 pub use srct_core::guard::{
-    derive_action_hash, derive_context_hash, Capability, Decision as GuardDecision, GuardApproval,
-    GuardBook, GuardError, InfraPolicy, SignedCapability, GUARD_POLICY_VERSION,
-    MAX_APPROVAL_LIFETIME, MAX_CAP_LIFETIME, MAX_GUARD_REGISTRY,
+    check_workload_credential, derive_action_hash, derive_context_hash, workload_key_fingerprint,
+    Capability, Decision as GuardDecision, GuardApproval, GuardBook, GuardError, InfraPolicy,
+    SignedCapability, WorkloadCredential, GUARD_POLICY_VERSION, MAX_APPROVAL_LIFETIME,
+    MAX_CAP_LIFETIME, MAX_GUARD_REGISTRY,
 };
 pub use srct_core::portable::{
     evaluate_policy, BoundAuthorization, DecodedIntent, DelegationProof, PaymentIntent,
@@ -112,8 +113,11 @@ pub fn decide(
 /// never allowed. Risk comes from the grant (`requires_approval`) OR-ed with
 /// the caller's flag: callers escalate, never de-escalate. When the grant
 /// binds a workload, the context is recomputed from the bound id and any
-/// caller-supplied id is ignored. Audience is NOT checked here — this check
-/// is portable and node-agnostic; the admitting node enforces scoping.
+/// caller-supplied id is ignored. When the grant binds a workload identity
+/// key, an optional `workload_cred_hex` envelope is verified as proof the
+/// presenting process holds the key; a bound grant without a valid credential
+/// denies (see [`guard_verify_full`]). Audience is NOT checked here — this
+/// check is portable and node-agnostic; the admitting node enforces scoping.
 /// Window counts and nonce replay need the stateful
 /// `GuardBook::authorize_signed` on the settling side; this is the pre-check
 /// every rail runs before that. It is NOT execution authorization: the
@@ -130,7 +134,37 @@ pub fn guard_verify(
     height: u64,
     high_risk: bool,
 ) -> Result<String, String> {
-    use srct_core::guard::{InfraPolicy, SignedCapability};
+    guard_verify_full(
+        network_id,
+        policy_hex,
+        cap_hex,
+        agent_id_hex,
+        action_hash_hex,
+        workload_id_hex,
+        height,
+        high_risk,
+        None,
+    )
+}
+
+/// [`guard_verify`] with an optional workload proof-of-possession credential
+/// (`workload_cred_hex`, a signed [`WorkloadCredential`] envelope). Required
+/// for key-bound grants; ignored for unbound (legacy) ones.
+#[allow(clippy::too_many_arguments)]
+pub fn guard_verify_full(
+    network_id: &str,
+    policy_hex: &str,
+    cap_hex: &str,
+    agent_id_hex: &str,
+    action_hash_hex: &str,
+    workload_id_hex: &str,
+    height: u64,
+    high_risk: bool,
+    workload_cred_hex: Option<&str>,
+) -> Result<String, String> {
+    use srct_core::guard::{
+        check_workload_credential, InfraPolicy, SignedCapability, WorkloadCredential,
+    };
     use srct_core::hash::{hash_from_hex, hash_to_hex};
     if network_id.is_empty() || network_id.len() > 64 {
         return Err("malformed rail network id".to_string());
@@ -200,6 +234,29 @@ pub fn guard_verify(
     }
     if cap.context_hash != expected_context {
         return Ok(json_deny("context hash mismatch", network_id, height));
+    }
+    // Possession: one shared rule with the stateful admission. Key-bound
+    // grants deny without a fresh credential for this exact admission.
+    let cred = match workload_cred_hex {
+        None => None,
+        Some(hex_str) => {
+            let bytes = hex::decode(hex_str.trim().trim_start_matches("0x"))
+                .map_err(|_| "malformed workload credential hex".to_string())?;
+            Some(
+                WorkloadCredential::deserialize(&bytes)
+                    .map_err(|e| format!("workload credential: {e}"))?,
+            )
+        }
+    };
+    if let Err(e) = check_workload_credential(
+        &policy,
+        cap,
+        &action_hash,
+        &expected_context,
+        height,
+        cred.as_ref(),
+    ) {
+        return Ok(json_deny(&e.to_string(), network_id, height));
     }
     if height >= cap.expiry_height {
         return Ok(json_deny("capability expired", network_id, height));
@@ -517,6 +574,7 @@ mod tests {
             requires_approval: false,
             approver: [0u8; 20],
             workload_id: [0u8; 32],
+            workload_key: [0u8; 32],
         };
         let action_hash = [1u8; 32];
         let workload = [2u8; 32];
@@ -595,6 +653,7 @@ mod tests {
             requires_approval: true,
             approver: approver_wallet.address().unwrap(),
             workload_id: bound,
+            workload_key: [0u8; 32],
         };
         let height = 50u64;
         let cap = Capability {
@@ -659,6 +718,85 @@ mod tests {
     }
 
     #[test]
+    fn guard_verify_full_enforces_workload_possession() {
+        use srct_core::guard::{
+            derive_context_hash, workload_key_fingerprint, Capability, InfraPolicy,
+            SignedCapability, WorkloadCredential, GUARD_POLICY_VERSION,
+        };
+        let owner_wallet = Wallet::new_random("guard-owner-4");
+        let owner_addr = owner_wallet.address().unwrap();
+        let workload_wallet = Wallet::new_random("guard-workload-4");
+        let workload_keys = srct_core::l2::Auth::keys_for(&workload_wallet).unwrap();
+        let agent_id = derive_agent_id(NETWORK, AgentRole::Machine, &owner_addr);
+        let policy = InfraPolicy {
+            version: GUARD_POLICY_VERSION,
+            network_id: NETWORK.to_string(),
+            agent_id,
+            owner: owner_addr,
+            max_calls_per_window: 5,
+            window_blocks: 100,
+            valid_from_height: 10,
+            valid_until_height: 1000,
+            revoked: false,
+            parent_agent_id: None,
+            requires_approval: false,
+            approver: [0u8; 20],
+            workload_id: [0u8; 32],
+            workload_key: workload_key_fingerprint(&workload_keys),
+        };
+        let height = 50u64;
+        let action_hash = [1u8; 32];
+        let presented = [2u8; 32];
+        let ctx = derive_context_hash(&presented, height);
+        let cap = Capability {
+            policy_hash: policy.hash(),
+            action_hash,
+            context_hash: ctx,
+            expiry_height: height + 10,
+            nonce: 1,
+            audience: [0u8; 32],
+        };
+        let signed = SignedCapability::issue(&owner_wallet, &cap).unwrap();
+        let policy_hex = hex::encode(policy.serialize());
+        let cap_hex = hex::encode(signed.serialize());
+        let check = |cred_hex: Option<String>| {
+            guard_verify_full(
+                NETWORK,
+                &policy_hex,
+                &cap_hex,
+                &hex::encode(agent_id),
+                &srct_core::hash::hash_to_hex(&action_hash),
+                &srct_core::hash::hash_to_hex(&presented),
+                height,
+                false,
+                cred_hex.as_deref(),
+            )
+        };
+        // No credential on a key-bound grant: deny, never allow.
+        let out = check(None).expect("a key-bound grant must answer");
+        assert!(out.contains("deny") && out.contains("credential"), "{out}");
+        // Stranger's key: impersonation denies by fingerprint.
+        let stranger = Wallet::new_random("guard-stranger-4");
+        let fake =
+            WorkloadCredential::issue(&stranger, &policy.hash(), &cap, &action_hash, &ctx, height)
+                .unwrap();
+        let out = check(Some(hex::encode(fake.serialize()))).expect("forgery must answer");
+        assert!(out.contains("deny"), "{out}");
+        // Honest proof of possession: allow.
+        let cred = WorkloadCredential::issue(
+            &workload_wallet,
+            &policy.hash(),
+            &cap,
+            &action_hash,
+            &ctx,
+            height,
+        )
+        .unwrap();
+        let out = check(Some(hex::encode(cred.serialize()))).expect("proof must answer");
+        assert!(out.contains("\"allow\""), "{out}");
+    }
+
+    #[test]
     fn guard_verify_refuses_an_unsigned_capability() {
         use srct_core::guard::{
             derive_context_hash, Capability, InfraPolicy, GUARD_POLICY_VERSION,
@@ -680,6 +818,7 @@ mod tests {
             requires_approval: false,
             approver: [0u8; 20],
             workload_id: [0u8; 32],
+            workload_key: [0u8; 32],
         };
         let workload = [2u8; 32];
         let height = 50u64;
