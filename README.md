@@ -219,13 +219,16 @@ trusting any number in it:
 - **The Smart Gate is per-node authority over a plaintext loopback transport.**
   Gate decisions are enforced by whichever node or runtime observes the bytes —
   there is no cross-node capability lock, and multi-node deployments converge
-  by registering the same owner-signed grants and replicating revocations.
+  by registering the same owner-signed grants and replicating revocations,
+  plus owner-set audience scoping for high-value capabilities. Unscoped
+  capabilities remain independently admittable on every node, stated plainly.
   The worker/MCP HTTP clients are plaintext `host:port` transports: loopback
   is the supported shape, remote endpoints need an explicit allow-list and
   still never receive the bearer token, so remote production use needs a
   TLS-terminating proxy. Gate audit receipts are node-local and
-  export-verifiable, not chain-anchored; managed-platform shims are designed
-  but not implemented.
+  export-verifiable, not chain-anchored; managed-cluster admission webhooks
+  are designed but not implemented (the worker SDK's in-process
+  `GuardGate::execute` is the implemented reference boundary).
 
 ---
 
@@ -753,28 +756,40 @@ answered as `allow / deny / needs_approval` anywhere, settled as trust on Solar.
   wall-clock), nonzero strictly increasing nonce, tumbling window,
   cross-principal deny. Fail-closed, deterministic, integer-only.
 - **How it works:** owner signs a narrow `InfraPolicy` once (`srct-core::guard`)
-  and registers it (`guard/grant`, signature mandatory). Before any key or
-  long-lived token is used, the workload calls the gate. The owner signs a
+  and registers it (`guard/grant`, signature mandatory). Risk lives in the
+  grant: a high-assurance grant names an independent approver and mandates a
+  signed approval for every admission — a caller reporting `high_risk: false`
+  cannot switch that off (callers escalate, never de-escalate), and a grant
+  that names its owner as approver is refused at registration. Before any key
+  or long-lived token is used, the workload calls the gate. The owner signs a
   capability bound to the exact action preimage. The runtime, container broker,
   cloud broker, or wallet signing service verifies the owner signature offline
   and executes only on `allow`. High-risk actions return `needs_approval`
-  until a signed `GuardApproval` from the grant owner — bound to the exact
-  capability instance, agent, action, context and expiry — is presented; a
-  missing approval gates, a forged one denies, and the old `approved: true`
-  boolean is rejected everywhere. Stateless pre-checks (`guard.check`,
+  until a signed `GuardApproval` from the grant's designated approver — bound
+  to the exact capability instance, agent, action, context and expiry — is
+  presented; a missing approval gates, a forged one denies, an owner-signed
+  one on a grant that names someone else denies, and the old `approved: true`
+  boolean is rejected everywhere. Grants can bind a workload id (caller ids
+  then ignored) and capabilities can scope to one enforcing node
+  (`SRCT_GUARD_AUDIENCE`). Stateless pre-checks (`guard.check`,
   `/v1/guard/decide`) commit nothing; stateful admission (`guard.authorize`,
-  `/v1/guard/authorize`) enforces window + nonce and is the execution boundary.
+  `/v1/guard/authorize`) enforces window + nonce and is the execution boundary,
+  as is the worker SDK's `GuardGate::execute`, which recomputes the action
+  hash from the exact work about to run before invoking the executor.
   Refusals consume no budget and are named (`action_mismatch`,
   `context_mismatch`, `expired`, `nonce_reuse`, `zero_nonce`,
-  `unsigned_capability`, `bad_approval`, `cross_principal`,
-  `window_exhausted`).
+  `unsigned_capability`, `bad_approval`, `self_approval`, `wrong_audience`,
+  `cross_principal`, `window_exhausted`).
 - **Replay, revocation, state:** nonces are nonzero and strictly increasing per
   grant, persisted in the node's `GuardBook` across restarts (`state.bin`);
   revocation kills the grant and every registered descendant and persists in a
   revocation set the stateless pre-check also consults. The node's registry +
   revocation set + book is authoritative per node; MCP-local gate state is a
-  non-authoritative cache. Registry (1024 grants) and book (1024 grants) refuse
-  when full rather than evicting.
+  non-authoritative cache. There is no cross-node nonce lock: scope
+  high-value capabilities to one node via `audience` (mis-scoped use denies
+  by name); unscoped capabilities stay independently admittable everywhere.
+  Registry (1024 grants) and book (1024 grants) refuse when full rather than
+  evicting.
 - **MCP credential rule:** the MCP client dials `host:port` only; loopback is
   trusted and is the only target that ever receives the API bearer token.
   Anything else needs `SRCT_MCP_TRUSTED_ENDPOINTS` + `SRCT_MCP_ALLOW_REMOTE=1`

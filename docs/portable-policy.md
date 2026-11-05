@@ -142,16 +142,19 @@ the honest weight note. For outsiders, HTTP or the bindings are the way in.
 Spend policies govern *payments*; the Smart Gate governs *any exact action*
 (deploys, signing-service use, container execution) under the same
 owner-signs-once discipline. The shapes rhyme on purpose: an owner-signed
-`InfraPolicy` grant, a signed capability (`SignedCapability`, the only form
-`cap_hex` takes — raw capabilities are refused as unsigned), a short lifetime
-(30 heights), strictly increasing nonzero nonces, and a signed high-risk
-approval (`GuardApproval`) instead of a boolean. The execution boundary
-recomputes the canonical action hash from the preimage it observes
-(`action_preimage_hex` is required at `guard.authorize` /
-`POST /v1/guard/authorize`); a caller-supplied hash alone is never trusted.
-Full architecture, threat model, and the authoritative-state rule (node
-registry + revocation set authoritative per node; MCP-local gate state a
-non-authoritative cache): [`smart-gate-architecture.md`](smart-gate-architecture.md).
+`InfraPolicy` grant carrying an owner-set risk model (`requires_approval`,
+independent `approver`, bound `workload_id`), a signed capability
+(`SignedCapability`, the only form `cap_hex` takes — raw capabilities are
+refused as unsigned), a short lifetime (30 heights), strictly increasing
+nonzero nonces, node scoping (`audience`), and a signed high-risk approval
+(`GuardApproval`) from the designated approver instead of a boolean. The
+execution boundary recomputes the canonical action hash from the preimage it
+observes (`action_preimage_hex` is required at `guard.authorize` /
+`POST /v1/guard/authorize`); a caller-supplied hash alone is never trusted,
+and a caller-supplied `high_risk: false` never de-escalates a high-assurance
+grant. Full architecture, threat model, and the authoritative-state rule
+(node registry + revocation set authoritative per node; MCP-local gate state
+a non-authoritative cache): [`smart-gate-architecture.md`](smart-gate-architecture.md).
 
 ## Rules the interface keeps
 

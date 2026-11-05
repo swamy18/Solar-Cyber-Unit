@@ -728,6 +728,9 @@ fn guard_check_requires_a_signed_capability() {
         valid_until_height: 10_000,
         revoked: false,
         parent_agent_id: None,
+        requires_approval: false,
+        approver: [0u8; 20],
+        workload_id: [0u8; 32],
     };
     let workload = [2u8; 32];
     let action = [1u8; 32];
@@ -741,6 +744,7 @@ fn guard_check_requires_a_signed_capability() {
         context_hash: ctx,
         expiry_height: HEIGHT + 10,
         nonce: 1,
+        audience: [0u8; 32],
     };
     let err = mcp
         .handle(&json!({
@@ -810,6 +814,9 @@ fn guard_authorize_recomputes_the_action_and_rejects_boolean_approval() {
         valid_until_height: 10_000,
         revoked: false,
         parent_agent_id: None,
+        requires_approval: false,
+        approver: [0u8; 20],
+        workload_id: [0u8; 32],
     };
     let workload = [4u8; 32];
     let preimage = b"deploy-42";
@@ -821,6 +828,7 @@ fn guard_authorize_recomputes_the_action_and_rejects_boolean_approval() {
         context_hash: ctx,
         expiry_height: HEIGHT + 10,
         nonce: 1,
+        audience: [0u8; 32],
     };
     let signed = SignedCapability::issue(&owner, &cap).unwrap();
     let base = || {
@@ -934,6 +942,79 @@ fn mcp_transport_refuses_untrusted_endpoints() {
             err.code
         );
     }
+}
+
+#[test]
+fn guard_check_enforces_owner_set_risk_and_scoped_caps_refuse_locally() {
+    use srct_core::guard::{
+        derive_action_hash, derive_context_hash, Capability, InfraPolicy, SignedCapability,
+        GUARD_POLICY_VERSION,
+    };
+    let owner = wallet(31);
+    let owner_addr = owner.address().unwrap();
+    let approver = wallet(32);
+    let agent_id = derive_agent_id(NET, AgentRole::Machine, &owner_addr);
+    // High-assurance grant: owner-named independent approver, bound workload.
+    let policy = InfraPolicy {
+        version: GUARD_POLICY_VERSION,
+        network_id: NET.to_string(),
+        agent_id,
+        owner: owner_addr,
+        max_calls_per_window: 5,
+        window_blocks: 100,
+        valid_from_height: 0,
+        valid_until_height: 10_000,
+        revoked: false,
+        parent_agent_id: None,
+        requires_approval: true,
+        approver: approver.address().unwrap(),
+        workload_id: [6u8; 32],
+    };
+    let preimage = b"deploy-42";
+    let cap = Capability {
+        policy_hash: policy.hash(),
+        action_hash: derive_action_hash(preimage),
+        context_hash: derive_context_hash(&[6u8; 32], HEIGHT),
+        expiry_height: HEIGHT + 10,
+        nonce: 1,
+        audience: [0u8; 32],
+    };
+    let signed = SignedCapability::issue(&owner, &cap).unwrap();
+    let mut mcp = SolarCyberUnitMcp::new();
+    // Caller claims low risk; the grant disagrees: gated, not allowed.
+    let out = mcp
+        .handle(&json!({
+            "op": "guard.check",
+            "network_id": NET,
+            "height": HEIGHT,
+            "policy_hex": hex::encode(policy.serialize()),
+            "cap_hex": hex::encode(signed.serialize()),
+            "agent_id_hex": hex::encode(agent_id),
+            "action_hash_hex": hash_to_hex(&cap.action_hash),
+            "workload_id_hex": hash_to_hex(&[6u8; 32]),
+            "high_risk": false,
+        }))
+        .expect("owner-set risk must answer");
+    assert_eq!(out["decision"], "needs_approval");
+    // An audience-scoped capability cannot be admitted by the unscoped local
+    // book: it belongs to its node.
+    let mut scoped = cap.clone();
+    scoped.audience = [0xAAu8; 32];
+    let scoped_signed = SignedCapability::issue(&owner, &scoped).unwrap();
+    let mut mcp2 = SolarCyberUnitMcp::new();
+    let err = mcp2
+        .handle(&json!({
+            "op": "guard.authorize",
+            "network_id": NET,
+            "height": HEIGHT,
+            "policy_hex": hex::encode(policy.serialize()),
+            "cap_hex": hex::encode(scoped_signed.serialize()),
+            "agent_id_hex": hex::encode(agent_id),
+            "action_preimage_hex": hex::encode(preimage),
+            "workload_id_hex": hash_to_hex(&[6u8; 32]),
+        }))
+        .expect_err("a scoped capability must not admit locally");
+    assert_eq!(err.code, "guard_refused");
 }
 
 #[test]

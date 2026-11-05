@@ -74,6 +74,9 @@ fn guard_policy() -> InfraPolicy {
         valid_until_height: 10_000,
         revoked: false,
         parent_agent_id: None,
+        requires_approval: false,
+        approver: [0u8; 20],
+        workload_id: [0u8; 32],
     }
 }
 
@@ -212,6 +215,7 @@ fn populate(node: &mut SharedNode) {
         context_hash: ctx,
         expiry_height: 40,
         nonce: 1,
+        audience: [0u8; 32],
     };
     match node.guards.authorize(
         &gp,

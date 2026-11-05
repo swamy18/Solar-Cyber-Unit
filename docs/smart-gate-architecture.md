@@ -37,27 +37,33 @@ Five concrete holes this design closes (each with a named regression test):
 ## 3. Primitive: signed, context-bound capability
 
 ```
-cap      = H(DOM_G || policy_hash || action_hash || context_hash || expiry || nonce)
+policy   = H(DOM_GP || ... || requires_approval || approver || workload_id)
+cap      = H(DOM_G || policy_hash || action_hash || context_hash || expiry || nonce || audience)
 action   = H(DOM_A || preimage)          // recomputed at the boundary, never trusted in
-context  = H(DOM_C || workload_id || height)
+context  = H(DOM_C || effective_workload || height)
 signed   = version || cap || sigs || keys // owner's signature over cap.signing_hash()
-approval = H(DOM_P || policy || cap || agent || action || context || expiry) + owner sigs
+approval = H(DOM_P || policy || cap || agent || action || context || expiry) + approver sigs
 ```
 
-- `policy_hash`: owner-signed narrow grant, network-bound, revocable. Empty allows nothing.
+- `policy_hash`: owner-signed narrow grant, network-bound, revocable. Empty allows nothing. The grant carries the risk model: `requires_approval` (high-assurance bit), `approver` (independent second-channel address), `workload_id` (bound workload, zero = unbound). All three are covered by the grant signature, so they cannot be added or stripped after issuance.
 - `action_hash`: SHA-256 over the domain tag and the **exact preimage bytes** about to execute (deploy digest or payment payload). The boundary recomputes it (§5).
-- `context_hash`: workload attestation id + height, recomputed by the verifier.
+- `context_hash`: workload id + height, recomputed by the verifier from the *effective* workload — the grant-bound id when the grant names one, so a caller-supplied id is ignored for bound grants.
 - `expiry`: short, max 30 heights from the check height (`MAX_CAP_LIFETIME`). Enforced by verifier, re-checked at admission. Heights, not wall-clock: `guard.rs` is pure and deterministic — no clock, no I/O.
 - `nonce`: strictly increasing per grant, **nonzero** (`ZeroNonce` refusal). `PaymentTracker` pattern reused.
-- `sigs`/`keys`: the owner's hybrid signature bundle (`1+2+3` accepted) over the capability hash, with the keys binding to the grant's `owner` address. The signature covers all five fields together, so none of policy, action, context, expiry or nonce can be swapped after signing.
+- `audience`: enforcing-node scope. Zero means unscoped (admittable anywhere — the documented multi-node caveat); non-zero means only the node configured with that audience admits it.
+- `sigs`/`keys`: the owner's hybrid signature bundle (`1+2+3` accepted) over the capability hash, with the keys binding to the grant's `owner` address. The signature covers all six fields together, so none of policy, action, context, expiry, nonce or audience can be swapped after signing.
 
-Verify is stateless exact match plus signature. Commit is stateful nonce + window spend in `GuardBook`.
+Verify is stateless exact match plus signature plus grant risk-model validity. Commit is stateful nonce + window spend in `GuardBook`.
 
 Three exacts must coincide: prior intent, present bytes, present moment. Missing one denies. No fuzzy match, no learning bypass.
 
 ### What `SignedCapability::verify` checks, in order
 
 Version, owner binding (`keys.address() == policy.owner`), bundle signature over the capability hash, then that the capability names this grant. Unsigned envelopes, stranger signatures, and tampered fields all refuse as `UnsignedCapability` / `PolicyMismatch` — never as allow.
+
+### Risk classification is owner-set, never caller-set
+
+The request's `high_risk` flag can only escalate a low-assurance grant into `needs_approval`; a `false` from the caller never de-escalates a high-assurance grant, because every boundary ORs the grant's `requires_approval` bit with the caller's flag. An attacker submitting `high_risk: false` for a dangerous operation still gates. Misconfigured high-assurance grants (no approver, owner as approver, agent as approver) fail closed with `SelfApproval` on every admission path and at grant registration.
 
 ## 4. Protocol
 
@@ -66,15 +72,15 @@ Version, owner binding (`keys.address() == policy.owner`), bundle signature over
 3. Issue: owner signs a capability bound to the exact action preimage. Long-term token never leaves vault.
 4. Verify: runtime / cloud broker / wallet service verifies offline via `srct-policy` crate (`guard_verify` checks the owner signature + all equalities). No node needed.
 5. Settle: receipt + hash-chained audit entry on the enforcing node (`guard_allow`, `guard_needs_approval`, `guard_refused`, `guard_grant`, `guard_revoke`). The audit log is node-local, bounded, and export-verifiable (`audit.verify`); it is **not** anchored to the chain — see §8.
-6. Escalate: high-risk calls return `needs_approval` until a signed `GuardApproval` from the grant owner, bound to the exact capability instance (grant + capability hash + agent + action + context + expiry), is presented. A missing approval gates; a forged one denies. The old boolean is rejected everywhere.
+6. Escalate: high-risk calls return `needs_approval` until a signed `GuardApproval` from the grant's *designated approver* — an address the owner named at issuance, independent of the owner — bound to the exact capability instance (grant + capability hash + agent + action + context + expiry), is presented. A missing approval gates; a forged one denies; an owner-signed approval on a grant that names someone else denies. The old boolean is rejected everywhere. Legacy grants that name no approver fall back to the owner (self-managed, documented as weaker — not second-channel).
 
 ## 5. Data structures
 
-- `InfraPolicy`: caps, validity heights, parent link, revocation flag. Same narrowing shape as `SpendPolicy`, domain tag `srct/guard-policy/v1`. Grants live in the node's registry (cap `MAX_GUARD_REGISTRY = 1024`, refusal when full).
-- `Capability`: policy_hash, action_hash, context_hash, expiry, **nonzero** nonce.
+- `InfraPolicy`: caps, validity heights, parent link, revocation flag, plus the owner-set risk model (`requires_approval`, `approver`, `workload_id`). Current layout version 2; v1 bytes still decode with legacy defaults (no mandated approval, owner approves, unbound workload). Same narrowing shape as `SpendPolicy`, domain tag `srct/guard-policy/v1`. Grants live in the node's registry (cap `MAX_GUARD_REGISTRY = 1024`, refusal when full).
+- `Capability`: policy_hash, action_hash, context_hash, expiry, **nonzero** nonce, `audience` (zero = unscoped).
 - `SignedCapability`: version + capability + owner `sigs`/`keys` bundles. This is the only form `cap_hex` takes on every boundary (node, MCP, `srct-policy`): raw capabilities are refused as "not signed".
-- `GuardApproval`: policy_hash, cap_hash (= capability signing hash), agent_id, action_hash, context_hash, expiry + owner `sigs`/`keys` over `srct/guard-approval/v1`. Lifetime cap 30 heights. Authority is the grant owner; the independence is the second signature over the exact instance, not a second boolean.
-- `Decision`: allow / needs_approval (missing approval) / deny(reason). Reasons named: `hash_mismatch`, `expired`, `nonce_reuse`, `zero_nonce`, `unsigned_capability`, `bad_approval`, `action_mismatch`, `context_mismatch`, `cross_principal`, `velocity_exceeded` (`window_exhausted`), `session_cap`.
+- `GuardApproval`: policy_hash, cap_hash (= capability signing hash), agent_id, action_hash, context_hash, expiry + **designated-approver** `sigs`/`keys` over `srct/guard-approval/v1`. Lifetime cap 30 heights. Authority is the grant's approver address (owner-named, enforced distinct); legacy zero-approver grants fall back to the owner.
+- `Decision`: allow / needs_approval (missing approval) / deny(reason). Reasons named: `hash_mismatch`, `expired`, `nonce_reuse`, `zero_nonce`, `unsigned_capability`, `bad_approval`, `self_approval`, `wrong_audience`, `action_mismatch`, `context_mismatch`, `cross_principal`, `velocity_exceeded` (`window_exhausted`), `session_cap`.
 - `Receipt`: audit entries per decision on the enforcing node. Duplicate receipt for same cap is `duplicate` semantics at the payment layer; conflicting receipt is `receipt_conflict`.
 
 All LE encoding, JSON portable form version 1 with hex fields. Canonical bytes equal signed bytes.
@@ -84,29 +90,30 @@ All LE encoding, JSON portable form version 1 with hex fields. Canonical bytes e
 - **Nonce discipline.** Nonce 0 is refused. Every admission requires `nonce > last_nonce` (strictly increasing from a `last_nonce = 0` start). Consumed nonces live in the persisted `GuardBook`; a replayed nonce is a named deny, and a refused call commits nothing (no budget consumed, no nonce stored).
 - **Overflow safety.** Window-end arithmetic uses `checked_add` (overflow denies instead of wrapping); spend counters use `checked_add`; time-window and lifetime math uses `saturating_sub` with explicit caps. Codec paths are bounded before allocation (`MAX_GUARD_BOOK_READ`, registry cap, per-field hex caps).
 - **Revocation.** Two sets, one authority: the node's `guard_registry` (grants it enforces) and `guard_revoked` (hashes it has killed). `guard_decide` (stateless) consults the node's revocation set even though it commits nothing. `guard_authorize` (stateful) requires the capability to name a registered, unrevoked grant. Revocation propagates to registered descendants via the parent-agent walk, and each killed grant's book state is forgotten so a restart can neither resurrect spent nonces nor replay them — the revocation set itself persists in `state.bin`.
-- **Restart and multi-node.** Grants, revocations and the capability book persist in `state.bin` (v10 sections; decode is bounded and fail-closed). The node's registry + revocation set + book is **authoritative per node**. Local MCP `GuardBook` state is a non-authoritative cache for keyless pre-checks — never present it as global. Multiple nodes reach the same answer by (a) publishing the grant on the L2 `Policy`/`PolicyRevoke` path and registering the same owner-signed bytes on each enforcing node, and (b) replicating revocations the same way. There is no cross-node nonce lock: the same capability must not be aimed at two enforcing nodes.
+- **Restart and multi-node.** Grants, revocations and the capability book persist in `state.bin` (v10 sections; decode is bounded and fail-closed; v1 grant bytes decode with legacy risk defaults). The node's registry + revocation set + book is **authoritative per node**. Local MCP `GuardBook` state is a non-authoritative cache for keyless pre-checks — never present it as global. Multiple nodes reach the same answer by (a) publishing the grant on the L2 `Policy`/`PolicyRevoke` path and registering the same owner-signed bytes on each enforcing node, and (b) replicating revocations the same way. There is no cross-node nonce lock; the mitigation is owner-set audience scoping: a capability scoped to node A denies on node B by name (`WrongAudience`), while unscoped (legacy) capabilities remain independently admittable everywhere — which is why high-value capabilities should be scoped.
+- **Workload binding.** When a grant names a `workload_id`, every boundary recomputes the context from the bound id and ignores any caller-supplied id — a spoofed presented id can neither help nor hurt. Unbound (legacy) grants trust the presented id, documented as weaker: bind the workload for anything that matters.
 - **Delegation.** A grant's `parent_agent_id` names its parent; narrowing follows the same attenuation rule as spend policies, and revocation of an ancestor kills every registered descendant (see the walk in `guard_revoke`). Cycle safety comes from one-way agent derivation; the walk itself is hop-bounded and fail-closed.
 
 ## 7. Trust boundaries
 
-- **Stateless pre-check vs stateful admission.** `guard.check`, `srct-policy::guard_verify` and `POST /v1/guard/decide` verify signatures and equalities and commit nothing. `guard.authorize` / `POST /v1/guard/authorize` additionally recompute the action hash from the supplied preimage, enforce the tumbling-window budget and the strictly increasing nonce, and commit on allow. Final authorization is the execution boundary (`GuardBook::authorize_signed` on the enforcing node or the runtime that recomputes), never an API pre-check.
+- **Stateless pre-check vs stateful admission.** `guard.check`, `srct-policy::guard_verify` and `POST /v1/guard/decide` verify signatures, grant risk-model validity, and equalities and commit nothing; risk is owner-set OR caller-escalated, and bound grants recompute context from the bound workload. `guard.authorize` / `POST /v1/guard/authorize` additionally recompute the action hash from the supplied preimage, enforce audience scoping, the tumbling-window budget and the strictly increasing nonce, and commit on allow. Final authorization is the execution boundary (`GuardBook::authorize_signed` on the enforcing node or the runtime that recomputes), never an API pre-check. The in-process reference boundary is the worker SDK's `GuardGate::execute` (`srct-worker/src/guard.rs`): it recomputes the canonical preimage from the exact work about to run, admits through the gate, and only then invokes the inner executor. Managed-cluster admission webhooks remain planned, not implemented.
 - **MCP credential protection.** The MCP HTTP client dials `host:port` only (no scheme, userinfo, or path). Loopback is trusted by default and is the **only** target that ever receives the `SRCT_API_TOKEN` bearer. Anything else is refused as `untrusted_endpoint` unless the exact `host:port` is listed in `SRCT_MCP_TRUSTED_ENDPOINTS` **and** `SRCT_MCP_ALLOW_REMOTE=1` is set — and even then the bearer is never sent over this plaintext transport. Mixed loopback/non-loopback DNS answers (rebinding shape) are refused; redirects (3xx) are errors, never followed; endpoint values and tokens never appear in error strings or logs. Remote operators must terminate TLS in front of the node; this client does not do HTTPS.
 - **Audit.** Every grant, allow, needs-approval, refusal and revocation appends to the node's bounded hash-chained `AuditLog` (`chain_valid`; `GET /v1/risk/policy` exports the live envelope). The chain exports as auditor/insurer-readable JSON (`AuditLog::export_json`, re-checked by `verify_export_json`, MCP `audit.verify`). Audit is node-local persistence, not consensus and not chain-anchored.
 
 ## 8. What is implemented, partial, and planned
 
-- **Implemented:** owner-signed grants and registration; signed capabilities end to end (core, `srct-policy`, MCP, node); signed high-risk approvals with missing-vs-forged distinction; execution-boundary action recomputation; strict nonzero monotonic nonces with persisted books; revocation with descendant propagation and restart-safe persistence; registry/book capacity caps with refusal; overflow-safe window arithmetic; stateless/stateful separation; MCP endpoint trust gate with no-token-to-untrusted rule and no-redirect rule; audit logging of every gate decision with verifiable export; negative tests for forgery, fake approval, action swap, replay, revocation, and untrusted endpoints.
-- **Partial:** grant ancestry is a parent link plus revocation propagation, not a full portable delegation-proof chain like spend policies; multi-node consistency is replication-by-operator (publish + register everywhere), not a consensus lock; MCP remote operation is dial-but-unauthenticated by design (plaintext client) — production remote use needs a TLS-terminating proxy, at which point the bearer model must be revisited.
-- **Planned (not implemented):** worker k8s/cloud broker shims; TLS in the MCP/worker HTTP clients; any chain anchoring of audit receipts; cross-node capability locks.
+- **Implemented:** owner-signed grants and registration; signed capabilities end to end (core, `srct-policy`, MCP, node, worker); owner-set risk classification (caller escalates, never de-escalates); independent-approver model with self-approval refused at registration and admission; signed high-risk approvals with missing-vs-forged-vs-wrong-approver distinction; execution-boundary action recomputation (node, MCP, worker `GuardGate`); workload binding with caller-supplied ids ignored for bound grants; audience scoping (`SRCT_GUARD_AUDIENCE`, enforced at node admission); strict nonzero monotonic nonces with persisted books; revocation with descendant propagation and restart-safe persistence; registry/book capacity caps with refusal; overflow-safe window arithmetic; stateless/stateful separation; MCP endpoint trust gate with no-token-to-untrusted rule and no-redirect rule; audit logging of every gate decision with verifiable export; negative tests for forgery, fake approval, wrong approver, de-escalation, action swap, workload spoofing, wrong audience, replay, revocation, and untrusted endpoints.
+- **Partial:** grant ancestry is a parent link plus revocation propagation, not a full portable delegation-proof chain like spend policies; multi-node consistency is replication-by-operator plus owner-set audience scoping (publish + register everywhere; scope a capability to one node to deny its replay on others), not a consensus lock — unscoped capabilities remain independently admittable everywhere, stated honestly; MCP remote operation is dial-but-unauthenticated by design (plaintext client) — production remote use needs a TLS-terminating proxy, at which point the bearer model must be revisited.
+- **Planned (not implemented):** managed-cluster (k8s) admission webhooks and cloud-broker shims; TLS in the MCP/worker HTTP clients; any chain anchoring of audit receipts; cross-node capability locks.
 
 ## 9. Code map
 
-- `crates/srct-core/src/guard.rs`: `InfraPolicy`, `Capability`, `SignedCapability`, `GuardApproval`, `derive_action_hash` / `derive_context_hash`, `GuardBook::authorize` + `authorize_signed`, tests for forgery/fake-approval/swap/zero-nonce.
-- `crates/srct-policy` (`guard_verify`): stateless signature + equality pre-check; denies unsigned envelopes.
-- `crates/srct-mcp` (`guard.check` / `guard.authorize`, `http_json` trust gate): signed pre-check; preimage-recomputing admission; `approved:true` rejected; loopback-only bearer.
-- `crates/srct-node/src/api.rs`: `POST /v1/guard/decide` (pre-check + revocation-set consult), `POST /v1/guard/grant` (owner-signed registration, registry cap), `POST /v1/guard/revoke` (owner-signed, descendant propagation), `POST /v1/guard/authorize` (signed + preimage + approval, audit).
-- `crates/srct-worker` + `templates/`: k8s admission shim, cloud broker shim, EVM facilitator shim (follow-up).
-- Tests: core `guard` unit tests, `srct-policy` verify tests, `srct-mcp` guard + transport tests, node `api` round-trip (grant → signed authorize → replay deny → revoke → dead), `state_persist` book round-trip.
+- `crates/srct-core/src/guard.rs`: `InfraPolicy` (v2 risk model), `Capability` (+ audience), `SignedCapability`, `GuardApproval` (designated approver), `derive_action_hash` / `derive_context_hash`, `GuardBook::authorize` + `authorize_signed`, tests for forgery/fake-approval/wrong-approver/de-escalation/swap/spoofed-workload/wrong-audience/zero-nonce/v1-compat.
+- `crates/srct-policy` (`guard_verify`): stateless signature + risk-model + binding pre-check; denies unsigned envelopes and self-approval grants.
+- `crates/srct-mcp` (`guard.check` / `guard.authorize`, `http_json` trust gate): signed pre-check with owner-set risk; preimage-recomputing admission; `approved:true` rejected; scoped caps refused locally; loopback-only bearer.
+- `crates/srct-node/src/api.rs`: `POST /v1/guard/decide` (pre-check + revocation-set consult + audience), `POST /v1/guard/grant` (owner-signed registration, risk-model validation, registry cap), `POST /v1/guard/revoke` (owner-signed, descendant propagation), `POST /v1/guard/authorize` (signed + preimage + designated approval, `SRCT_GUARD_AUDIENCE` scoping, audit).
+- `crates/srct-worker/src/guard.rs`: `GuardGate::execute` — the in-process reference execution boundary (recompute-then-run, drift refuses, high-assurance gates). `templates/`: k8s admission shim, cloud broker shim, EVM facilitator shim (follow-up).
+- Tests: core `guard` unit tests, `srct-policy` verify tests, `srct-mcp` guard + transport tests, node `api` round-trip (grant → signed authorize → replay deny → revoke → dead) plus owner-set-risk/independent-approver round-trip, worker `guard` execution tests, `state_persist` book round-trip.
 
 ## 10. Quantum and AI-agent resistance
 

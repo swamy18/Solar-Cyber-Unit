@@ -53,6 +53,13 @@ pub enum WorkerError {
     ObservationMalformed(&'static str),
     /// A result claimed by the caller carries no bytes.
     EmptyResult,
+    /// The Smart Gate refused the work at the execution boundary: the named
+    /// gate reason, carried verbatim. Never retry the same bytes blindly —
+    /// fetch a fresh capability or approval first.
+    GuardDenied(String),
+    /// The Smart Gate gated the work for a signed approval that was not
+    /// supplied. Fetch the designated approver's approval, then re-decide.
+    GuardApprovalNeeded,
 }
 
 impl fmt::Display for WorkerError {
@@ -76,6 +83,13 @@ impl fmt::Display for WorkerError {
             WorkerError::ObservationUnavailable(why) => write!(f, "observation unavailable: {why}"),
             WorkerError::ObservationMalformed(why) => write!(f, "malformed observation: {why}"),
             WorkerError::EmptyResult => write!(f, "executor produced no result bytes"),
+            WorkerError::GuardDenied(reason) => write!(f, "smart gate denied execution: {reason}"),
+            WorkerError::GuardApprovalNeeded => {
+                write!(
+                    f,
+                    "smart gate needs a signed approval from the designated approver"
+                )
+            }
         }
     }
 }
@@ -122,6 +136,7 @@ pub fn is_retryable(err: &WorkerError) -> bool {
         WorkerError::IdentityMismatch => false,
         WorkerError::ExecutionFailed { .. } => false,
         WorkerError::EmptyResult => false,
+        WorkerError::GuardDenied(_) | WorkerError::GuardApprovalNeeded => false,
     }
 }
 

@@ -20,7 +20,11 @@ use crate::ser::{Reader, Writer};
 use std::collections::BTreeMap;
 
 /// Version of the infra grant encoding. A future format MUST use a new value.
-pub const GUARD_POLICY_VERSION: u8 = 1;
+/// Current grant/envelope version. `InfraPolicy` decoding still accepts v1
+/// bytes (new fields default to legacy semantics); signed capability and
+/// approval envelopes only accept the current version.
+pub const GUARD_POLICY_VERSION: u8 = 2;
+const GUARD_POLICY_VERSION_V1: u8 = 1;
 /// Longest accepted network id, mirrors agent policy bound.
 pub const MAX_GUARD_NETWORK_LEN: usize = 64;
 /// Most grants tracked per book, cap-with-refusal like PolicyBook.
@@ -64,6 +68,8 @@ pub enum GuardError {
     UnsignedCapability,
     BadApproval(&'static str),
     ActionUnverified,
+    SelfApproval,
+    WrongAudience,
     NonceNotIncreasing { nonce: u64, last_nonce: u64 },
     HeightRewind { height: u64, window_start: u64 },
     WindowExhausted { calls: u64, max: u64 },
@@ -100,6 +106,12 @@ impl std::fmt::Display for GuardError {
             GuardError::ContextMismatch => write!(f, "context hash mismatch"),
             GuardError::CrossPrincipal => write!(f, "capability principal is not this agent"),
             GuardError::ZeroNonce => write!(f, "capability nonce is zero"),
+            GuardError::SelfApproval => {
+                write!(f, "high-assurance grant names no independent approver")
+            }
+            GuardError::WrongAudience => {
+                write!(f, "capability is scoped to another enforcing node")
+            }
             GuardError::UnsignedCapability => {
                 write!(f, "capability is not signed by the grant owner")
             }
@@ -130,6 +142,21 @@ impl std::error::Error for GuardError {}
 /// Owner-signed narrow grant for one workload identity.
 ///
 /// Bounds rate and validity only. Names no tools, images, or APIs.
+///
+/// Risk classification lives here, set by the owner at issuance — never in
+/// the request. `requires_approval` marks a high-assurance grant: every
+/// admission under it needs a signed [`GuardApproval`], and a caller-supplied
+/// `high_risk: false` cannot switch that off (callers can only escalate a
+/// low-assurance grant into `needs_approval`, never de-escalate a
+/// high-assurance one). A high-assurance grant MUST name a genuinely
+/// independent `approver` (non-zero, distinct from both owner and agent);
+/// owner-as-approver is refused as [`GuardError::SelfApproval`], because a
+/// second signature from the same authority is not a second channel.
+/// `workload_id` binds the grant to one authenticated workload (zero means
+/// unbound legacy semantics: the presented id is trusted). Capabilities may
+/// additionally scope themselves to one enforcing node via
+/// [`Capability::audience`] (multi-node replay rule, §6 of the architecture
+/// doc).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InfraPolicy {
     pub version: u8,
@@ -142,6 +169,9 @@ pub struct InfraPolicy {
     pub valid_until_height: u64,
     pub revoked: bool,
     pub parent_agent_id: Option<AgentId>,
+    pub requires_approval: bool,
+    pub approver: Address,
+    pub workload_id: Hash,
 }
 
 impl InfraPolicy {
@@ -153,8 +183,52 @@ impl InfraPolicy {
         sha256_dom(DOM_GUARD_POLICY, &[&self.serialize()])
     }
 
+    /// The address whose signature counts as approval: the designated
+    /// approver, or the owner for legacy grants that name none.
+    pub fn effective_approver(&self) -> Address {
+        if self.approver == [0u8; 20] {
+            self.owner
+        } else {
+            self.approver
+        }
+    }
+
+    /// The workload every admission context is recomputed from: the bound id
+    /// when the grant names one, so a caller-supplied id is ignored rather
+    /// than trusted.
+    pub fn effective_workload(&self, presented: &Hash) -> Hash {
+        if self.workload_id == [0u8; 32] {
+            *presented
+        } else {
+            self.workload_id
+        }
+    }
+
+    /// Structural plus risk-model validation. Called on every admission path
+    /// and at grant registration, so a misconfigured high-assurance grant
+    /// fails closed instead of silently degrading to owner self-approval.
+    pub fn validate(&self) -> Result<(), GuardError> {
+        if self.max_calls_per_window == 0 {
+            return Err(GuardError::Malformed("max calls is zero"));
+        }
+        if self.window_blocks == 0 {
+            return Err(GuardError::Malformed("window is zero"));
+        }
+        if self.valid_until_height <= self.valid_from_height {
+            return Err(GuardError::Malformed("empty validity range"));
+        }
+        if self.requires_approval
+            && (self.approver == [0u8; 20]
+                || self.approver == self.owner
+                || self.approver == self.agent_id)
+        {
+            return Err(GuardError::SelfApproval);
+        }
+        Ok(())
+    }
+
     pub fn serialize(&self) -> Vec<u8> {
-        let mut w = Writer::with_capacity(128);
+        let mut w = Writer::with_capacity(192);
         w.u8(self.version)
             .u16le(self.network_id.len() as u16)
             .raw(self.network_id.as_bytes())
@@ -173,13 +247,20 @@ impl InfraPolicy {
                 w.u8(0);
             }
         }
+        w.u8(u8::from(self.requires_approval))
+            .fixed(&self.approver)
+            .fixed(&self.workload_id);
         w.into_vec()
     }
 
     pub fn deserialize(bytes: &[u8]) -> Result<Self, GuardError> {
         let mut r = Reader::new(bytes);
         let version = r.u8().map_err(|_| GuardError::Malformed("version"))?;
-        if version != GUARD_POLICY_VERSION {
+        // v1 grants (pre risk-model) still decode: the new fields default to
+        // legacy semantics (no mandated approval, owner approves, unbound
+        // workload). Persisted registry grants migrate by decoding, never by
+        // resurrection.
+        if version != GUARD_POLICY_VERSION && version != GUARD_POLICY_VERSION_V1 {
             return Err(GuardError::UnsupportedVersion(version));
         }
         let net_len = r
@@ -231,9 +312,27 @@ impl InfraPolicy {
             ),
             _ => return Err(GuardError::Malformed("parent link out of range")),
         };
-        if r.remaining() != 0 {
-            return Err(GuardError::Malformed("trailing bytes"));
-        }
+        let (requires_approval, approver, workload_id) = if version == GUARD_POLICY_VERSION_V1 {
+            if r.remaining() != 0 {
+                return Err(GuardError::Malformed("trailing bytes"));
+            }
+            (false, [0u8; 20], [0u8; 32])
+        } else {
+            let risk_raw = r.u8().map_err(|_| GuardError::Malformed("risk flags"))?;
+            if risk_raw > 1 {
+                return Err(GuardError::Malformed("risk flags out of range"));
+            }
+            let approver = r
+                .fixed::<20>()
+                .map_err(|_| GuardError::Malformed("approver"))?;
+            let workload_id = r
+                .fixed::<32>()
+                .map_err(|_| GuardError::Malformed("workload"))?;
+            if r.remaining() != 0 {
+                return Err(GuardError::Malformed("trailing bytes"));
+            }
+            (risk_raw == 1, approver, workload_id)
+        };
         Ok(InfraPolicy {
             version,
             network_id,
@@ -245,11 +344,22 @@ impl InfraPolicy {
             valid_until_height,
             revoked: revoked_raw == 1,
             parent_agent_id,
+            requires_approval,
+            approver,
+            workload_id,
         })
     }
 }
 
 /// Short-lived exact-action capability. What the owner signs.
+///
+/// `audience` scopes the capability to one enforcing node (zero means
+/// unscoped legacy semantics: admittable anywhere). An enforcing node admits
+/// only capabilities whose audience equals its own configured audience, so an
+/// owner that scopes a capability to node A denies its replay on node B by
+/// name. This is scoping, not a cross-node lock: unscoped capabilities remain
+/// independently admittable on every node, which the architecture doc states
+/// plainly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Capability {
     pub policy_hash: Hash,
@@ -257,6 +367,7 @@ pub struct Capability {
     pub context_hash: Hash,
     pub expiry_height: u64,
     pub nonce: u64,
+    pub audience: Hash,
 }
 
 impl Capability {
@@ -265,12 +376,13 @@ impl Capability {
     }
 
     pub fn serialize(&self) -> Vec<u8> {
-        let mut w = Writer::with_capacity(112);
+        let mut w = Writer::with_capacity(144);
         w.fixed(&self.policy_hash)
             .fixed(&self.action_hash)
             .fixed(&self.context_hash)
             .u64le(self.expiry_height)
-            .u64le(self.nonce);
+            .u64le(self.nonce)
+            .fixed(&self.audience);
         w.into_vec()
     }
 
@@ -287,6 +399,9 @@ impl Capability {
             .map_err(|_| GuardError::Malformed("context hash"))?;
         let expiry_height = r.u64le().map_err(|_| GuardError::Malformed("expiry"))?;
         let nonce = r.u64le().map_err(|_| GuardError::Malformed("nonce"))?;
+        let audience = r
+            .fixed::<32>()
+            .map_err(|_| GuardError::Malformed("audience"))?;
         if r.remaining() != 0 {
             return Err(GuardError::Malformed("trailing bytes"));
         }
@@ -296,6 +411,7 @@ impl Capability {
             context_hash,
             expiry_height,
             nonce,
+            audience,
         })
     }
 }
@@ -377,7 +493,7 @@ impl SignedCapability {
             return Err(GuardError::UnsupportedVersion(version));
         }
         let cap_bytes = r
-            .fixed_slice(112)
+            .fixed_slice(144)
             .map_err(|_| GuardError::Malformed("capability bytes"))?;
         let cap = Capability::deserialize(cap_bytes)?;
         let sigs = crate::sig::Bundle::from_reader(&mut r)
@@ -489,6 +605,10 @@ impl GuardApproval {
 
     /// Verify against the live grant, the capability being approved, and the
     /// values the boundary recomputed. Every mismatch is a named refusal.
+    /// Authority is the grant's designated approver — an address the owner
+    /// named at issuance, distinct from the owner — never whoever happens to
+    /// hold the capability. Legacy grants that name no approver fall back to
+    /// the owner (documented as self-managed, not second-channel).
     pub fn verify(
         &self,
         policy: &InfraPolicy,
@@ -505,8 +625,10 @@ impl GuardApproval {
             .keys
             .address()
             .map_err(|_| GuardError::BadApproval("keys do not form an address"))?;
-        if addr != policy.owner {
-            return Err(GuardError::BadApproval("approver is not the grant owner"));
+        if addr != policy.effective_approver() {
+            return Err(GuardError::BadApproval(
+                "approval is not from the designated approver",
+            ));
         }
         crate::sig::verify_bundle(&self.sigs, &self.keys, &self.signing_hash())
             .map_err(|_| GuardError::BadApproval("approval signature invalid"))?;
@@ -728,6 +850,7 @@ impl GuardBook {
                 valid_until: policy.valid_until_height,
             });
         }
+        policy.validate()?;
         if policy.agent_id != *agent_id {
             return Err(GuardError::CrossPrincipal);
         }
@@ -818,14 +941,21 @@ impl GuardBook {
     /// Execution-boundary admission: the signed-capability + recomputed-action
     /// + cryptographic-approval path every trust boundary MUST use.
     ///
-    /// - Verifies the owner's signature over the capability (Issue 1).
+    /// - Verifies the owner's signature over the capability, then the grant's
+    ///   structural and risk-model validity (`SelfApproval` fails closed).
+    /// - Refuses capabilities scoped to another enforcing node (`audience`).
     /// - Recomputes the canonical action hash from the `action_preimage` the
     ///   boundary observes, and refuses unless it equals the capability's
-    ///   action (Issue 3). There is no hash-only overload here: a boundary
-    ///   that cannot name the preimage cannot authorize.
-    /// - For high-risk operations requires a verified [`GuardApproval`]
-    ///   (Issue 2). A missing approval answers `NeedsApproval`; a present
-    ///   but invalid one denies, so a forged approval is never silent.
+    ///   action. There is no hash-only overload here: a boundary that cannot
+    ///   name the preimage cannot authorize.
+    /// - Recomputes the context from the grant-bound workload when the grant
+    ///   names one, ignoring any caller-supplied id; a caller-supplied
+    ///   workload id is only trusted for unbound (legacy) grants.
+    /// - Risk comes from the grant (`requires_approval`) OR-ed with the
+    ///   caller's escalation flag — a caller can escalate into
+    ///   `NeedsApproval`, never de-escalate out of it. High-assurance calls
+    ///   require a [`GuardApproval`] from the grant's designated approver
+    ///   (independent of the owner): missing gates, forged denies.
     #[allow(clippy::too_many_arguments)]
     pub fn authorize_signed(
         &mut self,
@@ -835,18 +965,26 @@ impl GuardBook {
         network_id: &str,
         height: u64,
         action_preimage: &[u8],
-        expected_context: &Hash,
+        workload_id: &Hash,
+        node_audience: &Hash,
         high_risk: bool,
         approval: Option<&GuardApproval>,
     ) -> Decision {
         if let Err(e) = signed.verify(policy) {
             return Decision::Deny(e);
         }
+        if signed.cap.audience != *node_audience {
+            return Decision::Deny(GuardError::WrongAudience);
+        }
         let recomputed = derive_action_hash(action_preimage);
         if recomputed != signed.cap.action_hash {
             return Decision::Deny(GuardError::ActionMismatch);
         }
-        if high_risk {
+        let effective_ctx = derive_context_hash(&policy.effective_workload(workload_id), height);
+        if effective_ctx != signed.cap.context_hash {
+            return Decision::Deny(GuardError::ContextMismatch);
+        }
+        if high_risk || policy.requires_approval {
             match approval {
                 None => return Decision::NeedsApproval,
                 Some(ap) => {
@@ -855,7 +993,7 @@ impl GuardBook {
                         &signed.cap,
                         agent_id,
                         &recomputed,
-                        expected_context,
+                        &effective_ctx,
                         height,
                     ) {
                         return Decision::Deny(e);
@@ -870,7 +1008,7 @@ impl GuardBook {
             network_id,
             height,
             &recomputed,
-            expected_context,
+            &effective_ctx,
             false,
             true,
         ) {
@@ -896,6 +1034,9 @@ mod tests {
             valid_until_height: 1000,
             revoked: false,
             parent_agent_id: None,
+            requires_approval: false,
+            approver: [0u8; 20],
+            workload_id: [0u8; 32],
         }
     }
 
@@ -909,6 +1050,7 @@ mod tests {
             context_hash: ctx,
             expiry_height: height + 10,
             nonce,
+            audience: [0u8; 32],
         };
         (cap, action, ctx)
     }
@@ -1100,8 +1242,36 @@ mod tests {
             valid_until_height: 1000,
             revoked: false,
             parent_agent_id: None,
+            requires_approval: false,
+            approver: [0u8; 20],
+            workload_id: [0u8; 32],
         };
         (owner, policy)
+    }
+
+    /// A high-assurance grant: the owner names a genuinely independent
+    /// approver and a bound workload. Returns owner, approver, policy.
+    fn owned_assured_policy() -> (crate::wallet::Wallet, crate::wallet::Wallet, InfraPolicy) {
+        use crate::agent::{derive_agent_id, AgentRole};
+        let owner = crate::wallet::Wallet::new_random("guard-owner");
+        let approver = crate::wallet::Wallet::new_random("guard-approver");
+        let addr = owner.address().unwrap();
+        let policy = InfraPolicy {
+            version: GUARD_POLICY_VERSION,
+            network_id: "srct/testnet".to_string(),
+            agent_id: derive_agent_id("srct/testnet", AgentRole::Machine, &addr),
+            owner: addr,
+            max_calls_per_window: 5,
+            window_blocks: 100,
+            valid_from_height: 10,
+            valid_until_height: 1000,
+            revoked: false,
+            parent_agent_id: None,
+            requires_approval: true,
+            approver: approver.address().unwrap(),
+            workload_id: [5u8; 32],
+        };
+        (owner, approver, policy)
     }
 
     fn owned_cap(
@@ -1117,6 +1287,7 @@ mod tests {
             context_hash: derive_context_hash(workload, height),
             expiry_height: height + 10,
             nonce,
+            audience: [0u8; 32],
         }
     }
 
@@ -1125,7 +1296,6 @@ mod tests {
         let (owner, policy) = owned_policy();
         let workload = [2u8; 32];
         let height = 50u64;
-        let ctx = derive_context_hash(&workload, height);
         let cap = owned_cap(&policy, b"deploy-42", &workload, height, 1);
         let signed = SignedCapability::issue(&owner, &cap).unwrap();
         signed.verify(&policy).unwrap();
@@ -1141,7 +1311,8 @@ mod tests {
                 "srct/testnet",
                 height,
                 b"deploy-42",
-                &ctx,
+                &workload,
+                &[0u8; 32],
                 false,
                 None
             ),
@@ -1164,7 +1335,8 @@ mod tests {
                 "srct/testnet",
                 height,
                 b"deploy-42",
-                &ctx,
+                &workload,
+                &[0u8; 32],
                 false,
                 None
             ),
@@ -1231,7 +1403,8 @@ mod tests {
                 "srct/testnet",
                 height,
                 preimage,
-                &ctx,
+                &workload,
+                &[0u8; 32],
                 true,
                 None
             ),
@@ -1277,7 +1450,8 @@ mod tests {
                 "srct/testnet",
                 height,
                 preimage,
-                &ctx,
+                &workload,
+                &[0u8; 32],
                 true,
                 Some(&approval)
             ),
@@ -1306,7 +1480,8 @@ mod tests {
                 "srct/testnet",
                 height,
                 preimage,
-                &ctx,
+                &workload,
+                &[0u8; 32],
                 true,
                 Some(&fake)
             ),
@@ -1325,7 +1500,8 @@ mod tests {
                 "srct/testnet",
                 height,
                 b"transfer-2M",
-                &ctx,
+                &workload,
+                &[0u8; 32],
                 true,
                 Some(&approval)
             ),
@@ -1338,7 +1514,6 @@ mod tests {
         let (owner, policy) = owned_policy();
         let workload = [2u8; 32];
         let height = 50u64;
-        let ctx = derive_context_hash(&workload, height);
         // The owner approved "deploy-42"; the runtime is about to run "deploy-43".
         let cap = owned_cap(&policy, b"deploy-42", &workload, height, 1);
         let signed = SignedCapability::issue(&owner, &cap).unwrap();
@@ -1351,12 +1526,250 @@ mod tests {
                 "srct/testnet",
                 height,
                 b"deploy-43",
-                &ctx,
+                &workload,
+                &[0u8; 32],
                 false,
                 None
             ),
             Decision::Deny(GuardError::ActionMismatch)
         );
         assert!(book.is_empty(), "a swapped action commits no nonce");
+    }
+
+    #[test]
+    fn caller_cannot_deescalate_a_high_assurance_grant() {
+        use crate::sig::Bundle;
+        let (owner, approver, policy) = owned_assured_policy();
+        let bound = policy.workload_id;
+        let height = 50u64;
+        let preimage = b"deploy-42";
+        let cap = owned_cap(&policy, preimage, &bound, height, 1);
+        let signed = SignedCapability::issue(&owner, &cap).unwrap();
+
+        // The caller claims low risk. The grant says otherwise: gated anyway.
+        let mut book = GuardBook::default();
+        assert_eq!(
+            book.authorize_signed(
+                &policy,
+                &signed,
+                &policy.agent_id,
+                "srct/testnet",
+                height,
+                preimage,
+                &bound,
+                &[0u8; 32],
+                false,
+                None
+            ),
+            Decision::NeedsApproval
+        );
+        assert!(book.is_empty(), "a gated call commits no nonce");
+
+        // The designated approver — independent of the owner — allows.
+        let action = derive_action_hash(preimage);
+        let ctx = derive_context_hash(&bound, height);
+        let draft = GuardApproval {
+            version: GUARD_POLICY_VERSION,
+            policy_hash: policy.hash(),
+            cap_hash: cap.signing_hash(),
+            agent_id: policy.agent_id,
+            action_hash: action,
+            context_hash: ctx,
+            expiry_height: height + 5,
+            sigs: Bundle::default(),
+            keys: Bundle::default(),
+        };
+        let honest = GuardApproval {
+            sigs: crate::l2::Auth::sigs_for(&approver, &draft.signing_hash()).unwrap(),
+            keys: crate::l2::Auth::keys_for(&approver).unwrap(),
+            ..draft.clone()
+        };
+        honest
+            .verify(&policy, &cap, &policy.agent_id, &action, &ctx, height)
+            .unwrap();
+        assert_eq!(
+            book.authorize_signed(
+                &policy,
+                &signed,
+                &policy.agent_id,
+                "srct/testnet",
+                height,
+                preimage,
+                &bound,
+                &[0u8; 32],
+                false,
+                Some(&honest)
+            ),
+            Decision::Allow
+        );
+
+        // The owner's own signature is NOT an approval here: only the
+        // designated approver counts, so owner self-approval denies.
+        let owner_signed = GuardApproval {
+            sigs: crate::l2::Auth::sigs_for(&owner, &draft.signing_hash()).unwrap(),
+            keys: crate::l2::Auth::keys_for(&owner).unwrap(),
+            ..draft
+        };
+        let mut book2 = GuardBook::default();
+        assert!(matches!(
+            book2.authorize_signed(
+                &policy,
+                &signed,
+                &policy.agent_id,
+                "srct/testnet",
+                height,
+                preimage,
+                &bound,
+                &[0u8; 32],
+                false,
+                Some(&owner_signed)
+            ),
+            Decision::Deny(GuardError::BadApproval(_))
+        ));
+    }
+
+    #[test]
+    fn self_approval_grant_is_refused_at_admission() {
+        let (owner, mut policy) = owned_policy();
+        // Owner marks high assurance but names itself approver: misconfigured.
+        policy.requires_approval = true;
+        policy.approver = owner.address().unwrap();
+        assert!(matches!(policy.validate(), Err(GuardError::SelfApproval)));
+        let workload = [2u8; 32];
+        let height = 50u64;
+        let cap = owned_cap(&policy, b"deploy-42", &workload, height, 1);
+        let mut book = GuardBook::default();
+        let ctx = derive_context_hash(&workload, height);
+        assert_eq!(
+            book.authorize(
+                &policy,
+                &cap,
+                &policy.agent_id,
+                "srct/testnet",
+                height,
+                &derive_action_hash(b"deploy-42"),
+                &ctx,
+                false,
+                true,
+            ),
+            Decision::Deny(GuardError::SelfApproval)
+        );
+    }
+
+    #[test]
+    fn bound_workload_ignores_a_spoofed_presented_id() {
+        let (owner, _approver, policy) = owned_assured_policy();
+        let bound = policy.workload_id;
+        let height = 50u64;
+        let preimage = b"deploy-42";
+        let cap = owned_cap(&policy, preimage, &bound, height, 1);
+        let signed = SignedCapability::issue(&owner, &cap).unwrap();
+
+        // The caller presents a stranger's workload id. The grant is bound,
+        // so the boundary recomputes the context from the bound id and the
+        // check passes — the call gates on the missing approval instead of
+        // denying on context. A presented id can neither help nor hurt.
+        let mut book = GuardBook::default();
+        assert_eq!(
+            book.authorize_signed(
+                &policy,
+                &signed,
+                &policy.agent_id,
+                "srct/testnet",
+                height,
+                preimage,
+                &[9u8; 32],
+                &[0u8; 32],
+                true,
+                None
+            ),
+            Decision::NeedsApproval
+        );
+
+        // A capability whose context was actually built for another workload
+        // denies by name.
+        let mut spoofed = cap.clone();
+        spoofed.context_hash = derive_context_hash(&[9u8; 32], height);
+        let spoofed_signed = SignedCapability::issue(&owner, &spoofed).unwrap();
+        let mut book2 = GuardBook::default();
+        assert_eq!(
+            book2.authorize_signed(
+                &policy,
+                &spoofed_signed,
+                &policy.agent_id,
+                "srct/testnet",
+                height,
+                preimage,
+                &[9u8; 32],
+                &[0u8; 32],
+                true,
+                None
+            ),
+            Decision::Deny(GuardError::ContextMismatch)
+        );
+    }
+
+    #[test]
+    fn scoped_capability_is_refused_on_another_node() {
+        let (owner, policy) = owned_policy();
+        let workload = [2u8; 32];
+        let height = 50u64;
+        let node_a: Hash = [0xAAu8; 32];
+        let node_b: Hash = [0xBBu8; 32];
+        let mut cap = owned_cap(&policy, b"deploy-42", &workload, height, 1);
+        cap.audience = node_a;
+        let signed = SignedCapability::issue(&owner, &cap).unwrap();
+
+        // Home node admits (no approval needed on this low-assurance grant).
+        let mut book = GuardBook::default();
+        assert_eq!(
+            book.authorize_signed(
+                &policy,
+                &signed,
+                &policy.agent_id,
+                "srct/testnet",
+                height,
+                b"deploy-42",
+                &workload,
+                &node_a,
+                false,
+                None
+            ),
+            Decision::Allow
+        );
+        // The same bytes on another node deny by name and commit nothing.
+        let mut book2 = GuardBook::default();
+        assert_eq!(
+            book2.authorize_signed(
+                &policy,
+                &signed,
+                &policy.agent_id,
+                "srct/testnet",
+                height,
+                b"deploy-42",
+                &workload,
+                &node_b,
+                false,
+                None
+            ),
+            Decision::Deny(GuardError::WrongAudience)
+        );
+        assert!(book2.is_empty(), "a mis-scoped capability commits no nonce");
+    }
+
+    #[test]
+    fn v1_grant_bytes_decode_with_legacy_semantics() {
+        // A persisted v1 grant (pre risk-model) decodes: the new fields
+        // default to legacy semantics rather than bricking the registry.
+        let policy = test_policy();
+        let mut v2 = policy.serialize();
+        assert_eq!(v2[0], GUARD_POLICY_VERSION);
+        v2.truncate(v2.len() - 53);
+        v2[0] = 1;
+        let back = InfraPolicy::deserialize(&v2).expect("v1 grant decodes");
+        assert!(!back.requires_approval);
+        assert_eq!(back.approver, [0u8; 20]);
+        assert_eq!(back.workload_id, [0u8; 32]);
+        assert_eq!(back.owner, policy.owner);
     }
 }

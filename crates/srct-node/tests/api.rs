@@ -839,6 +839,9 @@ fn guard_grant_authorize_replay_revoke_round_trip() {
         valid_until_height: 10_000,
         revoked: false,
         parent_agent_id: None,
+        requires_approval: false,
+        approver: [0u8; 20],
+        workload_id: [0u8; 32],
     };
     let (s, granted) = post(
         &node,
@@ -862,6 +865,7 @@ fn guard_grant_authorize_replay_revoke_round_trip() {
             context_hash: derive_context_hash(&workload, h),
             expiry_height: h + 10,
             nonce,
+            audience: [0u8; 32],
         };
         hex::encode(SignedCapability::issue(&owner, &cap).unwrap().serialize())
     };
@@ -885,6 +889,7 @@ fn guard_grant_authorize_replay_revoke_round_trip() {
         context_hash: derive_context_hash(&workload, h),
         expiry_height: h + 10,
         nonce: 9,
+        audience: [0u8; 32],
     };
     let (s, forged) = post(
         &node,
@@ -942,6 +947,165 @@ fn guard_grant_authorize_replay_revoke_round_trip() {
     assert_eq!(s, 200, "{dead}");
     assert_eq!(dead["decision"], "deny");
     assert_eq!(dead["reason"], "grant revoked");
+}
+
+#[test]
+fn guard_owner_set_risk_and_independent_approver_are_enforced() {
+    use srct_core::guard::{
+        derive_action_hash, derive_context_hash, Capability, GuardApproval, InfraPolicy,
+        SignedCapability, GUARD_POLICY_VERSION,
+    };
+    let node = start();
+    let h = node_height(&node);
+    let owner = wallet(78, "guard-owner-ha");
+    let approver = wallet(79, "guard-approver-ha");
+    let owner_addr = owner.address().unwrap();
+    let agent_id = derive_agent_id(NET, AgentRole::Machine, &owner_addr);
+    let bound = [8u8; 32];
+    let assured = InfraPolicy {
+        version: GUARD_POLICY_VERSION,
+        network_id: NET.to_string(),
+        agent_id,
+        owner: owner_addr,
+        max_calls_per_window: 5,
+        window_blocks: 100,
+        valid_from_height: 0,
+        valid_until_height: 10_000,
+        revoked: false,
+        parent_agent_id: None,
+        requires_approval: true,
+        approver: approver.address().unwrap(),
+        workload_id: bound,
+    };
+    let grant = |policy: &InfraPolicy, signer: &Wallet| {
+        post(
+            &node,
+            "/v1/guard/grant",
+            &serde_json::json!({
+                "policy_hex": hex::encode(policy.serialize()),
+                "policy_sigs_hex": hex::encode(Auth::sigs_for(signer, &policy.signing_hash()).unwrap().to_bytes()),
+                "policy_keys_hex": hex::encode(Auth::keys_for(signer).unwrap().to_bytes()),
+            }),
+        )
+    };
+    // A high-assurance grant that names the owner as approver is refused at
+    // registration: no silent downgrade to self-approval.
+    let mut self_approved = assured.clone();
+    self_approved.approver = owner_addr;
+    let (s, body) = grant(&self_approved, &owner);
+    assert_eq!(s, 400, "owner-as-approver must not register: {body}");
+
+    let (s, granted) = grant(&assured, &owner);
+    assert_eq!(s, 200, "independent-approver grant registers: {granted}");
+
+    let preimage = b"deploy-42";
+    let action = derive_action_hash(preimage);
+    let signed_hex = |nonce: u64| {
+        let cap = Capability {
+            policy_hash: assured.hash(),
+            action_hash: action,
+            context_hash: derive_context_hash(&bound, h),
+            expiry_height: h + 10,
+            nonce,
+            audience: [0u8; 32],
+        };
+        hex::encode(SignedCapability::issue(&owner, &cap).unwrap().serialize())
+    };
+    let decide = |cap_hex: &str, high_risk: bool| {
+        post(
+            &node,
+            "/v1/guard/decide",
+            &serde_json::json!({
+                "policy_hex": hex::encode(assured.serialize()),
+                "cap_hex": cap_hex,
+                "agent_id_hex": hex::encode(agent_id),
+                "action_hash_hex": hash_to_hex(&action),
+                "workload_id_hex": hash_to_hex(&bound),
+                "high_risk": high_risk,
+            }),
+        )
+    };
+    // Caller claims low risk; the grant disagrees: gated both ways.
+    for flag in [false, true] {
+        let (s, out) = decide(&signed_hex(11), flag);
+        assert_eq!(s, 200, "{out}");
+        assert_eq!(out["decision"], "needs_approval");
+    }
+    // Stateful admission without an approval gates too.
+    let (s, gated) = post(
+        &node,
+        "/v1/guard/authorize",
+        &serde_json::json!({
+            "cap_hex": signed_hex(12),
+            "agent_id_hex": hex::encode(agent_id),
+            "action_preimage_hex": hex::encode(preimage),
+            "workload_id_hex": hash_to_hex(&bound),
+            "high_risk": false,
+        }),
+    );
+    assert_eq!(s, 200, "{gated}");
+    assert_eq!(gated["decision"], "needs_approval");
+
+    // The designated approver's signed approval admits (presented workload id
+    // is ignored: the grant is bound, so even a spoofed id gates the same).
+    let approval_for = |nonce: u64, signer: &Wallet| {
+        let cap = Capability {
+            policy_hash: assured.hash(),
+            action_hash: action,
+            context_hash: derive_context_hash(&bound, h),
+            expiry_height: h + 10,
+            nonce,
+            audience: [0u8; 32],
+        };
+        let draft = GuardApproval {
+            version: GUARD_POLICY_VERSION,
+            policy_hash: assured.hash(),
+            cap_hash: cap.signing_hash(),
+            agent_id,
+            action_hash: action,
+            context_hash: derive_context_hash(&bound, h),
+            expiry_height: h + 5,
+            sigs: srct_core::sig::Bundle::default(),
+            keys: srct_core::sig::Bundle::default(),
+        };
+        GuardApproval {
+            sigs: Auth::sigs_for(signer, &draft.signing_hash()).unwrap(),
+            keys: Auth::keys_for(signer).unwrap(),
+            ..draft
+        }
+    };
+    let (s, allowed) = post(
+        &node,
+        "/v1/guard/authorize",
+        &serde_json::json!({
+            "cap_hex": signed_hex(13),
+            "agent_id_hex": hex::encode(agent_id),
+            "action_preimage_hex": hex::encode(preimage),
+            "action_hash_hex": hash_to_hex(&action),
+            "workload_id_hex": hash_to_hex(&[9u8; 32]),
+            "high_risk": false,
+            "approval_hex": hex::encode(approval_for(13, &approver).serialize()),
+        }),
+    );
+    assert_eq!(s, 200, "{allowed}");
+    assert_eq!(allowed["decision"], "allow");
+
+    // The owner's own signature is not an approval here: only the designated
+    // approver counts.
+    let (s, denied) = post(
+        &node,
+        "/v1/guard/authorize",
+        &serde_json::json!({
+            "cap_hex": signed_hex(14),
+            "agent_id_hex": hex::encode(agent_id),
+            "action_preimage_hex": hex::encode(preimage),
+            "workload_id_hex": hash_to_hex(&bound),
+            "high_risk": false,
+            "approval_hex": hex::encode(approval_for(14, &owner).serialize()),
+        }),
+    );
+    assert_eq!(s, 200, "{denied}");
+    assert_eq!(denied["decision"], "deny");
 }
 
 /// `POST /v1/policy/decide` answers the engine without committing: allow for

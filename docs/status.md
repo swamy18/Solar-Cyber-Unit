@@ -2088,4 +2088,34 @@ same rule enforced in `srct-policy`, `srct-mcp` and the node API:
   Fixed by funding `BRIDGE_TOTAL_SAT` in the 8 tests
   (`crates/srct-node/tests/api.rs`); `run_bridge` now uses the named
   `BRIDGE_FEE_SAT`. Full `api` suite green (50 passed), plus `micro_safety`,
-  `agent_economy`, `x402` green; clippy and fmt clean.
+  `agent_economy`, `x402` green; clippy and fmt clean. CI `test and vectors`
+  is green on the follow-up commit.
+
+### 2026-11-05 Smart Gate correction pass (no consensus change)
+
+Review follow-ups closed as structural rules in `srct-core/src/guard.rs`,
+enforced in `srct-policy`, `srct-mcp`, `srct-node` and `srct-worker`:
+
+- **Owner-set risk.** `InfraPolicy` (layout v2, v1 still decodes) carries
+  `requires_approval`; every boundary ORs it with the caller's flag, so
+  `high_risk: false` from a caller never de-escalates a high-assurance
+  grant. New test: de-escalation attempt gates.
+- **Independent approver.** The grant names an `approver` distinct from
+  owner and agent; `GuardApproval::verify` requires the designated
+  approver's keys. Owner-as-approver fails closed (`SelfApproval`) at
+  registration and on every admission path. New tests: approver admits,
+  owner self-approval denies.
+- **Workload binding.** Grants may bind `workload_id`; boundaries recompute
+  the context from the bound id and ignore caller-supplied ids. New test:
+  spoofed presented id ignored, wrong-built context denies.
+- **Audience scoping.** Capabilities carry `audience`; nodes admit only
+  their own (`SRCT_GUARD_AUDIENCE`, zero by default). Unscoped legacy
+  capabilities admit everywhere (documented residual). New test: scoped
+  cap admits home, denies away, commits nothing.
+- **Reference execution boundary.** `srct-worker/src/guard.rs`
+  (`GuardGate::execute`) recomputes the canonical preimage from the exact
+  work about to run and only then invokes the executor; drift refuses.
+  K8s webhooks remain planned.
+- Docs updated in place: architecture doc (§§3-9), README (How it works,
+  replay/state, honest limits), portable-policy pointer, white paper
+  (Smart Gate subsection, replay table, invariant, limitations).

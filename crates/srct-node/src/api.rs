@@ -3568,10 +3568,28 @@ async fn policy_decide(
     })?
 }
 
+/// This node's capability-audience identity: capabilities scoped to another
+/// audience deny here. Configured via `SRCT_GUARD_AUDIENCE` (32-byte hex);
+/// absent or malformed means the zero audience, under which only unscoped
+/// (legacy) capabilities admit. Setting an audience is strict in the
+/// fail-closed direction: once set, unscoped capabilities stop admitting.
+fn node_audience() -> [u8; 32] {
+    let raw = std::env::var("SRCT_GUARD_AUDIENCE").unwrap_or_default();
+    let hex_str = raw.trim().trim_start_matches("0x");
+    if hex_str.len() != 64 {
+        return [0u8; 32];
+    }
+    srct_core::hash::hash_from_hex(hex_str).unwrap_or_default()
+}
+
 /// `POST /v1/guard/decide` — stateless Smart Gate pre-check over HTTP.
-/// Read-only: verifies grant shape, network binding, validity, capability
-/// hash equality, expiry and lifetime. Window counts and nonce replay need the
-/// stateful `GuardBook` (MCP `guard.authorize`); this route commits nothing.
+/// Read-only: verifies the capability signature, the grant's risk-model
+/// validity, grant shape, network binding, validity, capability hash
+/// equality, expiry and lifetime, plus audience scoping against this node.
+/// Risk is owner-set (`requires_approval`) OR-ed with the caller's flag;
+/// when the grant binds a workload the context is recomputed from the bound
+/// id. Window counts and nonce replay need the stateful `GuardBook` (MCP
+/// `guard.authorize`); this route commits nothing.
 #[derive(Deserialize)]
 struct GuardDecideReq {
     policy_hex: String,
@@ -3603,6 +3621,9 @@ async fn guard_decide(State(state): State<ApiState>, Json(req): Json<GuardDecide
         if let Err(e) = signed.verify(&policy) {
             return Err(bad(format!("capability: {e}")));
         }
+        if let Err(e) = policy.validate() {
+            return Err(bad(format!("grant: {e}")));
+        }
         let cap = &signed.cap;
         let agent_raw = hex::decode(req.agent_id_hex.trim().trim_start_matches("0x"))
             .map_err(|_| bad("malformed agent id hex"))?;
@@ -3615,7 +3636,7 @@ async fn guard_decide(State(state): State<ApiState>, Json(req): Json<GuardDecide
             .map_err(|_| bad("malformed action hash"))?;
         let workload_id = srct_core::hash::hash_from_hex(req.workload_id_hex.trim())
             .map_err(|_| bad("malformed workload id"))?;
-        let expected_ctx = derive_context_hash(&workload_id, height);
+        let expected_ctx = derive_context_hash(&policy.effective_workload(&workload_id), height);
         let deny = |reason: &str| {
             Ok(Json(json!({
                 "decision": "deny",
@@ -3632,6 +3653,9 @@ async fn guard_decide(State(state): State<ApiState>, Json(req): Json<GuardDecide
         }
         if cap.nonce == 0 {
             return deny("capability nonce is zero");
+        }
+        if cap.audience != node_audience() {
+            return deny("capability is scoped to another enforcing node");
         }
         if height < policy.valid_from_height {
             return deny("grant not yet valid");
@@ -3657,10 +3681,10 @@ async fn guard_decide(State(state): State<ApiState>, Json(req): Json<GuardDecide
         if cap.expiry_height.saturating_sub(height) > MAX_CAP_LIFETIME {
             return deny("capability lifetime exceeds cap");
         }
-        if req.high_risk.unwrap_or(false) {
+        if req.high_risk.unwrap_or(false) || policy.requires_approval {
             return Ok(Json(json!({
                 "decision": "needs_approval",
-                "reason": "high-risk action needs second-channel approval",
+                "reason": "high-risk action needs a signed approval from the designated approver",
                 "network_id": network,
                 "height": height,
                 "policy_hash": srct_core::hash::hash_to_hex(&policy.hash()),
@@ -3709,6 +3733,9 @@ fn decode_owned_guard(
 /// authority) and must name this node's network. Registration is idempotent:
 /// the same bytes hash the same. A grant whose window already ended is
 /// refused — registering dead authority only widens the file it persists in.
+/// The grant's risk model is validated here: a high-assurance grant
+/// (`requires_approval`) that names no independent approver is refused at
+/// registration, so it can never silently degrade to owner self-approval.
 #[derive(Deserialize)]
 struct GuardGrantReq {
     policy_hex: String,
@@ -3721,6 +3748,9 @@ async fn guard_grant(State(state): State<ApiState>, Json(req): Json<GuardGrantRe
         return Err(bad("guard grant over cap"));
     }
     let policy = decode_owned_guard(&req.policy_hex, &req.policy_sigs_hex, &req.policy_keys_hex)?;
+    policy
+        .validate()
+        .map_err(|e| bad(format!("grant risk model: {e}")))?;
     with_shared(&state, |sh| {
         let network = sh.chain.params().network_id.clone();
         let height = sh.chain.height();
@@ -3892,8 +3922,7 @@ async fn guard_authorize(
     }
     with_shared(&state, |sh| {
         use srct_core::guard::{
-            derive_action_hash, derive_context_hash, Decision as GuardDecision, GuardApproval,
-            SignedCapability,
+            derive_action_hash, Decision as GuardDecision, GuardApproval, SignedCapability,
         };
         let network = sh.chain.params().network_id.clone();
         let height = sh.chain.height();
@@ -3974,7 +4003,10 @@ async fn guard_authorize(
         }
         let workload_id = srct_core::hash::hash_from_hex(req.workload_id_hex.trim())
             .map_err(|_| bad("malformed workload id"))?;
-        let expected_ctx = derive_context_hash(&workload_id, height);
+        // Risk is owner-set, never caller-set: the grant's `requires_approval`
+        // bit ORs with the caller's flag inside `authorize_signed`, so a
+        // caller that reports `high_risk: false` on a high-assurance grant is
+        // still gated. Callers escalate; they never de-escalate.
         let high_risk = req.high_risk.unwrap_or(false);
         // Boolean approvals are dead: a high-risk call without a signed
         // approval envelope answers needs_approval; a forged envelope denies.
@@ -3996,7 +4028,8 @@ async fn guard_authorize(
             &network,
             height,
             &preimage,
-            &expected_ctx,
+            &workload_id,
+            &node_audience(),
             high_risk,
             approval.as_ref(),
         ) {
@@ -4034,7 +4067,7 @@ async fn guard_authorize(
                 );
                 Ok(Json(json!({
                     "decision": "needs_approval",
-                    "reason": "high-risk action needs second-channel approval",
+                    "reason": "high-risk action needs a signed approval from the designated approver",
                     "network_id": network,
                     "height": height,
                     "policy_hash": hash_to_hex(&cap.policy_hash),

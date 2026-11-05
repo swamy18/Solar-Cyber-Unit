@@ -14,6 +14,8 @@
 //! - [`discovery`] — task discovery and filtering over authoritative state (§18.4)
 //! - [`claim`] / [`submit`] — the two worker-side transaction flows (§18.5, §18.7)
 //! - [`executor`] — the execution seam the operator plugs its engine into (§18.6)
+//! - [`guard`] — the Smart Gate execution boundary: exact-work admission
+//!   before any executor runs
 //! - [`dispute`] — dispute observation and challenger participation (§18.14)
 //! - [`vwc`] — certificate observation/validation (§18.13, reusing §17)
 //! - [`client`] — the `WorkerClient` facade and `Earnings` (§18.9, §18.13)
@@ -29,6 +31,7 @@ pub mod dispute;
 pub mod error;
 pub mod executor;
 pub mod exit;
+pub mod guard;
 pub mod http;
 pub mod node;
 pub mod submit;
@@ -55,6 +58,7 @@ pub use executor::{
     ExecutorCapabilities,
 };
 pub use exit::{queue_exit, queue_exit_plan, ExitPlan};
+pub use guard::{guard_action_hash, guard_action_preimage, GuardGate};
 pub use http::{ConservationReport, HttpNode};
 pub use node::{BroadcastError, L2Broadcaster, L2NodeView};
 pub use submit::{reconcile_submitted, submit_plan, submit_result, SubmitPlan, SubmittedState};

@@ -262,13 +262,18 @@ impl SolarCyberUnitMcp {
     }
 
     /// `guard.check` — stateless Smart Gate pre-check. No book, no commit.
-    /// Verifies the owner's signature over the capability, then grant shape,
-    /// network binding, validity, capability equality, expiry and lifetime.
-    /// `cap_hex` MUST be a signed [`SignedCapability`] envelope; a bare
-    /// capability is refused as `unsigned_capability`. Answers allow /
-    /// needs_approval, refuses by name. This is a pre-check only: execution
-    /// authorization recomputes the action hash from the observed preimage in
-    /// `guard.authorize`.
+    /// Verifies the owner's signature over the capability and the grant's
+    /// risk-model validity, then grant shape, network binding, validity,
+    /// capability equality, expiry and lifetime. `cap_hex` MUST be a signed
+    /// [`SignedCapability`] envelope; a bare capability is refused as
+    /// `unsigned_capability`. Risk is owner-set (`requires_approval`) OR-ed
+    /// with the caller's flag — callers escalate, never de-escalate. When the
+    /// grant binds a workload, the context is recomputed from the bound id
+    /// and the presented id is ignored. Audience is not checked here: this
+    /// check is portable and node-agnostic; the admitting node enforces
+    /// scoping. Answers allow / needs_approval, refuses by name. This is a
+    /// pre-check only: execution authorization recomputes the action hash
+    /// from the observed preimage in `guard.authorize`.
     fn guard_check(&self, request: &Value) -> Result<Value, McpError> {
         let network_id = str_field(request, "network_id")?;
         let height = u64_field(request, "height")?;
@@ -285,6 +290,9 @@ impl SolarCyberUnitMcp {
         signed
             .verify(&policy)
             .map_err(|e| McpError::refused("guard_refused", e.to_string()))?;
+        policy
+            .validate()
+            .map_err(|e| McpError::refused("guard_refused", e.to_string()))?;
         let cap = &signed.cap;
         let agent_raw = hex_field(request, "agent_id_hex")?;
         if agent_raw.len() != 20 {
@@ -296,7 +304,7 @@ impl SolarCyberUnitMcp {
             .map_err(|e| McpError::bad(format!("action_hash: {e}")))?;
         let workload_id = hash_from_hex(str_field(request, "workload_id_hex")?.trim())
             .map_err(|e| McpError::bad(format!("workload_id: {e}")))?;
-        let expected_ctx = derive_context_hash(&workload_id, height);
+        let expected_ctx = derive_context_hash(&policy.effective_workload(&workload_id), height);
         let high_risk = request
             .get("high_risk")
             .and_then(Value::as_bool)
@@ -349,9 +357,9 @@ impl SolarCyberUnitMcp {
                 "capability lifetime exceeds cap",
             ));
         }
-        if high_risk {
+        if high_risk || policy.requires_approval {
             return Ok(
-                json!({"decision": "needs_approval", "reason": "high-risk action needs a signed approval, not a boolean"}),
+                json!({"decision": "needs_approval", "reason": "high-risk action needs a signed approval from the designated approver, not a boolean"}),
             );
         }
         Ok(json!({"decision": "allow", "policy_hash": hash_to_hex(&policy.hash())}))
@@ -363,9 +371,12 @@ impl SolarCyberUnitMcp {
     /// `action_preimage_hex`: the boundary recomputes
     /// `derive_action_hash(preimage)` from what it is about to execute and
     /// refuses unless it equals the capability's action (action-swap fix).
-    /// High-risk calls MUST supply `approval_hex` (a signed [`GuardApproval`]
-    /// envelope); the old `approved: true` boolean is no longer accepted. On
-    /// allow the state commits; on deny or approval-needed nothing mutates.
+    /// Risk is owner-set OR caller-escalated; high-assurance calls MUST supply
+    /// `approval_hex` (a signed [`GuardApproval`] envelope from the grant's
+    /// designated approver); the old `approved: true` boolean is no longer
+    /// accepted. The local book is unscoped, so audience-scoped capabilities
+    /// are refused here and must be admitted by their node. On allow the
+    /// state commits; on deny or approval-needed nothing mutates.
     /// Local MCP state is a non-authoritative cache: the node's registry +
     /// revocation set is authoritative (see the Smart Gate architecture doc).
     fn guard_authorize(&mut self, request: &Value) -> Result<Value, McpError> {
@@ -406,7 +417,6 @@ impl SolarCyberUnitMcp {
         }
         let workload_id = hash_from_hex(str_field(request, "workload_id_hex")?.trim())
             .map_err(|e| McpError::bad(format!("workload_id: {e}")))?;
-        let expected_ctx = derive_context_hash(&workload_id, height);
         let high_risk = request
             .get("high_risk")
             .and_then(Value::as_bool)
@@ -445,7 +455,8 @@ impl SolarCyberUnitMcp {
             network_id,
             height,
             &preimage,
-            &expected_ctx,
+            &workload_id,
+            &[0u8; 32],
             high_risk,
             approval.as_ref(),
         ) {
