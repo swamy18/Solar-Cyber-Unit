@@ -288,6 +288,94 @@ fn worker_ahead_of_node_self_heals_over_http() {
 }
 
 #[test]
+fn moving_chain_terminates_safely_over_http() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let (addr, shared) = spawn_node();
+    // Pre-mine so the worker starts behind, then keep churning while it
+    // executes: the chain under test never stands still.
+    for _ in 0..3 {
+        mine_empty(&shared);
+    }
+    let h = node_height(&shared);
+    let owner = wallet(72, "http-guard-owner-6");
+    let owner_addr = owner.address().unwrap();
+    let workload_wallet = wallet(73, "http-workload-6");
+    let workload = [4u8; 32];
+    let policy = keybound_policy(owner_addr, &workload_wallet);
+    let granted = register_grant(&http(addr), &policy, &owner);
+    assert_eq!(granted["policy_hash"], hex::encode(policy.hash()));
+
+    let work = test_work();
+    let preimage = srct_worker::guard_action_preimage(&work);
+    let action = derive_action_hash(&preimage);
+    // Capability built for the live height; the worker still believes an
+    // older one — and the chain keeps moving under it.
+    let signed = signed_cap(&owner, &policy, &action, &workload, h, 1);
+    let stop = Arc::new(AtomicBool::new(false));
+    let churn = {
+        let shared = Arc::clone(&shared);
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::SeqCst) {
+                mine_empty(&shared);
+            }
+        })
+    };
+    let mut gate = gate_for(
+        http(addr),
+        &policy,
+        signed,
+        None,
+        Some(workload_wallet),
+        h - 1,
+        workload,
+    );
+    let outcome = gate.execute(&CpuExecutor::default(), &work);
+    stop.store(true, Ordering::SeqCst);
+    churn.join().expect("the miner thread joins");
+    // Either terminal state is correct: an allow executed exactly once, or
+    // a deny executed nothing and committed nothing locally. The run
+    // terminates — it never spins waiting for a still chain.
+    match outcome {
+        Ok(out) => {
+            assert!(!out.output.is_empty(), "an allow executes once");
+            assert_eq!(
+                gate.book.state(&policy.hash()).map(|s| s.last_nonce),
+                Some(1),
+                "exactly one local commit for one execution"
+            );
+        }
+        Err(e) => {
+            assert!(
+                matches!(e, WorkerError::GuardDenied(_)),
+                "a moving chain fails closed, never otherwise: {e}"
+            );
+            assert!(
+                gate.book.is_empty(),
+                "a denied admission commits no local state"
+            );
+        }
+    }
+
+    // Recovery: with the chain still and a fresh capability at the live
+    // height, the same grant admits — nothing was poisoned by the churn.
+    let h2 = node_height(&shared);
+    let signed2 = signed_cap(&owner, &policy, &action, &workload, h2, 2);
+    let mut gate2 = gate_for(
+        http(addr),
+        &policy,
+        signed2,
+        None,
+        Some(wallet(73, "http-workload-6")),
+        h2,
+        workload,
+    );
+    gate2
+        .execute(&CpuExecutor::default(), &work)
+        .expect("a fresh capability admits after the churn");
+}
+
+#[test]
 fn replay_and_impersonation_denied_over_http() {
     let (addr, shared) = spawn_node();
     let h = node_height(&shared);

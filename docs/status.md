@@ -2216,6 +2216,33 @@ while local verification denied on context mismatch, with no execution.
 - Verification (working tree): worker guard 10, node api 52, core guard 21,
   policy 10, MCP 24, state_persist 3; clippy and fmt clean.
 
+### 2026-11-05 Moving-chain retry proof: HTTP churn + bounded exhaustion (no consensus change)
+
+Reviewer follow-up: the bounded retry was proven only against fakes, never
+against a moving chain, and retry exhaustion was unverified. Closed as code:
+
+- New `crates/srct-node/tests/guard_worker_http.rs`: a real `GuardGate` +
+  `NodeGateAuthority` + `CpuExecutor` against a real node over HTTP —
+  in-sync admission, behind/ahead self-heal (deny carries the new height,
+  retry rebuilds there), replay and impersonation denial, approval-gated
+  admission, and the node's reported height asserted on the wire.
+- New `moving_chain_terminates_safely_over_http`: pre-mines 3 blocks, then
+  churns blocks on a background thread while a behind worker with an old
+  capability executes. Either terminal state is correct and asserted:
+  allow executes exactly once (one local commit), or deny executes nothing
+  with no local commit. A fresh capability afterwards admits, proving no
+  poisoned state.
+- New unit test `retry_exhaustion_is_bounded`: a never-still authority is
+  admitted against exactly 3 times (`MAX_ADMIT_ATTEMPTS`), then the
+  `admission retries exhausted` error — termination by bound, not luck.
+- Wire-string contract pinned: the node denies skew as
+  `workload credential invalid: ...` (prefixed) and plain
+  `context hash mismatch`; `is_height_drift_deny` matches exactly those,
+  so only height-plausible denies retry — revocations and replays never do.
+- Behavior statement: key-bound credentials under drift deny at the
+  authority with no commit; the first attempt that names the live height
+  admits; exhaustion is always terminal and safe.
+
 ### 2026-11-05 Key-bound credential height sync + bounded retry (no consensus change)
 
 Follow-up gap: the possession proof was built once at the worker-observed
@@ -2235,7 +2262,7 @@ could never execute key-bound grants. Fixed without extending any lifetime:
 - Unit coverage: retry heals a mid-flight height move; non-drift denies
   never retry (call-counted); allow-without-height and malformed answers
   fail closed; wire reason strings pinned in core.
-- Verification (working tree): guard_worker_http 5, worker guard 12,
+- Verification (working tree): guard_worker_http 6, worker guard 13,
   node api 52, core guard 22, policy 10, MCP 24, state_persist 3;
   `cargo clippy --workspace --all-targets -- -D warnings` clean,
-  `cargo fmt --all --check` clean.
+  `cargo fmt --all --check` clean; churn test repeated 3x, stable.

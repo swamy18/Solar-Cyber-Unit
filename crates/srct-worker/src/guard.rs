@@ -422,6 +422,22 @@ mod tests {
             Err(WorkerError::ObservationUnavailable("authority unreachable"))
         }
     }
+    /// An authority whose chain never stands still: every attempt denies
+    /// stale at a height one past the attempt. Models a node that advances
+    /// between every round trip, so the retry bound — not luck — terminates
+    /// the execution.
+    struct ChurningAuthority {
+        calls: std::sync::Arc<std::sync::Mutex<usize>>,
+    }
+    impl GateAuthority for ChurningAuthority {
+        fn admit(&self, req: &AdmissionRequest) -> WorkerResult<Admission> {
+            *self.calls.lock().unwrap() += 1;
+            Ok(Admission::Deny {
+                reason: "workload credential invalid: credential names another context".to_string(),
+                height: Some(req.height + 1),
+            })
+        }
+    }
     /// Simulates the chain advancing mid-flight: the first admit denies as
     /// stale at a new height, the retry then admits there.
     struct FlappingAuthority {
@@ -1005,6 +1021,80 @@ mod tests {
             gate.book.state(&policy.hash()).map(|s| s.last_nonce),
             Some(1),
             "exactly one local commit for one execution"
+        );
+    }
+
+    #[test]
+    fn retry_exhaustion_is_bounded() {
+        use crate::executor::CpuExecutor;
+        use srct_core::guard::workload_key_fingerprint;
+        // The chain never stands still: every attempt denies stale at a new
+        // height. Execution must terminate after exactly MAX_ADMIT_ATTEMPTS
+        // admissions — no infinite retry, no execution, no local commit.
+        let owner = Wallet::new_random("churn-owner");
+        let addr = owner.address().unwrap();
+        let workload_wallet = Wallet::new_random("churn-workload");
+        let workload_keys = srct_core::l2::Auth::keys_for(&workload_wallet).unwrap();
+        let policy = InfraPolicy {
+            version: GUARD_POLICY_VERSION,
+            network_id: "srct/testnet".to_string(),
+            agent_id: derive_agent_id("srct/testnet", AgentRole::Machine, &addr),
+            owner: addr,
+            max_calls_per_window: 5,
+            window_blocks: 100,
+            valid_from_height: 0,
+            valid_until_height: 10_000,
+            revoked: false,
+            parent_agent_id: None,
+            requires_approval: false,
+            approver: [0u8; 20],
+            workload_id: [0u8; 32],
+            workload_key: workload_key_fingerprint(&workload_keys),
+        };
+        let work = test_work();
+        let preimage = guard_action_preimage(&work);
+        let workload = [4u8; 32];
+        let cap = Capability {
+            policy_hash: policy.hash(),
+            action_hash: derive_action_hash(&preimage),
+            context_hash: derive_context_hash(&workload, 50),
+            expiry_height: 10_000,
+            nonce: 1,
+            audience: [0u8; 32],
+        };
+        let signed = SignedCapability::issue(&owner, &cap).unwrap();
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+        let mut gate = GuardGate {
+            policy: policy.clone(),
+            signed,
+            approval: None,
+            book: GuardBook::default(),
+            authority: Box::new(ChurningAuthority {
+                calls: calls.clone(),
+            }),
+            workload_wallet: Some(workload_wallet),
+            agent_id: policy.agent_id,
+            network_id: "srct/testnet".to_string(),
+            height: 50,
+            workload_id: workload,
+            node_audience: [0u8; 32],
+            escalate_to_approval: false,
+        };
+        let err = gate
+            .execute(&CpuExecutor::default(), &work)
+            .expect_err("an ever-moving chain must terminate, not hang");
+        assert!(
+            matches!(err, WorkerError::GuardDenied(_)),
+            "unexpected: {err}"
+        );
+        assert_eq!(
+            *calls.lock().unwrap(),
+            MAX_ADMIT_ATTEMPTS as usize,
+            "the retry bound caps admissions even when the chain never stops"
+        );
+        assert!(
+            gate.book.is_empty(),
+            "denies never commit: nothing to forget, nothing spent"
         );
     }
 
