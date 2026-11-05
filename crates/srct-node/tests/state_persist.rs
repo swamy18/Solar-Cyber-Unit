@@ -19,6 +19,10 @@
 use srct_core::agent::{
     derive_agent_id, AgentRole, AuthorizationRequest, SpendPolicy, POLICY_VERSION,
 };
+use srct_core::guard::{
+    derive_context_hash, Capability, Decision as GuardDecision, InfraPolicy,
+    GUARD_POLICY_VERSION,
+};
 use srct_core::chain::Chain;
 use srct_core::credit::Reservation;
 use srct_core::hash::Hash;
@@ -53,6 +57,22 @@ fn policy() -> SpendPolicy {
         allowed_services: vec![[9u8; 32]],
         not_before_height: 0,
         expires_at_height: 10_000,
+        revoked: false,
+        parent_agent_id: None,
+    }
+}
+
+fn guard_policy() -> InfraPolicy {
+    let owner = [7u8; 20];
+    InfraPolicy {
+        version: GUARD_POLICY_VERSION,
+        network_id: NET.into(),
+        agent_id: derive_agent_id(NET, AgentRole::Machine, &owner),
+        owner,
+        max_calls_per_window: 10,
+        window_blocks: 100,
+        valid_from_height: 0,
+        valid_until_height: 10_000,
         revoked: false,
         parent_agent_id: None,
     }
@@ -149,8 +169,25 @@ fn populate(node: &mut SharedNode) {
         .expect("receipt accepted");
 
     // A released escrow bound to the exit that pays it (Gap 3 settlement).
+    // The escrow itself is stored too: since the orphan prune, a restart
+    // drops exit bindings whose escrow is not in the book, so a dangling
+    // binding would not round-trip.
+    let escrow = srct_core::escrow::ConditionalEscrow::open(
+        NET.into(),
+        [7u8; 20],
+        srct_core::bls_checkpoint::BlsPublicKey([1u8; 48]),
+        [1u8; 20],
+        srct_core::bls_checkpoint::BlsPublicKey([2u8; 48]),
+        srct_core::bls_checkpoint::BlsPublicKey([3u8; 48]),
+        500,
+        5,
+        0,
+    )
+    .expect("open escrow");
+    let escrow_id = escrow.id();
+    node.escrows.insert(escrow_id, escrow);
     node.escrow_exit.insert(
-        [8u8; 32],
+        escrow_id,
         srct_node::api::EscrowExitBinding {
             txid: [7u8; 64],
             owner: [1u8; 20],
@@ -160,6 +197,30 @@ fn populate(node: &mut SharedNode) {
 
     // A minted attestation that must never mint again, across a restart.
     node.attestations_used.insert([6u8; 32], 500);
+
+    // A Smart Gate grant the node enforces, plus one consumed capability:
+    // the window count and nonce must survive the restart, or a replay
+    // would look fresh.
+    let gp = guard_policy();
+    node.guard_registry.insert(gp.hash(), gp.clone());
+    node.guard_revoked.insert([5u8; 32]);
+    let workload = [2u8; 32];
+    let ctx = derive_context_hash(&workload, 10);
+    let action = [1u8; 32];
+    let cap = Capability {
+        policy_hash: gp.hash(),
+        action_hash: action,
+        context_hash: ctx,
+        expiry_height: 40,
+        nonce: 1,
+    };
+    match node
+        .guards
+        .authorize(&gp, &cap, &gp.agent_id, NET, 10, &action, &ctx, false, false)
+    {
+        GuardDecision::Allow => {}
+        other => panic!("guard allow: {other:?}"),
+    }
 }
 
 #[test]
@@ -196,6 +257,18 @@ fn node_books_survive_an_encode_decode_round_trip() {
     );
     assert!(b.policy_registry.contains_key(&policy().hash()));
     assert!(b.revoked_policies.contains(&[3u8; 32]));
+    assert_eq!(
+        b.escrow_exit.len(),
+        1,
+        "the exit binding survives because its escrow is stored"
+    );
+    assert!(b.guard_registry.contains_key(&guard_policy().hash()));
+    assert!(b.guard_revoked.contains(&[5u8; 32]));
+    assert_eq!(
+        b.guards.state(&guard_policy().hash()).map(|s| s.last_nonce),
+        Some(1),
+        "guard nonce survives the restart"
+    );
     assert_eq!(b.delegations.recorded().count(), 1);
     assert_eq!(
         b.policies.state(&policy().hash()).map(|s| s.last_nonce),

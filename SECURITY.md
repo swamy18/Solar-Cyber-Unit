@@ -56,13 +56,44 @@ with real value is not.
 - Any path by which a private key, a wallet file, a validator key or a bearer
   token is disclosed, or by which an encrypted wallet file can be decrypted
   without the passphrase.
-- Any path by which a policy, a credit line, a delegation chain or an escrow
-  authorisation can be forged, replayed, or bypassed.
+- Any path by which a policy, a credit line, a delegation chain, an escrow
+  authorisation, or a Smart Gate capability can be forged, replayed, or bypassed.
+  This includes `action_hash` / `context_hash` mismatch accepted as allow,
+  expired or over-lifetime capabilities accepted, reused nonces accepted,
+  cross-principal capabilities accepted, or window accounting mutated on deny.
 - Any unbounded resource consumption reachable from the network boundary (API,
   peer-to-peer frame, block or transaction decoding, storage recovery).
 - Any failure to fail closed: a refusal that is silently converted into a
   permissive path, or a missing-state case that produces an empty set where a
   populated one was meant.
+
+## Smart Gate security model
+
+The Smart Gate (`srct-core::guard`, `srct-policy::guard_verify`,
+MCP `guard.check` / `guard.authorize`, `POST /v1/guard/decide`) is a
+service-layer gate, not consensus. It answers `allow / deny /
+needs_approval` and never moves value by itself.
+
+- **Trusts:** the owner key that signed the grant, the verifier that
+  re-derives `action_hash` and `context_hash` from what it is about to
+  execute, and the Solar tip that anchors audit receipts. Endpoints are
+  assumed compromisable: long-lived tokens on laptops are treated as already
+  exposed.
+- **Enforces:** exact hash equality on all three bindings, expiry and the
+  30-height lifetime cap, strictly increasing nonces, tumbling-window budgets
+  that never mutate on deny, cross-principal rejection, and second-channel
+  approval for high-risk actions (the payer key never counts as approver).
+- **Does not promise:** malware prevention on the endpoint, attestation of
+  the workload binary itself, or network confidentiality. A forged
+  `action_hash` at the verifier (lying about what will execute) is an
+  integrator bug, not a gate bypass — report it as such with the adapter name.
+- **Integrator rules:** verify with the same `srct-core` functions or
+  `srct-policy` (do not re-implement the checks), recompute `action_hash`
+  and `context_hash` locally (never accept them from the requester alone),
+  treat `needs_approval` as deny until the approver signature lands, and
+  alert on `window_exhausted` bursts the way exit-watch alerts on full
+  windows. Forks are expected to verify but cannot inherit trust: network
+  binding, quorum, and history stay with the canonical chain.
 
 ## What is out of scope
 

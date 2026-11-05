@@ -1,6 +1,13 @@
 # Solar Smart Gate — Architecture (Phase 1 Design)
 
-Status: Phase 1-3 implemented. No consensus change. `guard.rs` + `srct-policy::guard_verify` + MCP `guard.check` / `guard.authorize` + `POST /v1/guard/decide` live. Worker k8s/cloud shims are follow-up.
+Status: implemented and enforced by the node. No consensus change. `guard.rs`
+(core book + persistence) + `srct-policy::guard_verify` + MCP `guard.check` /
+`guard.authorize` + node `POST /v1/guard/decide` (stateless pre-check),
+`POST /v1/guard/grant` (owner-signed registration),
+`POST /v1/guard/revoke` (owner-signed kill switch),
+`POST /v1/guard/authorize` (stateful admission with audit). Grants, revocations
+and the capability book persist in `state.bin` (envelope v10; v8/v9 migrate
+with empty gate state). Worker k8s/cloud shims are follow-up.
 
 ## 1. Goal
 

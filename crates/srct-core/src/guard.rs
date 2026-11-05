@@ -273,11 +273,11 @@ pub enum Decision {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct GuardState {
-    window_start_height: u64,
-    calls_in_window: u64,
-    last_nonce: u64,
-    total_calls: u64,
+pub struct GuardState {
+    pub window_start_height: u64,
+    pub calls_in_window: u64,
+    pub last_nonce: u64,
+    pub total_calls: u64,
 }
 
 /// Tumbling-window capability book keyed by grant hash.
@@ -293,12 +293,98 @@ impl Default for GuardBook {
     }
 }
 
+/// Largest entry count the guard-book codec will read back. Checked before
+/// any allocation; real books are capped at [`DEFAULT_MAX_GUARDS`].
+pub const MAX_GUARD_BOOK_READ: usize = 1 << 20;
+
 impl GuardBook {
     pub fn with_capacity(max_grants: usize) -> Self {
         GuardBook {
             states: BTreeMap::new(),
             max_grants,
         }
+    }
+
+    pub fn len(&self) -> usize {
+        self.states.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.states.is_empty()
+    }
+
+    pub fn state(&self, grant_hash: &Hash) -> Option<GuardState> {
+        self.states.get(grant_hash).copied()
+    }
+
+    /// Forget a grant's accounting (used when a grant is revoked or rotated).
+    pub fn forget(&mut self, grant_hash: &Hash) -> Option<GuardState> {
+        self.states.remove(grant_hash)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&Hash, GuardState)> {
+        self.states.iter().map(|(k, v)| (k, *v))
+    }
+
+    /// Restore one grant's accounting (restart recovery only). Refuses a
+    /// duplicate grant or a full book.
+    pub fn restore(
+        &mut self,
+        grant_hash: Hash,
+        state: GuardState,
+    ) -> Result<(), GuardError> {
+        if self.states.contains_key(&grant_hash) {
+            return Err(GuardError::Malformed("duplicate guard grant"));
+        }
+        if self.states.len() >= self.max_grants {
+            return Err(GuardError::BookFull { cap: self.max_grants });
+        }
+        self.states.insert(grant_hash, state);
+        Ok(())
+    }
+
+    /// Canonical encoding of the whole book: cap + entries.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = Writer::with_capacity(16 + self.states.len() * 64);
+        w.u64le(self.max_grants as u64);
+        w.u32le(self.states.len() as u32);
+        for (hash, st) in &self.states {
+            w.fixed(hash)
+                .u64le(st.window_start_height)
+                .u64le(st.calls_in_window)
+                .u64le(st.last_nonce)
+                .u64le(st.total_calls);
+        }
+        w.into_vec()
+    }
+
+    /// Decode what [`GuardBook::encode`] wrote. Bounded and fail-closed.
+    pub fn decode(r: &mut Reader<'_>) -> Result<Self, crate::error::Error> {
+        use crate::error::Error;
+        let max_raw = r.u64le()?;
+        if max_raw > MAX_GUARD_BOOK_READ as u64 {
+            return Err(Error::Malformed("guard book capacity over codec cap"));
+        }
+        let max = max_raw as usize;
+        let count = r.u32le()? as usize;
+        if count > max {
+            return Err(Error::Malformed("guard count over book capacity"));
+        }
+        let mut book = GuardBook::with_capacity(max);
+        for _ in 0..count {
+            let hash: Hash = r.fixed()?;
+            let state = GuardState {
+                window_start_height: r.u64le()?,
+                calls_in_window: r.u64le()?,
+                last_nonce: r.u64le()?,
+                total_calls: r.u64le()?,
+            };
+            book.states.insert(hash, state);
+        }
+        if book.states.len() != count {
+            return Err(Error::Malformed("duplicate guard grant in book"));
+        }
+        Ok(book)
     }
 
     /// Full check. On `Allow` the state commits. On `NeedsApproval` or any
@@ -548,5 +634,22 @@ mod tests {
         let cbytes = cap.serialize();
         let cback = Capability::deserialize(&cbytes).expect("cap roundtrip");
         assert_eq!(cap, cback);
+    }
+
+    #[test]
+    fn guard_book_roundtrip_encode() {
+        let policy = test_policy();
+        let mut book = GuardBook::default();
+        let (cap, action, ctx) = test_cap(&policy, 1, 50);
+        assert_eq!(
+            book.authorize(&policy, &cap, &[7u8; 20], "srct/testnet", 50, &action, &ctx, false, false),
+            Decision::Allow
+        );
+        let bytes = book.encode();
+        let mut r = crate::ser::Reader::new(&bytes);
+        let back = GuardBook::decode(&mut r).expect("book roundtrip");
+        assert_eq!(back.encode(), bytes, "decoded book re-encodes identically");
+        assert_eq!(back.len(), 1);
+        assert_eq!(back.state(&policy.hash()).map(|s| s.last_nonce), Some(1));
     }
 }

@@ -2,7 +2,7 @@
 
 <img src="Solar_Cyber_unit.png" alt="Solar Cyber Unit coin logo" width="200">
 
-Programmable money for machines: spend policies enforced at admission, escrow for verifiable work, micro-payments with a safety-first wallet. Pre-launch — no outside audit yet.
+Programmable money for machines: spend policies enforced at admission, escrow for verifiable work, micro-payments with a safety-first wallet, and a Smart Gate security layer any platform can verify. Pre-launch — no outside audit yet.
 
 **Author and copyright:** The project is open source — see [License](#license).
 
@@ -27,6 +27,7 @@ and redistribute.
 - [Use cases](#use-cases)
 - [Agent payments (x402)](#agent-payments-x402)
 - [Micro-payments and wallet safety](#micro-payments-and-wallet-safety)
+- [Smart Gate](#smart-gate)
 - [Agent economy](#agent-economy)
 - [How fraud is detected](#how-fraud-is-detected)
 - [How withdrawals work](#how-withdrawals-work)
@@ -723,6 +724,52 @@ The wallet around them is safer than a normal crypto wallet by construction
 
 ---
 
+## Smart Gate
+
+Universal security layer for the AI-agent era: one question — *may this
+workload do this exact action at this exact moment?* — answered as
+`allow / deny / needs_approval` anywhere, settled as trust on Solar.
+
+- **What it is:** a context-bound capability
+  `cap = H(policy_hash || action_hash || context_hash || expiry || nonce)`.
+  The grant bounds rate and validity only and names no tools, images, or APIs.
+  Exactness comes from hash equality: the runtime re-derives `action_hash`
+  and `context_hash` from what it is about to execute. One bit of drift denies.
+  Short-lived by construction (max 30 heights), single-use nonce, tumbling
+  window, cross-principal deny. Fail-closed, deterministic, integer-only.
+- **How it works:** owner signs a narrow `InfraPolicy` once (`srct-core::guard`).
+  Before any key or long-lived token is used, the workload calls the gate.
+  The gate mints a 2-minute capability bound to the exact action. The runtime,
+  container broker, cloud broker, or wallet signing service verifies offline
+  and executes only on `allow`. High-risk actions return `needs_approval` until
+  a second-channel approver co-signs. Refusals consume no budget and are named
+  (`action_mismatch`, `context_mismatch`, `expired`, `nonce_reuse`,
+  `cross_principal`, `window_exhausted`).
+- **How others use it:** free verify, paid trust. Any platform calls
+  `srct-policy::guard_verify`, MCP `guard.check` (stateless) /
+  `guard.authorize` (stateful `GuardBook`), or the node routes
+  `POST /v1/guard/decide` (stateless pre-check), `POST /v1/guard/grant`
+  (owner-signed registration), `POST /v1/guard/revoke` (owner-signed kill
+  switch), `POST /v1/guard/authorize` (stateful admission with audit) with
+  `policy_hex`, `cap_hex`, `agent_id_hex`, `action_hash_hex`,
+  `workload_id_hex`. Verification needs no Solar node; enforcement and audit
+  settle on Solar, which is what drives SRCT demand (fee burn + PSCB
+  accounting).
+- **Why copy does not transfer trust:** verification code is open by design;
+  the trust root is not copyable. Grants are network-bound, decisions anchor
+  to the canonical tip, and audit receipts are accepted because of the
+  validator quorum, bond ledger, and accumulated history behind them. A fork
+  gets a new network id and magic, old grants fail binding, and no quorum or
+  insurer accepts its proofs.
+- **Binance Oct 2026 mapping:** fake installer hash denies at the gate before
+  any deploy token exists; poisoned repo setup fails `action_hash`; lateral
+  move B -> A/C fails `cross_principal`; stolen token alone mints no valid
+  capability; pre-signed burst hits velocity + per-owner window caps and
+  high-value second approval. Full design:
+  [`docs/smart-gate-architecture.md`](docs/smart-gate-architecture.md).
+
+---
+
 ## Agent economy
 
 Portable reputation, tiered spend power, job escrow with result binding,
@@ -1065,7 +1112,7 @@ not expose it directly, but the worker SDK does (`add_credit_collateral`).
 | `fuzz/` | 17 cargo-fuzz targets over the attacker-controlled boundaries. |
 | `sim/` | Independent Python reference, attack simulations, and feature demos (`x402_paid_api_demo.py`, `micropayment_benchmark.py`, `agent_economy_demo.py`). |
 | `tests/vectors/` | Consensus vectors. Generated from source, never hand-edited. |
-| `docs/` | Design records, verification status and readiness reports — plus per-feature guides: `portable-policy.md`, `x402.md`, `micropayments.md`, `wallet-safety.md`, `reputation.md`, `agent-jobs.md`, `usd-settlement.md`, `ramps.md`, `lending.md`. |
+| `docs/` | Design records, verification status and readiness reports — plus per-feature guides: `portable-policy.md`, `x402.md`, `micropayments.md`, `wallet-safety.md`, `smart-gate-architecture.md`, `reputation.md`, `agent-jobs.md`, `usd-settlement.md`, `ramps.md`, `lending.md`. |
 | `paper/` | The Solar Cyber Unit protocol paper (LaTeX + PDF). |
 
 Nine crates in one workspace. **All consensus logic lives in `srct-core`**, which
@@ -1073,7 +1120,9 @@ has no I/O, no clock and no network. The service-layer feature modules
 live beside it without touching consensus: `x402.rs` (x402
 adapter, budget guard, Base rail options), `micro.rs` (batch/stream/sponsored), `safety.rs` (session budgets,
 risk guards, audit log + export), `portable.rs` (signed policies, delegation
-proofs, short-lived bound grants, intent→decision seam),
+proofs, short-lived bound grants, intent→decision seam), `guard.rs` (Smart
+Gate: narrow infra grants, context-bound capabilities, tumbling-window
+`GuardBook`),
 `passport.rs` + `tiers.rs` (portable reputation,
 tiered wallets), `jobs.rs` (agent job escrow), `fx.rs` (USD quotes),
 `ramp.rs` (entry/exit registry), `lending.rs` (loan marketplace). The `mini`

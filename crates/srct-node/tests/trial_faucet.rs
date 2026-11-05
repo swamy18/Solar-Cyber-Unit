@@ -288,7 +288,7 @@ fn trial_full_lifecycle_on_real_chain() {
     assert_eq!(body["state"], json!("repaid"));
     assert_eq!(body["repay_txid"], json!(hash512_to_hex(&repay_id)));
 
-    // 9. The book survives an encode/decode round trip (v9 envelope).
+    // 9. The book survives an encode/decode round trip (v10 envelope).
     let bytes = {
         let sh = node.shared.lock().unwrap();
         sh.encode_state()
@@ -297,7 +297,7 @@ fn trial_full_lifecycle_on_real_chain() {
     let chain = Chain::new(params.clone()).unwrap();
     let l2 = srct_node::l2::NodeL2::fresh(&params).unwrap();
     let mut fresh = SharedNode::new(chain, l2);
-    fresh.decode_state(&bytes).expect("v9 envelope replays");
+    fresh.decode_state(&bytes).expect("v10 envelope replays");
     let t: &TrialRecord = fresh.trials.get(&agent).expect("trial survived");
     assert_eq!(t.state, TrialState::Repaid);
     assert_eq!(t.amount_sat, TRIAL_AMOUNT);

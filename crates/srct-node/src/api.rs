@@ -209,8 +209,10 @@ const MAX_BODY_BYTES: usize = 5 * 1024 * 1024;
 /// network the books were written on, and a file from another network is
 /// refused instead of merged. Books are network-scoped (payment networks,
 /// policy scopes, job ids), so loading `srct/mini` books onto `srct/mainnet`
-/// would mix scopes that must never meet.
-const STATE_ENVELOPE_VERSION: u8 = 9;
+/// would mix scopes that must never meet. Version 10 appends the Smart Gate
+/// sections (grant registry, revocations, capability book) last; v8/v9 files
+/// migrate with empty gate state.
+const STATE_ENVELOPE_VERSION: u8 = 10;
 
 /// Largest entry count any single map section in the state envelope may
 /// declare, checked before allocation. Real books are bounded by their own
@@ -575,6 +577,16 @@ pub struct SharedNode {
     /// records the original. Only the owner can produce that statement, because
     /// it is the statement they sign.
     pub revoked_policies: BTreeSet<Hash>,
+    /// Smart Gate grants this node enforces (grant hash -> grant). Node-local
+    /// authority like `policy_registry`: admission checks the capability names
+    /// a grant the node actually holds and that is still live. Persisted.
+    pub guard_registry: BTreeMap<Hash, srct_core::guard::InfraPolicy>,
+    /// Revoked Smart Gate grant hashes. A grant naming a revoked hash is
+    /// refused even if its bytes say otherwise.
+    pub guard_revoked: BTreeSet<Hash>,
+    /// Smart Gate accounting: tumbling-window calls and nonces per grant.
+    /// Persisted, so a restart is not a replay window.
+    pub guards: srct_core::guard::GuardBook,
     /// L1 txids the API accepted; drained by the serve loop, which owns the
     /// P2P node and announces them to peers.
     pub tx_to_relay: Vec<Hash512>,
@@ -614,6 +626,9 @@ impl SharedNode {
             escrow_exit: BTreeMap::new(),
             policy_registry: BTreeMap::new(),
             revoked_policies: BTreeSet::new(),
+            guard_registry: BTreeMap::new(),
+            guard_revoked: BTreeSet::new(),
+            guards: srct_core::guard::GuardBook::default(),
             attestations_used: BTreeMap::new(),
             tx_to_relay: Vec::new(),
             l2_to_include: Vec::new(),
@@ -877,6 +892,18 @@ impl SharedNode {
             trials.u64le(t.requested_height);
         }
         put_section(&mut w, &trials.into_vec());
+        // Smart Gate (v10): grant registry, revocations, capability book.
+        put_section(
+            &mut w,
+            &encode_state_map(&self.guard_registry, |p| p.serialize()),
+        );
+        let mut guard_revoked = Writer::with_capacity(4 + self.guard_revoked.len() * 32);
+        guard_revoked.u32le(self.guard_revoked.len() as u32);
+        for hash in &self.guard_revoked {
+            guard_revoked.fixed(hash);
+        }
+        put_section(&mut w, &guard_revoked.into_vec());
+        put_section(&mut w, &self.guards.encode());
         w.into_vec()
     }
 
@@ -891,11 +918,12 @@ impl SharedNode {
     pub fn decode_state(&mut self, bytes: &[u8]) -> Result<(), String> {
         let mut r = Reader::new(bytes);
         let version = r.u8().map_err(|e| format!("state envelope: {e}"))?;
-        // v8 files lack the trailing trials section: migrate them by
-        // starting with an empty trial book instead of refusing to boot.
-        if version != STATE_ENVELOPE_VERSION && version != 8 {
+        // v8 files lack the trailing trials section and v9 files lack the
+        // Smart Gate sections: migrate them with empty books instead of
+        // refusing to boot.
+        if version != STATE_ENVELOPE_VERSION && version != 9 && version != 8 {
             return Err(format!(
-                "state envelope version {version}, this build reads {STATE_ENVELOPE_VERSION} (and migrates 8)"
+                "state envelope version {version}, this build reads {STATE_ENVELOPE_VERSION} (and migrates 8/9)"
             ));
         }
 
@@ -1443,11 +1471,17 @@ impl SharedNode {
             }
             Ok(map)
         })?;
-        // v8 files end here: no trials section. v9 appends it last.
-        let trials = if version == 8 {
+        // v8 files end here: no trials section. v9 appends trials last.
+        // v10 appends the Smart Gate sections after trials.
+        let (trials, guard_registry, guard_revoked, guards) = if version == 8 {
             r.expect_end().map_err(|e| format!("state envelope: {e}"))?;
-            BTreeMap::new()
-        } else {
+            (
+                BTreeMap::new(),
+                BTreeMap::new(),
+                BTreeSet::new(),
+                srct_core::guard::GuardBook::default(),
+            )
+        } else if version == 9 {
             let t = decode_section(&mut r, "trials", |sr| {
                 let count = sr.u32le().map_err(|e| format!("trials: {e}"))? as usize;
                 if count > MAX_STATE_ENTRIES {
@@ -1473,11 +1507,6 @@ impl SharedNode {
                         _ => return Err("trials: bad repay flag".into()),
                     };
                     let requested_height = sr.u64le().map_err(|e| format!("trials: {e}"))?;
-                    // A funded trial without its funding proof, or a repaid trial
-                    // without its repayment proof, is a half-written record: refuse
-                    // the file rather than trusting a bare flag. The reverse is
-                    // also refused: Requested carries no proofs, Funded carries
-                    // no repayment yet, and one txid can never be both sides.
                     if amount_sat == 0 {
                         return Err("trials: zero amount".into());
                     }
@@ -1521,9 +1550,111 @@ impl SharedNode {
                 }
                 Ok(map)
             })?;
+            r.expect_end().map_err(|e| format!("state envelope: {e}"))?;
+            (
+                t,
+                BTreeMap::new(),
+                BTreeSet::new(),
+                srct_core::guard::GuardBook::default(),
+            )
+        } else {
+            let t = decode_section(&mut r, "trials", |sr| {
+                let count = sr.u32le().map_err(|e| format!("trials: {e}"))? as usize;
+                if count > MAX_STATE_ENTRIES {
+                    return Err(format!(
+                        "trials: {count} entries over the {MAX_STATE_ENTRIES} cap"
+                    ));
+                }
+                let mut map = BTreeMap::new();
+                for _ in 0..count {
+                    let agent: Address = sr.fixed().map_err(|e| format!("trials: {e}"))?;
+                    let amount_sat = sr.u64le().map_err(|e| format!("trials: {e}"))?;
+                    let sponsor: Address = sr.fixed().map_err(|e| format!("trials: {e}"))?;
+                    let state = TrialState::from_u8(sr.u8().map_err(|e| format!("trials: {e}"))?)
+                        .ok_or("trials: unknown state")?;
+                    let fund_txid = match sr.u8().map_err(|e| format!("trials: {e}"))? {
+                        0 => None,
+                        1 => Some(sr.fixed().map_err(|e| format!("trials: {e}"))?),
+                        _ => return Err("trials: bad fund flag".into()),
+                    };
+                    let repay_txid = match sr.u8().map_err(|e| format!("trials: {e}"))? {
+                        0 => None,
+                        1 => Some(sr.fixed().map_err(|e| format!("trials: {e}"))?),
+                        _ => return Err("trials: bad repay flag".into()),
+                    };
+                    let requested_height = sr.u64le().map_err(|e| format!("trials: {e}"))?;
+                    if amount_sat == 0 {
+                        return Err("trials: zero amount".into());
+                    }
+                    match state {
+                        TrialState::Requested => {
+                            if fund_txid.is_some() || repay_txid.is_some() {
+                                return Err("trials: requested with txids".into());
+                            }
+                        }
+                        TrialState::Funded => {
+                            if fund_txid.is_none() || repay_txid.is_some() {
+                                return Err("trials: funded shape".into());
+                            }
+                        }
+                        TrialState::Repaid => {
+                            if fund_txid.is_none() || repay_txid.is_none() {
+                                return Err("trials: repaid shape".into());
+                            }
+                            if fund_txid == repay_txid {
+                                return Err("trials: fund and repay share a txid".into());
+                            }
+                        }
+                    }
+                    if map
+                        .insert(
+                            agent,
+                            TrialRecord {
+                                agent,
+                                amount_sat,
+                                sponsor,
+                                state,
+                                fund_txid,
+                                repay_txid,
+                                requested_height,
+                            },
+                        )
+                        .is_some()
+                    {
+                        return Err("trials: duplicate agent".into());
+                    }
+                }
+                Ok(map)
+            })?;
+            let guard_registry = decode_section(&mut r, "guard_registry", |sr| {
+                decode_state_map(sr, "guard_registry", |bytes| {
+                    srct_core::guard::InfraPolicy::deserialize(bytes)
+                        .map_err(|e| format!("guard grant: {e}"))
+                })
+            })?;
+            let guard_revoked = decode_section(&mut r, "guard_revoked", |sr| {
+                let count = sr.u32le().map_err(|e| format!("guard_revoked: {e}"))? as usize;
+                if count > MAX_STATE_ENTRIES {
+                    return Err(format!(
+                        "guard_revoked: {count} entries over the {MAX_STATE_ENTRIES} cap"
+                    ));
+                }
+                let mut set = BTreeSet::new();
+                for _ in 0..count {
+                    let hash: Hash = sr.fixed().map_err(|e| format!("guard_revoked: {e}"))?;
+                    set.insert(hash);
+                }
+                if set.len() != count {
+                    return Err("guard_revoked: duplicate entry".into());
+                }
+                Ok(set)
+            })?;
+            let guards = decode_section(&mut r, "guards", |sr| {
+                srct_core::guard::GuardBook::decode(sr).map_err(|e| format!("guards: {e}"))
+            })?;
             // Anything after the last section means the envelope is malformed.
             r.expect_end().map_err(|e| format!("state envelope: {e}"))?;
-            t
+            (t, guard_registry, guard_revoked, guards)
         };
 
         self.receipts = receipts;
@@ -1561,6 +1692,14 @@ impl SharedNode {
         self.loan_offers = loan_offers;
         self.standing_repay = standing_repay;
         self.trials = trials;
+        // Smart Gate books load as-is, like `revoked_policies`: a revocation
+        // or accounting entry whose grant is not in the registry is inert
+        // because `guard_authorize` only admits capabilities naming a live
+        // registered grant. Pruning here would make a clean load re-encode
+        // differently, which the persistence tests refuse.
+        self.guard_registry = guard_registry;
+        self.guard_revoked = guard_revoked;
+        self.guards = guards;
         Ok(())
     }
 
@@ -3525,6 +3664,281 @@ async fn guard_decide(
             "height": height,
             "policy_hash": srct_core::hash::hash_to_hex(&policy.hash()),
         })))
+    })?
+}
+
+/// Decode a hex-encoded Smart Gate grant and check that the owner signed it.
+///
+/// A grant is authority: rate bounds, validity window, ancestry link. A route
+/// that accepts grant bytes without the owner's signature is a route where
+/// anyone may mint authority for anyone else. The owner's keys must derive to
+/// the address the grant names as `owner`, and the signature must verify over
+/// `signing_hash`, which covers every field.
+fn decode_owned_guard(
+    hex_str: &str,
+    sigs_hex: &str,
+    keys_hex: &str,
+) -> Result<srct_core::guard::InfraPolicy, (StatusCode, Json<ErrorBody>)> {
+    let bytes = decode_hex_bytes(hex_str, "policy")?;
+    let policy = srct_core::guard::InfraPolicy::deserialize(&bytes)
+        .map_err(|e| bad(format!("policy: {e}")))?;
+    let sigs = decode_bundle(sigs_hex, "policy_sigs")?;
+    let keys = decode_bundle(keys_hex, "policy_keys")?;
+    let signing_key = keys
+        .address()
+        .map_err(|e| bad(format!("policy_keys: {e}")))?;
+    if signing_key != policy.owner {
+        return Err(bad("policy: the signing key is not the grant's owner"));
+    }
+    srct_core::sig::verify_bundle(&sigs, &keys, &policy.signing_hash())
+        .map_err(|e| bad(format!("policy: {e}")))?;
+    Ok(policy)
+}
+
+/// `POST /v1/guard/grant` — register a Smart Gate grant this node enforces.
+///
+/// The grant is owner-signed (same rule as `/v1/authorize`: no signature, no
+/// authority) and must name this node's network. Registration is idempotent:
+/// the same bytes hash the same. A grant whose window already ended is
+/// refused — registering dead authority only widens the file it persists in.
+#[derive(Deserialize)]
+struct GuardGrantReq {
+    policy_hex: String,
+    policy_sigs_hex: String,
+    policy_keys_hex: String,
+}
+
+async fn guard_grant(
+    State(state): State<ApiState>,
+    Json(req): Json<GuardGrantReq>,
+) -> ApiResult {
+    if req.policy_hex.len() > 8 * 1024 {
+        return Err(bad("guard grant over cap"));
+    }
+    let policy = decode_owned_guard(&req.policy_hex, &req.policy_sigs_hex, &req.policy_keys_hex)?;
+    with_shared(&state, |sh| {
+        let network = sh.chain.params().network_id.clone();
+        let height = sh.chain.height();
+        if policy.network_id != network {
+            return Err(bad("grant is for another network"));
+        }
+        if height >= policy.valid_until_height {
+            return Err(bad("grant window already ended"));
+        }
+        let hash = policy.hash();
+        if sh.guard_revoked.contains(&hash) {
+            return Err(fail(
+                StatusCode::CONFLICT,
+                "guard_refused",
+                "grant was revoked on this node",
+            ));
+        }
+        sh.guard_registry.insert(hash, policy);
+        audit_push(
+            sh,
+            "guard_grant",
+            Some(hash),
+            None,
+            format!("grant {}", hash_to_hex(&hash)),
+        );
+        Ok(Json(json!({
+            "policy_hash": hash_to_hex(&hash),
+            "registered": true,
+        })))
+    })?
+}
+
+/// `POST /v1/guard/revoke` — revoke a Smart Gate grant this node enforces.
+///
+/// The statement is the owner's: the same grant with `revoked` set, signed by
+/// the owner. The node maps it back to the hash it actually enforces by
+/// clearing the flag and records that hash as revoked. The live book state for
+/// the grant is forgotten, so a restart cannot resurrect spent nonces — but
+/// neither can it replay them: the revocation set persists.
+#[derive(Deserialize)]
+struct GuardRevokeReq {
+    policy_hex: String,
+    sigs_hex: String,
+    keys_hex: String,
+}
+
+async fn guard_revoke(
+    State(state): State<ApiState>,
+    Json(req): Json<GuardRevokeReq>,
+) -> ApiResult {
+    let bytes = decode_hex_bytes(&req.policy_hex, "policy")?;
+    let variant = srct_core::guard::InfraPolicy::deserialize(&bytes)
+        .map_err(|e| bad(format!("policy: {e}")))?;
+    let sigs = decode_bundle(&req.sigs_hex, "sigs")?;
+    let keys = decode_bundle(&req.keys_hex, "keys")?;
+    with_shared(&state, |sh| {
+        let owner = keys.address().map_err(|e| bad(format!("keys: {e}")))?;
+        if owner != variant.owner {
+            return Err(fail(
+                StatusCode::BAD_REQUEST,
+                "guard_refused",
+                "the revocation is signed by someone other than the grant owner",
+            ));
+        }
+        srct_core::sig::verify_bundle(&sigs, &keys, &variant.signing_hash())
+            .map_err(|e| bad(format!("revocation signature: {e}")))?;
+        let mut original = variant.clone();
+        original.revoked = false;
+        if !sh.guard_registry.contains_key(&original.hash()) {
+            return Err(fail(
+                StatusCode::CONFLICT,
+                "guard_refused",
+                "this node never enforced the grant being revoked",
+            ));
+        }
+        let was_new = sh.guard_revoked.insert(original.hash());
+        sh.guards.forget(&original.hash());
+        audit_push(
+            sh,
+            "guard_revoke",
+            Some(original.hash()),
+            None,
+            format!("grant {} revoked", hash_to_hex(&original.hash())),
+        );
+        Ok(Json(json!({
+            "policy_hash": hash_to_hex(&original.hash()),
+            "revoked": was_new,
+        })))
+    })?
+}
+
+/// `POST /v1/guard/authorize` — stateful Smart Gate admission on this node.
+///
+/// Same checks as `POST /v1/guard/decide`, plus the tumbling-window budget
+/// and strictly increasing nonce via the node's `GuardBook`. On `allow` the
+/// state commits; on `needs_approval` or any deny nothing mutates, so a
+/// refused burst cannot consume budget. A deny is a 200 with the reason — the
+/// question was answered, and the answer is no — exactly like
+/// `POST /v1/policy/decide`. The capability must name a grant this node holds
+/// in its registry and has not revoked.
+#[derive(Deserialize)]
+struct GuardAuthorizeReq {
+    cap_hex: String,
+    agent_id_hex: String,
+    action_hash_hex: String,
+    workload_id_hex: String,
+    high_risk: Option<bool>,
+    approved: Option<bool>,
+}
+
+async fn guard_authorize(
+    State(state): State<ApiState>,
+    Json(req): Json<GuardAuthorizeReq>,
+) -> ApiResult {
+    if req.cap_hex.len() > 1024 {
+        return Err(bad("capability over cap"));
+    }
+    with_shared(&state, |sh| {
+        use srct_core::guard::{derive_context_hash, Capability, Decision as GuardDecision};
+        let network = sh.chain.params().network_id.clone();
+        let height = sh.chain.height();
+        let cap_bytes =
+            hex::decode(req.cap_hex.trim().trim_start_matches("0x")).map_err(|_| bad("malformed capability hex"))?;
+        let cap = Capability::deserialize(&cap_bytes).map_err(|e| bad(format!("capability: {e}")))?;
+        let policy = sh
+            .guard_registry
+            .get(&cap.policy_hash)
+            .cloned()
+            .ok_or_else(|| {
+                fail(
+                    StatusCode::CONFLICT,
+                    "guard_refused",
+                    "capability names a grant this node does not enforce",
+                )
+            })?;
+        if sh.guard_revoked.contains(&cap.policy_hash) {
+            audit_push(
+                sh,
+                "guard_refused",
+                Some(cap.policy_hash),
+                None,
+                "grant revoked".to_string(),
+            );
+            return Ok(Json(json!({
+                "decision": "deny",
+                "reason": "grant revoked",
+                "network_id": network,
+                "height": height,
+            })));
+        }
+        let agent_raw = hex::decode(req.agent_id_hex.trim().trim_start_matches("0x"))
+            .map_err(|_| bad("malformed agent id hex"))?;
+        if agent_raw.len() != 20 {
+            return Err(bad("agent_id_hex must be 20 bytes"));
+        }
+        let mut agent_id = [0u8; 20];
+        agent_id.copy_from_slice(&agent_raw);
+        let action_hash = srct_core::hash::hash_from_hex(req.action_hash_hex.trim())
+            .map_err(|_| bad("malformed action hash"))?;
+        let workload_id = srct_core::hash::hash_from_hex(req.workload_id_hex.trim())
+            .map_err(|_| bad("malformed workload id"))?;
+        let expected_ctx = derive_context_hash(&workload_id, height);
+        let high_risk = req.high_risk.unwrap_or(false);
+        let approved = req.approved.unwrap_or(false);
+        match sh.guards.authorize(
+            &policy,
+            &cap,
+            &agent_id,
+            &network,
+            height,
+            &action_hash,
+            &expected_ctx,
+            high_risk,
+            approved,
+        ) {
+            GuardDecision::Allow => {
+                audit_push(
+                    sh,
+                    "guard_allow",
+                    Some(cap.policy_hash),
+                    None,
+                    format!("grant {} nonce {}", hash_to_hex(&cap.policy_hash), cap.nonce),
+                );
+                Ok(Json(json!({
+                    "decision": "allow",
+                    "network_id": network,
+                    "height": height,
+                    "policy_hash": hash_to_hex(&cap.policy_hash),
+                    "nonce": cap.nonce,
+                })))
+            }
+            GuardDecision::NeedsApproval => {
+                audit_push(
+                    sh,
+                    "guard_needs_approval",
+                    Some(cap.policy_hash),
+                    None,
+                    format!("grant {} nonce {}", hash_to_hex(&cap.policy_hash), cap.nonce),
+                );
+                Ok(Json(json!({
+                    "decision": "needs_approval",
+                    "reason": "high-risk action needs second-channel approval",
+                    "network_id": network,
+                    "height": height,
+                    "policy_hash": hash_to_hex(&cap.policy_hash),
+                })))
+            }
+            GuardDecision::Deny(e) => {
+                audit_push(
+                    sh,
+                    "guard_refused",
+                    Some(cap.policy_hash),
+                    None,
+                    e.to_string(),
+                );
+                Ok(Json(json!({
+                    "decision": "deny",
+                    "reason": e.to_string(),
+                    "network_id": network,
+                    "height": height,
+                })))
+            }
+        }
     })?
 }
 
@@ -8760,6 +9174,9 @@ pub fn router(state: ApiState, cfg: &ApiConfig) -> Router {
         .route("/v1/authorize", post(authorize))
         .route("/v1/policy/decide", post(policy_decide))
         .route("/v1/guard/decide", post(guard_decide))
+        .route("/v1/guard/grant", post(guard_grant))
+        .route("/v1/guard/revoke", post(guard_revoke))
+        .route("/v1/guard/authorize", post(guard_authorize))
         .route("/v1/delegation/verify", post(delegation_verify))
         .route("/v1/audit/verify", post(audit_verify_route))
         .route("/v1/delegation/link", post(delegation_link))

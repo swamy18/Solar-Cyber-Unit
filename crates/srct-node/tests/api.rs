@@ -808,6 +808,96 @@ fn authorize_grants_then_refuses_a_replayed_nonce() {
     assert_eq!(body["error"], "session_binding");
 }
 
+/// Smart Gate over HTTP: an owner-signed grant registers, a capability bound
+/// to the exact action and the node's own height authorizes once, a replayed
+/// nonce is refused by name, and revocation kills the grant. This is the
+/// Binance-October shape: a stolen token alone mints no valid capability, and
+/// a revoked grant stays dead across the node's own books.
+#[test]
+fn guard_grant_authorize_replay_revoke_round_trip() {
+    use srct_core::guard::{
+        derive_context_hash, Capability, InfraPolicy, GUARD_POLICY_VERSION,
+    };
+    let node = start();
+    let h = node_height(&node);
+    let owner = wallet(77, "guard-owner");
+    let owner_addr = owner.address().unwrap();
+    let policy = InfraPolicy {
+        version: GUARD_POLICY_VERSION,
+        network_id: NET.to_string(),
+        agent_id: derive_agent_id(NET, AgentRole::Machine, &owner_addr),
+        owner: owner_addr,
+        max_calls_per_window: 5,
+        window_blocks: 100,
+        valid_from_height: 0,
+        valid_until_height: 10_000,
+        revoked: false,
+        parent_agent_id: None,
+    };
+    let (s, granted) = post(
+        &node,
+        "/v1/guard/grant",
+        &serde_json::json!({
+            "policy_hex": hex::encode(policy.serialize()),
+            "policy_sigs_hex": hex::encode(Auth::sigs_for(&owner, &policy.signing_hash()).unwrap().to_bytes()),
+            "policy_keys_hex": hex::encode(Auth::keys_for(&owner).unwrap().to_bytes()),
+        }),
+    );
+    assert_eq!(s, 200, "owner-signed grant registers: {granted}");
+    assert_eq!(granted["policy_hash"], hash_to_hex(&policy.hash()));
+
+    let workload = [2u8; 32];
+    let action = [1u8; 32];
+    let cap = |nonce: u64| Capability {
+        policy_hash: policy.hash(),
+        action_hash: action,
+        context_hash: derive_context_hash(&workload, h),
+        expiry_height: h + 10,
+        nonce,
+    };
+    let authorize = |cap: &Capability| {
+        post(
+            &node,
+            "/v1/guard/authorize",
+            &serde_json::json!({
+                "cap_hex": hex::encode(cap.serialize()),
+                "agent_id_hex": hex::encode(policy.agent_id),
+                "action_hash_hex": hash_to_hex(&action),
+                "workload_id_hex": hash_to_hex(&workload),
+            }),
+        )
+    };
+    let (s, first) = authorize(&cap(1));
+    assert_eq!(s, 200, "{first}");
+    assert_eq!(first["decision"], "allow");
+
+    // Replay: the same nonce again is a named deny, not a second admission.
+    let (s, replay) = authorize(&cap(1));
+    assert_eq!(s, 200, "{replay}");
+    assert_eq!(replay["decision"], "deny");
+
+    // Revoke via the owner's signed revoked variant.
+    let mut revoked = policy.clone();
+    revoked.revoked = true;
+    let (s, body) = post(
+        &node,
+        "/v1/guard/revoke",
+        &serde_json::json!({
+            "policy_hex": hex::encode(revoked.serialize()),
+            "sigs_hex": hex::encode(Auth::sigs_for(&owner, &revoked.signing_hash()).unwrap().to_bytes()),
+            "keys_hex": hex::encode(Auth::keys_for(&owner).unwrap().to_bytes()),
+        }),
+    );
+    assert_eq!(s, 200, "{body}");
+    assert_eq!(body["revoked"], true);
+
+    // The live grant is dead: even a fresh nonce is refused by name.
+    let (s, dead) = authorize(&cap(2));
+    assert_eq!(s, 200, "{dead}");
+    assert_eq!(dead["decision"], "deny");
+    assert_eq!(dead["reason"], "grant revoked");
+}
+
 /// `POST /v1/policy/decide` answers the engine without committing: allow for
 /// a fitting intent, a named refusal for a forbidden one, approval-needed
 /// above the threshold. Deciding twice decides twice identically — the route
