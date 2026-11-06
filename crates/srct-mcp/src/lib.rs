@@ -572,11 +572,11 @@ impl SolarCyberUnitMcp {
         {
             let policy = SpendPolicy::deserialize(policy_bytes)
                 .map_err(|e| McpError::bad(format!("policy[{i}]: {e}")))?;
-            let mut r = srct_core::ser::Reader::new(sigs_bytes);
-            let sig_bundle = srct_core::sig::Bundle::from_reader(&mut r)
+            // Strict: each link's bundles are standalone encodings, so
+            // trailing bytes are refused rather than silently ignored.
+            let sig_bundle = srct_core::sig::Bundle::deserialize(sigs_bytes)
                 .map_err(|e| McpError::bad(format!("sigs[{i}]: {e}")))?;
-            let mut r = srct_core::ser::Reader::new(keys_bytes);
-            let key_bundle = srct_core::sig::Bundle::from_reader(&mut r)
+            let key_bundle = srct_core::sig::Bundle::deserialize(keys_bytes)
                 .map_err(|e| McpError::bad(format!("keys[{i}]: {e}")))?;
             links.push(srct_core::portable::SignedPolicy {
                 policy,

@@ -888,6 +888,37 @@ impl NetworkParams {
         if self.checkpoint_interval_blocks == 0 {
             return Err(Error::Malformed("checkpoint_interval_blocks must be > 0"));
         }
+        // Epoch cadence divides in `Header::expected_epoch` and the mining
+        // template path: zero is a divide-by-zero panic on profile data, so a
+        // malformed profile is refused at construction instead of crashing the
+        // node that loads it.
+        if self.nn_epoch_blocks == 0 {
+            return Err(Error::Malformed("nn_epoch_blocks must be > 0"));
+        }
+        // Block-shape caps gate allocation in `Chain::validate_standalone` and
+        // `Block::deserialize`: zero would refuse every block (including
+        // genesis) or admit nothing, so refuse the profile, not the chain.
+        if self.max_tx_count == 0 {
+            return Err(Error::Malformed("max_tx_count must be > 0"));
+        }
+        if self.max_block_bytes == 0 {
+            return Err(Error::Malformed("max_block_bytes must be > 0"));
+        }
+        // Fee-schedule ordering: the base-fee retarget clamps into
+        // `[min, max]`, so an inverted range would pin every block at an
+        // unintended floor and split nodes that clamp differently.
+        if self.base_fee_min_sat > self.base_fee_max_sat {
+            return Err(Error::Malformed(
+                "base_fee_min_sat must not exceed base_fee_max_sat",
+            ));
+        }
+        if self.base_fee_initial_sat < self.base_fee_min_sat
+            || self.base_fee_initial_sat > self.base_fee_max_sat
+        {
+            return Err(Error::Malformed(
+                "base_fee_initial_sat must lie within [base_fee_min_sat, base_fee_max_sat]",
+            ));
+        }
         // M4 HBM parameters: validated structurally so a bad config can never
         // land in a profile that opts into puzzle_id == 2 (which would otherwise
         // panic on the modular index in `memory_hash`). See review §6. Unknown
@@ -1297,5 +1328,33 @@ mod tests {
         let mut p = mini.clone();
         p.l2_deposit_minimum_sat = 0;
         assert!(p.validate().is_err());
+    }
+
+    #[test]
+    fn degenerate_block_shape_and_epoch_profiles_are_rejected() {
+        // `nn_epoch_blocks == 0` is a divide-by-zero in `expected_epoch` and
+        // the mining template; `max_tx_count/max_block_bytes == 0` refuses
+        // every block including genesis; inverted fee bounds pin the retarget
+        // at an unintended floor. All are profile bugs, refused here rather
+        // than panicking or splitting at runtime (audit: consensus-DoS).
+        let good = NetworkParams::mini();
+        let mut p = good.clone();
+        p.nn_epoch_blocks = 0;
+        assert!(p.validate().is_err());
+        let mut p = good.clone();
+        p.max_tx_count = 0;
+        assert!(p.validate().is_err());
+        let mut p = good.clone();
+        p.max_block_bytes = 0;
+        assert!(p.validate().is_err());
+        let mut p = good.clone();
+        p.base_fee_min_sat = p.base_fee_max_sat + 1;
+        assert!(p.validate().is_err());
+        let mut p = good.clone();
+        p.base_fee_initial_sat = p.base_fee_max_sat + 1;
+        assert!(p.validate().is_err());
+        // Shipped profiles stay valid.
+        good.validate().unwrap();
+        NetworkParams::mainnet().validate().unwrap();
     }
 }

@@ -118,7 +118,13 @@ impl Header {
     pub fn expected_epoch(&self, nn_epoch_blocks: u64) -> u32 {
         // Clamped rather than truncated: `height / nn_epoch_blocks` exceeds
         // `u32::MAX` past ~2.1e14 blocks, and a silent `as u32` wrap would make
-        // the epoch check disagree with itself.
+        // the epoch check disagree with itself. A zero interval is refused by
+        // `NetworkParams::validate`; return 0 here so a malformed profile
+        // fails closed through the epoch check instead of panicking on divide
+        // by zero (consensus code must never panic on profile data).
+        if nn_epoch_blocks == 0 {
+            return 0;
+        }
         (self.height / nn_epoch_blocks).min(u32::MAX as u64) as u32
     }
 }
@@ -644,6 +650,21 @@ mod tests {
         assert_eq!(h.expected_epoch(50_000), 1);
         h.height = 120_000;
         assert_eq!(h.expected_epoch(50_000), 2);
+    }
+
+    #[test]
+    fn expected_epoch_never_panics_and_template_matches_validation() {
+        // Audit: `nn_epoch_blocks == 0` was a divide-by-zero panic in both
+        // `expected_epoch` and the mining template (`as u32` truncation also
+        // diverged from the clamped form past u32::MAX). A malformed profile
+        // must fail closed, never panic, and the template must compute exactly
+        // what validation checks.
+        let h = Header::genesis([0u8; 32], 1);
+        assert_eq!(h.expected_epoch(0), 0);
+        let mut big = Header::genesis([0u8; 32], 1);
+        big.height = u64::MAX;
+        assert_eq!(big.expected_epoch(1), u32::MAX);
+        assert_eq!(big.expected_epoch(2_000), u32::MAX);
     }
 
     // --- Properties -------------------------------------------------------

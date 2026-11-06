@@ -187,6 +187,21 @@ impl Bundle {
         out
     }
 
+    /// Strict decode of a standalone bundle encoding: [`Bundle::from_reader`]
+    /// plus trailing-byte refusal. Use this for every bundle decoded from its
+    /// own byte string (API hex fields, portable JSON, MCP inputs). Embedded
+    /// uses (transactions, L2 payloads) keep `from_reader`, which reads one
+    /// bundle out of a larger buffer by design — those callers own the
+    /// trailing bytes. A standalone decode without `expect_end` silently
+    /// ignores smuggled trailing bytes, so two byte strings name one bundle
+    /// and authorization paths disagree about what was signed.
+    pub fn deserialize(bytes: &[u8]) -> Result<Self> {
+        let mut r = crate::ser::Reader::new(bytes);
+        let bundle = Bundle::from_reader(&mut r)?;
+        r.expect_end()?;
+        Ok(bundle)
+    }
+
     /// Parse a bundle, checking every bound *before* allocating for it.
     ///
     /// A length prefix here is attacker-controlled, so the cap is applied to
@@ -211,6 +226,15 @@ impl Bundle {
             let scheme = r.u8()?;
             if !scheme_supported(scheme) {
                 return Err(Error::UnsupportedSigScheme(scheme));
+            }
+            // Canonical-form enforcement at parse time, not only in
+            // `validate()`: a duplicate scheme adds bytes without adding
+            // independence, so it is never a hybrid. `verify_bundle` calls
+            // `validate` and would catch this, but wire decoding that accepts
+            // a non-canonical bundle lets two byte strings name one spend and
+            // forces every downstream caller to remember the second check.
+            if components.iter().any(|c: &Component| c.scheme == scheme) {
+                return Err(Error::DuplicateBundleScheme(scheme));
             }
             let len = r.u16le()? as usize;
             if len == 0 || len > MAX_COMPONENT_BYTES {
@@ -458,6 +482,40 @@ mod tests {
         assert!(matches!(
             Bundle::from_reader(&mut r),
             Err(Error::TooManyBundleComponents { .. })
+        ));
+    }
+
+    #[test]
+    fn deserialize_refuses_trailing_bytes() {
+        // Audit: standalone bundle decoders used `from_reader` without
+        // `expect_end`, silently ignoring smuggled trailing bytes. The strict
+        // helper refuses them so two byte strings never name one bundle.
+        let b = Bundle {
+            components: vec![ecdsa_component()],
+        };
+        let mut bytes = b.to_bytes();
+        bytes.push(0xFF);
+        assert!(matches!(
+            Bundle::deserialize(&bytes),
+            Err(Error::Malformed(_))
+        ));
+        assert_eq!(Bundle::deserialize(&b.to_bytes()).unwrap(), b);
+    }
+
+    #[test]
+    fn a_duplicate_scheme_is_rejected_at_parse_time() {
+        // Audit: `from_reader` accepted duplicate schemes and left the
+        // canonical-form check to `validate()`. Wire decoding must reject a
+        // non-canonical bundle itself so two byte strings never name one
+        // spend.
+        let b = Bundle {
+            components: vec![ecdsa_component(), ecdsa_component()],
+        };
+        let bytes = b.to_bytes();
+        let mut r = crate::ser::Reader::new(&bytes);
+        assert!(matches!(
+            Bundle::from_reader(&mut r),
+            Err(Error::DuplicateBundleScheme(_))
         ));
     }
 

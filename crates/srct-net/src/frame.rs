@@ -59,8 +59,19 @@ pub fn write_frame<W: Write>(
 /// reserved up front. A violating length is rejected before `payload` is ever
 /// read, so a peer cannot force an oversized allocation; a lying length that
 /// passes the cap pins only the bytes actually delivered.
+/// Upper bound on wall time spent reading a single frame. The socket read
+/// timeout bounds each stalled `read`, but a peer dripping one byte per
+/// timeout-minus-epsilon would otherwise hold a peer slot and its reader
+/// thread forever (Slowloris): every `read` returns just in time, so the
+/// timeout never fires, yet no frame ever completes. The deadline bounds the
+/// whole frame instead — a maximum-size frame that cannot arrive in this time
+/// is not a slow peer, it is a slot-exhaustion attempt, and the connection is
+/// closed. Together with the keepalive ping in `peer.rs` (which bounds total
+/// silence), a peer must either make progress or lose its slot.
+pub const MAX_FRAME_DURATION: std::time::Duration = std::time::Duration::from_secs(90);
+
 pub fn read_frame<R: Read>(r: &mut R, params: &NetworkParams) -> NetResult<(u8, Vec<u8>)> {
-    read_frame_inner(r, params, |_| {})
+    read_frame_inner(r, params, MAX_FRAME_DURATION, |_| {})
 }
 
 /// `read_frame` with a per-chunk capacity probe, so tests can prove the
@@ -69,8 +80,10 @@ pub fn read_frame<R: Read>(r: &mut R, params: &NetworkParams) -> NetResult<(u8, 
 fn read_frame_inner<R: Read>(
     r: &mut R,
     params: &NetworkParams,
+    deadline: std::time::Duration,
     mut on_chunk: impl FnMut(usize),
 ) -> NetResult<(u8, Vec<u8>)> {
+    let started = std::time::Instant::now();
     let mut magic = [0u8; 4];
     r.read_exact(&mut magic).map_err(truncated("magic"))?;
     if magic != params.network_magic {
@@ -102,6 +115,8 @@ fn read_frame_inner<R: Read>(
     // holds roughly the bytes it actually delivered, not the whole lie. With
     // `max_peers` inbound readers this caps the pinned memory at
     // `chunk_len * max_peers` rather than `MAX_FRAME_PAYLOAD * max_peers`.
+    // The whole-frame deadline is checked per chunk: a drip that stays under
+    // the per-read socket timeout but never finishes still loses its slot.
     let mut payload = Vec::new();
     if payload_len > 0 {
         let mut buf = [0u8; 64 * 1024];
@@ -110,6 +125,9 @@ fn read_frame_inner<R: Read>(
             let want = remaining.min(buf.len());
             r.read_exact(&mut buf[..want])
                 .map_err(truncated("payload"))?;
+            if started.elapsed() > deadline {
+                return Err(NetError::Truncated("frame read deadline exceeded".into()));
+            }
             payload.extend_from_slice(&buf[..want]);
             on_chunk(payload.capacity());
             remaining -= want;
@@ -222,7 +240,7 @@ mod tests {
         let mut r = head.as_slice().chain(Drip { delivered: 0 });
 
         let mut peak = 0usize;
-        let err = read_frame_inner(&mut r, &p, |cap| peak = peak.max(cap));
+        let err = read_frame_inner(&mut r, &p, MAX_FRAME_DURATION, |cap| peak = peak.max(cap));
         assert!(
             matches!(err, Err(NetError::Truncated(_))),
             "a quiet peer is truncated, got {err:?}"
@@ -230,6 +248,32 @@ mod tests {
         assert!(
             peak <= 1024,
             "declared 2MB but delivered 3 bytes, yet capacity peaked at {peak}"
+        );
+    }
+
+    #[test]
+    fn a_frame_that_drips_past_its_deadline_is_closed() {
+        // Audit (Slowloris): the socket read timeout bounds each stalled
+        // `read`, not the frame. A peer delivering slowly but steadily would
+        // otherwise hold its slot forever. The whole-frame deadline closes
+        // it instead.
+        struct SlowDrip;
+        impl Read for SlowDrip {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                buf[0] = 0xAA;
+                Ok(1)
+            }
+        }
+        let p = NetworkParams::mini();
+        let mut w = Writer::new();
+        w.raw(&p.network_magic).u8(7).u32le(1_000);
+        let head = w.into_vec();
+        let mut r = head.as_slice().chain(SlowDrip);
+        let err = read_frame_inner(&mut r, &p, std::time::Duration::from_millis(30), |_| {});
+        assert!(
+            matches!(err, Err(NetError::Truncated(_))),
+            "a dripping peer must hit the frame deadline, got {err:?}"
         );
     }
 
