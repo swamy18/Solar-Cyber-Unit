@@ -97,6 +97,16 @@ impl Wallet {
             .map_err(|_| Error::BadKey("scalar out of range"))
     }
 
+    /// Copy of the scalar that wipes itself on drop. Prefer this over reading
+    /// the public `private_key` field directly: a plain `[u8; 32]` copy lingers
+    /// in freed memory, while this one is overwritten when it goes out of
+    /// scope. The field stays public for serialization compatibility.
+    pub fn private_key_bytes(&self) -> zeroize::Zeroizing<[u8; 32]> {
+        let mut raw = zeroize::Zeroizing::new([0u8; 32]);
+        raw.copy_from_slice(&self.private_key);
+        raw
+    }
+
     pub fn pubkey(&self) -> Result<[u8; 33]> {
         let sk = self.signing_key()?;
         // Invariant: a compressed secp256k1 verifying key is always 33 bytes.
@@ -284,8 +294,7 @@ impl Wallet {
     pub fn schnorr_signing_key(&self) -> Result<k256::schnorr::SigningKey> {
         // `Zeroizing` so the stack copy is wiped even on the error path:
         // `from_bytes` returning `Err` must not leave the scalar behind.
-        let mut raw = zeroize::Zeroizing::new([0u8; 32]);
-        raw.copy_from_slice(&self.private_key);
+        let raw = self.private_key_bytes();
         k256::schnorr::SigningKey::from_bytes(&raw[..])
             .map_err(|_| Error::BadKey("scalar out of range"))
     }
@@ -519,6 +528,16 @@ mod tests {
         assert_ne!(key, [0u8; 32], "the fixture holds a live key");
         zeroize::Zeroize::zeroize(&mut key);
         assert_eq!(key, [0u8; 32], "the wipe must clear every byte");
+    }
+
+    #[test]
+    fn private_key_bytes_returns_a_wiping_copy_of_the_scalar() {
+        // Audit: the public `[u8; 32]` field copies linger in freed memory;
+        // the accessor returns a `Zeroizing` copy wiped on drop. It must name
+        // the same scalar the wallet signs with.
+        let w = Wallet::from_private_key_bytes(&[7u8; 32], "accessor-test").unwrap();
+        assert_eq!(&w.private_key_bytes()[..], &w.private_key[..]);
+        assert_eq!(w.private_key_bytes().len(), 32);
     }
 
     /// The redaction must not have cost the file format: a wallet still

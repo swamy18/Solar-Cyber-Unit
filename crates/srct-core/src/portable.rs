@@ -241,16 +241,12 @@ impl SignedPolicy {
             return Err(PortableError::UnsupportedVersion(doc.version));
         }
         let policy = SpendPolicy::deserialize(&decode_hex_field(&doc.policy_hex, "policy hex")?)?;
-        let sigs = Bundle::from_reader(&mut Reader::new(&decode_hex_field(
-            &doc.sigs_hex,
-            "sigs hex",
-        )?))
-        .map_err(|_| PortableError::Malformed("sigs bundle"))?;
-        let keys = Bundle::from_reader(&mut Reader::new(&decode_hex_field(
-            &doc.keys_hex,
-            "keys hex",
-        )?))
-        .map_err(|_| PortableError::Malformed("keys bundle"))?;
+        // Strict bundle decode: a grant hex field with trailing garbage is a
+        // different byte string naming the "same" grant, so it is refused.
+        let sigs = Bundle::deserialize(&decode_hex_field(&doc.sigs_hex, "sigs hex")?)
+            .map_err(|_| PortableError::Malformed("sigs bundle"))?;
+        let keys = Bundle::deserialize(&decode_hex_field(&doc.keys_hex, "keys hex")?)
+            .map_err(|_| PortableError::Malformed("keys bundle"))?;
         let signed = SignedPolicy { policy, sigs, keys };
         // The denormalized routing fields must describe the decoded grant: a
         // document that routes one way and verifies another is a confusion
@@ -660,7 +656,7 @@ impl BoundAuthorization {
         let bound_tx =
             hash_from_hex(doc.bound_tx.trim()).map_err(|_| PortableError::Malformed("tx hex"))?;
         let bundle = |raw_hex: &str, what: &'static str| {
-            Bundle::from_reader(&mut Reader::new(&decode_hex_field(raw_hex, what)?))
+            Bundle::deserialize(&decode_hex_field(raw_hex, what)?)
                 .map_err(|_| PortableError::Malformed(what))
         };
         let bound = BoundAuthorization {
@@ -909,6 +905,25 @@ mod tests {
         let json = signed.to_json();
         let parsed = SignedPolicy::from_json(&json).unwrap();
         assert_eq!(parsed.policy.hash(), signed.policy.hash());
+    }
+
+    #[test]
+    fn a_grant_bundle_with_trailing_bytes_is_refused() {
+        // Audit: standalone bundle hex fields used `from_reader` without
+        // `expect_end`, ignoring smuggled trailing bytes. The strict helper
+        // refuses them so two byte strings never name one grant.
+        let w = owner_wallet();
+        let owner = w.address().unwrap();
+        let signed = SignedPolicy::issue(&w, &root_policy(&owner)).unwrap();
+        let json = signed.to_json();
+        let mut doc: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let sigs_hex = doc["sigs_hex"].as_str().unwrap().to_string();
+        doc["sigs_hex"] = serde_json::Value::String(format!("{sigs_hex}ff"));
+        assert!(
+            SignedPolicy::from_json(&doc.to_string()).is_err(),
+            "trailing bundle bytes must be refused"
+        );
+        SignedPolicy::from_json(&json).unwrap();
     }
 
     #[test]

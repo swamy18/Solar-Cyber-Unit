@@ -281,8 +281,9 @@ fn get_bundle(r: &mut Reader<'_>, what: &str) -> Result<srct_core::sig::Bundle, 
         return Err(format!("{what}: bundle over the 8 KiB cap"));
     }
     let bytes = r.fixed_slice(len).map_err(|e| format!("{what}: {e}"))?;
-    let mut br = Reader::new(bytes);
-    srct_core::sig::Bundle::from_reader(&mut br).map_err(|e| format!("{what}: {e}"))
+    // Strict: the length-prefixed section must hold exactly one bundle, so
+    // trailing bytes inside the section are refused rather than ignored.
+    srct_core::sig::Bundle::deserialize(bytes).map_err(|e| format!("{what}: {e}"))
 }
 
 /// Inverse of [`encode_state_map`]: bounded count, no duplicate keys, every
@@ -4469,8 +4470,11 @@ fn decode_bundle(
     what: &str,
 ) -> Result<srct_core::sig::Bundle, (StatusCode, Json<ErrorBody>)> {
     let bytes = decode_hex_bytes(hex_str, what)?;
-    let mut r = srct_core::ser::Reader::new(&bytes);
-    srct_core::sig::Bundle::from_reader(&mut r).map_err(|e| bad(format!("{what}: {e}")))
+    // Strict: a bundle hex field with trailing garbage is refused, not
+    // truncated to its first bundle. Every authorization path (policy,
+    // payment, guard, credit, loans) decodes through here, so lax parsing
+    // would let two byte strings name one authorization.
+    srct_core::sig::Bundle::deserialize(&bytes).map_err(|e| bad(format!("{what}: {e}")))
 }
 
 /// Revoke a policy this node has issued under.
