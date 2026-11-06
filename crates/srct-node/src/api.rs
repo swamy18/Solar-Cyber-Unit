@@ -3805,11 +3805,41 @@ async fn guard_grant(State(state): State<ApiState>, Json(req): Json<GuardGrantRe
         if !sh.guard_registry.contains_key(&hash)
             && sh.guard_registry.len() >= srct_core::guard::MAX_GUARD_REGISTRY
         {
-            return Err(fail(
-                StatusCode::CONFLICT,
-                "guard_refused",
-                "grant registry is full",
-            ));
+            // Fail-closed but not fail-permanent: registration is owner-signed
+            // yet permissionless (any keyholder mints owners), so a refuse-only
+            // full registry is a lasting grief — 1024 self-signed junk grants,
+            // or just years of naturally expired ones, brick every future
+            // registration across restarts. Evict a dead grant instead: an
+            // expired one first, else one that never admitted anything (no
+            // nonce was ever consumed, so forgetting it replays nothing).
+            // Revoked tombstones and admitted grants are never evicted — the
+            // tombstone is what keeps a re-registration refused, and dropping
+            // admission state would re-admit spent nonces.
+            match srct_core::guard::select_grant_eviction_candidate(
+                &sh.guard_registry,
+                &sh.guard_revoked,
+                &sh.guards,
+                height,
+            ) {
+                Some(victim) => {
+                    sh.guard_registry.remove(&victim);
+                    sh.guards.forget(&victim);
+                    audit_push(
+                        sh,
+                        "guard_grant_evict",
+                        Some(victim),
+                        None,
+                        format!("evicted dead grant {}", hash_to_hex(&victim)),
+                    );
+                }
+                None => {
+                    return Err(fail(
+                        StatusCode::CONFLICT,
+                        "guard_refused",
+                        "grant registry is full",
+                    ))
+                }
+            }
         }
         sh.guard_registry.insert(hash, policy);
         audit_push(
@@ -8974,6 +9004,44 @@ fn trial_max_outstanding_sat() -> u64 {
         .unwrap_or(TRIAL_DEFAULT_MAX_OUTSTANDING_SAT)
 }
 
+/// How long a never-funded trial request lives (`SRCT_TRIAL_REQUEST_EXPIRY_BLOCKS`,
+/// default 10_000 blocks). Requests are unauthenticated — anyone names any
+/// agent — and `Requested` records count toward the sponsor's outstanding cap
+/// and pin book slots forever. Without expiry, a few thousand fake requests
+/// (zero coin spent) lock the sponsor cap and fill the book, bricking the
+/// faucet for every real agent permanently. Expiry bounds the grief to a
+/// rolling window: a request the sponsor never funds within the window stops
+/// existing, freeing the cap and the slot. Only `Requested` records expire —
+/// `Funded` and `Repaid` are money states, and one-trial-per-agent-ever holds
+/// for those. A re-request after expiry is a new promise, not a second trial.
+const TRIAL_DEFAULT_REQUEST_EXPIRY_BLOCKS: u64 = 10_000;
+
+fn trial_request_expiry_blocks() -> u64 {
+    std::env::var("SRCT_TRIAL_REQUEST_EXPIRY_BLOCKS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(TRIAL_DEFAULT_REQUEST_EXPIRY_BLOCKS)
+}
+
+/// Agent ids whose request died unfunded: `Requested` and older than the
+/// window. Pure (no env read) so tests pin the rule: money states never
+/// expire, funded-late still counts, and the boundary is exact.
+fn expired_trial_requests(
+    trials: &BTreeMap<Address, TrialRecord>,
+    height: u64,
+    expiry_blocks: u64,
+) -> Vec<Address> {
+    trials
+        .iter()
+        .filter(|(_, t)| {
+            t.state == TrialState::Requested
+                && t.requested_height.saturating_add(expiry_blocks) <= height
+        })
+        .map(|(a, _)| *a)
+        .collect()
+}
+
 /// Sponsor exposure right now: trials recorded but not yet repaid.
 fn trial_outstanding(trials: &BTreeMap<Address, TrialRecord>) -> u64 {
     trials
@@ -9065,6 +9133,23 @@ async fn trial_request(State(state): State<ApiState>, Json(req): Json<TrialAgent
                 "no trial sponsor is configured; set SRCT_TRIAL_SPONSOR",
             )
         })?;
+        // Reap requests the sponsor never funded: without this, fake requests
+        // (free, unauthenticated) pin the sponsor cap and book slots forever.
+        // Only never-funded promises die here; money states are untouched.
+        let height = sh.chain.height();
+        let stale = expired_trial_requests(&sh.trials, height, trial_request_expiry_blocks());
+        if !stale.is_empty() {
+            for a in &stale {
+                sh.trials.remove(a);
+            }
+            audit_push(
+                sh,
+                "trial_request_expire",
+                None,
+                None,
+                format!("expired {} unfunded trial request(s)", stale.len()),
+            );
+        }
         if sh.trials.contains_key(&agent) {
             return Err(fail(
                 StatusCode::CONFLICT,
@@ -9130,6 +9215,32 @@ async fn trial_fund(State(state): State<ApiState>, Json(req): Json<TrialTxReq>) 
                 "no trial recorded for this agent — request one first",
             )
         })?;
+        // A request the sponsor never funded inside the window is gone: it
+        // cannot be resurrected by pointing a payment at it later. Funded and
+        // Repaid records are money states and never expire here.
+        if trial.state == TrialState::Requested
+            && trial
+                .requested_height
+                .saturating_add(trial_request_expiry_blocks())
+                <= sh.chain.height()
+        {
+            sh.trials.remove(&agent);
+            audit_push(
+                sh,
+                "trial_request_expire",
+                None,
+                None,
+                format!(
+                    "expired unfunded trial request for {}",
+                    address_to_hex(&agent)
+                ),
+            );
+            return Err(fail(
+                StatusCode::NOT_FOUND,
+                "no_trial",
+                "that trial request expired unfunded — request again",
+            ));
+        }
         match trial.state {
             TrialState::Requested => {}
             TrialState::Funded => {
@@ -9890,5 +10001,70 @@ mod high_value_tests {
         // The listed approver passes.
         let (asigs, akeys) = approval_for(&approver, &id);
         require_high_value_approval(&payment, id, Some((&asigs, &akeys))).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod trial_expiry_tests {
+    use super::*;
+
+    fn record(agent_byte: u8, state: TrialState, requested_height: u64) -> TrialRecord {
+        TrialRecord {
+            agent: [agent_byte; 20],
+            amount_sat: 1_000_000,
+            sponsor: [0x5u8; 20],
+            state,
+            fund_txid: None,
+            repay_txid: None,
+            requested_height,
+        }
+    }
+
+    #[test]
+    fn only_unfunded_requests_expire_and_the_boundary_is_exact() {
+        // Hacker case: fake `Requested` records (free, unauthenticated) must
+        // die; money states (`Funded`, `Repaid`) never do — expiring those
+        // would free txids for double-counting one payment twice.
+        let mut trials = BTreeMap::new();
+        trials.insert([1u8; 20], record(1, TrialState::Requested, 0));
+        trials.insert([2u8; 20], record(2, TrialState::Requested, 1));
+        trials.insert([3u8; 20], {
+            let mut r = record(3, TrialState::Funded, 0);
+            r.fund_txid = Some([0xAAu8; 64]);
+            r
+        });
+        trials.insert([4u8; 20], {
+            let mut r = record(4, TrialState::Repaid, 0);
+            r.fund_txid = Some([0xBBu8; 64]);
+            r.repay_txid = Some([0xCCu8; 64]);
+            r
+        });
+        // Expiry 10: requested_at 0 dies exactly at height 10, requested_at 1
+        // survives height 10 and dies at 11.
+        assert_eq!(
+            expired_trial_requests(&trials, 9, 10),
+            Vec::<Address>::new()
+        );
+        assert_eq!(expired_trial_requests(&trials, 10, 10), vec![[1u8; 20]]);
+        let dead: Vec<Address> = expired_trial_requests(&trials, 11, 10);
+        assert!(dead.contains(&[1u8; 20]) && dead.contains(&[2u8; 20]));
+        assert!(!dead.contains(&[3u8; 20]), "funded money never expires");
+        assert!(!dead.contains(&[4u8; 20]), "repaid money never expires");
+    }
+
+    #[test]
+    fn expiry_arithmetic_never_panics_near_u64_max() {
+        let mut trials = BTreeMap::new();
+        trials.insert([9u8; 20], record(9, TrialState::Requested, u64::MAX));
+        // `requested + expiry` saturates instead of wrapping to a small
+        // number that would instantly (and wrongly) expire the record.
+        assert_eq!(
+            expired_trial_requests(&trials, u64::MAX, 10_000),
+            vec![[9u8; 20]]
+        );
+        assert_eq!(
+            expired_trial_requests(&trials, u64::MAX - 1, 10_000),
+            Vec::<Address>::new()
+        );
     }
 }

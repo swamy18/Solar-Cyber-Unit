@@ -17,7 +17,7 @@
 use crate::agent::AgentId;
 use crate::hash::{sha256_dom, Address, Hash};
 use crate::ser::{Reader, Writer};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Version of the infra grant encoding. A future format MUST use a new value.
 /// Current grant/envelope version. `InfraPolicy` decoding still accepts v1
@@ -961,8 +961,49 @@ impl Default for GuardBook {
 }
 
 /// Largest entry count the guard-book codec will read back. Checked before
-/// any allocation; real books are capped at [`DEFAULT_MAX_GUARDS`].
+/// any allocation, real books are capped at [`DEFAULT_MAX_GUARDS`].
 pub const MAX_GUARD_BOOK_READ: usize = 1 << 20;
+
+/// Pick the registry entry to sacrifice when the grant registry is full and a
+/// new grant arrives. Registration is owner-signed but permissionless — any
+/// keyholder can mint owners — so a full registry that only refuses is a
+/// permanent grief: 1024 self-signed junk grants (or a slow accumulation of
+/// naturally expired ones) brick every future registration, and the file
+/// persists the brick across restarts.
+///
+/// Eviction is safe exactly for grants that can never authorize again or never
+/// have: expired grants (the validity check precedes everything, and they
+/// cannot re-register), and live grants with no admission state (no nonce was
+/// ever consumed, so forgetting them replays nothing — every capability for
+/// them is as live after eviction as before). Never evicted: revoked grants
+/// (their tombstone is what keeps a re-registration refused) and grants with
+/// book state (forgetting `last_nonce` would re-admit already-used nonces).
+/// Expired entries are preferred over merely unused ones; ties break in hash
+/// order so every node picks the same victim. Returns `None` when every entry
+/// is load-bearing and the registration must still be refused.
+pub fn select_grant_eviction_candidate(
+    registry: &BTreeMap<Hash, InfraPolicy>,
+    revoked: &BTreeSet<Hash>,
+    book: &GuardBook,
+    height: u64,
+) -> Option<Hash> {
+    let mut unused_fallback: Option<Hash> = None;
+    for (hash, policy) in registry.iter() {
+        if revoked.contains(hash) {
+            continue;
+        }
+        if book.state(hash).is_some() {
+            continue;
+        }
+        if policy.valid_until_height <= height {
+            return Some(*hash);
+        }
+        if unused_fallback.is_none() {
+            unused_fallback = Some(*hash);
+        }
+    }
+    unused_fallback
+}
 
 impl GuardBook {
     pub fn with_capacity(max_grants: usize) -> Self {
@@ -1379,6 +1420,72 @@ mod tests {
             None,
         );
         assert_eq!(d, Decision::Allow);
+    }
+
+    #[test]
+    fn eviction_prefers_expired_then_unused_and_never_used_or_revoked() {
+        use super::select_grant_eviction_candidate;
+        use std::collections::{BTreeMap, BTreeSet};
+        let owner = test_owner();
+        let grant = |agent_byte: u8, valid_until: u64| {
+            let mut p = test_policy();
+            p.owner = owner.address().unwrap();
+            p.agent_id = [agent_byte; 20];
+            p.valid_from_height = 0;
+            p.valid_until_height = valid_until;
+            (p.hash(), p)
+        };
+        // Registry in hash order is not insertion order; build entries and
+        // sort expectations by hash instead of assuming positions.
+        let (h_expired, p_expired) = grant(1, 50);
+        let (h_live_unused, p_live_unused) = grant(2, 10_000);
+        let (h_live_unused2, p_live_unused2) = grant(3, 10_000);
+        let (h_used, p_used) = grant(4, 10_000);
+        let (h_revoked, p_revoked) = grant(5, 10_000);
+        let registry: BTreeMap<Hash, InfraPolicy> = [
+            (h_expired, p_expired),
+            (h_live_unused, p_live_unused),
+            (h_live_unused2, p_live_unused2),
+            (h_used, p_used),
+            (h_revoked, p_revoked),
+        ]
+        .into_iter()
+        .collect();
+        let mut revoked = BTreeSet::new();
+        revoked.insert(h_revoked);
+        let mut book = GuardBook::default();
+        // Mark h_used as admitted (any nonce consumes state).
+        book.states.insert(
+            h_used,
+            GuardState {
+                window_start_height: 90,
+                calls_in_window: 1,
+                last_nonce: 1,
+                total_calls: 1,
+            },
+        );
+        // Expired wins over everything at height 100.
+        assert_eq!(
+            select_grant_eviction_candidate(&registry, &revoked, &book, 100),
+            Some(h_expired)
+        );
+        // With no expired entry (height 10), the lowest-hash unused live
+        // grant is picked; used and revoked entries are never picked.
+        let got = select_grant_eviction_candidate(&registry, &revoked, &book, 10).unwrap();
+        assert!(
+            got == h_live_unused || got == h_live_unused2,
+            "must pick an unused live grant, got {got:?}"
+        );
+        assert_ne!(got, h_used);
+        assert_ne!(got, h_revoked);
+        // A registry of only used + revoked entries refuses: None.
+        let mut tight = BTreeMap::new();
+        tight.insert(h_used, registry[&h_used].clone());
+        tight.insert(h_revoked, registry[&h_revoked].clone());
+        assert_eq!(
+            select_grant_eviction_candidate(&tight, &revoked, &book, 100),
+            None
+        );
     }
 
     #[test]
