@@ -167,8 +167,7 @@ impl Message {
                 // accepts. Truncation keeps the shape encodable; the 64-byte
                 // bound stays the consensus wire rule.
                 let nid = &v.network_id.as_bytes()[..v.network_id.len().min(MAX_HANDSHAKE_STR_LEN)];
-                let ua =
-                    &v.user_agent.as_bytes()[..v.user_agent.len().min(MAX_HANDSHAKE_STR_LEN)];
+                let ua = &v.user_agent.as_bytes()[..v.user_agent.len().min(MAX_HANDSHAKE_STR_LEN)];
                 w.raw(&v.network_magic)
                     .u8(u8::try_from(nid.len()).unwrap_or(0));
                 w.raw(nid);

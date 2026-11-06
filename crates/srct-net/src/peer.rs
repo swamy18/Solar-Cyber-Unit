@@ -664,7 +664,10 @@ mod tests {
                 break;
             }
         }
-        assert!(refused, "a stalled peer must be dropped, not queued forever");
+        assert!(
+            refused,
+            "a stalled peer must be dropped, not queued forever"
+        );
         assert!(handle.is_stopped());
         handle.stop();
     }

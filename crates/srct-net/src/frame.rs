@@ -240,8 +240,7 @@ mod tests {
         let mut r = head.as_slice().chain(Drip { delivered: 0 });
 
         let mut peak = 0usize;
-        let err =
-            read_frame_inner(&mut r, &p, MAX_FRAME_DURATION, |cap| peak = peak.max(cap));
+        let err = read_frame_inner(&mut r, &p, MAX_FRAME_DURATION, |cap| peak = peak.max(cap));
         assert!(
             matches!(err, Err(NetError::Truncated(_))),
             "a quiet peer is truncated, got {err:?}"
@@ -271,12 +270,7 @@ mod tests {
         w.raw(&p.network_magic).u8(7).u32le(1_000);
         let head = w.into_vec();
         let mut r = head.as_slice().chain(SlowDrip);
-        let err = read_frame_inner(
-            &mut r,
-            &p,
-            std::time::Duration::from_millis(30),
-            |_| {},
-        );
+        let err = read_frame_inner(&mut r, &p, std::time::Duration::from_millis(30), |_| {});
         assert!(
             matches!(err, Err(NetError::Truncated(_))),
             "a dripping peer must hit the frame deadline, got {err:?}"

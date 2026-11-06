@@ -908,7 +908,9 @@ impl NetworkParams {
         // `[min, max]`, so an inverted range would pin every block at an
         // unintended floor and split nodes that clamp differently.
         if self.base_fee_min_sat > self.base_fee_max_sat {
-            return Err(Error::Malformed("base_fee_min_sat must not exceed base_fee_max_sat"));
+            return Err(Error::Malformed(
+                "base_fee_min_sat must not exceed base_fee_max_sat",
+            ));
         }
         if self.base_fee_initial_sat < self.base_fee_min_sat
             || self.base_fee_initial_sat > self.base_fee_max_sat
