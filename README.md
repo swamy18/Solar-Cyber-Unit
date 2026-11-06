@@ -820,6 +820,11 @@ answered as `allow / deny / needs_approval` anywhere, settled as trust on Solar.
   which is what drives SRCT demand (fee burn + PSCB accounting). Audit is
   node-local and export-verifiable, not chain-anchored. Full design:
   [`docs/smart-gate-architecture.md`](docs/smart-gate-architecture.md).
+- **Finance-gate quick start (V1):** company payments behind the gate —
+  frozen intent shape, five integration steps, and the sales demo:
+  [`docs/universal-security.md`](docs/universal-security.md),
+  `python scripts/finance_gate_demo.py --node http://127.0.0.1:PORT`.
+  Lock-in tests: `cargo test -p srct-node --test universal_security`.
 - **Why copy does not transfer trust:** verification code is open by design;
   the trust root is not copyable. Grants are network-bound, decisions anchor
   to the canonical tip, and audit receipts are accepted because of the
@@ -1177,7 +1182,7 @@ not expose it directly, but the worker SDK does (`add_credit_collateral`).
 | `fuzz/` | 17 cargo-fuzz targets over the attacker-controlled boundaries. |
 | `sim/` | Independent Python reference, attack simulations, and feature demos (`x402_paid_api_demo.py`, `micropayment_benchmark.py`, `agent_economy_demo.py`). |
 | `tests/vectors/` | Consensus vectors. Generated from source, never hand-edited. |
-| `docs/` | Design records, verification status and readiness reports — plus per-feature guides: `portable-policy.md`, `x402.md`, `micropayments.md`, `wallet-safety.md`, `smart-gate-architecture.md`, `reputation.md`, `agent-jobs.md`, `usd-settlement.md`, `ramps.md`, `lending.md`. |
+| `docs/` | Design records, verification status and readiness reports — plus per-feature guides: `portable-policy.md`, `universal-security.md`, `x402.md`, `micropayments.md`, `wallet-safety.md`, `smart-gate-architecture.md`, `reputation.md`, `agent-jobs.md`, `usd-settlement.md`, `ramps.md`, `lending.md`. |
 | `paper/` | The Solar Cyber Unit protocol paper (LaTeX + PDF). |
 
 Nine crates in one workspace. **All consensus logic lives in `srct-core`**, which
@@ -1391,6 +1396,7 @@ cargo test -p srct-node --test api escrow       # escrow open/settle over HTTP
 cargo test -p srct-core --test redteam          # adversarial regressions
 cargo test -p srct-core --test redteam_round2   # round-2 credit regressions
 cargo test -p srct-core --test pq_signature     # post-quantum bundle attacks
+cargo test -p srct-node --test universal_security # finance-gate V1: decide/authorize fail-closed over HTTP
 ```
 
 CI (`.github/workflows/ci.yml`) runs format, clippy, the full suite, a release
