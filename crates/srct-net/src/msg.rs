@@ -160,17 +160,24 @@ impl Message {
     fn encode_into(&self, w: &mut Writer) {
         match self {
             Message::Version(v) => {
+                // Clamp to the decoder's bound (`MAX_HANDSHAKE_STR_LEN`), not
+                // to 255: the old code produced messages this node's own
+                // decoder rejects (length byte > 64), so a node with a long
+                // `user_agent` sent handshakes nobody — including itself —
+                // accepts. Truncation keeps the shape encodable; the 64-byte
+                // bound stays the consensus wire rule.
+                let nid = &v.network_id.as_bytes()[..v.network_id.len().min(MAX_HANDSHAKE_STR_LEN)];
+                let ua =
+                    &v.user_agent.as_bytes()[..v.user_agent.len().min(MAX_HANDSHAKE_STR_LEN)];
                 w.raw(&v.network_magic)
-                    .u8(u8::try_from(v.network_id.len()).unwrap_or(0));
-                // Truncate rather than panic on an oversized string; the
-                // receiver will reject a too-long field anyway.
-                w.raw(&v.network_id.as_bytes()[..v.network_id.len().min(255)]);
+                    .u8(u8::try_from(nid.len()).unwrap_or(0));
+                w.raw(nid);
                 w.u32le(v.protocol_version)
                     .u64le(v.services)
                     .u64le(v.height)
                     .fixed(&v.tip_hash)
-                    .u8(u8::try_from(v.user_agent.len()).unwrap_or(0))
-                    .raw(&v.user_agent.as_bytes()[..v.user_agent.len().min(255)])
+                    .u8(u8::try_from(ua.len()).unwrap_or(0))
+                    .raw(ua)
                     .u64le(v.nonce);
             }
             Message::Verack { nonce } => {
@@ -504,6 +511,32 @@ mod tests {
                 assert_eq!(got[0].ip, ip);
             }
             other => panic!("expected Addr, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn oversized_handshake_strings_encode_within_the_wire_bound() {
+        // Audit: `Version::encode` truncated at 255 while the decoder caps at
+        // 64, so a node with a long `user_agent` emitted handshakes its own
+        // decoder rejects. Encoding must clamp to `MAX_HANDSHAKE_STR_LEN` so
+        // every encoded handshake decodes.
+        let v = Version {
+            network_magic: [0x6A, 0x4E, 0x54, 0x03],
+            network_id: "x".repeat(200),
+            protocol_version: PROTOCOL_VERSION,
+            services: 1,
+            height: 0,
+            tip_hash: [0x00; 64],
+            user_agent: "y".repeat(200),
+            nonce: 1,
+        };
+        let enc = Message::Version(v).encode();
+        match Message::decode(1, &enc).unwrap() {
+            Message::Version(got) => {
+                assert_eq!(got.network_id.len(), MAX_HANDSHAKE_STR_LEN);
+                assert_eq!(got.user_agent.len(), MAX_HANDSHAKE_STR_LEN);
+            }
+            other => panic!("expected Version, got {other:?}"),
         }
     }
 }

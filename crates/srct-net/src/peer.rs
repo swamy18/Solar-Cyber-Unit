@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::net::{SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
-use std::sync::mpsc::{channel, Receiver, Sender, SyncSender};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -22,6 +22,15 @@ pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Ban threshold score. Reaching or exceeding 100 disconnects and bans. §13.8.
 pub const BAN_SCORE_THRESHOLD: u32 = 100;
+
+/// Cap on queued outbound messages per peer. The old channel was unbounded:
+/// a slow (or deliberately stalled) peer accumulated every broadcast while its
+/// writer thread waited on a full socket buffer, growing memory without bound
+/// — one stalled peer could pin gigabytes while the node believed it was
+/// merely "behind". A full queue now drops the peer instead of the memory
+/// budget: the writer drains oldest-first and `send` refuses rather than
+/// queuing past this.
+pub const OUTBOUND_QUEUE_MAX: usize = 128;
 
 /// Local node handshake configuration.
 #[derive(Debug, Clone)]
@@ -71,7 +80,7 @@ pub struct PeerHandle {
     pub remote_addr: SocketAddr,
     pub version: Version,
     pub is_outbound: bool,
-    tx: Sender<Message>,
+    tx: SyncSender<Message>,
     ban_score: Arc<AtomicU32>,
     stopped: Arc<AtomicBool>,
     /// A handle on the socket, so `stop()` can actually close the connection.
@@ -123,9 +132,19 @@ impl PeerHandle {
         if self.stopped.load(Ordering::Relaxed) {
             return Err(NetError::Peer("peer disconnected".into()));
         }
-        self.tx
-            .send(msg)
-            .map_err(|_| NetError::Peer("peer channel closed".into()))
+        // `try_send`: never grow past `OUTBOUND_QUEUE_MAX`. A slow peer's
+        // queue filling up is a disconnect, not backpressure on the event
+        // loop — blocking here would stall every other peer behind one.
+        match self.tx.try_send(msg) {
+            Ok(()) => Ok(()),
+            Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                self.stop();
+                Err(NetError::Peer("peer outbound queue full".into()))
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                Err(NetError::Peer("peer channel closed".into()))
+            }
+        }
     }
 
     /// Current misbehaviour ban score.
@@ -435,7 +454,8 @@ pub fn spawn_peer(
     table: PeerTable,
 ) -> NetResult<PeerHandle> {
     let remote_addr = stream.peer_addr()?;
-    let (outbound_tx, outbound_rx): (Sender<Message>, Receiver<Message>) = channel();
+    let (outbound_tx, outbound_rx): (SyncSender<Message>, Receiver<Message>) =
+        sync_channel(OUTBOUND_QUEUE_MAX);
     let ban_score = Arc::new(AtomicU32::new(0));
     let stopped = Arc::new(AtomicBool::new(false));
     let reader_done = Arc::new(AtomicBool::new(false));
@@ -520,8 +540,11 @@ pub fn spawn_peer(
                     match Message::decode(ty, &payload) {
                         Ok(msg) => match msg {
                             Message::Ping { nonce } => {
-                                // Auto respond with PONG
-                                let _ = auto_pong_tx.send(Message::Pong { nonce });
+                                // Auto respond with PONG. Non-blocking: if the
+                                // peer's queue is full it is already being
+                                // dropped; blocking the reader here would stall
+                                // inbound processing behind one slow peer.
+                                let _ = auto_pong_tx.try_send(Message::Pong { nonce });
                             }
                             Message::Pong { nonce } => {
                                 if ping_sent && nonce == ping_nonce {
@@ -564,7 +587,7 @@ pub fn spawn_peer(
                         ping_sent = false;
                     } else {
                         ping_nonce = generate_nonce();
-                        let _ = auto_pong_tx.send(Message::Ping { nonce: ping_nonce });
+                        let _ = auto_pong_tx.try_send(Message::Ping { nonce: ping_nonce });
                         ping_sent = true;
                     }
                     continue;
@@ -597,4 +620,52 @@ pub fn spawn_peer(
     });
 
     Ok(handle)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_full_outbound_queue_drops_the_peer_instead_of_growing_memory() {
+        // Audit: the outbound channel was unbounded, so one stalled peer
+        // pinned every broadcast queued behind it. The queue is now bounded
+        // (`OUTBOUND_QUEUE_MAX`); filling it must disconnect the peer rather
+        // than grow memory.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = std::net::TcpStream::connect(addr).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        // Never read from `server`: `client`'s writer has nowhere to drain.
+        let _ = server;
+
+        let params = NetworkParams::mini();
+        let (event_tx, _event_rx) = std::sync::mpsc::sync_channel::<PeerEvent>(16);
+        let live = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let inbound = std::sync::Arc::new(AtomicUsize::new(0));
+        let table = PeerTable::new(live, inbound);
+        let version = Version {
+            network_magic: params.network_magic,
+            network_id: params.network_id.clone(),
+            protocol_version: PROTOCOL_VERSION,
+            services: 1,
+            height: 0,
+            tip_hash: srct_core::block::genesis_block(1).block_hash(),
+            user_agent: "test".into(),
+            nonce: 0xA11CE,
+        };
+        let handle = spawn_peer(7, client, version, true, params, event_tx, table).unwrap();
+        // Fill past the cap: `send` must eventually refuse and mark stopped
+        // instead of queueing forever.
+        let mut refused = false;
+        for _ in 0..(OUTBOUND_QUEUE_MAX + 64) {
+            if handle.send(Message::Ping { nonce: 1 }).is_err() {
+                refused = true;
+                break;
+            }
+        }
+        assert!(refused, "a stalled peer must be dropped, not queued forever");
+        assert!(handle.is_stopped());
+        handle.stop();
+    }
 }

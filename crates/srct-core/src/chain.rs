@@ -2094,7 +2094,10 @@ impl Chain {
             difficulty,
             nonce: 0,
             puzzle_id: self.params.puzzle_id,
-            epoch_id: (height / self.params.nn_epoch_blocks) as u32,
+            epoch_id: height
+                .checked_div(self.params.nn_epoch_blocks)
+                .unwrap_or(0)
+                .min(u32::MAX as u64) as u32,
             extra_nonce: [0u8; 16],
             sig_scheme: crate::hash::SIG_SCHEME_SECP256K1_ECDSA,
         };

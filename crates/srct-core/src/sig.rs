@@ -212,6 +212,15 @@ impl Bundle {
             if !scheme_supported(scheme) {
                 return Err(Error::UnsupportedSigScheme(scheme));
             }
+            // Canonical-form enforcement at parse time, not only in
+            // `validate()`: a duplicate scheme adds bytes without adding
+            // independence, so it is never a hybrid. `verify_bundle` calls
+            // `validate` and would catch this, but wire decoding that accepts
+            // a non-canonical bundle lets two byte strings name one spend and
+            // forces every downstream caller to remember the second check.
+            if components.iter().any(|c: &Component| c.scheme == scheme) {
+                return Err(Error::DuplicateBundleScheme(scheme));
+            }
             let len = r.u16le()? as usize;
             if len == 0 || len > MAX_COMPONENT_BYTES {
                 return Err(Error::BadComponentLength(len));
@@ -458,6 +467,23 @@ mod tests {
         assert!(matches!(
             Bundle::from_reader(&mut r),
             Err(Error::TooManyBundleComponents { .. })
+        ));
+    }
+
+    #[test]
+    fn a_duplicate_scheme_is_rejected_at_parse_time() {
+        // Audit: `from_reader` accepted duplicate schemes and left the
+        // canonical-form check to `validate()`. Wire decoding must reject a
+        // non-canonical bundle itself so two byte strings never name one
+        // spend.
+        let b = Bundle {
+            components: vec![ecdsa_component(), ecdsa_component()],
+        };
+        let bytes = b.to_bytes();
+        let mut r = crate::ser::Reader::new(&bytes);
+        assert!(matches!(
+            Bundle::from_reader(&mut r),
+            Err(Error::DuplicateBundleScheme(_))
         ));
     }
 
