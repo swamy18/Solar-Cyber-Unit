@@ -8,8 +8,8 @@ cap, a 1 SRCT initial reward, 210,000-block halvings, `TARGET_SUPPLY_SAT` /
 `MAX_HALVINGS` constants). None of those names or numbers exist in the code.
 The text below is what `crates/srct-core/src/supply.rs` and
 `crates/srct-core/src/params.rs` actually implement, pinned by
-`SPEC.md §7`/`§10`, `sim/supply_schedule_sim.py`, and
-`tests/vectors/supply_vectors.json`. If any of the three ever disagree, the
+`SPEC.md §7`/`§10`, `verification/sim/supply_schedule_sim.py`, and
+`verification/tests/vectors/supply_vectors.json`. If any of the three ever disagree, the
 tests (`supply::tests::*`, `params::tests::*`) fail first.
 
 ## Design
@@ -83,7 +83,7 @@ the mainnet value on a 1-second profile would mint a four-digit percentage per
 year against its own issued supply, which is why the tails are set
 independently. The largest tail window issues ~0.34 % of supply on mainnet —
 about a third of the 1 % anchor, so the anchor never binds the approved
-schedule (`sim/supply_schedule_sim.py` prints
+schedule (`verification/sim/supply_schedule_sim.py` prints
 `largest_tail_window_pct_of_issued`).
 
 If a block reward would cross either bound, the block is refused
@@ -159,7 +159,7 @@ sat) and never consult the L1 floor (`l2_fees_do_not_use_the_l1_gas_floor`).
   `escrow_ceiling_sat`, no fee-burn target (deflation accepted), activation at
   each profile's ladder exhaustion. Implemented in `supply.rs`/`params.rs`/`chain.rs`,
   vectors regenerated, and pinned by `supply::tests::*`, `params::tests::*`,
-  `sim/supply_schedule_sim.py --selftest` and `sim/tail_emission_sim.py --selftest`.
+  `verification/sim/supply_schedule_sim.py --selftest` and `verification/sim/tail_emission_sim.py --selftest`.
 - **Decision 18 (2026-10-09):** the stock cap deleted and replaced by the rate
   anchor (≤ 1 % of issued per halving period), with net-supply reporting
   (issuance minus burns) on `status`, `/v1/conservation` and `/metrics`.
@@ -176,5 +176,5 @@ sat) and never consult the L1 floor (`l2_fees_do_not_use_the_l1_gas_floor`).
 - `SPEC.md` §5 (PoW), §7 (supply schedule), §8 (fees), §10 (profiles)
 - `crates/srct-core/src/supply.rs` (implementation + tests)
 - `crates/srct-core/src/fees.rs` (M1 fee split)
-- `sim/supply_schedule_sim.py` (independent Python reference cross-check)
-- `tests/vectors/supply_vectors.json` (pinned numbers)
+- `verification/sim/supply_schedule_sim.py` (independent Python reference cross-check)
+- `verification/tests/vectors/supply_vectors.json` (pinned numbers)

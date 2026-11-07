@@ -4,8 +4,8 @@ NOT consensus code. Nothing here is imported by any Rust crate, and nothing
 here changes a reward, a fee, a cap or an invariant. It exists so every number
 quoted in `docs/monetary-redesign.md` is reproducible with one command.
 
-    python sim/tail_emission_sim.py            # full comparative analysis
-    python sim/tail_emission_sim.py --selftest # assertions + vector cross-check
+    python verification/sim/tail_emission_sim.py            # full comparative analysis
+    python verification/sim/tail_emission_sim.py --selftest # assertions + vector cross-check
 
 `--selftest` exits non-zero if any hand-computed value, committed supply vector,
 monotonicity property, continuity property or overflow bound does not hold.
@@ -440,7 +440,7 @@ def main(argv: list[str]) -> int:
                   f"{years_at(p, exhaustion_height(p)):.2f} years")
         print()
 
-    print("Run `python sim/tail_emission_sim.py --selftest` for the assertions")
+    print("Run `python verification/sim/tail_emission_sim.py --selftest` for the assertions")
     print("and the committed-vector cross-check.")
     return 0
 

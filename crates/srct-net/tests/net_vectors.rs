@@ -10,7 +10,7 @@
 //! Regenerate with `UPDATE_NET_VECTORS=1 cargo test -p srct-net`.
 //!
 //! Note what is *not* here: a second implementation, the way
-//! `sim/srct_reference.py` re-derives the puzzle from §5 prose. A disagreement
+//! `verification/sim/srct_reference.py` re-derives the puzzle from §5 prose. A disagreement
 //! between two encoders of these rules looks exactly like a consensus split,
 //! and that check is still owed.
 
@@ -181,7 +181,7 @@ fn build_vectors() -> (Vec<Item>, Vec<Fact>) {
         ),
     ));
     // count(2 LE) + one entry(65). The count is 2 bytes, not 4 — see the
-    // independent check in `sim/net_reference.py`, which caught 4 + 1 + 64 here.
+    // independent check in `verification/sim/net_reference.py`, which caught 4 + 1 + 64 here.
     facts.push(("inv_tx_len".into(), 2 + 1 + 64));
 
     let tx_enc = Message::Tx(Box::new(wire_tx.clone())).encode();
@@ -203,7 +203,7 @@ fn build_vectors() -> (Vec<Item>, Vec<Fact>) {
     // --- CHECKPOINT (M4, §13.5 msg_type = 11) ---------------------------
     // A deterministic, *structural* certificate: fixed payload, a fixed
     // byte-pattern aggregate and a fixed 3-bit bitmap, so
-    // `sim/net_reference.py` can rebuild the exact bytes from §13 prose
+    // `verification/sim/net_reference.py` can rebuild the exact bytes from §13 prose
     // without a pairing library. Real BLS aggregation is pinned by the M4
     // integration tests, not by a wire vector — a second encoder cannot
     // reproduce pairing math, and a vector only one implementation can build
@@ -285,7 +285,7 @@ fn build_vectors() -> (Vec<Item>, Vec<Fact>) {
 #[test]
 fn net_vectors_are_stable() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tests/vectors/net_vectors.json");
+        .join("../../verification/tests/vectors/net_vectors.json");
     let (items, facts) = build_vectors();
 
     let mut doc = serde_json::Map::new();
@@ -294,7 +294,7 @@ fn net_vectors_are_stable() {
         "note".into(),
         serde_json::json!(
             "Wire-format vectors. Regenerate with UPDATE_NET_VECTORS=1 cargo test -p srct-net. \
-             No independent implementation exists yet, unlike sim/srct_reference.py for §5."
+             No independent implementation exists yet, unlike verification/sim/srct_reference.py for §5."
         ),
     );
     doc.insert(

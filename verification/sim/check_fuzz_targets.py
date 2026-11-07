@@ -9,7 +9,10 @@ import re
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
+# Repository root: this script lives in `verification/sim/`, while `fuzz/`
+# and `.github/` live at the repo root, so the root is two levels up —
+# unlike the vector scripts, whose `tests/vectors` sibling moved along.
+ROOT = Path(__file__).resolve().parents[2]
 
 
 def registered_targets() -> list:

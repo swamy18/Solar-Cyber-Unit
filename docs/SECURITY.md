@@ -15,7 +15,7 @@ Use one of these channels, in this order:
 
 Include: the affected crate and file, the version or commit, a description of
 the impact, and a reproduction (a failing test is ideal — the repository's
-`fuzz/` and `tests/vectors/` harnesses accept them directly).
+`fuzz/` and `verification/tests/vectors/` harnesses accept them directly).
 
 ### Encryption
 

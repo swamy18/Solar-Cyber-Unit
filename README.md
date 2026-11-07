@@ -291,10 +291,10 @@ Ask the engine before you spend — no wallet, no chain state needed:
 
 ```sh
 # Offline: the codec self-test (intents, decisions, document shapes).
-python sim/policy_decide_demo.py --self-test
+python verification/sim/policy_decide_demo.py --self-test
 
 # Against a node (serve with --api-listen first; policy.json via MCP policy.export).
-python sim/policy_decide_demo.py --node http://127.0.0.1:8080 --policy policy.json \
+python verification/sim/policy_decide_demo.py --node http://127.0.0.1:8080 --policy policy.json \
   --agent-id <hex> --recipient <hex> --amount-sat 400 --threshold-sat 100
 # → decision: allow | needs_approval | deny (with reason)
 ```
@@ -744,7 +744,7 @@ SRCT, an EVM rail (`eip155:8453` Base, `eip155:84532` Base Sepolia —
 advertised, never settled by this node); `amount` is a decimal satoshi string.
 
 Full mapping, curl flow and limits: [`docs/x402.md`](docs/x402.md). Demo:
-`python sim/x402_paid_api_demo.py`.
+`python verification/sim/x402_paid_api_demo.py`.
 
 ---
 
@@ -760,7 +760,7 @@ and the credit path. Full guide: [`docs/micropayments.md`](docs/micropayments.md
 | Stream channels | `POST /v1/streams/open`, `POST /v1/streams/settle`, `GET /v1/streams/{id}` | Open once (rate per block, expiry, hard cap); each unit of work mints an off-chain voucher; only the final voucher settles on chain as a `MachinePayment` with `reference` = stream id, bound to the stream's recipient. `StreamBook` enforces exact, ordered, in-cap settlement; accounting persists in `state.bin` (v8). |
 | Sponsored intents | library `srct_core::micro::SponsoredIntent` | A sponsor signs fee coverage (`sign_sponsor_intent` / `verify_sponsor_intent`, bound to sponsor + batch hash + fee + expiry). Auditable fee-attribution record — deliberately not a consensus fee-payer, so a sponsor can cover a priced quote but never mint authority. |
 
-Benchmark (`python sim/micropayment_benchmark.py`): 10 payments to one
+Benchmark (`python verification/sim/micropayment_benchmark.py`): 10 payments to one
 provider cost one base fee instead of ten; a 100-unit stream settles once
 instead of 100 times. Latency follows the same curve — fewer transactions is
 fewer confirmation waits.
@@ -1007,7 +1007,7 @@ from revenue (`POST /v1/lending/autorepay`, revocable, capped, expiring;
 [`docs/treats.md`](docs/treats.md). Transferable reward claims for agents, machines and robots — the third value component next to liquid SRCT and committed escrow. Backed by 10% of each block's PSCB leg (`Chain::treat_reserve`, reorg-rewound, reported in `status` / `conservation` / `/metrics`). No open mint: Treats accrue only from verified settlement (receipt auto-mint, VWC claim) with base weight plus capped fee bonus, or from owner-signed gifts. Storable and capped (per-holder + global ceilings, no decay); agent-to-agent transfers move under sender signatures; redemption burns Treats for single-use vouchers (fee credit, discount, trial, service credit). `GET /v1/treats/balance/{agent}?role=`, `POST /v1/treats/gift`, `POST /v1/treats/transfer`, `POST /v1/treats/claim-work`, `POST /v1/treats/redeem`, `POST /v1/treats/voucher/consume`, `GET /v1/treats/reserve`. A Trial-kind voucher covers part of `POST /v1/trials/repay`. `srct-worker treats-balance` shows the balance.
 
 Demo covering reputation, tiers, jobs, USD quotes, ramps and lending:
-`python sim/agent_economy_demo.py`.
+`python verification/sim/agent_economy_demo.py`.
 
 ---
 
@@ -1243,7 +1243,8 @@ not expose it directly, but the worker SDK does (`add_credit_collateral`).
 
 | Path | What it is |
 |---|---|
-| [`SPEC.md`](SPEC.md) | **Normative.** Where a disagreement exists, this wins. |
+| [`SPEC.md`](docs/SPEC.md) | **Normative.** Where a disagreement exists, this wins. |
+| [`SECURITY.md`](docs/SECURITY.md) | Disclosure policy: what counts as a report, how to send one. |
 | [`AGENTS.md`](AGENTS.md) | Lint, type-check and test commands for this session. |
 | `crates/srct-core/` | Protocol implementation. All consensus logic. |
 | `crates/srct-net/` | P2P wire protocol, sync and relay. |
@@ -1255,8 +1256,8 @@ not expose it directly, but the worker SDK does (`add_credit_collateral`).
 | `crates/srct-mcp/` | Keyless MCP surface over agent identity, payments — and the agent wallet guard. |
 | `crates/srct-policy/` | Chain-agnostic policy engine: portable grants, delegation proofs, bound grants, JSON decisions + TS/Python bindings. No consensus imports — but still compiles all of `srct-core` (see crate docs); outsiders use HTTP or the bindings. |
 | `fuzz/` | 17 cargo-fuzz targets over the attacker-controlled boundaries. |
-| `sim/` | Independent Python reference, attack simulations, and feature demos (`x402_paid_api_demo.py`, `micropayment_benchmark.py`, `agent_economy_demo.py`). |
-| `tests/vectors/` | Consensus vectors. Generated from source, never hand-edited. |
+| `verification/sim/` | Independent Python reference, attack simulations, and feature demos (`x402_paid_api_demo.py`, `micropayment_benchmark.py`, `agent_economy_demo.py`). |
+| `verification/tests/vectors/` | Consensus vectors. Generated from source, never hand-edited. |
 | `docs/` | Design records, verification status and readiness reports — plus per-feature guides: `portable-policy.md`, `universal-security.md`, `x402.md`, `micropayments.md`, `wallet-safety.md`, `smart-gate-architecture.md`, `reputation.md`, `agent-jobs.md`, `usd-settlement.md`, `ramps.md`, `lending.md`. |
 | `paper/` | The Solar Cyber Unit protocol paper (LaTeX + PDF). |
 
@@ -1274,7 +1275,9 @@ tiered wallets), `jobs.rs` (agent job escrow), `fx.rs` (USD quotes),
 profile is the same code with different parameters — never a second
 implementation — so anything tested on `mini` is the production code path.
 
-Key documents: [`docs/decisions.md`](docs/decisions.md) for design decisions,
+Key documents: [`docs/SPEC.md`](docs/SPEC.md) for the normative protocol,
+[`docs/SECURITY.md`](docs/SECURITY.md) for the disclosure policy,
+[`docs/decisions.md`](docs/decisions.md) for design decisions,
 [`docs/status.md`](docs/status.md) for the verification record,
 [`docs/mainnet-readiness.md`](docs/mainnet-readiness.md) for what blocks launch,
 [`docs/monetary-policy.md`](docs/monetary-policy.md) for the supply analysis,
@@ -1441,7 +1444,7 @@ digest-checked file with a fail-closed load (a corrupt file refuses to start)
 cargo test --workspace                                   # 1404 passed, 0 failed, 1 ignored
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
-python sim/verify_vectors.py --check                     # consensus vectors
+python verification/sim/verify_vectors.py --check                     # consensus vectors
 ```
 
 The test count above is refreshed from `scripts/test_count.sh`, which is the
@@ -1490,8 +1493,8 @@ branch, and this repository keeps `main` as its only branch, so applying a bump
 is an owner step (`cargo update -p <crate>` plus `cargo audit`). Security
 *alerts* are unaffected: those come from the advisory database, not from PRs.
 
-**Vectors.** `tests/vectors/` holds the consensus byte layouts, generated only
-from the implementation. `sim/srct_reference.py` is a second PoW implementation
+**Vectors.** `verification/tests/vectors/` holds the consensus byte layouts, generated only
+from the implementation. `verification/sim/srct_reference.py` is a second PoW implementation
 written from `SPEC.md` rather than from the Rust (by the same author — a second
 implementation, not a second party), and it reproduces all 21 puzzle digests —
 that agreement is evidence the spec is unambiguous rather than merely
@@ -1523,12 +1526,12 @@ persons to whom it is furnished to do so, including commercially.
 
 ## Security
 
-[`SECURITY.md`](SECURITY.md) is the disclosure policy: what counts as a
+[`SECURITY.md`](docs/SECURITY.md) is the disclosure policy: what counts as a
 vulnerability, the severity model, the 90-day window, and the intake channel
 (GitHub Security Advisory, or `security@solarcyberunit.org`). Do not open a public
 issue for a security defect.
 
 ---
 
-Full protocol specification: [`SPEC.md`](SPEC.md).
+Full protocol specification: [`SPEC.md`](docs/SPEC.md).
 Design decisions: [`docs/decisions.md`](docs/decisions.md).

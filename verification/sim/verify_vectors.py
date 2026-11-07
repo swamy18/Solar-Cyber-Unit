@@ -7,8 +7,8 @@ Python can author), so this script runs the right generators and then checks
 the result. Supply vectors *are* computed here, because they are arithmetic
 over the schedule rather than digests.
 
-    python sim/verify_vectors.py          # regenerate + verify, non-zero on failure
-    python sim/verify_vectors.py --check  # verify only, do not write
+    python verification/sim/verify_vectors.py          # regenerate + verify, non-zero on failure
+    python verification/sim/verify_vectors.py --check  # verify only, do not write
 
 The generated files are then re-checked against a live implementation:
 `puzzle_crosscheck.py` re-derives every puzzle digest from the independent

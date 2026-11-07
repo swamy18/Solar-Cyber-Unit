@@ -1,9 +1,9 @@
 //! The Layer-2 authority and credit rules, cross-checked against an
 //! independent implementation (SPEC.md §21, §22).
 //!
-//! `sim/l2_authority_reference.py` is a second implementation of the same
+//! `verification/sim/l2_authority_reference.py` is a second implementation of the same
 //! rules, written from the specification in a different language, and it emits
-//! the scenarios in `tests/vectors/l2_authority_vectors.json`. This suite
+//! the scenarios in `verification/tests/vectors/l2_authority_vectors.json`. This suite
 //! replays those scenarios against the Rust state machine and asserts that
 //! every step reaches the *same verdict* for the same reason, and that the
 //! state ends in the same shape.
@@ -214,7 +214,7 @@ fn expected(step: &Value) -> Result<(), String> {
 fn the_authority_and_credit_rules_match_the_independent_implementation() {
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../tests/vectors/l2_authority_vectors.json"
+        "/../../verification/tests/vectors/l2_authority_vectors.json"
     );
     let text = std::fs::read_to_string(path).expect("the vector file is present");
     let vectors: Value = serde_json::from_str(&text).expect("the vector file is json");
@@ -576,7 +576,7 @@ fn the_authority_and_credit_rules_match_the_independent_implementation() {
 fn the_vector_file_is_current() {
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../tests/vectors/l2_authority_vectors.json"
+        "/../../verification/tests/vectors/l2_authority_vectors.json"
     );
     let text = std::fs::read_to_string(path).expect("the vector file is present");
     let vectors: Value = serde_json::from_str(&text).expect("the vector file is json");

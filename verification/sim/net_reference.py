@@ -1,6 +1,6 @@
 """Independent Python implementation of the Solar Cyber Unit wire format (SPEC.md section 13).
 
-This is the same discipline as ``sim/srct_reference.py`` for the PoW puzzle:
+This is the same discipline as ``verification/sim/srct_reference.py`` for the PoW puzzle:
 a second implementation written from the *prose* of the specification rather
 than from the Rust source, so that a disagreement points at the spec instead of
 at either implementation.
@@ -9,11 +9,11 @@ Why it matters here. A round-trip test only proves a codec agrees with itself.
 If ``VERSION`` encoded ``user_agent`` before ``protocol_version`` and the decoder
 read them in the same wrong order, every round-trip test in the crate passes and
 two implementations of section 13.5 silently desync -- which looks exactly like a
-consensus split. ``tests/vectors/net_vectors.json`` pins the bytes, but that file
+consensus split. ``verification/tests/vectors/net_vectors.json`` pins the bytes, but that file
 is generated *from* the Rust, so it cannot catch a bug that is in both.
 
-    python sim/net_reference.py            # cross-check against the vectors
-    python sim/net_reference.py --show     # print the derived bytes
+    python verification/sim/net_reference.py            # cross-check against the vectors
+    python verification/sim/net_reference.py --show     # print the derived bytes
 
 What this can and cannot check. Everything the wire format defines from a spec
 constant: the frame envelope, every ``msg_type`` payload, ``VERSION`` for both

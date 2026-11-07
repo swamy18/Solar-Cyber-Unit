@@ -79,18 +79,18 @@ rules in code would have been the wrong order.
   handshake, synced, reorged onto the heavier branch and kept relaying; both
   data directories then passed `srct-node verify` (replay from genesis, UTXO +
   supply + PSCB match).
-- An independent Python implementation of the PoW puzzle (`sim/srct_reference.py`),
+- An independent Python implementation of the PoW puzzle (`verification/sim/srct_reference.py`),
   written from the prose of SPEC.md rather than from the Rust source, reproduces
-  all 21 puzzle digests in `tests/vectors/puzzle_vectors.json`. This is the only
+  all 21 puzzle digests in `verification/tests/vectors/puzzle_vectors.json`. This is the only
   real evidence that SPEC.md is unambiguous rather than merely consistent with the
   Rust code.
 - All five vector files in SPEC.md §12 exist, are generated from source, and are
-  read by tests. `sim/verify_vectors.py` regenerates and cross-checks them.
+  read by tests. `verification/sim/verify_vectors.py` regenerates and cross-checks them.
   Each consuming test was checked to actually fail when the value it pins is
   perturbed, so none of them pass vacuously. `net_vectors.json` (§13.12) is the
   wire-format set — frame envelope, every `msg_type`, `VERSION` for both
   profiles, locator construction. It now has the independent implementation the
-  puzzle set has: `sim/net_reference.py` re-derives §13.2 framing and §13.5
+  puzzle set has: `verification/sim/net_reference.py` re-derives §13.2 framing and §13.5
   messages from the prose alone and is run by `verify_vectors.py --check`. It
   found a real bug on its first run (ADDR field order, below). Five of the 28
   pinned values are chain-derived — a mined block and locator entries from a
@@ -481,16 +481,16 @@ cargo test --workspace                                 # 139 tests
 cargo test -p srct-core --test redteam                   # red-team regression suite
 cargo clippy --workspace --all-targets -- -D warnings # clean
 cargo fmt --all --check                               # clean
-python sim/difficulty_attack_sim.py                     # attack containment
-python sim/difficulty_attack_sim.py --ablation \
+python verification/sim/difficulty_attack_sim.py                     # attack containment
+python verification/sim/difficulty_attack_sim.py --ablation \
     --start-difficulty 100000                           # which rule is load-bearing
-python sim/supply_schedule_sim.py                       # supply vectors
-python sim/puzzle_crosscheck.py                         # Rust vs independent Python
-python sim/verify_vectors.py --check                    # all four vector files
+python verification/sim/supply_schedule_sim.py                       # supply vectors
+python verification/sim/puzzle_crosscheck.py                         # Rust vs independent Python
+python verification/sim/verify_vectors.py --check                    # all four vector files
 
 # Regenerate vectors (puzzle/difficulty/ser digests must come from Rust;
 # supply is arithmetic and is done in Python):
-python sim/verify_vectors.py
+python verification/sim/verify_vectors.py
 UPDATE_PUZZLE_VECTORS=1 cargo test -p srct-core --lib puzzle_vectors_are_stable
 UPDATE_DIFFICULTY_VECTORS=1 cargo test -p srct-core --lib difficulty_vectors_are_stable
 UPDATE_SER_VECTORS=1 cargo test -p srct-core --lib serialization_vectors_are_stable
@@ -652,8 +652,8 @@ announces the txid next.
   one-shot submitter served and released.
 - `crates/srct-net/src/relay.rs` — 11 unit tests for the bookkeeping, including the
   stall scenario and both response budgets.
-- `tests/vectors/net_vectors.json` regenerated with `TX` and `kind = 0` bytes, plus
-  the five new §13.14 bounds; `sim/net_reference.py` re-derives all of them from
+- `verification/tests/vectors/net_vectors.json` regenerated with `TX` and `kind = 0` bytes, plus
+  the five new §13.14 bounds; `verification/sim/net_reference.py` re-derives all of them from
   the §13 prose and now agrees on 32 values. **It caught an arithmetic error in
   the vector generator** (`inv_tx_len` typed as `4 + 1 + 32` when `INV`'s count is
   `u16`) — the kind of mistake a self-consistent encoder cannot find.
@@ -1409,7 +1409,7 @@ the declared committee and records the highest observed height. `Checkpoint` and
 **Transport.** `msg_type = 11 CHECKPOINT` (§13.5), relay-only, complete
 certificates — verified on receipt against the local committee and relayed if
 valid; consensus never consults it. Protocol version stays 1 under the §13.5
-freeze rule. New §13.12 vector + independent `sim/net_reference.py` encoder
+freeze rule. New §13.12 vector + independent `verification/sim/net_reference.py` encoder
 agree byte-for-byte.
 
 **Observation, not activation.** `Chain::submit`, fork choice and
@@ -1662,10 +1662,10 @@ fields) and is pinned by `mainnet_genesis_is_frozen_for_the_version_bump`.
 
 ### How it is verified
 
-- **An independent implementation.** `sim/l2_authority_reference.py` is a second
+- **An independent implementation.** `verification/sim/l2_authority_reference.py` is a second
   implementation of the same rules, written from SPEC.md §21-§22 in Python: it
   derives secp256k1 addresses, the agent identities, the grant hashes and the
-  position ids itself. It emits `tests/vectors/l2_authority_vectors.json`, and
+  position ids itself. It emits `verification/tests/vectors/l2_authority_vectors.json`, and
   `crates/srct-l2/tests/l2_authority_vectors.rs` replays those scenarios and
   asserts the same verdict, the same reason and the same final state. Building
   it found two divergences in the *reference* (the replay guard has to come
@@ -1867,7 +1867,7 @@ its test (Decision 31):
   paths and `GET /v1/risk/policy`.
 - **Bindings that run.** `POST /v1/policy/decide` (read-only, deny-as-200),
   `/v1/delegation/verify`, `/v1/audit/verify`, with `NodeHttpBackend` in
-  both bindings and `sim/policy_decide_demo.py`; verified live against a
+  both bindings and `verification/sim/policy_decide_demo.py`; verified live against a
   real node (allow, deny, approval-needed over HTTP).
 - **Crate weight, stated honestly.** `srct-policy` stays a facade (full
   `srct-core` compile); outsiders use HTTP/bindings. 5 tests pin the seam.
@@ -2011,13 +2011,13 @@ node-local service layer over the existing primitives (`MachinePayment`,
 mint or settlement-rule change:
 
 - **x402 adapter** (`srct-core/src/x402.rs`, `GET /v1/paid/weather`,
-  `POST /v1/x402/verify|settle`, `docs/x402.md`, `sim/x402_paid_api_demo.py`).
+  `POST /v1/x402/verify|settle`, `docs/x402.md`, `verification/sim/x402_paid_api_demo.py`).
   Tests: `srct-core --test x402`, `srct-node --test x402`.
 - **Micro-payments + wallet safety** (`micro.rs`: batch quotes, stream
   channels, sponsored intents; `safety.rs`: session budgets, risk guards,
   hash-chained audit log, unsettled/orphan reconciliation;
   `docs/micropayments.md`, `docs/wallet-safety.md`,
-  `sim/micropayment_benchmark.py`). Tests: `srct-node --test micro_safety`.
+  `verification/sim/micropayment_benchmark.py`). Tests: `srct-node --test micro_safety`.
 - **Agent economy** (`passport.rs`: portable reputation with issuer-signed
   batches and score tiers; `tiers.rs`: narrowed tier wallets; `jobs.rs`: job
   escrow with result binding and dispute holds; `fx.rs`: signed USD/stablecoin
@@ -2025,7 +2025,7 @@ mint or settlement-rule change:
   `lending.rs`: standard loan offers, borrower history, limits, dashboard,
   collateral valuation, autorepay; `docs/reputation.md`, `docs/agent-jobs.md`,
   `docs/usd-settlement.md`, `docs/ramps.md`, `docs/lending.md`,
-  `sim/agent_economy_demo.py`). Tests: `srct-node --test agent_economy`.
+  `verification/sim/agent_economy_demo.py`). Tests: `srct-node --test agent_economy`.
 - Also today: `Jolunit/JLNT` rebrand to Solar Cyber Unit/SRCT, SRCT coin logo
   in README, `l2_credit_apply` fuzz-target fix (debt-monotonicity invariant;
   target-only, see `docs/fuzz.md`), and pool/release hardening carried over

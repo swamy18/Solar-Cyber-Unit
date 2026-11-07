@@ -8,7 +8,7 @@ Simulates the agent loop the task asks for without needing keys:
 
 Run directly to print the whole loop:
 
-    python sim/x402_paid_api_demo.py
+    python verification/sim/x402_paid_api_demo.py
 
 The crypto (request/authorize/pay) lives in Rust (`cargo test -p srct-core
 --test x402`, `cargo test -p srct-node --test x402`); this script mirrors the

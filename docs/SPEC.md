@@ -4,7 +4,7 @@
 **Status:** Draft — §0–§12 normative for `srct-core`; §13 normative for `srct-net`; §14 records the M1–M5 protocol mechanisms and, for each, whether it is consensus-active today; §15–§17 normative for `srct-l2`; §18 for `srct-worker`; §19 for L1↔L2 integration. §19.1, §19.2, §19.4, §19.5 and §19.6 are implemented and tested. §20 (conditional escrow) is implemented as a non-consensus node-records-state surface in `srct-core::escrow` and `srct-node::api`; coin settlement runs via `POST /v1/escrow/{id}/settle` (§20.2).
 **Scope:** Layer 1 (base layer, §0–§13), the M1–M5 protocol mechanisms (§14), Layer 2 and the worker SDK (§15–§18), and L1↔L2 integration including deposits and exits (§19). §13 covers block and transaction relay between nodes.
 
-This document is the **normative reference**. Any implementation in any language must produce identical byte-level output for the vectors in `tests/vectors/`. Five vector files exist today — the four covering §0–§12, plus `net_vectors.json` (§13.12) for the wire format.
+This document is the **normative reference**. Any implementation in any language must produce identical byte-level output for the vectors in `verification/tests/vectors/`. Five vector files exist today — the four covering §0–§12, plus `net_vectors.json` (§13.12) for the wire format.
 
 ---
 
@@ -455,7 +455,7 @@ There is deliberately **no** consensus upper bound. An upper bound needs a refer
 
 A node that skips the local-clock check can be talked into accepting a higher-difficulty branch; that is the same tradeoff Bitcoin accepts, only with a wider window. See `docs/status.md`.
 
-`sim/difficulty_attack_sim.py` measures this rule. Under the protocol as specified, a 40% attacker cannot make blocks arrive faster than the target spacing at any allowance: the median rule anchors honest timestamps at real time (a minority is outvoted six-to-five in the median), and the solve-time clamp bounds any single retarget to `[0.25, 5]`. The attacker's future stamps instead surface as `5T` solve times on the honest→attacker transitions, which the LWMA weights heavily, so the attack *raises* difficulty and slows the network down for the attacker as well.
+`verification/sim/difficulty_attack_sim.py` measures this rule. Under the protocol as specified, a 40% attacker cannot make blocks arrive faster than the target spacing at any allowance: the median rule anchors honest timestamps at real time (a minority is outvoted six-to-five in the median), and the solve-time clamp bounds any single retarget to `[0.25, 5]`. The attacker's future stamps instead surface as `5T` solve times on the honest→attacker transitions, which the LWMA weights heavily, so the attack *raises* difficulty and slows the network down for the attacker as well.
 
 Design doc §28.9 reports that a two-hour allowance let a 40% attacker reach ~104s average block time. That is not reproducible under this specification, and cannot be: 104s is below the solve-time clamp floor (`T/4` = 150s), so no retarget can ask for a difficulty that low. Those figures come from a model without the solve-time clamp, without a difficulty floor, and with honest miners copying the tip instead of anchoring on the median. `--design-doc-model` in the simulation reproduces the mechanism; the short allowance is retained regardless, as defence in depth for the case where an attacker reaches 50% and can move the median itself.
 
@@ -500,8 +500,8 @@ calls it. Because the first rung is paid by `halving_period − 1` blocks
 (genesis occupies a height without minting), the ladder era issues
 `149 × 262 800 − 76 = 39 157 124 SRCT`. There is no stock cap any more
 (Decision 18): with a tail, long-run issuance is unbounded by design, so the
-bound is per-height, never a single total. `sim/supply_schedule_sim.py`
-regenerates these numbers and `tests/vectors/supply_vectors.json` pins them.
+bound is per-height, never a single total. `verification/sim/supply_schedule_sim.py`
+regenerates these numbers and `verification/tests/vectors/supply_vectors.json` pins them.
 
 **Rate anchor (hard, enforced in code):** after ladder exhaustion, gross
 issuance inside the current `halving_period` window plus the next reward must
@@ -646,7 +646,7 @@ Mainnet: maturity `100`, finality `100`, activation `100`. Mini: `10`, `20`,
 
 ## 10. Network profiles (Section 17: mini version = same code, different config)
 
-The mini version is **not** a second codebase. It is the same `srct-core` with a different `NetworkParams`. Non-consensus constants live in code; consensus constants live in `params.rs` and are mirrored by `sim/` cross-checks.
+The mini version is **not** a second codebase. It is the same `srct-core` with a different `NetworkParams`. Non-consensus constants live in code; consensus constants live in `params.rs` and are mirrored by `verification/sim/` cross-checks.
 
 | Parameter | `mainnet` | `mini` | `testnet` |
 |---|---|---|---|
@@ -741,19 +741,19 @@ The genesis block is **not** a premine: it contains zero value and no spendable 
 
 ## 12. Test vectors
 
-`tests/vectors/*.json` are consumed by the Rust test suite. A language implementation is correct only if it reproduces them byte for byte.
+`verification/tests/vectors/*.json` are consumed by the Rust test suite. A language implementation is correct only if it reproduces them byte for byte.
 
 | File | Covers | Generated by | Consumed by |
 |---|---|---|---|
-| `puzzle_vectors.json` | header serialization, stage 1 seed, stage 2 activation digest, stage 3 final, work-share accounting | `UPDATE_PUZZLE_VECTORS=1 cargo test -p srct-core` | `puzzle_vectors_are_stable`, `sim/puzzle_crosscheck.py` |
+| `puzzle_vectors.json` | header serialization, stage 1 seed, stage 2 activation digest, stage 3 final, work-share accounting | `UPDATE_PUZZLE_VECTORS=1 cargo test -p srct-core` | `puzzle_vectors_are_stable`, `verification/sim/puzzle_crosscheck.py` |
 | `ser_vectors.json` | input / output / tx / header byte layouts | `UPDATE_SER_VECTORS=1 cargo test -p srct-core` | `serialization_vectors_are_stable` |
-| `supply_vectors.json` | reward ladder, cumulative issuance integral, rate-anchor allowance | `sim/supply_schedule_sim.py` | `a_supply_vector_file_exists_to_show_the_pattern`, `sim/verify_vectors.py` |
+| `supply_vectors.json` | reward ladder, cumulative issuance integral, rate-anchor allowance | `verification/sim/supply_schedule_sim.py` | `a_supply_vector_file_exists_to_show_the_pattern`, `verification/sim/verify_vectors.py` |
 | `difficulty_vectors.json` | LWMA next-difficulty, timestamp clamp behaviour | `UPDATE_DIFFICULTY_VECTORS=1 cargo test -p srct-core` | `difficulty_vectors_are_stable` |
 | `net_vectors.json` | frame envelope, every `msg_type` payload, `VERSION` layout, locator construction (§13.12) | `UPDATE_NET_VECTORS=1 cargo test -p srct-net` | `net_vectors_are_stable` |
 
-`sim/puzzle_crosscheck.py` is the important one: it re-derives every puzzle digest with `sim/srct_reference.py`, a second implementation written from the prose of this document rather than from the Rust source. If the two disagree, the disagreement is in the spec, not in either implementation.
+`verification/sim/puzzle_crosscheck.py` is the important one: it re-derives every puzzle digest with `verification/sim/srct_reference.py`, a second implementation written from the prose of this document rather than from the Rust source. If the two disagree, the disagreement is in the spec, not in either implementation.
 
-Regenerate and verify everything with `python sim/verify_vectors.py` (`--check` to verify without writing).
+Regenerate and verify everything with `python verification/sim/verify_vectors.py` (`--check` to verify without writing).
 
 ---
 
@@ -3039,6 +3039,20 @@ machinery are reused unchanged.
 5. `queued_height < height`: the queue block must be final before the block that
    settles it.
 
+**Trust assumption: the committed root is miner-supplied (C1/N1).** Consensus
+verifies the exit proof against the `l2_state_root` the queue block committed,
+but it never recomputes that root from the L2 transactions — the L2 state
+machine runs in each node's replay, and a replay mismatch is recorded
+(`UnbackedClaim`), not rejected. Consequences, stated plainly: a miner that
+commits a fabricated root plus a self-consistent proof can release sink deposits
+it does not own (`crates/srct-l2/tests/bogus_root.rs` proves this on a live
+chain), and two honest nodes can agree on every L1 block while holding
+different L2 balances. `srct-node verify` fails on any unbacked claim rather
+than printing "ok" over a drained sink, but that is detection, not prevention.
+Before mainnet the project must take one of the two exits: make the block
+validator reject any root that differs from the replayed L2 state, or
+re-document L2 as a federated layer with explicit trust assumptions.
+
 **Who may settle it.** Permissionless (E-2). Anyone may build and submit a
 claim; consensus pays only the recorded `destination` and the `claimant`'s
 prepaid fee. No operator privilege and no second authorisation path to audit.
@@ -3099,6 +3113,14 @@ arbitrator** signing (arbiter release).
   the same parties differ by nonce.
 - Release signing hash: `h = H(id ‖ verdict)` (DOM_ESCROW). For the standard pay-to-payee
   outcome `verdict = ReleasedToPayee (0)`.
+- **Open locks nothing (N4).** `open` records intent only: it does not check the
+  payer's L2 balance and reserves nothing, so one payer can open several escrows
+  backed by the same coins (the API test suite pins this: unfunded opens return
+  200). Funding is enforced once, at settlement, when the bound `ExitQueue`
+  debits the payer — the first settlement to apply wins and later ones fail for
+  insufficient balance. A payee must therefore treat the *release signature* as
+  authorization and the *settlement* (`Finalized`) as payment; delivering work
+  against a release alone risks non-payment.
 
 ### 20.2 State machine
 

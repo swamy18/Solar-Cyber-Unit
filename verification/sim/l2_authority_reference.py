@@ -17,8 +17,8 @@ The scenarios it runs are emitted as a vector file that the Rust test suite
 reads back and asserts against, so the two implementations are compared rather
 than merely coexisting:
 
-    python sim/l2_authority_reference.py            # write the vectors
-    python sim/l2_authority_reference.py --check    # verify only, do not write
+    python verification/sim/l2_authority_reference.py            # write the vectors
+    python verification/sim/l2_authority_reference.py --check    # verify only, do not write
 
 The error names are the Rust `L2Error` variant names, because a rule that
 refuses for a different reason is a different rule.
@@ -1253,7 +1253,7 @@ def build_vectors() -> dict:
         "version": 1,
         "description": (
             "Layer-2 authority and credit scenarios, derived from SPEC.md "
-            "sections 21 and 22 by sim/l2_authority_reference.py. The Rust "
+            "sections 21 and 22 by verification/sim/l2_authority_reference.py. The Rust "
             "suite reads this file and asserts the same outcomes, so the two "
             "implementations are compared rather than merely coexisting."
         ),

@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "description": "Layer-2 authority and credit scenarios, derived from SPEC.md sections 21 and 22 by sim/l2_authority_reference.py. The Rust suite reads this file and asserts the same outcomes, so the two implementations are compared rather than merely coexisting.",
+  "description": "Layer-2 authority and credit scenarios, derived from SPEC.md sections 21 and 22 by verification/sim/l2_authority_reference.py. The Rust suite reads this file and asserts the same outcomes, so the two implementations are compared rather than merely coexisting.",
   "addresses": {
     "agent": "f2988a8980709a15036acaa1ed6d39530e080b81",
     "borrower": "e6110d591258c55a3acd828310b4b4d64a94d50e",

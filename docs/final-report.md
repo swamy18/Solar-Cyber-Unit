@@ -96,7 +96,7 @@ now explicitly listed as **not measured**.
    (39,945,600 − 39,157,200), then — once the approved tail forced the exact
    block-by-block semantics — to **788 476** (39,945,600 − 39,157,124), because
    genesis occupies a rung-0 height without minting. `supply::tests`,
-   `sim/supply_schedule_sim.py` and `tests/vectors/supply_vectors.json` now pin
+   `verification/sim/supply_schedule_sim.py` and `verification/tests/vectors/supply_vectors.json` now pin
    the exact figure.
 2. **SPEC reward formula matched nothing in code:** SPEC said
    `start_reward_sat >> halvings`, but `supply::period_reward_sat` halves

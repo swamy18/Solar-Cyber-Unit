@@ -1132,7 +1132,7 @@ verified, not asserted.
 | Milestone | Delivered |
 |---|---|
 | **M1 (decision recorded)** | M-A…M-G recorded above; Decisions 7/10 amended for issuance and the escrow rule only. Commit `e3a5713`. |
-| **M2 (model)** | `sim/supply_schedule_sim.py` exits 0 and regenerated `tests/vectors/supply_vectors.json`; `sim/tail_emission_sim.py --selftest` exits 0; `sim/verify_vectors.py` exits 0. The two sims and `supply.rs` agree to the satoshi, including the period-boundary off-by-one that both previously carried and the exact ladder-era total (39,157,124.5 SRCT at the first tail block). |
+| **M2 (model)** | `verification/sim/supply_schedule_sim.py` exits 0 and regenerated `verification/tests/vectors/supply_vectors.json`; `verification/sim/tail_emission_sim.py --selftest` exits 0; `verification/sim/verify_vectors.py` exits 0. The two sims and `supply.rs` agree to the satoshi, including the period-boundary off-by-one that both previously carried and the exact ladder-era total (39,157,124.5 SRCT at the first tail block). |
 | **M3 (consensus)** | `supply::check_mint_at_height` is the single mint gate and `Chain::apply_block` calls it; `params::validate` refuses a zero tail floor/constant and an escrow above its ceiling; §6.1 tests 1–14 exist (`historical_replay_is_unchanged_by_the_tail` = `historical_heights_keep_their_ladder_rungs_under_the_tail`, `reward_step_at_the_ladder_tail_boundary_is_at_most_a_halving` = `every_tail_step_is_at_most_a_halving_and_reaches_the_floor`); `cargo test --workspace` 0 failures; clippy `-D warnings` clean; fmt clean. |
 | **M4 (spec/docs)** | SPEC §7 and §19.4, this file, `docs/monetary-policy.md`, `docs/mainnet-readiness.md` and `README.md` re-stated to the shipped function; no document still claims a frozen zero tail or the `cap − max_issuance_sat` backing rule. |
 | **M5 (ops)** | Vectors frozen in git; `srct-node verify` and `/v1/conservation` report the joint bound; `srct-worker run` gates on it (older nodes fall back to the sanity cap, i.e. a stricter check). |
@@ -1183,7 +1183,7 @@ issuance integral alone. The rate anchor is enforced in
 `supply::check_mint_at_height` (1 % of issued per post-ladder window; the ladder
 era is grandfathered), pinned by
 `supply::tests::rate_anchor_refuses_a_schedule_that_over_issues_a_window` and
-the sim's rate-headroom section. `tests/vectors/supply_vectors.json` is
+the sim's rate-headroom section. `verification/tests/vectors/supply_vectors.json` is
 regenerated with the anchor fields (`rate_anchor_max_pct_per_period`,
 `largest_tail_window_pct_of_issued` ≈ 0.34 % on mainnet). Net supply
 (gross issuance minus burned + PSCB removal, both rewound on reorg) is reported
@@ -1826,7 +1826,7 @@ findings, each verified against the code, each fixed with its test:
    nothing; a deny is a 200 with the reason so a "no" is never mistaken for
    a transport failure), `/v1/delegation/verify`, `/v1/audit/verify` — with
    `NodeHttpBackend` in both bindings (stdlib only, no toolchain) and a
-   runnable demo (`sim/policy_decide_demo.py --self-test`, then live
+   runnable demo (`verification/sim/policy_decide_demo.py --self-test`, then live
    against a node). Verified live: same node, same grant — allow, deny and
    approval-needed all answered over real HTTP.
 4. **Crate weight, stated honestly.** `srct-policy` stays a stable API

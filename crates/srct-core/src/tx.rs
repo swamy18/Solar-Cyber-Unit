@@ -870,7 +870,7 @@ mod tests {
         assert_eq!(one.gas_used(), GAS_TX_BASE + GAS_PER_INPUT + GAS_PER_OUTPUT);
     }
 
-    /// Byte layouts pinned in `tests/vectors/ser_vectors.json`.
+    /// Byte layouts pinned in `verification/tests/vectors/ser_vectors.json`.
     ///
     /// Section sizes alone are already asserted above; what matters for a
     /// second implementation is the exact byte order, so the full
@@ -879,7 +879,7 @@ mod tests {
     fn serialization_vectors_are_stable() {
         // Regenerate with: UPDATE_SER_VECTORS=1 cargo test -p srct-core
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/vectors/ser_vectors.json");
+            .join("../../verification/tests/vectors/ser_vectors.json");
 
         // A hybrid input: two schemes over one outpoint, which is the shape
         // the variable-length encoding exists for.

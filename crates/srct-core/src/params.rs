@@ -417,7 +417,7 @@ pub struct NetworkParams {
 impl NetworkParams {
     /// Deterministic future-timestamp allowance (SPEC.md §6.1).
     ///
-    /// The 2-hour allowance used by Bitcoin was shown by `sim/difficulty_attack_sim.py`
+    /// The 2-hour allowance used by Bitcoin was shown by `verification/sim/difficulty_attack_sim.py`
     /// to let a 40% attacker pull difficulty down; one block time does not.
     pub fn future_limit_ms(&self) -> u64 {
         self.target_block_time_ms

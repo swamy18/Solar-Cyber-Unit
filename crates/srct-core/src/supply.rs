@@ -629,7 +629,7 @@ mod tests {
     #[test]
     fn supply_vectors_agree_with_the_implementation() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/vectors/supply_vectors.json");
+            .join("../../verification/tests/vectors/supply_vectors.json");
         let raw = std::fs::read_to_string(&path).expect("supply_vectors.json must exist");
         let v: serde_json::Value = serde_json::from_str(&raw).expect("must be valid JSON");
         assert_eq!(v["sat_per_srct"], 100_000_000u64, "SPEC.md section 0");

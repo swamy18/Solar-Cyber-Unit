@@ -6,13 +6,13 @@ the keyless MCP `policy.export`), a payment intent, and a node that decides.
 
 Run the offline self-test (no node needed):
 
-    python sim/policy_decide_demo.py --self-test
+    python verification/sim/policy_decide_demo.py --self-test
 
 Decide against a local node (needs a portable policy JSON file — export one
 with the MCP `policy.export` op, or copy the `policy_json` from a Rust test
 fixture):
 
-    python sim/policy_decide_demo.py --node http://127.0.0.1:8080 \
+    python verification/sim/policy_decide_demo.py --node http://127.0.0.1:8080 \
         --policy policy.json --agent-id <hex> --recipient <hex> \
         --amount-sat 400 --threshold-sat 100
 

@@ -126,8 +126,8 @@ agent loop is then `PolicyClient.for_node(url)` in Python or
 self-test, then live against a node):
 
 ```bash
-python sim/policy_decide_demo.py --self-test
-python sim/policy_decide_demo.py --node http://127.0.0.1:8080 \
+python verification/sim/policy_decide_demo.py --self-test
+python verification/sim/policy_decide_demo.py --node http://127.0.0.1:8080 \
   --policy policy.json --agent-id <hex> --recipient <hex> \
   --amount-sat 400 --threshold-sat 100
 ```

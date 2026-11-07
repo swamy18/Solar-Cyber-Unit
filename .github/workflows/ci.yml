@@ -61,21 +61,21 @@ jobs:
         # Runs the Rust vector tests first (to prove the committed files match
         # the current implementation), then the independent Python reference
         # against them. A disagreement here is a spec ambiguity, not a
-        # formatting difference -- see SPEC.md section 12.
+        # formatting difference -- see docs/SPEC.md section 12.
         run: |
           cargo test -p srct-core --lib vectors
-          python sim/puzzle_crosscheck.py
-          python sim/verify_vectors.py --check
-          python sim/l2_authority_reference.py --check
-          python sim/check_fuzz_targets.py
+          python verification/sim/puzzle_crosscheck.py
+          python verification/sim/verify_vectors.py --check
+          python verification/sim/l2_authority_reference.py --check
+          python verification/sim/check_fuzz_targets.py
 
       - name: Difficulty attack containment
-        # Guards the claim in SPEC.md 6.1: the future-timestamp allowance
+        # Guards the claim in docs/SPEC.md 6.1: the future-timestamp allowance
         # must not let a minority attacker speed up the chain.
-        run: python sim/difficulty_attack_sim.py
+        run: python verification/sim/difficulty_attack_sim.py
 
       - name: Supply cross-check against design doc
-        run: python sim/supply_schedule_sim.py
+        run: python verification/sim/supply_schedule_sim.py
 
   fuzz-smoke:
     name: fuzz smoke (nightly + ASan)

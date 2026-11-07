@@ -7,7 +7,7 @@ time. Three primitives make that economical. None changes consensus; all reuse
 
 ## Benchmark: total cost, not just the fee
 
-Regenerate with `python sim/micropayment_benchmark.py`. Gas constants are
+Regenerate with `python verification/sim/micropayment_benchmark.py`. Gas constants are
 `GAS_TX_BASE=16_000`, `GAS_PER_INPUT=1_000`, `GAS_PER_OUTPUT=250`; fee is
 `base_fee * gas` (50% burn / 50% PSCB, tip = excess).
 

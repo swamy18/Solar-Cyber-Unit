@@ -923,9 +923,9 @@ mod tests {
         ));
     }
 
-    /// Cases pinned in `tests/vectors/puzzle_vectors.json`.
+    /// Cases pinned in `verification/tests/vectors/puzzle_vectors.json`.
     ///
-    /// `sim/puzzle_crosscheck.py` recomputes every one of these with an
+    /// `verification/sim/puzzle_crosscheck.py` recomputes every one of these with an
     /// independent Python implementation written from SPEC.md, and the two
     /// must agree byte for byte. That is the only real evidence that
     /// SPEC.md is unambiguous rather than merely consistent with this code.
@@ -956,7 +956,7 @@ mod tests {
         // Regenerate with: UPDATE_PUZZLE_VECTORS=1 cargo test -p srct-core
         let cases = vector_cases();
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/vectors/puzzle_vectors.json");
+            .join("../../verification/tests/vectors/puzzle_vectors.json");
 
         let mut json = String::from("{\n");
         json.push_str(

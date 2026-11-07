@@ -3,7 +3,7 @@
 Mirrors the Rust tests without keys: tier narrowing math, USD-quote math,
 passport scoring with counterparty dampening, and the job lifecycle.
 
-    python sim/agent_economy_demo.py
+    python verification/sim/agent_economy_demo.py
 
 The cryptography (owner signatures, BLS attestations) lives in the Rust
 wallet and node tests (`cargo test -p srct-node --test agent_economy`).

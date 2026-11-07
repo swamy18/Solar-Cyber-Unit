@@ -1,16 +1,16 @@
 """Cross-check the Rust PoW puzzle against the independent Python reference.
 
-SPEC.md section 12 states that `tests/vectors/*.json` are consumed by both the
+SPEC.md section 12 states that `verification/tests/vectors/*.json` are consumed by both the
 Rust test suite and this script, and that a language implementation is correct
 only if it reproduces them byte for byte.
 
-That second half is the point. `sim/srct_reference.py` is a second
+That second half is the point. `verification/sim/srct_reference.py` is a second
 implementation written from the prose of SPEC.md, not from the Rust source. If
 the two agree on every vector, that is real evidence the spec is unambiguous --
 if they disagree, the disagreement is in the spec, not in either
 implementation.
 
-    python sim/puzzle_crosscheck.py          # check, non-zero exit on mismatch
+    python verification/sim/puzzle_crosscheck.py          # check, non-zero exit on mismatch
 
 Regenerate the vectors from Rust with:
 

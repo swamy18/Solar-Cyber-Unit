@@ -3,7 +3,7 @@
 Regenerates the numbers the design doc commits to and checks them against the
 Rust implementation. Run directly to print the whole schedule:
 
-    python sim/supply_schedule_sim.py
+    python verification/sim/supply_schedule_sim.py
 
 Independent of `tail_emission_sim.py`, which owns the tail *comparison*; this
 script owns the committed vectors. Both must agree with `supply.rs` to the

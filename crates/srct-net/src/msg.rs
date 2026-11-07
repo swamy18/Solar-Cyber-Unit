@@ -212,7 +212,7 @@ impl Message {
                     // round-trips through our own decoder and so passed every
                     // test in this crate while disagreeing with the spec, and
                     // therefore with every other implementation. Caught by
-                    // `sim/net_reference.py`, the independent encoder written
+                    // `verification/sim/net_reference.py`, the independent encoder written
                     // from the prose. Note the payload length is identical
                     // either way (18 bytes per entry), so a length assertion
                     // could never have found it.
@@ -483,7 +483,7 @@ mod tests {
 
     /// ADDR carried `ip | port` and the spec says `port | ip` (§13.5). A
     /// round-trip test cannot see this, because both sides of our own codec
-    /// agreed; only `sim/net_reference.py` caught it. Assert the literal bytes
+    /// agreed; only `verification/sim/net_reference.py` caught it. Assert the literal bytes
     /// so the order cannot drift back.
     #[test]
     fn addr_entry_is_port_then_ip() {

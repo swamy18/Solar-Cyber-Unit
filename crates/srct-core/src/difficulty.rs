@@ -4,7 +4,7 @@
 //! Design doc Section 28.2/28.10: use a *proven* algorithm (Zawy-style linearly
 //! weighted moving average), a per-block change limit, and a short future
 //! timestamp allowance. The 2-hour allowance Bitcoin uses was measured in
-//! `sim/difficulty_attack_sim.py` to let a 40% attacker drag difficulty down;
+//! `verification/sim/difficulty_attack_sim.py` to let a 40% attacker drag difficulty down;
 //! one block time does not.
 
 use crate::error::{Error, Result};
@@ -157,7 +157,7 @@ pub fn validate_timestamp(
 
 /// Node policy: reject timestamps ahead of the local clock.
 ///
-/// This is the rule `sim/difficulty_attack_sim.py` measures. One block time is
+/// This is the rule `verification/sim/difficulty_attack_sim.py` measures. One block time is
 /// tight enough that a 40% attacker cannot manufacture median progress; the same
 /// simulation shows a two-hour allowance lets it drag difficulty down.
 pub fn validate_local_clock(timestamp_ms: u64, now_ms: u64, params: &NetworkParams) -> Result<()> {
@@ -450,7 +450,7 @@ mod tests {
         );
     }
 
-    /// Named cases pinned in `tests/vectors/difficulty_vectors.json`.
+    /// Named cases pinned in `verification/tests/vectors/difficulty_vectors.json`.
     ///
     /// These exist because the retarget is easy to "fix" in a way that still
     /// passes a hand-written test: the multiplicative form and the
@@ -510,7 +510,7 @@ mod tests {
         // Regenerate with: UPDATE_DIFFICULTY_VECTORS=1 cargo test -p srct-core
         let cases = vector_cases();
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/vectors/difficulty_vectors.json");
+            .join("../../verification/tests/vectors/difficulty_vectors.json");
 
         if std::env::var("UPDATE_DIFFICULTY_VECTORS").is_ok() {
             let mut json = String::from("{\n");

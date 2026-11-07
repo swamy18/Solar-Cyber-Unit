@@ -6,7 +6,7 @@ against the Rust implementation (`BatchQuote::price`, `aggregate_payments`).
 
 Run directly:
 
-    python sim/micropayment_benchmark.py
+    python verification/sim/micropayment_benchmark.py
 
 What it measures:
 - on-chain cost: gas * base fee for 1 separate settlement vs 1 shared batch
