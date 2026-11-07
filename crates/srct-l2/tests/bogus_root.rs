@@ -144,7 +144,15 @@ fn fabricated_root_exit_drains_sink_and_replays_as_unbacked() {
     // Consensus places no honesty constraint on the committed root: an empty
     // L2 section carrying an arbitrary root is structurally valid.
     let qb = chain
-        .mine_block_with_l2_root(miner, vec![], vec![], bogus_root, ts(q), None, DEFAULT_MAX_ATTEMPTS)
+        .mine_block_with_l2_root(
+            miner,
+            vec![],
+            vec![],
+            bogus_root,
+            ts(q),
+            None,
+            DEFAULT_MAX_ATTEMPTS,
+        )
         .unwrap();
     chain.submit(qb).unwrap();
     assert_eq!(

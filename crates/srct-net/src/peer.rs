@@ -122,7 +122,10 @@ impl PeerTable {
         if !handle.is_outbound {
             self.inbound.fetch_add(1, Ordering::Relaxed);
         }
-        self.live.lock().unwrap_or_else(|e| e.into_inner()).insert(handle.id, handle); // poison-tolerant: a prior panic while holding the lock must not cascade into a node shutdown
+        self.live
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(handle.id, handle); // poison-tolerant: a prior panic while holding the lock must not cascade into a node shutdown
     }
 }
 

@@ -156,7 +156,11 @@ fn generated_wallet_file_is_owner_only_from_creation() {
         "perm-check",
     ]);
     assert_eq!(code, 0, "generate failed: {err}");
-    let mode = std::fs::metadata(&wallet).expect("wallet file").permissions().mode() & 0o777;
+    let mode = std::fs::metadata(&wallet)
+        .expect("wallet file")
+        .permissions()
+        .mode()
+        & 0o777;
     assert_eq!(
         mode, 0o600,
         "W1: generated wallet must be 0600, got {mode:o}"

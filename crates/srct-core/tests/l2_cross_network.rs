@@ -23,8 +23,7 @@
 
 use srct_core::hash::Address;
 use srct_core::l2::{
-    AgentSpendPayload, CreditOpenPayload, ExitQueuePayload, L2Payload, L2Transaction,
-    PolicyPayload,
+    AgentSpendPayload, CreditOpenPayload, ExitQueuePayload, L2Payload, L2Transaction, PolicyPayload,
 };
 use srct_core::wallet::Wallet;
 
@@ -37,7 +36,11 @@ fn addr(w: &Wallet) -> Address {
 }
 
 fn wire_has_no_network(bytes: &[u8]) {
-    for net in [b"srct/mini".as_slice(), b"srct/testnet".as_slice(), b"srct/mainnet".as_slice()] {
+    for net in [
+        b"srct/mini".as_slice(),
+        b"srct/testnet".as_slice(),
+        b"srct/mainnet".as_slice(),
+    ] {
         assert!(
             bytes.windows(net.len()).all(|w| w != net),
             "N3: signed L2 bytes must not name a network, yet contain {:?}",
@@ -93,8 +96,7 @@ fn agent_spend_signature_carries_no_network() {
 fn credit_open_signature_carries_no_network() {
     let lender = wallet(7);
     let borrower = addr(&wallet(8));
-    let p = CreditOpenPayload::build(&lender, borrower, 200_000, 100_000, 50, 100, 500, 1)
-        .unwrap();
+    let p = CreditOpenPayload::build(&lender, borrower, 200_000, 100_000, 50, 100, 500, 1).unwrap();
     p.verify_auth().expect("credit open must verify");
     wire_has_no_network(&p.serialize());
 }

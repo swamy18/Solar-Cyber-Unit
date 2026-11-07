@@ -275,7 +275,8 @@ impl P2pNode {
                                 continue;
                             }
                             if l_inbound.load(Ordering::Relaxed) >= l_config.max_inbound
-                                || l_peers.lock().unwrap_or_else(|e| e.into_inner()).len() >= l_config.max_peers
+                                || l_peers.lock().unwrap_or_else(|e| e.into_inner()).len()
+                                    >= l_config.max_peers
                                 || l_handshakes.load(Ordering::Relaxed) >= l_config.max_inbound
                             // poison-tolerant: a prior panic while holding the lock must not cascade into a node shutdown
                             {
@@ -456,7 +457,12 @@ impl P2pNode {
 
             // Then the address book, in most-recent-first order.
             // poison-tolerant: a prior panic while holding the lock must not cascade into a node shutdown
-            if let Some(ab) = self.address_book.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            if let Some(ab) = self
+                .address_book
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+            {
                 for addr in ab.addresses() {
                     if !connected.contains(&addr) && !self.is_banned(addr.ip()) {
                         cands.push(addr);
@@ -493,7 +499,12 @@ impl P2pNode {
                     dialed += 1;
                     // Record the address in the book.
                     // poison-tolerant: a prior panic while holding the lock must not cascade into a node shutdown
-                    if let Some(ab) = self.address_book.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+                    if let Some(ab) = self
+                        .address_book
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .as_mut()
+                    {
                         ab.add(addr);
                     }
                 }
@@ -620,14 +631,24 @@ impl P2pNode {
                     // Inbound addresses are as valid a reconnect source as
                     // outbound — the peer was reachable, so it may be again.
                     // poison-tolerant: a prior panic while holding the lock must not cascade into a node shutdown
-                    if let Some(ab) = self.address_book.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+                    if let Some(ab) = self
+                        .address_book
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .as_mut()
+                    {
                         ab.add(remote_addr);
                     }
 
                     // If the peer is ahead, ask for blocks
                     if version.height > state.chain.height() {
                         let locator = create_locator(state.chain);
-                        if let Some(peer) = self.peers.lock().unwrap_or_else(|e| e.into_inner()).get(&peer_id) {
+                        if let Some(peer) = self
+                            .peers
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .get(&peer_id)
+                        {
                             // poison-tolerant: a prior panic while holding the lock must not cascade into a node shutdown
                             let _ = peer.send(Message::GetBlocks {
                                 locator,
@@ -657,7 +678,12 @@ impl P2pNode {
                         })
                         .collect();
                     if !entries.is_empty() {
-                        if let Some(peer) = self.peers.lock().unwrap_or_else(|e| e.into_inner()).get(&peer_id) {
+                        if let Some(peer) = self
+                            .peers
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .get(&peer_id)
+                        {
                             // poison-tolerant: a prior panic while holding the lock must not cascade into a node shutdown
                             let _ = peer.send(Message::Inv(entries));
                         }
@@ -687,7 +713,12 @@ impl P2pNode {
                     // peer is registered before its reader thread starts (see
                     // `spawn_peer`) and released only once the node has decided
                     // the connection is over.
-                    if !self.peers.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&peer_id) {
+                    if !self
+                        .peers
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .contains_key(&peer_id)
+                    {
                         // poison-tolerant: a prior panic while holding the lock must not cascade into a node shutdown
                         continue;
                     }
@@ -714,7 +745,12 @@ impl P2pNode {
     fn release_peer(&self, peer_id: usize, syncer: &mut SyncManager, relay: &mut RelayManager) {
         syncer.peer_disconnected(peer_id);
         relay.peer_disconnected(peer_id);
-        if let Some(p) = self.peers.lock().unwrap_or_else(|e| e.into_inner()).remove(&peer_id) {
+        if let Some(p) = self
+            .peers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&peer_id)
+        {
             // poison-tolerant: a prior panic while holding the lock must not cascade into a node shutdown
             if !p.is_outbound {
                 self.inbound_count.fetch_sub(1, Ordering::Relaxed);
@@ -979,7 +1015,10 @@ impl P2pNode {
                         // Rare path (a conflict means a quorum signed two
                         // histories), so a small allocation here is fine.
                         let short = |h: &srct_core::hash::Hash512| {
-                            h.iter().take(8).map(|b| format!("{b:02x}")).collect::<String>()
+                            h.iter()
+                                .take(8)
+                                .map(|b| format!("{b:02x}"))
+                                .collect::<String>()
                         };
                         eprintln!(
                             "ALERT: conflicting finality at height {height}: quorum signed \

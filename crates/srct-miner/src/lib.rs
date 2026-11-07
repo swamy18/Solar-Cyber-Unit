@@ -227,7 +227,8 @@ pub fn solve_header(
                         };
                         if ok {
                             if !found.swap(true, Ordering::Relaxed) {
-                                *solution.lock().unwrap_or_else(|e| e.into_inner()) = Some(header.clone());
+                                *solution.lock().unwrap_or_else(|e| e.into_inner()) =
+                                    Some(header.clone());
                             }
                             return;
                         }

@@ -3718,7 +3718,10 @@ fn escrow_open_records_without_checking_payer_funding_n4() {
                 "nonce": nonce,
             }),
         );
-        assert_eq!(s, 200, "N4: unfunded open {nonce} must currently succeed: {b}");
+        assert_eq!(
+            s, 200,
+            "N4: unfunded open {nonce} must currently succeed: {b}"
+        );
         assert!(b["escrow_id"].is_string());
     }
 }

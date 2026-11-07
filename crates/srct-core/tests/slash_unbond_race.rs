@@ -219,7 +219,9 @@ fn equivocator_unbonds_then_slash_evidence_is_refused() {
     let bond = bond_tx(&chain, &w, &ops[..66], &sk, 5_000_000);
     let bond_id = bond.txid();
     let bond_height = chain.height() + 1;
-    let bb = chain.mine_block(bonder, vec![bond], ts(bond_height)).unwrap();
+    let bb = chain
+        .mine_block(bonder, vec![bond], ts(bond_height))
+        .unwrap();
     chain.submit(bb).unwrap();
     assert!(
         chain.bonds().get(&bond_id).is_some(),

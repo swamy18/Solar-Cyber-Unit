@@ -37,7 +37,9 @@ use srct_core::wallet::Wallet;
 #[test]
 fn mainnet_bootstrap_secrets_are_reproducible_public_material() {
     let first = mainnet_committee_secrets();
-    let second: Vec<SecretKey> = (1u8..=21).map(srct_core::params::mainnet_validator_secret).collect();
+    let second: Vec<SecretKey> = (1u8..=21)
+        .map(srct_core::params::mainnet_validator_secret)
+        .collect();
     assert_eq!(first.len(), 21);
     assert_eq!(second.len(), 21);
     for (a, b) in first.iter().zip(second.iter()) {
@@ -52,7 +54,9 @@ fn mainnet_bootstrap_secrets_are_reproducible_public_material() {
     assert_eq!(params.genesis_validators.len(), 21);
     for seed in 1u8..=21 {
         assert!(
-            params.genesis_validators.contains(&mainnet_validator_key(seed)),
+            params
+                .genesis_validators
+                .contains(&mainnet_validator_key(seed)),
             "seed {seed} must be a genesis validator"
         );
     }
@@ -149,9 +153,10 @@ fn one_dust_bond_replaces_the_bootstrap_with_a_singleton_committee() {
 
     let (sk, pk) = bls_pair(7);
     let net = chain.params().clone();
-    let total: u64 = ops.iter().map(|op| chain.utxo().get(op).unwrap().out.value).fold(0, |a, v| {
-        a.saturating_add(v)
-    });
+    let total: u64 = ops
+        .iter()
+        .map(|op| chain.utxo().get(op).unwrap().out.value)
+        .fold(0, |a, v| a.saturating_add(v));
     let value = 1u64; // dust: the minimum the rules accept
     let fee = fee_for(&chain, ops.len(), 2);
     let mut tx = w
@@ -216,14 +221,13 @@ fn testnet_ts(height: u64, bump: u64) -> u64 {
 /// (`testnet_validator_secret`), so "the attacker" below is anyone with the
 /// repo.
 fn testnet_committee() -> Vec<(SecretKey, BlsPublicKey)> {
-    let mut pairs: Vec<(SecretKey, BlsPublicKey)> =
-        srct_core::params::testnet_committee_secrets()
-            .into_iter()
-            .map(|sk| {
-                let pk = sk.public_key();
-                (sk, pk)
-            })
-            .collect();
+    let mut pairs: Vec<(SecretKey, BlsPublicKey)> = srct_core::params::testnet_committee_secrets()
+        .into_iter()
+        .map(|sk| {
+            let pk = sk.public_key();
+            (sk, pk)
+        })
+        .collect();
     pairs.sort_by_key(|a| a.1 .0);
     pairs
 }
@@ -273,14 +277,18 @@ fn forged_finality_on_short_fork_locks_out_heavier_honest_work() {
     let honest = wallet(92).address().unwrap();
     let mut chain = Chain::new(NetworkParams::testnet()).unwrap();
     for h in 1..=20u64 {
-        let b = chain.mine_block(attacker, vec![], testnet_ts(h, 0)).unwrap();
+        let b = chain
+            .mine_block(attacker, vec![], testnet_ts(h, 0))
+            .unwrap();
         chain.submit(b).unwrap();
     }
 
     // Attacker's fork on top of the tip: two blocks, then a quorum
     // certificate (3 of 4, all from public seeds) on the second one.
     for h in 21..=22u64 {
-        let b = chain.mine_block(attacker, vec![], testnet_ts(h, 7)).unwrap();
+        let b = chain
+            .mine_block(attacker, vec![], testnet_ts(h, 7))
+            .unwrap();
         chain.submit(b).unwrap();
     }
     let forged_at = 22u64;
@@ -312,10 +320,7 @@ fn forged_finality_on_short_fork_locks_out_heavier_honest_work() {
     for h in 21..=27u64 {
         if let Err(e) = chain.submit(rival.block_at(h).unwrap().clone()) {
             assert!(
-                matches!(
-                    e,
-                    srct_core::error::Error::ReorgWouldCrossFinality { .. }
-                ),
+                matches!(e, srct_core::error::Error::ReorgWouldCrossFinality { .. }),
                 "H3: honest work must be refused across forged finality, got: {e}"
             );
             refused += 1;

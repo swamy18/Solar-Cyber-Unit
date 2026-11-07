@@ -341,8 +341,7 @@ mod coinbase_check_tests {
     use srct_core::params::NetworkParams;
 
     fn wallet(seed: u8) -> srct_core::wallet::Wallet {
-        srct_core::wallet::Wallet::from_private_key_bytes(&[seed; 32], "coinbase-check")
-            .unwrap()
+        srct_core::wallet::Wallet::from_private_key_bytes(&[seed; 32], "coinbase-check").unwrap()
     }
 
     fn template_paying(miner_hex: &str) -> Block {
@@ -376,8 +375,7 @@ mod coinbase_check_tests {
         let me = srct_core::hash::address_to_hex(&w.address().unwrap());
         let attacker = srct_core::hash::address_to_hex(&wallet(12).address().unwrap());
         let mut template = template_paying(&me);
-        template.txs[0].outputs[0].address =
-            srct_core::hash::address_from_hex(&attacker).unwrap();
+        template.txs[0].outputs[0].address = srct_core::hash::address_from_hex(&attacker).unwrap();
         let err = template_pays_miner(&template, &me).unwrap_err();
         assert!(
             err.contains("instead of --miner"),
