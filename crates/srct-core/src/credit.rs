@@ -1816,8 +1816,11 @@ impl CreditGate for CreditBook {
             // Unknown means either never issued or consumed so long ago the
             // outcome log evicted it: both refuse. Without membership here a
             // replayed receipt re-debits the moment the debtor re-reserves.
+            // Membership is only *checked* here — a refusal below must not
+            // consume the reservation, or a failed settle would burn the
+            // retry (and the release that follows it).
             None => {
-                if !self.outstanding.remove(&reservation.id) {
+                if !self.outstanding.contains(&reservation.id) {
                     return Err(Error::Malformed("unknown or already-consumed reservation"));
                 }
             }
@@ -1851,6 +1854,8 @@ impl CreditGate for CreditBook {
             .settled_payments
             .checked_add(reservation.amount_sat)
             .ok_or(Error::ValueOverflow)?;
+        // Consume membership exactly once, on the success path only.
+        self.outstanding.remove(&reservation.id);
         self.record_reservation(reservation.id, ReservationOutcome::Settled);
         Ok(())
     }
@@ -1872,9 +1877,10 @@ impl CreditGate for CreditBook {
                 ))
             }
             // Same rule as `settle`: an id the book never issued — or one
-            // whose outcome was evicted — releases nothing.
+            // whose outcome was evicted — releases nothing. Checked, not
+            // consumed, here: the commit below is the only removal.
             None => {
-                if !self.outstanding.remove(&reservation.id) {
+                if !self.outstanding.contains(&reservation.id) {
                     return Err(Error::Malformed("unknown or already-consumed reservation"));
                 }
             }
@@ -1906,6 +1912,8 @@ impl CreditGate for CreditBook {
                 }
             }
         }
+        // Consume membership exactly once, on the success path only.
+        self.outstanding.remove(&reservation.id);
         self.record_reservation(reservation.id, ReservationOutcome::Released);
         self.check_conservation()
     }
