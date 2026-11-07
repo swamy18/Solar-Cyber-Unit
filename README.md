@@ -1,6 +1,6 @@
 # Solar Cyber Unit (SRCT)
 
-<img src="Solar_Cyber_unit.png" alt="Solar Cyber Unit coin logo" width="200">
+<img src="docs/assets/Solar_Cyber_unit.png" alt="Solar Cyber Unit coin logo" width="200">
 
 Programmable money for machines: spend policies enforced at admission, escrow for verifiable work, micro-payments with a safety-first wallet, and a Smart Gate security layer any platform can verify. Pre-launch — no outside audit yet.
 
