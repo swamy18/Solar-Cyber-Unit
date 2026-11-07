@@ -121,7 +121,11 @@ fn machine_policy(owner: &Wallet, provider_addr: &[u8; 20], service: [u8; 32]) -
 }
 
 fn policy_sigs_hex(owner: &Wallet, policy: &SpendPolicy) -> String {
-    hex::encode(Auth::sigs_for(owner, &policy.signing_hash()).unwrap().to_bytes())
+    hex::encode(
+        Auth::sigs_for(owner, &policy.signing_hash())
+            .unwrap()
+            .to_bytes(),
+    )
 }
 
 fn policy_keys_hex(owner: &Wallet) -> String {
@@ -240,7 +244,8 @@ fn guard_decide_fail_closed_v1() {
     let workload = [2u8; 32];
     let preimage = b"pay-400-sat";
     let action = derive_action_hash(preimage);
-    let cap_hex = |cap: &Capability| hex::encode(SignedCapability::issue(&owner, cap).unwrap().serialize());
+    let cap_hex =
+        |cap: &Capability| hex::encode(SignedCapability::issue(&owner, cap).unwrap().serialize());
     let decide = |cap_hex: &str, action_hash_hex: String| {
         post(
             &node,
@@ -267,27 +272,41 @@ fn guard_decide_fail_closed_v1() {
     assert_eq!(out["decision"], "allow");
 
     // Wrong action hash: the executed bytes do not match the grant.
-    let (s, out) = decide(&cap_hex(&good), hash_to_hex(&derive_action_hash(b"pay-401-sat")));
+    let (s, out) = decide(
+        &cap_hex(&good),
+        hash_to_hex(&derive_action_hash(b"pay-401-sat")),
+    );
     assert_eq!(s, 200, "{out}");
     assert_eq!(out["decision"], "deny");
     assert_eq!(out["reason"], "action hash mismatch");
 
     // Expired capability.
-    let expired = Capability { expiry_height: h, nonce: 2, ..good.clone() };
+    let expired = Capability {
+        expiry_height: h,
+        nonce: 2,
+        ..good.clone()
+    };
     let (s, out) = decide(&cap_hex(&expired), hash_to_hex(&action));
     assert_eq!(s, 200, "{out}");
     assert_eq!(out["decision"], "deny");
     assert_eq!(out["reason"], "capability expired");
 
     // Lifetime over the 30-height cap.
-    let long = Capability { expiry_height: h + 31, nonce: 3, ..good.clone() };
+    let long = Capability {
+        expiry_height: h + 31,
+        nonce: 3,
+        ..good.clone()
+    };
     let (s, out) = decide(&cap_hex(&long), hash_to_hex(&action));
     assert_eq!(s, 200, "{out}");
     assert_eq!(out["decision"], "deny");
     assert_eq!(out["reason"], "capability lifetime exceeds cap");
 
     // Zero nonce: never admissible.
-    let zero = Capability { nonce: 0, ..good.clone() };
+    let zero = Capability {
+        nonce: 0,
+        ..good.clone()
+    };
     let (s, out) = decide(&cap_hex(&zero), hash_to_hex(&action));
     assert_eq!(s, 200, "{out}");
     assert_eq!(out["decision"], "deny");

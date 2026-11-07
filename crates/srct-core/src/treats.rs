@@ -227,9 +227,14 @@ impl fmt::Display for TreatError {
                 write!(f, "insufficient treats: have {have}, want {want}")
             }
             TreatError::BadAmount => write!(f, "treat amount is zero or over its per-record cap"),
-            TreatError::CapExceeded => write!(f, "treat cap exceeded: balance or outstanding would overflow its ceiling"),
+            TreatError::CapExceeded => write!(
+                f,
+                "treat cap exceeded: balance or outstanding would overflow its ceiling"
+            ),
             TreatError::NonceReuse => write!(f, "certificate nonce already used or not increasing"),
-            TreatError::Expired => write!(f, "certificate is expired or lives past its max lifetime"),
+            TreatError::Expired => {
+                write!(f, "certificate is expired or lives past its max lifetime")
+            }
             TreatError::BadSignature(w) => write!(f, "certificate signature invalid: {w}"),
             TreatError::UnknownVoucher => write!(f, "unknown treat voucher"),
             TreatError::VoucherConsumed => write!(f, "treat voucher already consumed"),
@@ -276,7 +281,8 @@ impl TreatEvent {
     pub fn deserialize(bytes: &[u8]) -> Result<Self, TreatError> {
         let mut r = Reader::new(bytes);
         let event = Self::decode_reader(&mut r)?;
-        r.expect_end().map_err(|_| TreatError::Malformed("trailing bytes"))?;
+        r.expect_end()
+            .map_err(|_| TreatError::Malformed("trailing bytes"))?;
         Ok(event)
     }
 
@@ -287,7 +293,9 @@ impl TreatEvent {
             // separately. Accept both ledger generations' event shape.
             return Err(TreatError::UnsupportedVersion(version));
         }
-        let net_len = r.u16le().map_err(|_| TreatError::Malformed("network len"))? as usize;
+        let net_len = r
+            .u16le()
+            .map_err(|_| TreatError::Malformed("network len"))? as usize;
         if net_len == 0 || net_len > MAX_TREAT_NETWORK_ID_LEN {
             return Err(TreatError::BadNetworkId(net_len));
         }
@@ -297,7 +305,9 @@ impl TreatEvent {
         let network_id = std::str::from_utf8(net_bytes)
             .map_err(|_| TreatError::Malformed("network id is not utf-8"))?
             .to_string();
-        let subject = r.fixed::<20>().map_err(|_| TreatError::Malformed("subject"))?;
+        let subject = r
+            .fixed::<20>()
+            .map_err(|_| TreatError::Malformed("subject"))?;
         let kind_raw = r.u8().map_err(|_| TreatError::Malformed("kind"))?;
         // Gifts never travel as events; refuse them here so a hand-built
         // event cannot mint an arbitrary gift amount.
@@ -308,11 +318,23 @@ impl TreatEvent {
             Some(k) => k,
         };
         let height = r.u64le().map_err(|_| TreatError::Malformed("height"))?;
-        let source = r.fixed::<32>().map_err(|_| TreatError::Malformed("source"))?;
+        let source = r
+            .fixed::<32>()
+            .map_err(|_| TreatError::Malformed("source"))?;
         let prev = r.fixed::<32>().map_err(|_| TreatError::Malformed("prev"))?;
         let repeats = r.u32le().map_err(|_| TreatError::Malformed("repeats"))?;
         let streak = r.u32le().map_err(|_| TreatError::Malformed("streak"))?;
-        Ok(TreatEvent { version, network_id, subject, kind, height, source, prev, repeats, streak })
+        Ok(TreatEvent {
+            version,
+            network_id,
+            subject,
+            kind,
+            height,
+            source,
+            prev,
+            repeats,
+            streak,
+        })
     }
 
     pub fn event_id(&self) -> Hash {
@@ -325,9 +347,8 @@ impl TreatEvent {
         if base == 0 {
             return 0;
         }
-        let novelty_bps = (BPS_DENOM as u64).saturating_sub(
-            (self.repeats as u64).saturating_mul(NOVELTY_STEP_BPS),
-        );
+        let novelty_bps = (BPS_DENOM as u64)
+            .saturating_sub((self.repeats as u64).saturating_mul(NOVELTY_STEP_BPS));
         // Floor novelty at 10% so long-running pairs still earn something.
         let novelty_bps = novelty_bps.max(1_000);
         let streak_bps = ((self.streak as u64).saturating_mul(STREAK_STEP_BPS)).min(STREAK_MAX_BPS);
@@ -532,20 +553,25 @@ impl TreatLedger {
 
     fn check_caps(&self, subject: &AgentId, add: u64) -> Result<(), TreatError> {
         let have = self.balance(subject);
-        if have.checked_add(add).map(|b| b > MAX_TREAT_BALANCE_PER_AGENT).unwrap_or(true) {
+        if have
+            .checked_add(add)
+            .map(|b| b > MAX_TREAT_BALANCE_PER_AGENT)
+            .unwrap_or(true)
+        {
             return Err(TreatError::CapExceeded);
         }
-        if self.outstanding.checked_add(add).map(|o| o > MAX_TREAT_OUTSTANDING).unwrap_or(true) {
+        if self
+            .outstanding
+            .checked_add(add)
+            .map(|o| o > MAX_TREAT_OUTSTANDING)
+            .unwrap_or(true)
+        {
             return Err(TreatError::CapExceeded);
         }
         Ok(())
     }
 
-    fn apply_mint(
-        &mut self,
-        event: &TreatEvent,
-        extra: u64,
-    ) -> Result<AppliedTreat, TreatError> {
+    fn apply_mint(&mut self, event: &TreatEvent, extra: u64) -> Result<AppliedTreat, TreatError> {
         if event.version != 1 && event.version != 2 {
             return Err(TreatError::UnsupportedVersion(event.version));
         }
@@ -557,11 +583,19 @@ impl TreatLedger {
         }
         let known = self.accounts.contains_key(&event.subject);
         if !known && self.accounts.len() >= self.max_subjects {
-            return Err(TreatError::SubjectLimit { cap: self.max_subjects });
+            return Err(TreatError::SubjectLimit {
+                cap: self.max_subjects,
+            });
         }
-        let current = self.accounts.get(&event.subject).cloned().unwrap_or_default();
+        let current = self
+            .accounts
+            .get(&event.subject)
+            .cloned()
+            .unwrap_or_default();
         if event.prev != current.accumulator {
-            return Err(TreatError::ChainBroken { subject: event.subject });
+            return Err(TreatError::ChainBroken {
+                subject: event.subject,
+            });
         }
         let minted = event
             .mint_amount()
@@ -571,7 +605,9 @@ impl TreatLedger {
         {
             let ring = self.sources.entry(event.subject).or_default();
             if ring.contains(&event.source) {
-                return Err(TreatError::DuplicateSource { source: event.source });
+                return Err(TreatError::DuplicateSource {
+                    source: event.source,
+                });
             }
             if ring.len() >= MAX_TRACKED_SOURCES {
                 ring.pop_front();
@@ -585,23 +621,43 @@ impl TreatLedger {
             w.raw(&current.accumulator).fixed(&event_id);
             sha256_dom(DOM_TREAT_ACC, &[w.as_slice()])
         };
-        let (balance, lifetime_earned, streak, repeats, events) =
-            match event.kind {
-                TreatKind::DisputeLost => {
-                    // Slash to zero: fraud forfeits Treats.
-                    (0, current.lifetime_earned, 0, current.repeats, current.events.checked_add(1).ok_or(TreatError::Overflow)?)
-                }
-                _ => {
-                    let balance = current.balance.checked_add(minted).ok_or(TreatError::Overflow)?;
-                    let lifetime_earned = current.lifetime_earned.checked_add(minted).ok_or(TreatError::Overflow)?;
-                    let events = current.events.checked_add(1).ok_or(TreatError::Overflow)?;
-                    (balance, lifetime_earned, event.streak, current.repeats, events)
-                }
-            };
+        let (balance, lifetime_earned, streak, repeats, events) = match event.kind {
+            TreatKind::DisputeLost => {
+                // Slash to zero: fraud forfeits Treats.
+                (
+                    0,
+                    current.lifetime_earned,
+                    0,
+                    current.repeats,
+                    current.events.checked_add(1).ok_or(TreatError::Overflow)?,
+                )
+            }
+            _ => {
+                let balance = current
+                    .balance
+                    .checked_add(minted)
+                    .ok_or(TreatError::Overflow)?;
+                let lifetime_earned = current
+                    .lifetime_earned
+                    .checked_add(minted)
+                    .ok_or(TreatError::Overflow)?;
+                let events = current.events.checked_add(1).ok_or(TreatError::Overflow)?;
+                (
+                    balance,
+                    lifetime_earned,
+                    event.streak,
+                    current.repeats,
+                    events,
+                )
+            }
+        };
         if event.kind == TreatKind::DisputeLost {
             self.outstanding = self.outstanding.saturating_sub(current.balance);
         } else {
-            self.outstanding = self.outstanding.checked_add(minted).ok_or(TreatError::Overflow)?;
+            self.outstanding = self
+                .outstanding
+                .checked_add(minted)
+                .ok_or(TreatError::Overflow)?;
         }
         let next = TreatAccount {
             accumulator: acc,
@@ -614,7 +670,12 @@ impl TreatLedger {
             events,
         };
         self.accounts.insert(event.subject, next.clone());
-        Ok(AppliedTreat { event: event.clone(), event_id, minted, balance: next.balance })
+        Ok(AppliedTreat {
+            event: event.clone(),
+            event_id,
+            minted,
+            balance: next.balance,
+        })
     }
 
     /// Commit a ledger-built event. Refusals mutate nothing.
@@ -625,7 +686,11 @@ impl TreatLedger {
     }
 
     /// Commit with a capped fee-proportional bonus for verified spend.
-    pub fn commit_with_fee(&mut self, event: &TreatEvent, fee_sat: u64) -> Result<AppliedTreat, TreatError> {
+    pub fn commit_with_fee(
+        &mut self,
+        event: &TreatEvent,
+        fee_sat: u64,
+    ) -> Result<AppliedTreat, TreatError> {
         self.apply_mint(event, fee_bonus(fee_sat))
     }
 
@@ -656,7 +721,9 @@ impl TreatLedger {
         actor: &Address,
         msg: &Hash,
     ) -> Result<(), TreatError> {
-        let addr = keys.address().map_err(|_| TreatError::BadSignature("bad key bundle"))?;
+        let addr = keys
+            .address()
+            .map_err(|_| TreatError::BadSignature("bad key bundle"))?;
         if &addr != actor {
             return Err(TreatError::BadSignature("signer is not the named actor"));
         }
@@ -702,17 +769,32 @@ impl TreatLedger {
         }
         let known = self.accounts.contains_key(&cert.recipient);
         if !known && self.accounts.len() >= self.max_subjects {
-            return Err(TreatError::SubjectLimit { cap: self.max_subjects });
+            return Err(TreatError::SubjectLimit {
+                cap: self.max_subjects,
+            });
         }
         self.check_caps(&cert.recipient, cert.amount)?;
         self.giver_nonces.insert(cert.giver, cert.nonce);
-        let mut acc = self.accounts.get(&cert.recipient).cloned().unwrap_or_default();
-        acc.balance = acc.balance.checked_add(cert.amount).ok_or(TreatError::Overflow)?;
-        acc.lifetime_earned = acc.lifetime_earned.checked_add(cert.amount).ok_or(TreatError::Overflow)?;
+        let mut acc = self
+            .accounts
+            .get(&cert.recipient)
+            .cloned()
+            .unwrap_or_default();
+        acc.balance = acc
+            .balance
+            .checked_add(cert.amount)
+            .ok_or(TreatError::Overflow)?;
+        acc.lifetime_earned = acc
+            .lifetime_earned
+            .checked_add(cert.amount)
+            .ok_or(TreatError::Overflow)?;
         acc.last_height = height.max(acc.last_height);
         acc.events = acc.events.checked_add(1).ok_or(TreatError::Overflow)?;
         self.accounts.insert(cert.recipient, acc);
-        self.outstanding = self.outstanding.checked_add(cert.amount).ok_or(TreatError::Overflow)?;
+        self.outstanding = self
+            .outstanding
+            .checked_add(cert.amount)
+            .ok_or(TreatError::Overflow)?;
         Ok(self.balance(&cert.recipient))
     }
 
@@ -744,15 +826,24 @@ impl TreatLedger {
         }
         let sender_bal = self.balance(&cert.sender_subject);
         if sender_bal < cert.amount {
-            return Err(TreatError::InsufficientBalance { have: sender_bal, want: cert.amount });
+            return Err(TreatError::InsufficientBalance {
+                have: sender_bal,
+                want: cert.amount,
+            });
         }
         let recipient_known = self.accounts.contains_key(&cert.recipient);
         if !recipient_known && self.accounts.len() >= self.max_subjects {
-            return Err(TreatError::SubjectLimit { cap: self.max_subjects });
+            return Err(TreatError::SubjectLimit {
+                cap: self.max_subjects,
+            });
         }
         // Cap check on the recipient before mutating anything.
         let r_have = self.balance(&cert.recipient);
-        if r_have.checked_add(cert.amount).map(|b| b > MAX_TREAT_BALANCE_PER_AGENT).unwrap_or(true) {
+        if r_have
+            .checked_add(cert.amount)
+            .map(|b| b > MAX_TREAT_BALANCE_PER_AGENT)
+            .unwrap_or(true)
+        {
             // Self-transfer only needs the balance to already fit, which it
             // does by construction — skip the cap trip for that case.
             if cert.sender_subject != cert.recipient {
@@ -762,20 +853,37 @@ impl TreatLedger {
         self.sender_nonces.insert(cert.sender, cert.nonce);
         if cert.sender_subject != cert.recipient {
             {
-                let mut s = self.accounts.get(&cert.sender_subject).cloned().unwrap_or_default();
+                let mut s = self
+                    .accounts
+                    .get(&cert.sender_subject)
+                    .cloned()
+                    .unwrap_or_default();
                 s.balance -= cert.amount;
                 s.last_height = height.max(s.last_height);
                 self.accounts.insert(cert.sender_subject, s);
             }
             {
-                let mut r = self.accounts.get(&cert.recipient).cloned().unwrap_or_default();
-                r.balance = r.balance.checked_add(cert.amount).ok_or(TreatError::Overflow)?;
-                r.lifetime_earned = r.lifetime_earned.checked_add(cert.amount).ok_or(TreatError::Overflow)?;
+                let mut r = self
+                    .accounts
+                    .get(&cert.recipient)
+                    .cloned()
+                    .unwrap_or_default();
+                r.balance = r
+                    .balance
+                    .checked_add(cert.amount)
+                    .ok_or(TreatError::Overflow)?;
+                r.lifetime_earned = r
+                    .lifetime_earned
+                    .checked_add(cert.amount)
+                    .ok_or(TreatError::Overflow)?;
                 r.last_height = height.max(r.last_height);
                 self.accounts.insert(cert.recipient, r);
             }
         }
-        Ok((self.balance(&cert.sender_subject), self.balance(&cert.recipient)))
+        Ok((
+            self.balance(&cert.sender_subject),
+            self.balance(&cert.recipient),
+        ))
     }
 
     /// Burn `treats` from `subject` for redemption. Returns the burned amount.
@@ -785,10 +893,16 @@ impl TreatLedger {
         }
         let mut acc = self.accounts.get(subject).cloned().unwrap_or_default();
         if acc.balance < treats {
-            return Err(TreatError::InsufficientBalance { have: acc.balance, want: treats });
+            return Err(TreatError::InsufficientBalance {
+                have: acc.balance,
+                want: treats,
+            });
         }
         acc.balance -= treats;
-        acc.lifetime_redeemed = acc.lifetime_redeemed.checked_add(treats).ok_or(TreatError::Overflow)?;
+        acc.lifetime_redeemed = acc
+            .lifetime_redeemed
+            .checked_add(treats)
+            .ok_or(TreatError::Overflow)?;
         self.accounts.insert(*subject, acc);
         self.outstanding = self.outstanding.saturating_sub(treats);
         Ok(treats)
@@ -807,7 +921,10 @@ impl TreatLedger {
             return Err(TreatError::BadAmount);
         }
         let seq = self.voucher_seq;
-        self.voucher_seq = self.voucher_seq.checked_add(1).ok_or(TreatError::Overflow)?;
+        self.voucher_seq = self
+            .voucher_seq
+            .checked_add(1)
+            .ok_or(TreatError::Overflow)?;
         let expiry_height = height.saturating_add(VOUCHER_LIFETIME_BLOCKS);
         let mut w = Writer::with_capacity(128);
         w.raw(network_id.as_bytes())
@@ -836,7 +953,11 @@ impl TreatLedger {
         height: u64,
         want: Option<VoucherKind>,
     ) -> Result<u64, TreatError> {
-        let v = self.vouchers.get(id).cloned().ok_or(TreatError::UnknownVoucher)?;
+        let v = self
+            .vouchers
+            .get(id)
+            .cloned()
+            .ok_or(TreatError::UnknownVoucher)?;
         if self.consumed.contains(id) {
             return Err(TreatError::VoucherConsumed);
         }
@@ -859,7 +980,8 @@ impl TreatLedger {
     pub fn encode(&self) -> Vec<u8> {
         let mut w = Writer::with_capacity(128 + self.accounts.len() * 80);
         w.u8(TREATS_VERSION);
-        w.u16le(self.network_id.len() as u16).raw(self.network_id.as_bytes());
+        w.u16le(self.network_id.len() as u16)
+            .raw(self.network_id.as_bytes());
         w.u64le(self.outstanding);
         w.u32le(self.accounts.len() as u32);
         for (id, a) in &self.accounts {
@@ -906,7 +1028,8 @@ impl TreatLedger {
     pub fn decode(bytes: &[u8]) -> Result<Self, TreatError> {
         let mut r = Reader::new(bytes);
         let l = Self::decode_reader(&mut r)?;
-        r.expect_end().map_err(|_| TreatError::Malformed("trailing"))?;
+        r.expect_end()
+            .map_err(|_| TreatError::Malformed("trailing"))?;
         Ok(l)
     }
 
@@ -915,18 +1038,26 @@ impl TreatLedger {
         if v != 1 && v != TREATS_VERSION {
             return Err(TreatError::UnsupportedVersion(v));
         }
-        let n = r.u16le().map_err(|_| TreatError::Malformed("network len"))? as usize;
+        let n = r
+            .u16le()
+            .map_err(|_| TreatError::Malformed("network len"))? as usize;
         if n == 0 || n > MAX_TREAT_NETWORK_ID_LEN {
             return Err(TreatError::BadNetworkId(n));
         }
-        let nb = r.fixed_slice(n).map_err(|_| TreatError::Malformed("network"))?;
+        let nb = r
+            .fixed_slice(n)
+            .map_err(|_| TreatError::Malformed("network"))?;
         let network_id = std::str::from_utf8(nb)
             .map_err(|_| TreatError::Malformed("network utf8"))?
             .to_string();
-        let outstanding = r.u64le().map_err(|_| TreatError::Malformed("outstanding"))?;
+        let outstanding = r
+            .u64le()
+            .map_err(|_| TreatError::Malformed("outstanding"))?;
         let count = r.u32le().map_err(|_| TreatError::Malformed("count"))? as usize;
         if count > DEFAULT_MAX_SUBJECTS {
-            return Err(TreatError::SubjectLimit { cap: DEFAULT_MAX_SUBJECTS });
+            return Err(TreatError::SubjectLimit {
+                cap: DEFAULT_MAX_SUBJECTS,
+            });
         }
         let mut ledger = TreatLedger::with_capacity(network_id, DEFAULT_MAX_SUBJECTS);
         ledger.outstanding = outstanding;
@@ -940,32 +1071,58 @@ impl TreatLedger {
             let repeats = r.u32le().map_err(|_| TreatError::Malformed("repeats"))?;
             let last_height = r.u64le().map_err(|_| TreatError::Malformed("height"))?;
             let events = r.u64le().map_err(|_| TreatError::Malformed("events"))?;
-            ledger.accounts.insert(id, TreatAccount {
-                accumulator, balance, lifetime_earned, lifetime_redeemed,
-                streak, repeats, last_height, events,
-            });
+            ledger.accounts.insert(
+                id,
+                TreatAccount {
+                    accumulator,
+                    balance,
+                    lifetime_earned,
+                    lifetime_redeemed,
+                    streak,
+                    repeats,
+                    last_height,
+                    events,
+                },
+            );
         }
         if v == 1 {
             // Legacy envelope: no nonce guards, claims, or vouchers.
-            r.expect_end().map_err(|_| TreatError::Malformed("trailing"))?;
+            r.expect_end()
+                .map_err(|_| TreatError::Malformed("trailing"))?;
             return Ok(ledger);
         }
-        let g = r.u32le().map_err(|_| TreatError::Malformed("giver nonces"))? as usize;
+        let g = r
+            .u32le()
+            .map_err(|_| TreatError::Malformed("giver nonces"))? as usize;
         if g > DEFAULT_MAX_SUBJECTS {
-            return Err(TreatError::SubjectLimit { cap: DEFAULT_MAX_SUBJECTS });
+            return Err(TreatError::SubjectLimit {
+                cap: DEFAULT_MAX_SUBJECTS,
+            });
         }
         for _ in 0..g {
-            let addr = r.fixed::<20>().map_err(|_| TreatError::Malformed("giver"))?;
-            let nonce = r.u64le().map_err(|_| TreatError::Malformed("giver nonce"))?;
+            let addr = r
+                .fixed::<20>()
+                .map_err(|_| TreatError::Malformed("giver"))?;
+            let nonce = r
+                .u64le()
+                .map_err(|_| TreatError::Malformed("giver nonce"))?;
             ledger.giver_nonces.insert(addr, nonce);
         }
-        let s = r.u32le().map_err(|_| TreatError::Malformed("sender nonces"))? as usize;
+        let s = r
+            .u32le()
+            .map_err(|_| TreatError::Malformed("sender nonces"))? as usize;
         if s > DEFAULT_MAX_SUBJECTS {
-            return Err(TreatError::SubjectLimit { cap: DEFAULT_MAX_SUBJECTS });
+            return Err(TreatError::SubjectLimit {
+                cap: DEFAULT_MAX_SUBJECTS,
+            });
         }
         for _ in 0..s {
-            let addr = r.fixed::<20>().map_err(|_| TreatError::Malformed("sender"))?;
-            let nonce = r.u64le().map_err(|_| TreatError::Malformed("sender nonce"))?;
+            let addr = r
+                .fixed::<20>()
+                .map_err(|_| TreatError::Malformed("sender"))?;
+            let nonce = r
+                .u64le()
+                .map_err(|_| TreatError::Malformed("sender nonce"))?;
             ledger.sender_nonces.insert(addr, nonce);
         }
         let c = r.u32le().map_err(|_| TreatError::Malformed("claimed"))? as usize;
@@ -973,40 +1130,71 @@ impl TreatLedger {
             return Err(TreatError::Malformed("claimed over cap"));
         }
         for _ in 0..c {
-            let h = r.fixed::<32>().map_err(|_| TreatError::Malformed("claimed id"))?;
+            let h = r
+                .fixed::<32>()
+                .map_err(|_| TreatError::Malformed("claimed id"))?;
             ledger.claimed_tasks.insert(h);
         }
-        ledger.voucher_seq = r.u64le().map_err(|_| TreatError::Malformed("voucher seq"))?;
+        ledger.voucher_seq = r
+            .u64le()
+            .map_err(|_| TreatError::Malformed("voucher seq"))?;
         let vc = r.u32le().map_err(|_| TreatError::Malformed("vouchers"))? as usize;
         if vc > 1 << 20 {
             return Err(TreatError::Malformed("vouchers over cap"));
         }
         for _ in 0..vc {
-            let id = r.fixed::<32>().map_err(|_| TreatError::Malformed("voucher id"))?;
-            let nl = r.u16le().map_err(|_| TreatError::Malformed("voucher net len"))? as usize;
+            let id = r
+                .fixed::<32>()
+                .map_err(|_| TreatError::Malformed("voucher id"))?;
+            let nl = r
+                .u16le()
+                .map_err(|_| TreatError::Malformed("voucher net len"))?
+                as usize;
             if nl == 0 || nl > MAX_TREAT_NETWORK_ID_LEN {
                 return Err(TreatError::BadNetworkId(nl));
             }
-            let nb = r.fixed_slice(nl).map_err(|_| TreatError::Malformed("voucher net"))?;
+            let nb = r
+                .fixed_slice(nl)
+                .map_err(|_| TreatError::Malformed("voucher net"))?;
             let network_id = std::str::from_utf8(nb)
                 .map_err(|_| TreatError::Malformed("voucher net utf8"))?
                 .to_string();
-            let recipient = r.fixed::<20>().map_err(|_| TreatError::Malformed("voucher recipient"))?;
-            let value_sat = r.u64le().map_err(|_| TreatError::Malformed("voucher value"))?;
-            let kind = VoucherKind::from_u8(r.u8().map_err(|_| TreatError::Malformed("voucher kind"))?)
-                .ok_or(TreatError::Malformed("voucher kind range"))?;
-            let expiry_height = r.u64le().map_err(|_| TreatError::Malformed("voucher expiry"))?;
-            ledger.vouchers.insert(id, TreatVoucher { id, network_id, recipient, value_sat, kind, expiry_height });
+            let recipient = r
+                .fixed::<20>()
+                .map_err(|_| TreatError::Malformed("voucher recipient"))?;
+            let value_sat = r
+                .u64le()
+                .map_err(|_| TreatError::Malformed("voucher value"))?;
+            let kind =
+                VoucherKind::from_u8(r.u8().map_err(|_| TreatError::Malformed("voucher kind"))?)
+                    .ok_or(TreatError::Malformed("voucher kind range"))?;
+            let expiry_height = r
+                .u64le()
+                .map_err(|_| TreatError::Malformed("voucher expiry"))?;
+            ledger.vouchers.insert(
+                id,
+                TreatVoucher {
+                    id,
+                    network_id,
+                    recipient,
+                    value_sat,
+                    kind,
+                    expiry_height,
+                },
+            );
         }
         let cc = r.u32le().map_err(|_| TreatError::Malformed("consumed"))? as usize;
         if cc > 1 << 20 {
             return Err(TreatError::Malformed("consumed over cap"));
         }
         for _ in 0..cc {
-            let h = r.fixed::<32>().map_err(|_| TreatError::Malformed("consumed id"))?;
+            let h = r
+                .fixed::<32>()
+                .map_err(|_| TreatError::Malformed("consumed id"))?;
             ledger.consumed.insert(h);
         }
-        r.expect_end().map_err(|_| TreatError::Malformed("trailing"))?;
+        r.expect_end()
+            .map_err(|_| TreatError::Malformed("trailing"))?;
         Ok(ledger)
     }
 }
@@ -1059,7 +1247,9 @@ mod tests {
     #[test]
     fn commit_applies_caps_and_fee_bonus() {
         let mut l = TreatLedger::new(NET);
-        let ev = l.event_for([1u8; 20], TreatKind::VerifiedWork, 10, [2u8; 32]).unwrap();
+        let ev = l
+            .event_for([1u8; 20], TreatKind::VerifiedWork, 10, [2u8; 32])
+            .unwrap();
         let base = ev.mint_amount();
         let applied = l.commit_with_fee(&ev, 5_000).unwrap();
         assert_eq!(applied.minted, base + 5);
@@ -1103,7 +1293,10 @@ mod tests {
             expiry_height: 5_000,
         };
         let auth = Auth::sign(&giver, &cert.signing_hash()).unwrap();
-        assert_eq!(l.apply_gift(&cert, &auth.keys, &auth.sigs, 10), Err(TreatError::CapExceeded));
+        assert_eq!(
+            l.apply_gift(&cert, &auth.keys, &auth.sigs, 10),
+            Err(TreatError::CapExceeded)
+        );
     }
 
     #[test]
@@ -1128,22 +1321,41 @@ mod tests {
         ));
         let auth = Auth::sign(&giver, &cert.signing_hash()).unwrap();
         // Expired refused.
-        assert_eq!(l.apply_gift(&cert, &auth.keys, &auth.sigs, 600), Err(TreatError::Expired));
+        assert_eq!(
+            l.apply_gift(&cert, &auth.keys, &auth.sigs, 600),
+            Err(TreatError::Expired)
+        );
         // Past max lifetime refused.
-        let far = GiftCertificate { expiry_height: 10 + TREAT_CERT_MAX_LIFETIME + 1, ..cert.clone() };
+        let far = GiftCertificate {
+            expiry_height: 10 + TREAT_CERT_MAX_LIFETIME + 1,
+            ..cert.clone()
+        };
         let far_auth = Auth::sign(&giver, &far.signing_hash()).unwrap();
-        assert_eq!(l.apply_gift(&far, &far_auth.keys, &far_auth.sigs, 10), Err(TreatError::Expired));
+        assert_eq!(
+            l.apply_gift(&far, &far_auth.keys, &far_auth.sigs, 10),
+            Err(TreatError::Expired)
+        );
         // Good gift applies.
-        assert_eq!(l.apply_gift(&cert, &auth.keys, &auth.sigs, 10).unwrap(), 100);
+        assert_eq!(
+            l.apply_gift(&cert, &auth.keys, &auth.sigs, 10).unwrap(),
+            100
+        );
         // Replay refused.
         assert_eq!(
             l.apply_gift(&cert, &auth.keys, &auth.sigs, 11),
             Err(TreatError::NonceReuse)
         );
         // Over-cap gift refused.
-        let big = GiftCertificate { amount: MAX_GIFT_AMOUNT + 1, nonce: 2, ..cert.clone() };
+        let big = GiftCertificate {
+            amount: MAX_GIFT_AMOUNT + 1,
+            nonce: 2,
+            ..cert.clone()
+        };
         let big_auth = Auth::sign(&giver, &big.signing_hash()).unwrap();
-        assert_eq!(l.apply_gift(&big, &big_auth.keys, &big_auth.sigs, 11), Err(TreatError::BadAmount));
+        assert_eq!(
+            l.apply_gift(&big, &big_auth.keys, &big_auth.sigs, 11),
+            Err(TreatError::BadAmount)
+        );
     }
 
     #[test]
@@ -1151,27 +1363,44 @@ mod tests {
         let mut l = TreatLedger::new(NET);
         let sender_w = wallet(43);
         let sender_addr = sender_w.address().unwrap();
-        let sender_sub = crate::agent::derive_agent_id(NET, crate::agent::AgentRole::Machine, &sender_addr);
+        let sender_sub =
+            crate::agent::derive_agent_id(NET, crate::agent::AgentRole::Machine, &sender_addr);
         // Fund the sender via gift.
         let giver = wallet(44);
         let giver_addr = giver.address().unwrap();
         let fund = GiftCertificate {
-            network_id: NET.into(), giver: giver_addr, recipient: sender_sub,
-            amount: 500, nonce: 1, expiry_height: 5_000,
+            network_id: NET.into(),
+            giver: giver_addr,
+            recipient: sender_sub,
+            amount: 500,
+            nonce: 1,
+            expiry_height: 5_000,
         };
         let fa = Auth::sign(&giver, &fund.signing_hash()).unwrap();
         l.apply_gift(&fund, &fa.keys, &fa.sigs, 10).unwrap();
         let recipient = [8u8; 20];
         let cert = TransferCertificate {
-            network_id: NET.into(), sender: sender_addr, sender_subject: sender_sub,
-            recipient, amount: 200, nonce: 1, expiry_height: 5_000,
+            network_id: NET.into(),
+            sender: sender_addr,
+            sender_subject: sender_sub,
+            recipient,
+            amount: 200,
+            nonce: 1,
+            expiry_height: 5_000,
         };
         let auth = Auth::sign(&sender_w, &cert.signing_hash()).unwrap();
         let (s, r) = l.apply_transfer(&cert, &auth.keys, &auth.sigs, 11).unwrap();
         assert_eq!((s, r), (300, 200));
         // Replay refused; overspend refused.
-        assert_eq!(l.apply_transfer(&cert, &auth.keys, &auth.sigs, 12), Err(TreatError::NonceReuse));
-        let over = TransferCertificate { amount: 10_000, nonce: 2, ..cert.clone() };
+        assert_eq!(
+            l.apply_transfer(&cert, &auth.keys, &auth.sigs, 12),
+            Err(TreatError::NonceReuse)
+        );
+        let over = TransferCertificate {
+            amount: 10_000,
+            nonce: 2,
+            ..cert.clone()
+        };
         let oa = Auth::sign(&sender_w, &over.signing_hash()).unwrap();
         assert!(matches!(
             l.apply_transfer(&over, &oa.keys, &oa.sigs, 12),
@@ -1183,7 +1412,9 @@ mod tests {
     fn claim_work_needs_a_fresh_task() {
         let mut l = TreatLedger::new(NET);
         let worker = [6u8; 20];
-        let a = l.claim_verified_work([1u8; 32], [2u8; 32], worker, 3_000, 20).unwrap();
+        let a = l
+            .claim_verified_work([1u8; 32], [2u8; 32], worker, 3_000, 20)
+            .unwrap();
         assert!(a.minted >= TreatKind::VerifiedWork.base());
         assert_eq!(
             l.claim_verified_work([1u8; 32], [2u8; 32], worker, 3_000, 21),
@@ -1194,30 +1425,55 @@ mod tests {
     #[test]
     fn vouchers_are_single_use_and_expire() {
         let mut l = TreatLedger::new(NET);
-        let v = l.issue_voucher(NET, [7u8; 20], 900, VoucherKind::Trial, 100).unwrap();
+        let v = l
+            .issue_voucher(NET, [7u8; 20], 900, VoucherKind::Trial, 100)
+            .unwrap();
         assert_eq!(l.voucher_liability(100), 900);
-        assert_eq!(l.consume_voucher(&v.id, 101, Some(VoucherKind::Trial)).unwrap(), 900);
-        assert_eq!(l.consume_voucher(&v.id, 102, Some(VoucherKind::Trial)), Err(TreatError::VoucherConsumed));
+        assert_eq!(
+            l.consume_voucher(&v.id, 101, Some(VoucherKind::Trial))
+                .unwrap(),
+            900
+        );
+        assert_eq!(
+            l.consume_voucher(&v.id, 102, Some(VoucherKind::Trial)),
+            Err(TreatError::VoucherConsumed)
+        );
         assert_eq!(l.voucher_liability(102), 0);
-        let v2 = l.issue_voucher(NET, [7u8; 20], 100, VoucherKind::Trial, 100).unwrap();
-        assert_eq!(l.consume_voucher(&v2.id, 101, Some(VoucherKind::FeeCredit)), Err(TreatError::KindMismatch));
-        assert_eq!(l.consume_voucher(&v2.id, 10_000, None), Err(TreatError::VoucherExpired));
+        let v2 = l
+            .issue_voucher(NET, [7u8; 20], 100, VoucherKind::Trial, 100)
+            .unwrap();
+        assert_eq!(
+            l.consume_voucher(&v2.id, 101, Some(VoucherKind::FeeCredit)),
+            Err(TreatError::KindMismatch)
+        );
+        assert_eq!(
+            l.consume_voucher(&v2.id, 10_000, None),
+            Err(TreatError::VoucherExpired)
+        );
     }
 
     #[test]
     fn encode_decode_round_trip_v2_and_legacy_v1() {
         let mut l = TreatLedger::new(NET);
-        let ev = l.event_for([3u8; 20], TreatKind::ServiceCompleted, 5, [4u8; 32]).unwrap();
+        let ev = l
+            .event_for([3u8; 20], TreatKind::ServiceCompleted, 5, [4u8; 32])
+            .unwrap();
         l.commit(&ev).unwrap();
         let giver = wallet(45);
         let giver_addr = giver.address().unwrap();
         let gift = GiftCertificate {
-            network_id: NET.into(), giver: giver_addr, recipient: [3u8; 20],
-            amount: 50, nonce: 1, expiry_height: 5_000,
+            network_id: NET.into(),
+            giver: giver_addr,
+            recipient: [3u8; 20],
+            amount: 50,
+            nonce: 1,
+            expiry_height: 5_000,
         };
         let ga = Auth::sign(&giver, &gift.signing_hash()).unwrap();
         l.apply_gift(&gift, &ga.keys, &ga.sigs, 6).unwrap();
-        let v = l.issue_voucher(NET, [3u8; 20], 10, VoucherKind::FeeCredit, 6).unwrap();
+        let v = l
+            .issue_voucher(NET, [3u8; 20], 10, VoucherKind::FeeCredit, 6)
+            .unwrap();
         let _ = (v,);
         let bytes = l.encode();
         let back = TreatLedger::decode(&bytes).unwrap();

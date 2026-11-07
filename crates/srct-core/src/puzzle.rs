@@ -496,9 +496,14 @@ pub fn run_puzzle(spec: &PuzzleSpec, header: &Header) -> PuzzleRun {
     let seed = stage1_seed(spec, header);
     let act = stage2_activation_digest(spec, &seed, header.epoch_id);
     let final_hash = match spec.kind {
-        PuzzleKind::VwcLinked => {
-            stage3_final_vwc(spec, &seed, &act, header.nonce, header.epoch_id, &header.extra_nonce)
-        }
+        PuzzleKind::VwcLinked => stage3_final_vwc(
+            spec,
+            &seed,
+            &act,
+            header.nonce,
+            header.epoch_id,
+            &header.extra_nonce,
+        ),
         _ => stage3_final(spec, &seed, &act, header.nonce, header.epoch_id),
     };
     PuzzleRun {
@@ -558,9 +563,14 @@ impl PuzzleSolver {
         let seed = stage1_seed(&self.spec, header);
         let act = stage2_activation_digest_with(&self.spec, &seed, &weights);
         let final_hash = match self.spec.kind {
-            PuzzleKind::VwcLinked => {
-                stage3_final_vwc(&self.spec, &seed, &act, header.nonce, epoch_id, &header.extra_nonce)
-            }
+            PuzzleKind::VwcLinked => stage3_final_vwc(
+                &self.spec,
+                &seed,
+                &act,
+                header.nonce,
+                epoch_id,
+                &header.extra_nonce,
+            ),
             _ => stage3_final(&self.spec, &seed, &act, header.nonce, epoch_id),
         };
         PuzzleRun {

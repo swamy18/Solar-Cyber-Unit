@@ -1074,15 +1074,28 @@ fn cmd_trial_repay(args: &[String]) -> Result<i32, String> {
 
 fn cmd_treats_balance(args: &[String]) -> Result<i32, String> {
     let (view, agent) = trial_node(args, "treats-balance")?;
-    let role = str_arg(args, "--role").map(|s| s.as_str()).unwrap_or("machine");
+    let role = str_arg(args, "--role")
+        .map(|s| s.as_str())
+        .unwrap_or("machine");
     let (code, doc) = view
-        .get_full_json(&format!("/v1/treats/balance/{}?role={}", hex::encode(agent), role))
+        .get_full_json(&format!(
+            "/v1/treats/balance/{}?role={}",
+            hex::encode(agent),
+            role
+        ))
         .map_err(|e| format!("could not read treats: {e}"))?;
     if !(200..300).contains(&code) {
         let why = HttpNode::refusal_detail(&doc).unwrap_or_else(|| format!("HTTP {code}"));
         return Err(format!("treats balance refused: {why}"));
     }
-    for key in ["balance", "lifetime_earned", "lifetime_redeemed", "streak", "outstanding", "reserve_sat"] {
+    for key in [
+        "balance",
+        "lifetime_earned",
+        "lifetime_redeemed",
+        "streak",
+        "outstanding",
+        "reserve_sat",
+    ] {
         if let Some(v) = doc.get(key) {
             println!("{key:<16} {v}");
         }

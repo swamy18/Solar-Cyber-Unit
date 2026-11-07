@@ -927,7 +927,12 @@ impl SharedNode {
         // v8 files lack the trailing trials section and v9 files lack the
         // Smart Gate sections: migrate them with empty books instead of
         // refusing to boot.
-        if version != STATE_ENVELOPE_VERSION && version != 11 && version != 10 && version != 9 && version != 8 {
+        if version != STATE_ENVELOPE_VERSION
+            && version != 11
+            && version != 10
+            && version != 9
+            && version != 8
+        {
             return Err(format!(
                 "state envelope version {version}, this build reads {STATE_ENVELOPE_VERSION} (and migrates 8/9/10/11)"
             ));
@@ -1666,7 +1671,8 @@ impl SharedNode {
                 srct_core::treats::TreatLedger::new(mine.clone())
             } else {
                 let tr = decode_section(&mut r, "treats", |sr| {
-                    srct_core::treats::TreatLedger::decode_reader(sr).map_err(|e| format!("treats: {e}"))
+                    srct_core::treats::TreatLedger::decode_reader(sr)
+                        .map_err(|e| format!("treats: {e}"))
                 })?;
                 if tr.network_id() != mine {
                     return Err("treats: network mismatch".into());
@@ -9493,7 +9499,11 @@ async fn trial_repay(State(state): State<ApiState>, Json(req): Json<TrialTxReq>)
             let vid = decode_hash(vhex)?;
             voucher_cover = sh
                 .treats
-                .consume_voucher(&vid, sh.chain.height(), Some(srct_core::treats::VoucherKind::Trial))
+                .consume_voucher(
+                    &vid,
+                    sh.chain.height(),
+                    Some(srct_core::treats::VoucherKind::Trial),
+                )
                 .map_err(|e| fail(StatusCode::CONFLICT, "voucher_refused", e.to_string()))?;
         }
         let due = trial.amount_sat.saturating_sub(voucher_cover);
@@ -9534,7 +9544,6 @@ async fn trial_repay(State(state): State<ApiState>, Json(req): Json<TrialTxReq>)
 // when the API is bound non-loopback with a token. Loopback-only binds, which
 // every test uses, stay unauthenticated by design.
 
-
 // --- SRCT Treats: transferable reward claims for agents/machines/robots ---
 //
 // Exactly two acquisition paths: (1) fee-based auto-mint from verified
@@ -9544,7 +9553,9 @@ async fn trial_repay(State(state): State<ApiState>, Json(req): Json<TrialTxReq>)
 // removed, so no API can print Treats from nothing. Transfers move claims
 // between holders under sender signatures; redemption burns Treats and
 // pays from the Treat reserve via single-use vouchers.
-fn treats_role(role: Option<&str>) -> Result<srct_core::agent::AgentRole, (StatusCode, Json<ErrorBody>)> {
+fn treats_role(
+    role: Option<&str>,
+) -> Result<srct_core::agent::AgentRole, (StatusCode, Json<ErrorBody>)> {
     match role.unwrap_or("machine") {
         "machine" => Ok(srct_core::agent::AgentRole::Machine),
         "human" => Ok(srct_core::agent::AgentRole::Human),
@@ -9641,7 +9652,10 @@ struct TreatsTransferReq {
 }
 
 /// `POST /v1/treats/transfer` — agent-to-agent move under the sender's key.
-async fn treats_transfer(State(state): State<ApiState>, Json(req): Json<TreatsTransferReq>) -> ApiResult {
+async fn treats_transfer(
+    State(state): State<ApiState>,
+    Json(req): Json<TreatsTransferReq>,
+) -> ApiResult {
     if req.amount == 0 {
         return Err(bad("amount must be > 0"));
     }
@@ -9686,7 +9700,10 @@ struct TreatsClaimWorkReq {
 /// `POST /v1/treats/claim-work` — fee-based path 2. The node looks up the
 /// VWC for the task in its own L2 state and mints VerifiedWork once.
 /// No certificate, no claim; already-claimed tasks refuse.
-async fn treats_claim_work(State(state): State<ApiState>, Json(req): Json<TreatsClaimWorkReq>) -> ApiResult {
+async fn treats_claim_work(
+    State(state): State<ApiState>,
+    Json(req): Json<TreatsClaimWorkReq>,
+) -> ApiResult {
     let task_id = decode_hash(&req.task_id)?;
     with_shared(&state, |sh| {
         let network = sh.chain.params().network_id.clone();
@@ -9723,25 +9740,34 @@ struct TreatsRedeemReq {
 /// single-use voucher toward one benefit: `fee_credit` (default),
 /// `discount`, `trial`, or `service_credit`. The voucher, not raw sats,
 /// is what benefit paths consume, so every spend is exactly-once.
-async fn treats_redeem(State(state): State<ApiState>, Json(req): Json<TreatsRedeemReq>) -> ApiResult {
+async fn treats_redeem(
+    State(state): State<ApiState>,
+    Json(req): Json<TreatsRedeemReq>,
+) -> ApiResult {
     if req.treats == 0 {
         return Err(bad("treats must be > 0"));
     }
     let addr = decode_address(&req.agent_hex)?;
     let role = treats_role(req.role.as_deref())?;
-    let kind = srct_core::treats::VoucherKind::parse_kind(req.kind.as_deref().unwrap_or("fee_credit"))
-        .ok_or_else(|| bad("kind must be fee_credit, discount, trial or service_credit"))?;
+    let kind =
+        srct_core::treats::VoucherKind::parse_kind(req.kind.as_deref().unwrap_or("fee_credit"))
+            .ok_or_else(|| bad("kind must be fee_credit, discount, trial or service_credit"))?;
     with_shared(&state, |sh| {
         let network = sh.chain.params().network_id.clone();
         let subject = derive_agent_id(&network, role, &addr);
         let outstanding = sh.treats.outstanding().max(1);
         let reserve = sh.chain.treat_reserve();
-        let quote = srct_core::treats::redeem_quote(req.treats, reserve, outstanding).ok_or_else(|| bad("quote overflow"))?;
+        let quote = srct_core::treats::redeem_quote(req.treats, reserve, outstanding)
+            .ok_or_else(|| bad("quote overflow"))?;
         if quote == 0 || quote > reserve {
             return Err(bad("treat reserve exhausted"));
         }
-        sh.treats.burn_for_redeem(&subject, req.treats).map_err(|e| bad(e.to_string()))?;
-        sh.chain.spend_treat_reserve(quote).map_err(|e| bad(e.to_string()))?;
+        sh.treats
+            .burn_for_redeem(&subject, req.treats)
+            .map_err(|e| bad(e.to_string()))?;
+        sh.chain
+            .spend_treat_reserve(quote)
+            .map_err(|e| bad(e.to_string()))?;
         let height = sh.chain.height();
         let voucher = sh
             .treats
@@ -9786,7 +9812,9 @@ async fn treats_voucher_consume(
             .treats
             .consume_voucher(&vid, height, want)
             .map_err(|e| bad(e.to_string()))?;
-        Ok(Json(json!({ "voucher_id": hash_to_hex(&vid), "value_sat": value })))
+        Ok(Json(
+            json!({ "voucher_id": hash_to_hex(&vid), "value_sat": value }),
+        ))
     })?
 }
 
@@ -9801,7 +9829,6 @@ async fn treats_reserve(State(state): State<ApiState>) -> ApiResult {
         })))
     })?
 }
-
 
 pub fn router(state: ApiState, cfg: &ApiConfig) -> Router {
     let mut app = Router::new();
