@@ -149,3 +149,20 @@ Verify is free and offline. Trust is not copyable: network_id binding, validator
 - B -> A/C lateral via AI tool -> cross_principal deny, delegation ancestry fails.
 - Stolen deploy token alone -> no valid capability without owner signature + fresh context + nonce.
 - 50 pre-signed burst -> velocity + per-owner window cap refuse by name, high-value needs signed second approval.
+
+## 13. Ephemeral swarm rounds (dynamic multi-agent approval)
+
+Static M-of-N multisigs assume the signer set never changes; AI swarms
+spawn and terminate per micro-task. `templates/srct_swarm.py` assembles
+the approval set per decision instead: `open_round` names the high-value
+transaction and its required roles (default auditor + budget +
+compliance), independent verifiers vote, and `authorize` releases the
+spend only when every required role approved, none denied, and the round
+is live. One agent fills one role (hat-switching refused), any required
+deny blocks, decided rounds never re-open, and the JSON store is the
+audit trail of what was asked, who answered, and what was decided.
+Honest boundary: this gates the template-driven spend — the operator
+invokes `pay` / releases the `GuardApproval` only after a go. On-chain
+N-of-M would need a consensus change (`GuardApproval` names one
+designated approver today); round votes are audit evidence, not chain
+proof. `python templates/srct_swarm.py --selftest` exercises it offline.

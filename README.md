@@ -453,7 +453,13 @@ CPU / solar-edge capacity, discover the cheapest fitting offer, match it
 to a payable L2 task (`python templates/srct_depin.py --selftest`) — and
 locked tokens are tracked by `templates/srct_stake.py`: validator-bond
 facts plus the lending yield leg with projections and the live risk
-dashboard (`python templates/srct_stake.py --selftest`).
+dashboard (`python templates/srct_stake.py --selftest`). Insolvent
+sub-agents self-heal through `templates/srct_shield.py` — parent credit
+lines anchored to live loan offers, exact accept payload on trip
+(`python templates/srct_shield.py --selftest`) — and high-value spends
+clear an ephemeral multi-agent vote first via `templates/srct_swarm.py`
+(auditor + budget + compliance must each approve;
+`python templates/srct_swarm.py --selftest`).
 
 **Trial faucet (operator setup).** Trials stay disabled until a sponsor is
 configured — with no sponsor there is no money behind a trial, so every

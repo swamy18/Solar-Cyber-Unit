@@ -292,3 +292,17 @@ interest), `autorepay_status` (the borrower's standing instruction).
 Redirecting protocol revenue (fees, slash vesting) to stakers is not
 included: that is a monetary-policy decision needing a consensus change,
 not a template.
+
+## Agent Shield (insolvency tripwire)
+
+A sub-agent at 0 SRCT mid-workflow crashes everything downstream.
+`templates/srct_shield.py` heals the half that needs no consensus:
+parents register credit delegation lines anchored to their live on-chain
+`LoanOffer` (`register_line` refuses caps the offer cannot cover), and
+`check` trips under the floor — returning the exact `POST
+/v1/loans/accept` payload (terms from the parent's signed offer,
+signatures left for the sub-agent's own key) plus a standing-repay hint,
+and appending the trip to the board trail. The PSCB-backed emergency
+micro-loan half is reported as unavailable, not faked: drawing rights on
+the reserve need a consensus change. `python templates/srct_shield.py
+--selftest` exercises it offline.
