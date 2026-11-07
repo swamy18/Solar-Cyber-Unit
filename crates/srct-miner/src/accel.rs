@@ -298,6 +298,21 @@ pub fn solve_header_batched_with<B: ComputeBackend + Clone + Send>(
             cfg.validate()?;
             None
         }
+        crate::PowMode::VwcLinked(spec) => {
+            if template.puzzle_id != spec.id {
+                return Err(Error::BadPuzzleSpec(format!(
+                    "template names puzzle {} but the miner holds {}",
+                    template.puzzle_id, spec.id
+                )));
+            }
+            if spec.kind != srct_core::puzzle::PuzzleKind::VwcLinked {
+                return Err(Error::BadPuzzleSpec(
+                    "vwc-linked mode needs a vwc-linked spec".into(),
+                ));
+            }
+            spec.validate()?;
+            Some(spec.clone())
+        }
     };
 
     let n_threads = if threads == 0 {
@@ -335,6 +350,7 @@ pub fn solve_header_batched_with<B: ComputeBackend + Clone + Send>(
                 let mut seq_solver = match &mode {
                     crate::PowMode::Hybrid(spec) => Some(PuzzleSolver::new(spec.clone())),
                     crate::PowMode::Hbm(_) => None,
+                    crate::PowMode::VwcLinked(spec) => Some(PuzzleSolver::new(spec.clone())),
                 };
                 let mut local: u64 = 0;
                 let mut chunk: Vec<Header> = Vec::with_capacity(batch);

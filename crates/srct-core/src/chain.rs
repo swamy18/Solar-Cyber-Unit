@@ -59,6 +59,12 @@ struct Snapshot {
     bond_snapshots: HashMap<u64, BondLedger>,
     slash_vault: SlashVault,
     slash_undo: HashMap<Hash512, SlashVault>,
+    /// Latest verified-work-certificate id committed to by VWC-linked mining
+    /// (puzzle_id = 3). The first 16 bytes go into `header.extra_nonce` so
+    /// stage 3 binds the block to useful L2 compute. Rewound on reorg like
+    /// every other chain-state field.
+    latest_vwc_hash: Option<Hash>,
+    latest_vwc_undo: HashMap<Hash512, Option<Hash>>,
     finality: FinalityManager,
 }
 
@@ -140,6 +146,10 @@ pub struct Chain {
     /// block hash. Stored only when touched: an empty, untouched vault needs
     /// no undo because there is nothing to restore.
     slash_undo: HashMap<Hash512, SlashVault>,
+    /// Latest VWC id for VWC-linked mining. See `Snapshot` comment above.
+    latest_vwc_hash: Option<Hash>,
+    /// Pre-block VWC states for reorg correctness.
+    latest_vwc_undo: HashMap<Hash512, Option<Hash>>,
     /// Non-coinbase transactions the most recent successful reorg rolled back,
     /// oldest block first. Drained by the caller so the mempool can re-admit
     /// them.
@@ -192,6 +202,8 @@ impl Chain {
             bond_snapshots: HashMap::from([(0u64, BondLedger::default())]),
             slash_vault: SlashVault::new(),
             slash_undo: HashMap::new(),
+            latest_vwc_hash: None,
+            latest_vwc_undo: HashMap::new(),
             released_exits: HashSet::new(),
             exit_undo: HashMap::new(),
             disconnected_txs: Vec::new(),
@@ -427,16 +439,18 @@ impl Chain {
     /// Dispatch PoW verification by the header's `puzzle_id`.
     ///
     /// `puzzle_id == 1` uses the cached hybrid `PuzzleSolver` (§5); `puzzle_id == 2`
-    /// verifies the M4 HBM scratchpad proof against the network's `hbm` config.
+    /// verifies the M4 HBM scratchpad proof against the network's `hbm` config;
+    /// `puzzle_id == 3` uses the cached solver with VWC-linked stage 3, where
+    /// `header.extra_nonce` carries a verified-work-certificate id commitment.
     /// Unknown ids are rejected structurally by `puzzle_for` first. This is the
     /// single authority for PoW acceptance so `check_block` and `mine_block`
     /// can never disagree on what a valid proof is.
     fn pow_satisfies(&mut self, header: &crate::block::Header) -> Result<bool> {
         let spec = self.puzzle_for(header.puzzle_id)?;
         match spec.kind {
-            PuzzleKind::Hybrid => {
-                // The cached solver must be the hybrid spec; the hybrid puzzle
-                // is the only one that caches epoch-derived NN weights.
+            PuzzleKind::Hybrid | PuzzleKind::VwcLinked => {
+                // The cached solver must match the header's puzzle id; the
+                // solver's `run` dispatches stage 3 by spec kind.
                 if spec.id != self.solver.spec().id {
                     return Err(Error::BadPuzzleSpec(format!(
                         "solver holds puzzle {} but the header names {}",
@@ -451,6 +465,33 @@ impl Chain {
                 Ok(res)
             }
         }
+    }
+
+    /// Record the latest verified-work-certificate id for VWC-linked mining.
+    /// Called by the node after applying L2 state so the next template's
+    /// `extra_nonce` carries a real VWC commitment. `None` clears the
+    /// commitment (no VWC settled yet).
+    pub fn set_latest_vwc_hash(&mut self, hash: Option<Hash>) {
+        self.latest_vwc_hash = hash;
+    }
+
+    /// The latest VWC hash, if any. Read by the template builder to populate
+    /// `extra_nonce` for `puzzle_id = 3` blocks.
+    pub fn latest_vwc_hash(&self) -> Option<Hash> {
+        self.latest_vwc_hash
+    }
+
+    /// Build the `extra_nonce` for a template: the first 16 bytes of the
+    /// latest VWC hash when mining `puzzle_id = 3`, otherwise zero bytes.
+    fn vwc_extra_nonce(&self) -> [u8; 16] {
+        if self.params.puzzle_id == 3 {
+            if let Some(hash) = self.latest_vwc_hash {
+                let mut enc = [0u8; 16];
+                enc.copy_from_slice(&hash[..16]);
+                return enc;
+            }
+        }
+        [0u8; 16]
     }
 
     /// Cumulative PoW difficulty along the chain ending at `hash`.
@@ -1742,6 +1783,8 @@ impl Chain {
             bond_snapshots: self.bond_snapshots.clone(),
             slash_vault: self.slash_vault.clone(),
             slash_undo: self.slash_undo.clone(),
+            latest_vwc_hash: self.latest_vwc_hash,
+            latest_vwc_undo: self.latest_vwc_undo.clone(),
             finality: self.finality.clone(),
         }
     }
@@ -1765,6 +1808,8 @@ impl Chain {
         self.bond_snapshots = s.bond_snapshots;
         self.slash_vault = s.slash_vault;
         self.slash_undo = s.slash_undo;
+        self.latest_vwc_hash = s.latest_vwc_hash;
+        self.latest_vwc_undo = s.latest_vwc_undo;
         self.finality = s.finality;
     }
 
@@ -2140,7 +2185,7 @@ impl Chain {
                 .checked_div(self.params.nn_epoch_blocks)
                 .unwrap_or(0)
                 .min(u32::MAX as u64) as u32,
-            extra_nonce: [0u8; 16],
+            extra_nonce: self.vwc_extra_nonce(),
             sig_scheme: crate::hash::SIG_SCHEME_SECP256K1_ECDSA,
         };
 

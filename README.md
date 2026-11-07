@@ -477,6 +477,20 @@ threads (release build, `hybrid-v1`), so one such machine holds ~10-minute
 blocks alone until difficulty passes ~68M. Launch is CPU-fair by construction;
 difficulty does the hardening, not special hardware.
 
+**Puzzles.** The registry ships three entries:
+
+| Puzzle id | Name | Stage 3 commits to | Active on |
+|-----------|------|--------------------|-----------|
+| 1 | `hybrid-v1` | block fields only | `mainnet`/`mini`/`testnet` (default) |
+| 2 | `hbm-v1` | memory-hard scratchpad | staged, not live |
+| 3 | `vwc-v1` | block fields + latest verified-work-certificate id | opt-in |
+
+`vwc-v1` binds mining to useful L2 compute: `header.extra_nonce` carries the
+latest verified-work-certificate id from a settled task, so stage 3 commits to
+both the block and a real piece of verified work rather than pure brute force.
+No bond, no cap, no identity required — a profile opts in by setting
+`puzzle_id: 3`. See [`docs/mining.md`](docs/mining.md).
+
 ### Option A — mine inside the node (simplest start)
 
 ```sh

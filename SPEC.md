@@ -291,6 +291,17 @@ is **not** the active mining puzzle on any profile: every profile mines
 scratchpad is the designed upgrade route for ASIC pressure, not a second live
 puzzle.
 
+`vwc-v1` is registered in code as `puzzle_id = 3` (`PuzzleSpec::vwc_v1`) but
+is **not** the active mining puzzle on any profile. It is an opt-in puzzle:
+a profile sets `puzzle_id = 3` to activate it. Stage 1 (hash chain) and stage
+2 (integer-only NN) are identical to `hybrid-v1`; stage 3 additionally commits
+to the latest verified-work-certificate id carried in `header.extra_nonce`
+(first 16 bytes of the VWC id, domain tag `DOM_S3_VWC =
+srct/puzzle/stage3-vwc/v1`). This binds mining to useful L2 compute — a
+settled task's VWC — rather than pure brute force. No cap, no bond, no
+identity: a fresh laptop mines full rewards identically to `hybrid-v1`, and
+the VWC commitment is data, not a gate.
+
 ### 5.2 Stage 1 — memory-hard-ish hash chain
 
 ```

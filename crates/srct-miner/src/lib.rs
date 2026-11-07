@@ -29,6 +29,10 @@ use srct_core::puzzle::{PuzzleKind, PuzzleSolver, PuzzleSpec};
 pub enum PowMode {
     Hybrid(PuzzleSpec),
     Hbm(HbmConfig),
+    /// VWC-linked mining (puzzle_id = 3): stage 3 commits to a verified-work
+    /// certificate id carried in `header.extra_nonce`. The template already
+    /// carries the commitment; the miner only grinds `nonce`.
+    VwcLinked(PuzzleSpec),
 }
 
 /// Outcome of a successful grind.
@@ -46,6 +50,7 @@ fn satisfies(mode: &PowMode, solver: &mut PuzzleSolver, header: &Header) -> Resu
             let ok = srct_core::hbm_pow::hbm_satisfies_cfg(header, header.difficulty, cfg)?;
             Ok(ok)
         }
+        PowMode::VwcLinked(_) => solver.satisfies(header),
     }
 }
 
@@ -97,6 +102,20 @@ pub fn solve_header(
             }
             cfg.validate()?;
         }
+        PowMode::VwcLinked(spec) => {
+            if template.puzzle_id != spec.id {
+                return Err(Error::BadPuzzleSpec(format!(
+                    "template names puzzle {} but the miner holds {}",
+                    template.puzzle_id, spec.id
+                )));
+            }
+            if spec.kind != PuzzleKind::VwcLinked {
+                return Err(Error::BadPuzzleSpec(
+                    "vwc-linked mode needs a vwc-linked spec".into(),
+                ));
+            }
+            spec.validate()?;
+        }
     }
 
     let n_threads = if threads == 0 {
@@ -113,6 +132,7 @@ pub fn solve_header(
         let spec_owned = match &mode {
             PowMode::Hybrid(spec) => Some(spec.clone()),
             PowMode::Hbm(_) => None,
+            PowMode::VwcLinked(spec) => Some(spec.clone()),
         };
         let mut solver =
             PuzzleSolver::new(spec_owned.unwrap_or_else(srct_core::puzzle::PuzzleSpec::hybrid_v1));
@@ -135,6 +155,12 @@ pub fn solve_header(
                 }
             }
             extra = extra.wrapping_add(1);
+            // For VWC-linked mining, `extra_nonce` carries the VWC
+            // commitment and must not be advanced; exhausting nonce space
+            // means no solution for this template.
+            if let PowMode::VwcLinked(_) = &mode {
+                return Ok(None);
+            }
             // Full 2^64 x 2^128 space exhausted without a solution.
             if extra == u128::from_le_bytes(template.extra_nonce) {
                 return Ok(None);
@@ -163,6 +189,7 @@ pub fn solve_header(
                 let spec_owned = match &mode {
                     PowMode::Hybrid(spec) => Some(spec.clone()),
                     PowMode::Hbm(_) => None,
+                    PowMode::VwcLinked(spec) => Some(spec.clone()),
                 };
                 let mut solver = PuzzleSolver::new(
                     spec_owned.unwrap_or_else(srct_core::puzzle::PuzzleSpec::hybrid_v1),
@@ -213,6 +240,12 @@ pub fn solve_header(
                         }
                     }
                     extra = extra.wrapping_add(1);
+                    // For VWC-linked mining, `extra_nonce` carries the VWC
+                    // commitment and must not be advanced; this thread's
+                    // nonce space is exhausted.
+                    if let PowMode::VwcLinked(_) = &mode {
+                        return;
+                    }
                     if extra == u128::from_le_bytes(template.extra_nonce) {
                         return;
                     }

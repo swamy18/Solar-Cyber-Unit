@@ -18,7 +18,7 @@ use sha2::{Digest, Sha256};
 
 use crate::block::Header;
 use crate::error::{Error, Result};
-use crate::hash::{sha256_dom, Hash, DOM_S1, DOM_S2, DOM_S3, DOM_W};
+use crate::hash::{sha256_dom, Hash, DOM_S1, DOM_S2, DOM_S3, DOM_S3_VWC, DOM_W};
 use crate::ser::Writer;
 use crate::u256::{target_for_difficulty, U256};
 
@@ -61,6 +61,10 @@ pub enum PuzzleKind {
     Hybrid,
     /// §M4 HBM scratchpad PoW. Verification parameters live in `HbmConfig`.
     Hbm,
+    /// VWC-linked PoW (puzzle_id = 3): stage 3 final hash additionally commits
+    /// to a verified-work-certificate id carried in `header.extra_nonce`, so
+    /// mining binds to useful L2 compute rather than pure brute force.
+    VwcLinked,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,6 +116,23 @@ impl PuzzleSpec {
             nn_layers: 0,
             min_nn_share_bps: 0,
             max_nn_share_bps: 0,
+        }
+    }
+
+    /// `puzzle_id = 3`. VWC-linked hybrid PoW: same hash+NN stages as
+    /// `hybrid-v1`, but stage 3 additionally commits to a verified-work
+    /// certificate id carried in `header.extra_nonce`.
+    pub fn vwc_v1() -> Self {
+        PuzzleSpec {
+            id: 3,
+            name: "vwc-v1".into(),
+            kind: PuzzleKind::VwcLinked,
+            hash_rounds: 16,
+            nn_input_dim: 16,
+            nn_hidden_dim: 16,
+            nn_layers: 3,
+            min_nn_share_bps: 3_000,
+            max_nn_share_bps: 5_000,
         }
     }
 
@@ -174,7 +195,7 @@ impl PuzzleSpec {
                 // which are meaningless for a non-hybrid puzzle — do not apply.
                 return Ok(());
             }
-            PuzzleKind::Hybrid => {}
+            PuzzleKind::Hybrid | PuzzleKind::VwcLinked => {}
         }
         if self.nn_input_dim == 0 || self.nn_hidden_dim == 0 || self.nn_layers == 0 {
             return Err(Error::BadPuzzleSpec(
@@ -446,6 +467,23 @@ pub fn stage3_final(
     sha256_dom(DOM_S3, &[seed, act_digest, w.as_slice()])
 }
 
+/// Stage 3 for VWC-linked mining (puzzle_id = 3). Commits the final hash to a
+/// verified-work-certificate id carried in `vwc_commitment` (the first 16 bytes
+/// of a VWC id, stored in `header.extra_nonce`). Uses a distinct domain tag so
+/// the same header fields produce a different final hash than hybrid-v1.
+pub fn stage3_final_vwc(
+    _spec: &PuzzleSpec,
+    seed: &Hash,
+    act_digest: &Hash,
+    nonce: u64,
+    epoch_id: u32,
+    vwc_commitment: &[u8; 16],
+) -> Hash {
+    let mut w = Writer::with_capacity(32);
+    w.u64le(nonce).u32le(epoch_id).raw(vwc_commitment);
+    sha256_dom(DOM_S3_VWC, &[seed, act_digest, w.as_slice()])
+}
+
 /// Full puzzle evaluation for a header. Returns the final hash and stage digests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PuzzleRun {
@@ -457,7 +495,12 @@ pub struct PuzzleRun {
 pub fn run_puzzle(spec: &PuzzleSpec, header: &Header) -> PuzzleRun {
     let seed = stage1_seed(spec, header);
     let act = stage2_activation_digest(spec, &seed, header.epoch_id);
-    let final_hash = stage3_final(spec, &seed, &act, header.nonce, header.epoch_id);
+    let final_hash = match spec.kind {
+        PuzzleKind::VwcLinked => {
+            stage3_final_vwc(spec, &seed, &act, header.nonce, header.epoch_id, &header.extra_nonce)
+        }
+        _ => stage3_final(spec, &seed, &act, header.nonce, header.epoch_id),
+    };
     PuzzleRun {
         seed,
         activation_digest: act,
@@ -514,7 +557,12 @@ impl PuzzleSolver {
         let weights = self.weights_for(epoch_id).clone();
         let seed = stage1_seed(&self.spec, header);
         let act = stage2_activation_digest_with(&self.spec, &seed, &weights);
-        let final_hash = stage3_final(&self.spec, &seed, &act, header.nonce, epoch_id);
+        let final_hash = match self.spec.kind {
+            PuzzleKind::VwcLinked => {
+                stage3_final_vwc(&self.spec, &seed, &act, header.nonce, epoch_id, &header.extra_nonce)
+            }
+            _ => stage3_final(&self.spec, &seed, &act, header.nonce, epoch_id),
+        };
         PuzzleRun {
             seed,
             activation_digest: act,
@@ -553,11 +601,13 @@ pub struct PuzzleRegistry {
 }
 
 impl PuzzleRegistry {
-    /// Registry containing `hybrid-v1` (puzzle id 1) and `hbm-v1` (puzzle id 2).
+    /// Registry containing `hybrid-v1` (puzzle id 1), `hbm-v1` (puzzle id 2),
+    /// and `vwc-v1` (puzzle id 3).
     pub fn genesis() -> Self {
         let mut r = PuzzleRegistry::default();
         r.entries.insert(1, PuzzleSpec::hybrid_v1());
         r.entries.insert(2, PuzzleSpec::hbm_v1());
+        r.entries.insert(3, PuzzleSpec::vwc_v1());
         r
     }
 

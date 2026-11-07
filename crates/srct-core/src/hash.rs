@@ -52,6 +52,10 @@ pub const DOM_VALIDATOR_ML_DSA: &[u8] = b"srct/validator-mldsa/v1";
 pub const DOM_S1: &[u8] = b"srct/puzzle/stage1/v1";
 pub const DOM_S2: &[u8] = b"srct/puzzle/stage2/v1";
 pub const DOM_S3: &[u8] = b"srct/puzzle/stage3/v1";
+/// Stage 3 domain tag for VWC-linked mining (puzzle_id = 3). Commits the
+/// final hash to a verified-work-certificate id so mining binds to useful
+/// L2 compute, not just brute force.
+pub const DOM_S3_VWC: &[u8] = b"srct/puzzle/stage3-vwc/v1";
 pub const DOM_W: &[u8] = b"srct/puzzle/weights/v1";
 
 pub const SIG_SCHEME_SECP256K1_ECDSA: u8 = 1;

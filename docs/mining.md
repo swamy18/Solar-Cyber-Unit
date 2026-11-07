@@ -54,6 +54,42 @@ A new chip joins by implementing the same contract and passing the
 differential test — never by forking consensus. (SPEC §5.3 names the exact
 kernel surface; SPEC §13.1/§19.2 specify the template and pool protocols.)
 
+## Puzzle registry
+
+The chain ships three registered puzzles. `puzzle_id` lives in the block
+header and the active one is `NetworkParams::puzzle_id`; profiles default to
+`hybrid-v1`.
+
+| id | Name | Kind | Stage 3 input | Notes |
+|---|---|---|---|---|
+| 1 | `hybrid-v1` | hash + integer NN | block fields only | Default active puzzle on every profile. SPEC §5. |
+| 2 | `hbm-v1` | memory-hard scratchpad | memory hash | Staged upgrade route for ASIC pressure. Not live. SPEC §M4. |
+| 3 | `vwc-v1` | hash + integer NN + VWC id | block fields + verified-work-certificate id | `extra_nonce` carries the latest VWC id, so mining anchors useful L2 compute. Opt-in: set `puzzle_id: 3` on a profile. No cap, no bond, no identity. |
+
+### VWC-linked mining (`vwc-v1`, puzzle_id = 3)
+
+`vwc-v1` reuses `hybrid-v1`'s stage 1 (hash chain) and stage 2 (integer NN)
+and changes only stage 3: the final hash additionally commits to the latest
+verified-work-certificate id from a settled L2 task, carried in
+`header.extra_nonce` (first 16 bytes of the VWC id). A distinct domain tag
+(`srct/puzzle/stage3-vwc/v1`) keeps the output disjoint from `hybrid-v1`.
+
+The effect: mining is no longer pure brute force. A block's proof binds the
+chain to a real, verified piece of compute that the L2 task economy already
+settled. The node tracks the latest VWC id after applying each block and the
+template builder writes it into `extra_nonce`, so an external miner grinds
+only `nonce` and never needs to touch the commitment.
+
+Why this is fair:
+- **No cap.** Every miner runs the same puzzle; no per-address win limit.
+- **No bond.** A fresh laptop can mine full rewards instantly, same as `hybrid-v1`.
+- **No identity.** Mining stays permissionless; the VWC commitment is data, not a gate.
+- **Useful work.** Electricity spent mining also anchors L2 compute rather than being discarded.
+
+A profile opts in by setting `puzzle_id: 3` (and ensuring at least one VWC
+has settled, or `extra_nonce` stays zero — which is still a valid proof).
+`hbm-v1` remains the fallback upgrade route if ASIC pressure ever appears.
+
 ## Upgrade route: hbm-v1
 
 A second puzzle, `hbm-v1` (`puzzle_id = 2`), is designed and registered in
