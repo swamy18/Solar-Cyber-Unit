@@ -351,6 +351,12 @@ impl RoundTracker {
     /// transaction that paid it. Reconciling receipts against the chain is
     /// how an operator proves "paid": a receipt with `txid: None` is
     /// recorded intent, one with `Some` names the evidence.
+    ///
+    /// Crash-safe order is send-on-chain first, then record with the
+    /// resulting txid, then [`Self::save_to_file`] immediately: recording
+    /// first and crashing before the save loses the receipt while the
+    /// coin is gone, and the retry double-pays. Never re-record the same
+    /// payment — a second record debits pending twice.
     pub fn mark_paid_with_txid(
         &mut self,
         miner: &Address,
