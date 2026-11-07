@@ -440,8 +440,14 @@ Setup: `srct-worker generate` a wallet, fund it, `srct-worker grant` a
 bounded policy (its `policy_hex` goes above), then serve. The loop polls open
 tasks, claims, runs `my_task_fn(task_dict) -> bytes`, submits the bytes, and
 skips failures without retrying blind. Framework adapters (LangChain,
-CrewAI, OpenClaw) are documented at the bottom of the template file.
-`python templates/srct_agent.py --selftest` exercises the loop offline.
+CrewAI, OpenClaw) are documented at the bottom of the template file —
+or import `templates/srct_frameworks.py` for ready-made guard middleware:
+`langchain_tool` / `crewai_tool` / `llamaindex_tool` wrap any function so the
+spend policy is checked before it runs
+(`python templates/srct_frameworks.py --selftest` exercises it offline).
+Funding is one call too: `templates/srct_fund.py` picks the cheapest live
+ramp quote, opens the intent and waits for the provider's fill
+(`ensure_funded(...)`; `python templates/srct_fund.py --selftest`).
 
 **Trial faucet (operator setup).** Trials stay disabled until a sponsor is
 configured — with no sponsor there is no money behind a trial, so every

@@ -32,3 +32,10 @@ Quotes expire; intents are terminal (filled or refunded, never both); the
 settle signature covers (intent id + outcome) so only the quoted provider
 closes its own intent. Exchange integrations implement the provider side
 against these four calls: publish, list, accept, settle.
+
+Agent-side funding is one call: `templates/srct_fund.py` lists live
+`stable_to_srct` quotes, picks the cheapest fee covering the target,
+opens the intent and polls the registry trail until it is `filled`
+(`ensure_funded(...)`; `--selftest` exercises it offline). Custody still
+never touches the SDK or the node — the provider fills out of band and
+closes the intent with its own signature.
