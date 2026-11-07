@@ -70,6 +70,7 @@ pub mod state_root;
 pub mod stream;
 pub mod supply;
 pub mod tiers;
+pub mod treats;
 pub mod tx;
 pub mod u256;
 pub mod validators;

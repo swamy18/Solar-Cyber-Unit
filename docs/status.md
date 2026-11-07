@@ -14,7 +14,7 @@ finality is consensus-active on activated profiles** (Decisions 11–12, §14.7�
 
 | # | Mechanism | Consensus-active | Module |
 |---|---|---|---|
-| M1 | 50/50 PSCB (Protocol Security & Compute Buffer) fee split | **Yes** — SPEC.md §8 | `fees.rs`, `chain.rs` |
+| M1 | 50/50 PSCB (Protocol Security & Compute Buffer) fee split; PSCB leg subdivides into retained PSCB + 5% B-Saver + 10% SRCT Treats backing | **Yes** — SPEC.md §8 | `fees.rs`, `bsaver.rs`, `treats.rs`, `chain.rs` |
 | M2 | Time-Locked Compute Reserve & 50/50 Anti-Collusion Slash Vault | No — no rule creates a slash record yet | `slash.rs` |
 | M3 | Universal Hardware-Agnostic Canonical Compute IR | No — envelopes only | `compute_ir.rs` |
 | M4 | Memory-bound HBM scratchpad PoW puzzle | No — not a registered `puzzle_id` | `hbm_pow.rs` |

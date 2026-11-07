@@ -547,6 +547,14 @@ halves are the removal term net-supply reporting subtracts from gross
 issuance. `verify_canonical_chain`
 re-derives both by replay and fails if either diverges.
 
+The PSCB leg subdivides, all integer-floored: 5% to the B-Saver floor (cap
+10%) and 10% to the SRCT Treats backing (cap 20%), the remainder retained as
+PSCB. Invariant: `burned + pscb_retained + bsaver + treat == base_fee_total`.
+`Chain::treat_reserve` and `Chain::bsaver_reserve` are credited and rewound
+per block exactly like PSCB and are likewise re-derived by
+`verify_canonical_chain`. Redemption from the Treat reserve never mints: an
+empty reserve refuses.
+
 ```
 gas_per_tx  = 16 000 + 1 000 × input_count + 250 × output_count
 gas_cap     = 2 000 000 per block

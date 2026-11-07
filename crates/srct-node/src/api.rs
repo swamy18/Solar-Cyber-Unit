@@ -212,7 +212,7 @@ const MAX_BODY_BYTES: usize = 5 * 1024 * 1024;
 /// would mix scopes that must never meet. Version 10 appends the Smart Gate
 /// sections (grant registry, revocations, capability book) last; v8/v9 files
 /// migrate with empty gate state.
-const STATE_ENVELOPE_VERSION: u8 = 10;
+const STATE_ENVELOPE_VERSION: u8 = 11;
 
 /// Largest entry count any single map section in the state envelope may
 /// declare, checked before allocation. Real books are bounded by their own
@@ -588,6 +588,8 @@ pub struct SharedNode {
     /// Smart Gate accounting: tumbling-window calls and nonces per grant.
     /// Persisted, so a restart is not a replay window.
     pub guards: srct_core::guard::GuardBook,
+    /// SRCT Treats ledger: non-transferable dopamine reward claims for agents/machines/robots. Node-local, persisted.
+    pub treats: srct_core::treats::TreatLedger,
     /// L1 txids the API accepted; drained by the serve loop, which owns the
     /// P2P node and announces them to peers.
     pub tx_to_relay: Vec<Hash512>,
@@ -598,6 +600,7 @@ pub struct SharedNode {
 
 impl SharedNode {
     pub fn new(chain: Chain, l2: NodeL2) -> Self {
+        let network_id = chain.params().network_id.clone();
         SharedNode {
             chain,
             pool: Mempool::default(),
@@ -630,6 +633,7 @@ impl SharedNode {
             guard_registry: BTreeMap::new(),
             guard_revoked: BTreeSet::new(),
             guards: srct_core::guard::GuardBook::default(),
+            treats: srct_core::treats::TreatLedger::new(network_id),
             attestations_used: BTreeMap::new(),
             tx_to_relay: Vec::new(),
             l2_to_include: Vec::new(),
@@ -905,6 +909,7 @@ impl SharedNode {
         }
         put_section(&mut w, &guard_revoked.into_vec());
         put_section(&mut w, &self.guards.encode());
+        put_section(&mut w, &self.treats.encode());
         w.into_vec()
     }
 
@@ -922,7 +927,7 @@ impl SharedNode {
         // v8 files lack the trailing trials section and v9 files lack the
         // Smart Gate sections: migrate them with empty books instead of
         // refusing to boot.
-        if version != STATE_ENVELOPE_VERSION && version != 9 && version != 8 {
+        if version != STATE_ENVELOPE_VERSION && version != 10 && version != 9 && version != 8 {
             return Err(format!(
                 "state envelope version {version}, this build reads {STATE_ENVELOPE_VERSION} (and migrates 8/9)"
             ));
@@ -1473,14 +1478,15 @@ impl SharedNode {
             Ok(map)
         })?;
         // v8 files end here: no trials section. v9 appends trials last.
-        // v10 appends the Smart Gate sections after trials.
-        let (trials, guard_registry, guard_revoked, guards) = if version == 8 {
+        // v10 appends the Smart Gate sections after trials. v11 appends Treats last.
+        let (trials, guard_registry, guard_revoked, guards, treats) = if version == 8 {
             r.expect_end().map_err(|e| format!("state envelope: {e}"))?;
             (
                 BTreeMap::new(),
                 BTreeMap::new(),
                 BTreeSet::new(),
                 srct_core::guard::GuardBook::default(),
+                srct_core::treats::TreatLedger::new(mine.clone()),
             )
         } else if version == 9 {
             let t = decode_section(&mut r, "trials", |sr| {
@@ -1557,6 +1563,7 @@ impl SharedNode {
                 BTreeMap::new(),
                 BTreeSet::new(),
                 srct_core::guard::GuardBook::default(),
+                srct_core::treats::TreatLedger::new(mine.clone()),
             )
         } else {
             let t = decode_section(&mut r, "trials", |sr| {
@@ -1653,9 +1660,20 @@ impl SharedNode {
             let guards = decode_section(&mut r, "guards", |sr| {
                 srct_core::guard::GuardBook::decode(sr).map_err(|e| format!("guards: {e}"))
             })?;
-            // Anything after the last section means the envelope is malformed.
-            r.expect_end().map_err(|e| format!("state envelope: {e}"))?;
-            (t, guard_registry, guard_revoked, guards)
+            let treats = if version == 10 {
+                r.expect_end().map_err(|e| format!("state envelope: {e}"))?;
+                srct_core::treats::TreatLedger::new(mine.clone())
+            } else {
+                let tr = decode_section(&mut r, "treats", |sr| {
+                    srct_core::treats::TreatLedger::decode_reader(sr).map_err(|e| format!("treats: {e}"))
+                })?;
+                if tr.network_id() != mine {
+                    return Err("treats: network mismatch".into());
+                }
+                r.expect_end().map_err(|e| format!("state envelope: {e}"))?;
+                tr
+            };
+            (t, guard_registry, guard_revoked, guards, treats)
         };
 
         self.receipts = receipts;
@@ -1701,6 +1719,7 @@ impl SharedNode {
         self.guard_registry = guard_registry;
         self.guard_revoked = guard_revoked;
         self.guards = guards;
+        self.treats = treats;
         Ok(())
     }
 
@@ -2005,6 +2024,9 @@ async fn status(State(state): State<ApiState>) -> ApiResult {
             "total_supply_sat": sh.chain.total_supply_sat(),
             "pscb_reserve_sat": sh.chain.pscb_reserve(),
             "bsaver_reserve_sat": sh.chain.bsaver_reserve(),
+            "treat_reserve_sat": sh.chain.treat_reserve(),
+            "treat_reserve_sat": sh.chain.treat_reserve(),
+            "treats_outstanding": sh.treats.outstanding(),
             "finalized_height": sh.chain.finalized_height(),
             "finality_activation_height": p.finality_activation_height,
             "finality_depth": p.finality_depth,
@@ -2269,6 +2291,13 @@ async fn metrics(
             "B-Saver floor reserve, in satoshi (5% of fee PSCB leg, cap 10%; non-spendable sub-ledger).",
             &net,
             sh.chain.bsaver_reserve(),
+        );
+        gauge(
+            &mut out,
+            "srct_treat_reserve_sat",
+            "SRCT Treats reserve, in satoshi (10% of fee PSCB leg backing non-transferable agent Treats).",
+            &net,
+            sh.chain.treat_reserve(),
         );
         gauge(
             &mut out,
@@ -9446,6 +9475,113 @@ async fn trial_repay(State(state): State<ApiState>, Json(req): Json<TrialTxReq>)
 // when the API is bound non-loopback with a token. Loopback-only binds, which
 // every test uses, stay unauthenticated by design.
 
+
+// --- SRCT Treats: dopamine reward claims for agents/machines/robots ---
+async fn treats_balance(
+    State(state): State<ApiState>,
+    Path(raw): Path<String>,
+) -> ApiResult {
+    let addr = decode_address(&raw)?;
+    with_shared(&state, |sh| {
+        let network = sh.chain.params().network_id.clone();
+        let subject = derive_agent_id(&network, AgentRole::Machine, &addr);
+        let bal = sh.treats.balance(&subject);
+        let acc = sh.treats.account(&subject).cloned().unwrap_or_default();
+        Ok(Json(json!({
+            "agent_id": hex::encode(subject),
+            "address": hex::encode(addr),
+            "network_id": network,
+            "balance": bal,
+            "lifetime_earned": acc.lifetime_earned,
+            "lifetime_redeemed": acc.lifetime_redeemed,
+            "streak": acc.streak,
+            "outstanding": sh.treats.outstanding(),
+            "reserve_sat": sh.chain.treat_reserve(),
+        })))
+    })?
+}
+
+#[derive(Deserialize)]
+struct TreatsMintReq {
+    agent_hex: String,
+    kind: String,
+    source_hex: String,
+    height: Option<u64>,
+}
+
+async fn treats_mint(State(state): State<ApiState>, Json(req): Json<TreatsMintReq>) -> ApiResult {
+    let addr = decode_address(&req.agent_hex)?;
+    let source = decode_hash(&req.source_hex)?;
+    let kind = match req.kind.as_str() {
+        "verified_work" => srct_core::treats::TreatKind::VerifiedWork,
+        "service_completed" => srct_core::treats::TreatKind::ServiceCompleted,
+        "payment_completed" => srct_core::treats::TreatKind::PaymentCompleted,
+        "dispute_won" => srct_core::treats::TreatKind::DisputeWon,
+        "dispute_lost" => srct_core::treats::TreatKind::DisputeLost,
+        _ => return Err(bad("kind must be verified_work, service_completed, payment_completed, dispute_won or dispute_lost")),
+    };
+    with_shared(&state, |sh| {
+        let network = sh.chain.params().network_id.clone();
+        let subject = derive_agent_id(&network, AgentRole::Machine, &addr);
+        let height = req.height.unwrap_or_else(|| sh.chain.height());
+        if sh.treats.network_id() != network {
+            sh.treats = srct_core::treats::TreatLedger::new(network.clone());
+        }
+        let ev = sh.treats.event_for(subject, kind, height, source).map_err(|e| bad(e.to_string()))?;
+        let applied = sh.treats.commit(&ev).map_err(|e| bad(e.to_string()))?;
+        Ok(Json(json!({
+            "agent_id": hex::encode(subject),
+            "minted": applied.minted,
+            "balance": applied.balance,
+            "event_id": hex::encode(applied.event_id),
+        })))
+    })?
+}
+
+#[derive(Deserialize)]
+struct TreatsRedeemReq {
+    agent_hex: String,
+    treats: u64,
+}
+
+async fn treats_redeem(State(state): State<ApiState>, Json(req): Json<TreatsRedeemReq>) -> ApiResult {
+    if req.treats == 0 {
+        return Err(bad("treats must be > 0"));
+    }
+    let addr = decode_address(&req.agent_hex)?;
+    with_shared(&state, |sh| {
+        let network = sh.chain.params().network_id.clone();
+        let subject = derive_agent_id(&network, AgentRole::Machine, &addr);
+        let outstanding = sh.treats.outstanding().max(1);
+        let reserve = sh.chain.treat_reserve();
+        let quote = srct_core::treats::redeem_quote(req.treats, reserve, outstanding).ok_or_else(|| bad("quote overflow"))?;
+        if quote == 0 || quote > reserve {
+            return Err(bad("treat reserve exhausted"));
+        }
+        sh.treats.burn_for_redeem(&subject, req.treats).map_err(|e| bad(e.to_string()))?;
+        sh.chain.spend_treat_reserve(quote).map_err(|e| bad(e.to_string()))?;
+        Ok(Json(json!({
+            "agent_id": hex::encode(subject),
+            "burned": req.treats,
+            "payout_sat": quote,
+            "balance": sh.treats.balance(&subject),
+            "reserve_sat": sh.chain.treat_reserve(),
+        })))
+    })?
+}
+
+async fn treats_reserve(State(state): State<ApiState>) -> ApiResult {
+    with_shared(&state, |sh| {
+        Ok(Json(json!({
+            "reserve_sat": sh.chain.treat_reserve(),
+            "outstanding": sh.treats.outstanding(),
+            "subjects": sh.treats.subjects(),
+            "bps": srct_core::treats::TREAT_BPS,
+        })))
+    })?
+}
+
+
 pub fn router(state: ApiState, cfg: &ApiConfig) -> Router {
     let mut app = Router::new();
     app = app
@@ -9552,7 +9688,11 @@ pub fn router(state: ApiState, cfg: &ApiConfig) -> Router {
         .route("/v1/trials/request", post(trial_request))
         .route("/v1/trials/fund", post(trial_fund))
         .route("/v1/trials/{agent}", get(trial_get))
-        .route("/v1/trials/repay", post(trial_repay));
+        .route("/v1/trials/repay", post(trial_repay))
+        .route("/v1/treats/balance/{agent}", get(treats_balance))
+        .route("/v1/treats/mint", post(treats_mint))
+        .route("/v1/treats/redeem", post(treats_redeem))
+        .route("/v1/treats/reserve", get(treats_reserve));
     // The stack stays `Router<ApiState>` (no state yet) until the end, where a
     // single `with_state` resolves it to the servable `Router<()>`.
     let mut app: Router<ApiState> = app.layer(DefaultBodyLimit::max(MAX_BODY_BYTES));

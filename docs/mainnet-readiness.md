@@ -244,7 +244,7 @@ epoch:
 
 | Mechanism | Consensus-active? | Authority |
 |---|---|---|
-| M1 (50/50 PSCB fee split) | **Yes**, everywhere | SPEC §8 |
+| M1 (50/50 PSCB fee split; PSCB leg carries B-Saver + Treats) | **Yes**, everywhere | SPEC §8 |
 | M2 (Anti-Collusion Slash Vault) | **No** — no rule creates a slash record | `slash.rs` |
 | M3 (Canonical Compute IR) | **No** — envelopes only | `compute_ir.rs` |
 | M4 (HBM scratchpad PoW) | **No** — registered as `puzzle_id = 2` but not the active mining puzzle | `hbm_pow.rs` |

@@ -29,6 +29,7 @@ and redistribute.
 - [Micro-payments and wallet safety](#micro-payments-and-wallet-safety)
 - [Smart Gate](#smart-gate)
 - [Agent economy](#agent-economy)
+  - [SRCT Treats](docs/treats.md)
 - [How fraud is detected](#how-fraud-is-detected)
 - [How withdrawals work](#how-withdrawals-work)
 - [Validators and finality](#validators-and-finality)
@@ -80,7 +81,7 @@ transfers, blocks and P2P work like any Bitcoin-shaped chain: 1 SRCT =
 come only from mining (`hybrid-v1` proof of work); genesis minted nothing,
 so the premine is 0%. There is no stock cap — a halving ladder issues
 39,157,124 SRCT, then a small tail emission pays miners forever. Every
-block's base fee splits 50/50 into a burn and the on-chain PSCB reserve,
+block's base fee splits 50/50 into a burn and the on-chain PSCB leg (retained PSCB plus the 5% B-Saver floor and the 10% SRCT Treats backing),
 so usage removes supply from the spendable set. Full detail:
 [Supply](#supply), [Mining](#mining).
 
@@ -163,13 +164,14 @@ Every piece of jargon, in one line each:
 
 | Term | What it is |
 |---|---|
-| `PSCB` | Protocol-owned reserve: half of every fee accrues to it instead of the miner; it pays whistleblower bounties and vesting. |
+| `PSCB` | Protocol-owned leg: half of every base fee (retained PSCB plus the B-Saver floor and the Treats backing); pays whistleblower bounties and vesting. |
+| `Treats` | Non-transferable dopamine reward claims for agents/machines/robots, backed by 10% of the PSCB leg and redeemable only for fee-credit sats. Never a UTXO, never transferable. |
 | `VWC` | Verified-work certificate: a credential derived from a *settled* task — proof work was paid for, never a self-claim. |
 | `TopN` | Committee rule: the N largest bonds form the validator set (N = 21). |
 | `PPLNS` | Pool payout rule: pay per last N shares — rewards recent work, resists pool-hopping. |
 | `VWB` / escrow | The locked funds behind a task or trade, released only by the rules both sides agreed to. |
 | `sats` | Smallest unit: 1 SRCT = 100,000,000 sats. Integer-only accounting, no floats. |
-| `state.bin` | One node's local books (payments, jobs, reputation…). Restarts survive; other nodes may disagree — see [Honest limits](#honest-limits). |
+| `state.bin` | One node's local books (payments, jobs, reputation, Treats…). Restarts survive; other nodes may disagree — see [Honest limits](#honest-limits). |
 | `mini` / `testnet` / `mainnet` | Network profiles: same code, different parameters (fast local testing → real deployment). |
 
 ---
@@ -564,7 +566,7 @@ validator and node cannot disagree about what is mintable at a height:
    The ladder era is grandfathered.
 
 **Net supply can fall.** The base fee splits 50/50 into a burn and an on-chain
-reserve, so usage *removes* supply from the spendable set. Combined with a
+reserve leg (retained PSCB + B-Saver + Treats backing), so usage *removes* supply from the spendable set. Combined with a
 declining tail reward, the simulation measures net supply falling below
 break-even at ≈5% activity and being at 25% at the fee floor. This is a measured
 consequence, not a bug — the analysis and sensitivity tables are in
@@ -930,6 +932,10 @@ collateral first, then the borrower's posted bond, then the lender absorbs
 the shortfall — never minted. Borrowers can authorize automatic repayment
 from revenue (`POST /v1/lending/autorepay`, revocable, capped, expiring;
 `credit/deposit` routes the authorized share first).
+
+### SRCT Treats
+
+[`docs/treats.md`](docs/treats.md). Non-transferable dopamine reward claims for agents, machines and robots — the third value component next to liquid SRCT and committed escrow. Backed by 10% of each block's PSCB leg (`Chain::treat_reserve`, reorg-rewound, reported in `status` / `conservation` / `/metrics`). Mint weights are fixed in code (VerifiedWork 20, ServiceCompleted/PaymentCompleted 5, DisputeWon 10, DisputeLost slashes to zero) with novelty damping, streak bonus and inactivity decay. Redemption burns Treats for fee-credit sats at `reserve * treats / outstanding`. `GET /v1/treats/balance/{agent}`, `POST /v1/treats/mint`, `POST /v1/treats/redeem`, `GET /v1/treats/reserve`.
 
 Demo covering reputation, tiers, jobs, USD quotes, ramps and lending:
 `python sim/agent_economy_demo.py`.

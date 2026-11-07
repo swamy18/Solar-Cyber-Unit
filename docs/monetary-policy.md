@@ -26,7 +26,7 @@ is unbounded by design and every bound consensus enforces is a rate, never a
 total.
 
 **Net supply** — gross issuance minus everything usage ever removed (the burned
-half plus the PSCB half of every block's base fee) — is what holders
+half plus the PSCB leg of every block's base fee, i.e. retained PSCB + B-Saver + Treats backing) — is what holders
 experience, and `status`, `GET /v1/conservation` and the `/metrics` gauges
 report it (Decision 18 §4.5).
 
@@ -97,7 +97,7 @@ SPEC.md §8, implemented in `fees::split_fees` / `fees::split_flat_fee`:
 | Component | Destination |
 |---|---|
 | **Burn** | 50% of the base-fee portion (ceil — the odd satoshi goes here), removed from the UTXO set forever |
-| **PSCB** | 50% of the base-fee portion (floor) to the Protocol Security & Compute Buffer reserve |
+| **PSCB leg** | 50% of the base-fee portion (floor): retained PSCB + 5% B-Saver floor (cap 10%) + 10% SRCT Treats backing (cap 20%) |
 | **Miner tip** | The full tip (`total_fees − base_fee × gas_used`) goes to the block producer |
 
 Both L1 (`split_fees`) and L2 (`split_flat_fee`, Decision D3) round the same

@@ -48,6 +48,8 @@ struct Snapshot {
     pscb_undo: HashMap<Hash512, u64>,
     bsaver_reserve: u64,
     bsaver_undo: HashMap<Hash512, u64>,
+    treat_reserve: u64,
+    treat_undo: HashMap<Hash512, u64>,
     burned_fees_total: u64,
     burned_undo: HashMap<Hash512, u64>,
     released_exits: HashSet<(Address, u64)>,
@@ -92,6 +94,11 @@ pub struct Chain {
     bsaver_reserve: u64,
     /// Per-block B-Saver deltas, keyed by block hash.
     bsaver_undo: HashMap<Hash512, u64>,
+    /// SRCT Treats reserve: 10% carve-out from the fee PSCB leg (cap 20%).
+    /// Backs non-transferable agent Treat redemptions; rewound like PSCB.
+    treat_reserve: u64,
+    /// Per-block Treat deltas, keyed by block hash.
+    treat_undo: HashMap<Hash512, u64>,
     /// Exit identities already released to L1, keyed by `(owner, nonce)`
     /// (approved P1). One release per identity, ever: consensus refuses a
     /// replay by this set rather than by bookkeeping, so a re-submitted
@@ -176,6 +183,8 @@ impl Chain {
             pscb_undo: HashMap::new(),
             bsaver_reserve: 0,
             bsaver_undo: HashMap::new(),
+            treat_reserve: 0,
+            treat_undo: HashMap::new(),
             burned_fees_total: 0,
             burned_undo: HashMap::new(),
             bonds: BondLedger::default(),
@@ -258,6 +267,20 @@ impl Chain {
         self.bsaver_reserve
     }
 
+    /// SRCT Treats reserve: 10% of the fee PSCB leg backing Treat redemptions.
+    pub fn treat_reserve(&self) -> u64 {
+        self.treat_reserve
+    }
+
+    /// Debit the Treat reserve for a redemption payout. Fails when empty.
+    pub fn spend_treat_reserve(&mut self, amount: u64) -> crate::error::Result<()> {
+        if amount > self.treat_reserve {
+            return Err(crate::error::Error::BadFee("treat reserve exhausted"));
+        }
+        self.treat_reserve -= amount;
+        Ok(())
+    }
+
     /// Cumulative base-fee value destroyed by the M1 burn half (Stage SA-4).
     ///
     /// Together with [`Chain::pscb_reserve`] this is everything usage ever
@@ -273,6 +296,7 @@ impl Chain {
         self.burned_fees_total
             .saturating_add(self.pscb_reserve)
             .saturating_add(self.bsaver_reserve)
+            .saturating_add(self.treat_reserve)
     }
 
     /// Height below which history is immutable.
@@ -784,9 +808,12 @@ impl Chain {
         // B-Saver: 5% carve-out from the *fee* PSCB leg only — vault
         // payouts stay fully in PSCB so the floor stays small by construction.
         let bsaver_delta = crate::bsaver::bsaver_cut_default(split.pscb);
+        let treat_delta = crate::treats::treat_cut_default(split.pscb);
         let pscb_delta = split
             .pscb
             .checked_sub(bsaver_delta)
+            .ok_or(Error::ValueOverflow)?
+            .checked_sub(treat_delta)
             .ok_or(Error::ValueOverflow)?
             .checked_add(vault_payouts)
             .ok_or(Error::ValueOverflow)?;
@@ -800,6 +827,11 @@ impl Chain {
             .checked_add(bsaver_delta)
             .ok_or(Error::ValueOverflow)?;
         self.bsaver_undo.insert(hash, bsaver_delta);
+        self.treat_reserve = self
+            .treat_reserve
+            .checked_add(treat_delta)
+            .ok_or(Error::ValueOverflow)?;
+        self.treat_undo.insert(hash, treat_delta);
         // The destroyed half, tracked the same way (Stage SA-4): the two
         // halves together are the removal term net-supply reporting needs.
         // Slash burns fold in likewise — removed supply is removed supply.
@@ -1634,6 +1666,12 @@ impl Chain {
                 .checked_sub(delta)
                 .ok_or(Error::ValueOverflow)?;
         }
+        if let Some(delta) = self.treat_undo.remove(hash) {
+            self.treat_reserve = self
+                .treat_reserve
+                .checked_sub(delta)
+                .ok_or(Error::ValueOverflow)?;
+        }
         // Undo the burn debit the same way, or a reorg would leave phantom
         // removal behind and net-supply reporting would drift from replay.
         if let Some(delta) = self.burned_undo.remove(hash) {
@@ -1693,6 +1731,8 @@ impl Chain {
             pscb_undo: self.pscb_undo.clone(),
             bsaver_reserve: self.bsaver_reserve,
             bsaver_undo: self.bsaver_undo.clone(),
+            treat_reserve: self.treat_reserve,
+            treat_undo: self.treat_undo.clone(),
             burned_fees_total: self.burned_fees_total,
             burned_undo: self.burned_undo.clone(),
             released_exits: self.released_exits.clone(),
@@ -1714,6 +1754,8 @@ impl Chain {
         self.pscb_undo = s.pscb_undo;
         self.bsaver_reserve = s.bsaver_reserve;
         self.bsaver_undo = s.bsaver_undo;
+        self.treat_reserve = s.treat_reserve;
+        self.treat_undo = s.treat_undo;
         self.burned_fees_total = s.burned_fees_total;
         self.burned_undo = s.burned_undo;
         self.released_exits = s.released_exits;
@@ -2601,6 +2643,12 @@ impl Chain {
         if probe.bsaver_undo != self.bsaver_undo {
             return Err(Error::Malformed("bsaver undo records diverged on replay"));
         }
+        if probe.treat_reserve != self.treat_reserve {
+            return Err(Error::Malformed("treat reserve diverged on replay"));
+        }
+        if probe.treat_undo != self.treat_undo {
+            return Err(Error::Malformed("treat undo records diverged on replay"));
+        }
         // Released exit identities are consensus state (approved P1): a wrong
         // undo here would unmark a spent exit or keep a reorged one marked,
         // and `verify` would be blind to both.
@@ -3234,8 +3282,11 @@ mod tests {
         assert_eq!(removed, full_base, "removal is the whole base fee");
         assert_eq!(
             removed,
-            chain.burned_fees_total() + chain.pscb_reserve() + chain.bsaver_reserve(),
-            "removal is burned plus PSCB plus B-Saver"
+            chain.burned_fees_total()
+                + chain.pscb_reserve()
+                + chain.bsaver_reserve()
+                + chain.treat_reserve(),
+            "removal is burned plus PSCB plus B-Saver plus Treats"
         );
         let r = chain.supply_report();
         assert_eq!(r.removed_sat, removed);
@@ -3291,6 +3342,7 @@ mod tests {
 
         let reserve_with_fee = chain.pscb_reserve();
         let bsaver_with_fee = chain.bsaver_reserve();
+        let treat_with_fee = chain.treat_reserve();
         assert!(reserve_with_fee > 0, "no PSCB was credited for the fee");
         assert_eq!(
             bsaver_with_fee,
@@ -3298,9 +3350,14 @@ mod tests {
             "B-Saver is 5% of the PSCB leg"
         );
         assert_eq!(
-            reserve_with_fee + bsaver_with_fee,
+            treat_with_fee,
+            crate::treats::treat_cut_default(base_portion / 2),
+            "Treats is 10% of the PSCB leg"
+        );
+        assert_eq!(
+            reserve_with_fee + bsaver_with_fee + treat_with_fee,
             base_portion / 2,
-            "PSCB + B-Saver is 50% of the base-fee portion"
+            "PSCB + B-Saver + Treats is 50% of the base-fee portion"
         );
 
         // Reorg inside the finality window: fork at 11 and rebuild 12..=15.
@@ -3335,6 +3392,11 @@ mod tests {
             chain.bsaver_reserve(),
             0,
             "the paying block was rolled back, so its B-Saver credit must be rewound"
+        );
+        assert_eq!(
+            chain.treat_reserve(),
+            0,
+            "the paying block was rolled back, so its Treat credit must be rewound"
         );
         chain
             .verify_canonical_chain()
