@@ -66,6 +66,26 @@ share (30–50% of modelled work) and no floating point anywhere keep the
 neural stage a cost model rather than a liability. Full detail:
 [Mining](#mining).
 
+Four properties, one line each:
+
+- **Admission-enforced policy** — spend rules are checked at admission
+  (`check_tx`/`admit_payment`), the way a double-spend is refused: an
+  unauthorized transaction never enters a block, so no gas is wasted on it.
+  Full detail: [Machines and agents](#machines-and-agents).
+- **Machine-native micro-payments (x402)** — agents bill per call (API hits,
+  data streams) with batched quotes (N payments → one transaction) and stream
+  channels (a whole usage window settles once), so small payments never each
+  pay a transaction fee. Full detail: [Micro-payments and wallet
+  safety](#micro-payments-and-wallet-safety).
+- **Smart Gate (agent safety net)** — a built-in local gatekeeper that keeps
+  AI agents from going rogue by restricting permissions, tool access and
+  spending capability per action. Full detail: [Smart
+  Gate](#smart-gate).
+- **Verifiable compute escrow (L2)** — when one machine buys compute from
+  another, correctness settles natively and trustlessly through disputes,
+  committee verdicts and slashing. Full detail: [What the chain is
+  for](#what-the-chain-is-for).
+
 ---
 
 ## The four pieces
