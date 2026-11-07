@@ -531,7 +531,8 @@ difficulty does the hardening, not special hardware.
 
 `vwc-v1` binds mining to useful L2 compute: `header.extra_nonce` carries the
 latest verified-work-certificate id from a settled task, so stage 3 commits to
-both the block and a real piece of verified work rather than pure brute force.
+both the block and a real piece of verified work rather than pure brute force —
+and consensus enforces it (any other commitment is refused as a bad puzzle).
 No bond, no cap, no identity required — a profile opts in by setting
 `puzzle_id: 3`. See [`docs/mining.md`](docs/mining.md).
 
@@ -733,8 +734,10 @@ Agent ──GET + PAYMENT-SIGNATURE──▶ verify → admit → 200 + PAYMENT-
   `POST /v1/payment/submit`).
 - Client budget (`X402Budget { max_amount_sat, allowed_recipients,
   allowed_services }`) is enforced *before* signing — a server asking for
-  more is refused locally. `check_guarded` adds the short window: the spend
-  must land before its expiry, and the window is capped at 30 blocks.
+  more is refused locally. Absent allow-lists mean unbounded; present ones
+  are enforced exactly like `SpendPolicy` (empty present denies all).
+  `check_guarded` adds the short window: the spend must land before its
+  expiry, and the window is capped at 30 blocks.
 - `scheme` is `exact` only; `network` is CAIP-2 `srct:<reference>`
 (`srct_core::x402::srct_network_caip2` / `parse_srct_network`) or, beside
 SRCT, an EVM rail (`eip155:8453` Base, `eip155:84532` Base Sepolia —

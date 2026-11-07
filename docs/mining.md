@@ -86,8 +86,13 @@ Why this is fair:
 - **No identity.** Mining stays permissionless; the VWC commitment is data, not a gate.
 - **Useful work.** Electricity spent mining also anchors L2 compute rather than being discarded.
 
-A profile opts in by setting `puzzle_id: 3` (and ensuring at least one VWC
-has settled, or `extra_nonce` stays zero — which is still a valid proof).
+A profile opts in by setting `puzzle_id: 3`. The binding is
+consensus-enforced, not advisory: the header's `extra_nonce` must equal
+the chain-acknowledged latest VWC id (zeros before the first VWC
+settles), and anything else is refused as a bad puzzle — templates emit
+exactly these bytes, so honest miners are unaffected. The node feeds the
+latest VWC id after L2 application (and re-feeds it after every reorg);
+until that feed is wired, the rule pins `extra_nonce` to zero.
 `hbm-v1` remains the fallback upgrade route if ASIC pressure ever appears.
 
 ## Photonic & custom silicon (attestation, not multipliers)

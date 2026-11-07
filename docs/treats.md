@@ -55,7 +55,16 @@ single-use voucher toward one benefit kind: `fee_credit` (default),
 spend exactly once: directly via
 `POST /v1/treats/voucher/consume {voucher_id, kind?}`, or internally by
 trial repay — `POST /v1/trials/repay` accepts an optional `voucher_id` and
-a Trial-kind voucher covers part of the L1 repayment.
+a Trial-kind voucher covers part of the L1 repayment. Two guarantees:
+the voucher names its recipient and nobody else's id spends it, and the
+node previews the cover before verifying the payment — a failed payment
+never burns the discount (the burn happens only on the success path).
+
+Novelty damping counts *consecutive* repeats of one kind (tracked per
+account): same kind again pays less, anything else resets to full
+novelty. Persisted ledgers decode only if `outstanding` covers the
+account balances and stays under the cap — a forged state file refuses
+instead of loading a drain-ready ledger.
 
 Free gifts dilute the quote rather than draining fixed value: new claims
 raise `outstanding` against the same reserve, so each Treat redeems for
