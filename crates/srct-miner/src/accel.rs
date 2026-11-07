@@ -427,7 +427,7 @@ pub fn solve_header_batched_with<B: ComputeBackend + Clone + Send>(
                         }
                         let won = match flush(&mut chunk) {
                             Err(e) => {
-                                *first_err.lock().unwrap() = Some(e);
+                                *first_err.lock().unwrap_or_else(|e| e.into_inner()) = Some(e);
                                 found.store(true, Ordering::Relaxed);
                                 return;
                             }
@@ -435,7 +435,7 @@ pub fn solve_header_batched_with<B: ComputeBackend + Clone + Send>(
                         };
                         if let Some(h) = won {
                             if !found.swap(true, Ordering::Relaxed) {
-                                *solution.lock().unwrap() = Some(h);
+                                *solution.lock().unwrap_or_else(|e| e.into_inner()) = Some(h);
                             }
                             return;
                         }
@@ -457,10 +457,10 @@ pub fn solve_header_batched_with<B: ComputeBackend + Clone + Send>(
     });
 
     // A recorded backend refusal outranks "no solution" (see `lib.rs`).
-    if let Some(e) = first_err.lock().unwrap().take() {
+    if let Some(e) = first_err.lock().unwrap_or_else(|e| e.into_inner()).take() {
         return Err(e);
     }
-    let header = solution.lock().unwrap().clone();
+    let header = solution.lock().unwrap_or_else(|e| e.into_inner()).clone();
     match header {
         Some(header) => Ok(Some(crate::MineSolution {
             header,

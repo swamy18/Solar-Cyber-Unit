@@ -921,7 +921,7 @@ impl Pool {
 /// spawning threads without limit). Each admitted connection is bounded in
 /// every dimension: request count, total lifetime, request rate (token
 /// bucket), per-line read deadline, per-reply write deadline (a peer that
-/// stops reading cannot pin the thread in `write_all`), and a 16 MiB line
+/// stops reading cannot pin the thread in `write_all`), and a 9 MiB line
 /// cap against allocation attacks — a failed write closes the connection
 /// instead of looping. Block submits additionally run under the pool's
 /// submit deadline, so a hung node times out the share. Accounting itself
@@ -983,10 +983,13 @@ pub fn serve_limited(listener: TcpListener, pool: Arc<Pool>, limits: ServeLimits
     unreachable!("listener.incoming never returns None");
 }
 
-/// Largest single protocol line the pool will buffer (16 MiB, mirroring the
-/// node API's response cap): a valid share line is kilobytes, so anything
-/// larger without a newline is an allocation attack.
-const MAX_LINE_BYTES: u64 = 16 * 1024 * 1024;
+/// Largest single protocol line the pool will buffer (9 MiB): a `submit`
+/// carries `block_hex` for a block of at most `max_block_bytes` (4 MiB on
+/// every profile, i.e. 8M hex chars) plus a small JSON envelope, so 9 MiB
+/// leaves ~1.4 MiB of headroom while cutting the worst-case per-connection
+/// buffer from 16 MiB. Anything larger without a newline is an allocation
+/// attack, not a share.
+const MAX_LINE_BYTES: u64 = 9 * 1024 * 1024;
 
 fn handle_conn(stream: TcpStream, pool: &Pool, limits: ServeLimits) {
     let started = std::time::Instant::now();
@@ -1037,9 +1040,9 @@ fn handle_conn(stream: TcpStream, pool: &Pool, limits: ServeLimits) {
         }
         served += 1;
         line.clear();
-        // Line cap: block_hex rides inside one JSON line, and a valid v1
-        // template is kilobytes — anything past 16 MiB without a newline is
-        // an allocation attack, not a share.
+        // Line cap: block_hex rides inside one JSON line (up to 8M hex chars
+        // for a 4 MiB block plus envelope) — anything past 9 MiB without a
+        // newline is an allocation attack, not a share.
         let mut capped = reader.by_ref().take(MAX_LINE_BYTES);
         let n = match capped.read_line(&mut line) {
             Ok(n) => n,
@@ -1725,6 +1728,42 @@ mod tests {
         let out = pool.submit_job(job_b.job_id, miner, job_b.block).unwrap();
         assert!(out.block);
         assert_eq!(pool.stats_for(&miner).shares, 1);
+    }
+
+    #[test]
+    fn line_cap_fits_largest_block_but_rejects_allocation_attack() {
+        // Largest real line: 4 MiB block as 8M hex chars plus a small JSON
+        // envelope. The cap must clear that with headroom, and must stay well
+        // below the old 16 MiB that let one connection pin 16 MiB (512 conns
+        // = 8 GiB, 32 per-IP = 512 MiB).
+        let cap = MAX_LINE_BYTES;
+        assert!(cap >= 8 * 1024 * 1024 + 1024 * 1024);
+        assert!(cap < 16 * 1024 * 1024);
+        assert_eq!(cap, 9 * 1024 * 1024);
+    }
+
+    #[test]
+    fn oversized_line_without_newline_is_refused() {
+        use std::io::{BufRead, BufReader, Write};
+        let submitted = Arc::new(Mutex::new(Vec::new()));
+        let pool = Arc::new(test_pool(1, submitted).0);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || serve(listener, pool));
+        let mut stream = TcpStream::connect(addr).unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(15)))
+            .unwrap();
+        // One byte past the cap, no newline: the server must refuse without
+        // buffering unbounded input.
+        let flood = vec![b'x'; (MAX_LINE_BYTES + 1) as usize];
+        stream.write_all(&flood).unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        let out: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(out["accepted"], false);
+        assert_eq!(out["reason"], "line too long");
     }
 
     #[test]

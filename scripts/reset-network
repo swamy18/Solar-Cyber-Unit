@@ -19,13 +19,33 @@ while [ $# -gt 0 ]; do
 done
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+cd "$REPO_ROOT"
 "$SCRIPT_DIR/stop-network" --data-root "$DATA_ROOT" || true
 
-# Guard against wiping the host: empty, root, home or missing marker.
+# Guard against wiping the host: empty, root, home, or anything outside the
+# repo tree. The old check blocked only the exact strings `/`, `~` and `$HOME`,
+# so `/home`, `/etc` or `$HOME/` (trailing slash) passed straight to `rm -rf`.
 if [ -z "$DATA_ROOT" ] || [ "$DATA_ROOT" = "/" ] || [ "$DATA_ROOT" = "~" ] || [ "$DATA_ROOT" = "$HOME" ]; then
     echo "refusing to remove unsafe DATA_ROOT: $DATA_ROOT" >&2
     exit 1
 fi
+# Canonicalize without requiring existence, then require containment in the
+# repo tree. Refuses absolute escapes (/home, /etc, $HOME, $HOME/) and
+# dot-dot escapes (../..), and pins relative roots under the repo since we
+# already cd'd there.
+if command -v realpath >/dev/null 2>&1; then
+    RESOLVED="$(realpath -m "$DATA_ROOT")"
+else
+    RESOLVED="$(readlink -m "$DATA_ROOT")"
+fi
+case "$RESOLVED" in
+    "$REPO_ROOT"/*) ;;
+    *)
+        echo "refusing to remove DATA_ROOT outside the repo tree: $DATA_ROOT (resolves to $RESOLVED)" >&2
+        exit 1
+        ;;
+esac
 
 if [ -d "$DATA_ROOT" ]; then
     rm -rf "$DATA_ROOT"

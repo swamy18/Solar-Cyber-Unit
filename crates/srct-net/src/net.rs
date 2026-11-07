@@ -75,7 +75,7 @@ fn now_ms() -> u64 {
 
 /// Apply §13.9's 1-per-hour decay and report whether the address is banned.
 fn is_banned(bans: &Arc<Mutex<HashMap<IpAddr, BanState>>>, ip: IpAddr) -> bool {
-    let mut map = bans.lock().unwrap(); // invariant: poison needs a prior panic, which aborts the process
+    let mut map = bans.lock().unwrap_or_else(|e| e.into_inner()); // poison-tolerant: a prior panic while holding the lock must not cascade into a node shutdown
     let now = now_ms();
     let Some(state) = map.get_mut(&ip) else {
         return false;
@@ -90,7 +90,7 @@ fn is_banned(bans: &Arc<Mutex<HashMap<IpAddr, BanState>>>, ip: IpAddr) -> bool {
 
 /// Record an inbound-bound violation and prune the table if it grew too large.
 fn score_violation(bans: &Arc<Mutex<HashMap<IpAddr, BanState>>>, ip: IpAddr) {
-    let mut map = bans.lock().unwrap(); // invariant: poison needs a prior panic, which aborts the process
+    let mut map = bans.lock().unwrap_or_else(|e| e.into_inner()); // poison-tolerant: a prior panic while holding the lock must not cascade into a node shutdown
     let now = now_ms();
     let state = map.entry(ip).or_insert(BanState {
         score: 0,
@@ -275,9 +275,9 @@ impl P2pNode {
                                 continue;
                             }
                             if l_inbound.load(Ordering::Relaxed) >= l_config.max_inbound
-                                || l_peers.lock().unwrap().len() >= l_config.max_peers
+                                || l_peers.lock().unwrap_or_else(|e| e.into_inner()).len() >= l_config.max_peers
                                 || l_handshakes.load(Ordering::Relaxed) >= l_config.max_inbound
-                            // invariant: poison needs a prior panic, which aborts the process
+                            // poison-tolerant: a prior panic while holding the lock must not cascade into a node shutdown
                             {
                                 score_violation(&l_bans, peer_addr.ip());
                                 drop(stream);
@@ -438,7 +438,7 @@ impl P2pNode {
         // then drop it before dialing so `connect_with_timeout` can acquire it
         // without a deadlock.
         let (candidates, outbound_count, total_count) = {
-            let peers = self.peers.lock().unwrap(); // invariant: poison needs a prior panic
+            let peers = self.peers.lock().unwrap_or_else(|e| e.into_inner()); // invariant: poison needs a prior panic
             let outbound_count = peers.values().filter(|p| p.is_outbound).count();
             let total = peers.len();
 
@@ -455,8 +455,8 @@ impl P2pNode {
             }
 
             // Then the address book, in most-recent-first order.
-            // invariant: poison needs a prior panic, which aborts the process
-            if let Some(ab) = self.address_book.lock().unwrap().as_ref() {
+            // poison-tolerant: a prior panic while holding the lock must not cascade into a node shutdown
+            if let Some(ab) = self.address_book.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
                 for addr in ab.addresses() {
                     if !connected.contains(&addr) && !self.is_banned(addr.ip()) {
                         cands.push(addr);
@@ -492,8 +492,8 @@ impl P2pNode {
                     println!("reconnected peer {id} -> {addr}");
                     dialed += 1;
                     // Record the address in the book.
-                    // invariant: poison needs a prior panic, which aborts the process
-                    if let Some(ab) = self.address_book.lock().unwrap().as_mut() {
+                    // poison-tolerant: a prior panic while holding the lock must not cascade into a node shutdown
+                    if let Some(ab) = self.address_book.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
                         ab.add(addr);
                     }
                 }
@@ -509,7 +509,7 @@ impl P2pNode {
     /// Broadcast an inventory announcement to all peers except `exclude_peer`.
     pub fn broadcast_inv(&self, entries: Vec<InvEntry>, exclude_peer: Option<usize>) {
         let msg = Message::Inv(entries);
-        let peers = self.peers.lock().unwrap(); // invariant: poison needs a prior panic, which aborts the process
+        let peers = self.peers.lock().unwrap_or_else(|e| e.into_inner()); // poison-tolerant: a prior panic while holding the lock must not cascade into a node shutdown
         for (id, peer) in peers.iter() {
             if Some(*id) != exclude_peer {
                 let _ = peer.send(msg.clone());
@@ -541,7 +541,7 @@ impl P2pNode {
     /// would make it an amplifier. A peer receiving an invalid one refuses it
     /// the same way and does not re-relay.
     pub fn broadcast_checkpoint(&self, cp: srct_core::bls_checkpoint::Checkpoint) {
-        let peers = self.peers.lock().unwrap(); // invariant: poison needs a prior panic, which aborts the process
+        let peers = self.peers.lock().unwrap_or_else(|e| e.into_inner()); // poison-tolerant: a prior panic while holding the lock must not cascade into a node shutdown
         for peer in peers.values() {
             let _ = peer.send(crate::msg::Message::Checkpoint(cp.clone()));
         }
@@ -560,7 +560,7 @@ impl P2pNode {
     /// that fails its own checks drops it and does not re-relay, so a bad vote
     /// travels at most one hop.
     pub fn broadcast_vote(&self, vote: srct_core::arbitration::ArbitrationVote) {
-        let peers = self.peers.lock().unwrap(); // invariant: poison needs a prior panic, which aborts the process
+        let peers = self.peers.lock().unwrap_or_else(|e| e.into_inner()); // poison-tolerant: a prior panic while holding the lock must not cascade into a node shutdown
         for peer in peers.values() {
             let _ = peer.send(crate::msg::Message::ArbitrationVote(Box::new(vote.clone())));
         }
@@ -619,16 +619,16 @@ impl P2pNode {
                     // Record the address in the book for future reconnects.
                     // Inbound addresses are as valid a reconnect source as
                     // outbound — the peer was reachable, so it may be again.
-                    // invariant: poison needs a prior panic, which aborts the process
-                    if let Some(ab) = self.address_book.lock().unwrap().as_mut() {
+                    // poison-tolerant: a prior panic while holding the lock must not cascade into a node shutdown
+                    if let Some(ab) = self.address_book.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
                         ab.add(remote_addr);
                     }
 
                     // If the peer is ahead, ask for blocks
                     if version.height > state.chain.height() {
                         let locator = create_locator(state.chain);
-                        if let Some(peer) = self.peers.lock().unwrap().get(&peer_id) {
-                            // invariant: poison needs a prior panic, which aborts the process
+                        if let Some(peer) = self.peers.lock().unwrap_or_else(|e| e.into_inner()).get(&peer_id) {
+                            // poison-tolerant: a prior panic while holding the lock must not cascade into a node shutdown
                             let _ = peer.send(Message::GetBlocks {
                                 locator,
                                 stop: ZERO_HASH512,
@@ -657,8 +657,8 @@ impl P2pNode {
                         })
                         .collect();
                     if !entries.is_empty() {
-                        if let Some(peer) = self.peers.lock().unwrap().get(&peer_id) {
-                            // invariant: poison needs a prior panic, which aborts the process
+                        if let Some(peer) = self.peers.lock().unwrap_or_else(|e| e.into_inner()).get(&peer_id) {
+                            // poison-tolerant: a prior panic while holding the lock must not cascade into a node shutdown
                             let _ = peer.send(Message::Inv(entries));
                         }
                     }
@@ -687,8 +687,8 @@ impl P2pNode {
                     // peer is registered before its reader thread starts (see
                     // `spawn_peer`) and released only once the node has decided
                     // the connection is over.
-                    if !self.peers.lock().unwrap().contains_key(&peer_id) {
-                        // invariant: poison needs a prior panic, which aborts the process
+                    if !self.peers.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&peer_id) {
+                        // poison-tolerant: a prior panic while holding the lock must not cascade into a node shutdown
                         continue;
                     }
                     self.handle_message(peer_id, msg, state.reborrow(), now_ms);
@@ -714,8 +714,8 @@ impl P2pNode {
     fn release_peer(&self, peer_id: usize, syncer: &mut SyncManager, relay: &mut RelayManager) {
         syncer.peer_disconnected(peer_id);
         relay.peer_disconnected(peer_id);
-        if let Some(p) = self.peers.lock().unwrap().remove(&peer_id) {
-            // invariant: poison needs a prior panic, which aborts the process
+        if let Some(p) = self.peers.lock().unwrap_or_else(|e| e.into_inner()).remove(&peer_id) {
+            // poison-tolerant: a prior panic while holding the lock must not cascade into a node shutdown
             if !p.is_outbound {
                 self.inbound_count.fetch_sub(1, Ordering::Relaxed);
             }
@@ -737,7 +737,7 @@ impl P2pNode {
     /// The flag is the authority because `stop()` is the only thing that sets it,
     /// and it is set before the socket is touched.
     fn swept_stopped_peers(&self) -> Vec<usize> {
-        let peers = self.peers.lock().unwrap(); // invariant: poison needs a prior panic, which aborts the process
+        let peers = self.peers.lock().unwrap_or_else(|e| e.into_inner()); // poison-tolerant: a prior panic while holding the lock must not cascade into a node shutdown
         peers
             .iter()
             // Only peers that have been ended *and* whose reader has not reported
@@ -771,7 +771,7 @@ impl P2pNode {
             Message::GetBlocks { locator, stop } => {
                 let inv = find_fork_and_collect_inv(chain, &locator, &stop);
                 if !inv.is_empty() {
-                    let peers = self.peers.lock().unwrap(); // invariant: poison needs a prior panic, which aborts the process
+                    let peers = self.peers.lock().unwrap_or_else(|e| e.into_inner()); // poison-tolerant: a prior panic while holding the lock must not cascade into a node shutdown
                     if let Some(peer) = peers.get(&peer_id) {
                         let _ = peer.send(Message::Inv(inv));
                     }
@@ -808,7 +808,7 @@ impl P2pNode {
                 // receive gigabytes (§13.14).
                 let txs =
                     relay.handle_get_data_tx(&tx_entries, pool, self.config.params.max_block_bytes);
-                let peers = self.peers.lock().unwrap(); // invariant: poison needs a prior panic, which aborts the process
+                let peers = self.peers.lock().unwrap_or_else(|e| e.into_inner()); // poison-tolerant: a prior panic while holding the lock must not cascade into a node shutdown
                 if let Some(peer) = peers.get(&peer_id) {
                     for b in blocks {
                         let _ = peer.send(Message::Block(Box::new(b)));
@@ -827,7 +827,7 @@ impl P2pNode {
                     // An inbound bound was exceeded, and §13.8 requires that this
                     // *bans* rather than merely dropping: dropping alone leaves
                     // the node doing the decoding work for every message.
-                    let peers = self.peers.lock().unwrap(); // invariant: poison needs a prior panic, which aborts the process
+                    let peers = self.peers.lock().unwrap_or_else(|e| e.into_inner()); // poison-tolerant: a prior panic while holding the lock must not cascade into a node shutdown
                     if let Some(peer) = peers.get(&peer_id) {
                         peer.add_ban_score(INBOUND_VIOLATION_SCORE);
                     }
@@ -876,7 +876,7 @@ impl P2pNode {
                     Err(MempoolError::Invalid(_)) | Err(MempoolError::Oversized { .. }) => {
                         relay.mark_known(txid);
                         relay.note_refused();
-                        let peers = self.peers.lock().unwrap(); // invariant: poison needs a prior panic, which aborts the process
+                        let peers = self.peers.lock().unwrap_or_else(|e| e.into_inner()); // poison-tolerant: a prior panic while holding the lock must not cascade into a node shutdown
                         if let Some(peer) = peers.get(&peer_id) {
                             peer.add_ban_score(10);
                         }
@@ -919,7 +919,7 @@ impl P2pNode {
                     SyncResult::AlreadyKnown => {}
                     SyncResult::Invalid(_) => {
                         // Misbehaviour score +10 for an invalid block (§13.9)
-                        let peers = self.peers.lock().unwrap(); // invariant: poison needs a prior panic, which aborts the process
+                        let peers = self.peers.lock().unwrap_or_else(|e| e.into_inner()); // poison-tolerant: a prior panic while holding the lock must not cascade into a node shutdown
                         if let Some(peer) = peers.get(&peer_id) {
                             peer.add_ban_score(10);
                         }
@@ -942,7 +942,7 @@ impl P2pNode {
                 // produce and expensive to verify (§13.8).
                 let clock = now_ms.unwrap_or_else(crate::net::now_ms);
                 if !relay.allow_control_from(peer_id, clock) {
-                    let peers = self.peers.lock().unwrap(); // invariant: poison needs a prior panic, which aborts the process
+                    let peers = self.peers.lock().unwrap_or_else(|e| e.into_inner()); // poison-tolerant: a prior panic while holding the lock must not cascade into a node shutdown
                     if let Some(peer) = peers.get(&peer_id) {
                         peer.add_ban_score(INBOUND_VIOLATION_SCORE);
                     }
@@ -955,16 +955,41 @@ impl P2pNode {
                 // not — a bad or conflicting certificate must not propagate.
                 // `RealBls` is pairing-checked, so a forged aggregate is
                 // rejected here rather than merely counted.
-                if chain
-                    .apply_checkpoint(&cp, &srct_core::bls::RealBls)
-                    .is_ok()
-                {
-                    let peers = self.peers.lock().unwrap(); // invariant: poison needs a prior panic, which aborts the process
-                    for (id, peer) in peers.iter() {
-                        if *id != peer_id {
-                            let _ = peer.send(Message::Checkpoint(cp.clone()));
+                //
+                // H3: a conflicting certificate is a quorum signing two
+                // histories — the one condition that can lock the network onto
+                // a forged branch (C2/H3). Cheap forgeries fail verification
+                // silently, but a *conflict* means real keys equivocated, so
+                // it gets a loud alert instead of a quiet drop. No ban: the
+                // peer may be honestly relaying evidence, not attacking.
+                match chain.apply_checkpoint(&cp, &srct_core::bls::RealBls) {
+                    Ok(()) => {
+                        let peers = self.peers.lock().unwrap_or_else(|e| e.into_inner()); // poison-tolerant: a prior panic while holding the lock must not cascade into a node shutdown
+                        for (id, peer) in peers.iter() {
+                            if *id != peer_id {
+                                let _ = peer.send(Message::Checkpoint(cp.clone()));
+                            }
                         }
                     }
+                    Err(srct_core::finality::FinalityError::ConflictingFinality {
+                        height,
+                        finalized,
+                        conflicting,
+                    }) => {
+                        // Rare path (a conflict means a quorum signed two
+                        // histories), so a small allocation here is fine.
+                        let short = |h: &srct_core::hash::Hash512| {
+                            h.iter().take(8).map(|b| format!("{b:02x}")).collect::<String>()
+                        };
+                        eprintln!(
+                            "ALERT: conflicting finality at height {height}: quorum signed \
+                             {}... but this node finalized {}... — possible forged-finality \
+                             branch (C2/H3); refusing to reorg, not relaying",
+                            short(&conflicting),
+                            short(&finalized),
+                        );
+                    }
+                    Err(_) => {}
                 }
             }
             Message::ArbitrationVote(vote) => {
@@ -973,7 +998,7 @@ impl P2pNode {
                 // certificates are (§13.8).
                 let clock = now_ms.unwrap_or_else(crate::net::now_ms);
                 if !relay.allow_control_from(peer_id, clock) {
-                    let peers = self.peers.lock().unwrap(); // invariant: poison needs a prior panic, which aborts the process
+                    let peers = self.peers.lock().unwrap_or_else(|e| e.into_inner()); // poison-tolerant: a prior panic while holding the lock must not cascade into a node shutdown
                     if let Some(peer) = peers.get(&peer_id) {
                         peer.add_ban_score(INBOUND_VIOLATION_SCORE);
                     }
@@ -1005,7 +1030,7 @@ impl P2pNode {
                         .record(&vote, &chain.params().network_id, height, &committee)
                         .is_ok();
                 if accepted {
-                    let peers = self.peers.lock().unwrap(); // invariant: poison needs a prior panic, which aborts the process
+                    let peers = self.peers.lock().unwrap_or_else(|e| e.into_inner()); // poison-tolerant: a prior panic while holding the lock must not cascade into a node shutdown
                     for (id, peer) in peers.iter() {
                         if *id != peer_id {
                             let _ = peer.send(Message::ArbitrationVote(vote.clone()));
@@ -1021,7 +1046,7 @@ impl P2pNode {
 
     /// Number of active connected peers.
     pub fn peer_count(&self) -> usize {
-        self.peers.lock().unwrap().len() // invariant: poison needs a prior panic, which aborts the process
+        self.peers.lock().unwrap_or_else(|e| e.into_inner()).len() // poison-tolerant: a prior panic while holding the lock must not cascade into a node shutdown
     }
 
     /// Whether an address is currently banned for inbound-bound violations.
@@ -1033,7 +1058,7 @@ impl P2pNode {
 
     /// Addresses currently at or over the ban threshold.
     pub fn banned_count(&self) -> usize {
-        let mut map = self.ban_scores.lock().unwrap(); // invariant: poison needs a prior panic, which aborts the process
+        let mut map = self.ban_scores.lock().unwrap_or_else(|e| e.into_inner()); // poison-tolerant: a prior panic while holding the lock must not cascade into a node shutdown
         let now = now_ms();
         let mut count = 0;
         for state in map.values_mut() {
@@ -1054,7 +1079,7 @@ impl P2pNode {
         if entries.is_empty() {
             return;
         }
-        let peers = self.peers.lock().unwrap(); // invariant: poison needs a prior panic, which aborts the process
+        let peers = self.peers.lock().unwrap_or_else(|e| e.into_inner()); // poison-tolerant: a prior panic while holding the lock must not cascade into a node shutdown
         if let Some(peer) = peers.get(&peer_id) {
             let _ = peer.send(Message::GetData(entries));
         }
@@ -1063,7 +1088,7 @@ impl P2pNode {
     /// Stop the network listener and all peer threads.
     pub fn stop(&self) {
         self.running.store(false, Ordering::Relaxed);
-        let peers = self.peers.lock().unwrap(); // invariant: poison needs a prior panic, which aborts the process
+        let peers = self.peers.lock().unwrap_or_else(|e| e.into_inner()); // poison-tolerant: a prior panic while holding the lock must not cascade into a node shutdown
         for peer in peers.values() {
             peer.stop();
         }

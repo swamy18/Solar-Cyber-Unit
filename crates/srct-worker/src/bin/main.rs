@@ -171,19 +171,35 @@ fn cmd_generate(args: &[String]) -> Result<i32, String> {
     let wallet = srct_core::wallet::Wallet::new_random(label);
     let json =
         serde_json::to_string_pretty(&wallet).map_err(|e| format!("wallet encode failed: {e}"))?;
-    // Best-effort restrictive permissions; on Windows the file inherits the
-    // directory ACL, which the operator is responsible for placing sensibly.
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(out)
-        .map_err(|e| format!("cannot create {out}: {e}"))?;
+    // W1: this file holds a plaintext private key, so it must never be
+    // world-readable — not even between creation and chmod. On Unix the mode
+    // is set atomically at creation (`create_new` + `mode(0o600)` ignores the
+    // umask for this file); the post-write `set_permissions` is a second
+    // barrier, and its error is fatal rather than swallowed — a silent chmod
+    // failure used to leave the key world-readable. On Windows the file
+    // inherits the directory ACL, which the operator must place sensibly.
+    #[cfg(unix)]
+    let mut file = {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut o = fs::OpenOptions::new();
+        o.write(true).create_new(true).mode(0o600);
+        o.open(out)
+            .map_err(|e| format!("cannot create {out}: {e}"))?
+    };
+    #[cfg(not(unix))]
+    let mut file = {
+        let mut o = fs::OpenOptions::new();
+        o.write(true).create_new(true);
+        o.open(out)
+            .map_err(|e| format!("cannot create {out}: {e}"))?
+    };
     file.write_all(json.as_bytes())
         .map_err(|e| format!("write failed: {e}"))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(out, fs::Permissions::from_mode(0o600));
+        fs::set_permissions(out, fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("cannot restrict {out} to owner-only: {e}"))?;
     }
     // Print only the path. The key bytes now exist in exactly one operator-
     // controlled file and nowhere else in this process's output.

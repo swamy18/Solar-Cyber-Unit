@@ -3687,3 +3687,38 @@ fn oversized_submit_hex_is_refused_before_allocation() {
         assert!(body.to_string().contains("16 MiB"));
     }
 }
+
+#[test]
+fn escrow_open_records_without_checking_payer_funding_n4() {
+    // N4 confirmation: `open` records intent only. A payer with no L2 balance
+    // can open two escrows whose combined amount exceeds anything they own —
+    // both return 200. Funding is enforced once, at settlement, when the bound
+    // `ExitQueue` debits the payer (first settlement to apply wins). A payee
+    // must therefore treat the release signature as authorization and
+    // `Finalized` as payment. If open ever reserves funds, rewrite this test
+    // to assert refusal of the second open.
+    let node = start();
+    let arb_pk = BlsSecretKey::derive(&[5u8; 32]).unwrap().public_key();
+    let payer_pk = BlsSecretKey::derive(&[7u8; 32]).unwrap().public_key();
+    let payee_pk = BlsSecretKey::derive(&[8u8; 32]).unwrap().public_key();
+    let payer_addr = wallet(71, "n4-payer").address().unwrap();
+    let payee_addr = wallet(72, "n4-payee").address().unwrap();
+    for nonce in [21u64, 22u64] {
+        let (s, b) = post(
+            &node,
+            "/v1/escrow/open",
+            &serde_json::json!({
+                "network_id": "srct/test",
+                "payer": address_to_hex(&payer_addr),
+                "payer_bls": hex::encode(payer_pk.0),
+                "payee": address_to_hex(&payee_addr),
+                "payee_bls": hex::encode(payee_pk.0),
+                "arbitrator": hex::encode(arb_pk.0),
+                "amount_sat": 50_000_000u64,
+                "nonce": nonce,
+            }),
+        );
+        assert_eq!(s, 200, "N4: unfunded open {nonce} must currently succeed: {b}");
+        assert!(b["escrow_id"].is_string());
+    }
+}

@@ -139,6 +139,31 @@ fn make_wallet(wallet: &PathBuf) -> String {
         .to_string()
 }
 
+/// W1: a generated wallet holds a plaintext private key, so the file must be
+/// owner-only from creation — never 0644, not even briefly. Unix-only: on
+/// Windows the file inherits the directory ACL instead.
+#[cfg(unix)]
+#[test]
+fn generated_wallet_file_is_owner_only_from_creation() {
+    use std::os::unix::fs::PermissionsExt;
+    let wallet = tmp("perm-owner-only.json");
+    let _ = std::fs::remove_file(&wallet);
+    let (code, _, err) = exec(&[
+        "generate",
+        "--out-file",
+        wallet.to_str().unwrap(),
+        "--label",
+        "perm-check",
+    ]);
+    assert_eq!(code, 0, "generate failed: {err}");
+    let mode = std::fs::metadata(&wallet).expect("wallet file").permissions().mode() & 0o777;
+    assert_eq!(
+        mode, 0o600,
+        "W1: generated wallet must be 0600, got {mode:o}"
+    );
+    let _ = std::fs::remove_file(&wallet);
+}
+
 #[test]
 fn run_refuses_a_node_whose_joint_supply_exceeds_the_cap() {
     let wallet = tmp("gate-broken.json");

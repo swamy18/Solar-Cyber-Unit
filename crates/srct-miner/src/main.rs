@@ -153,14 +153,15 @@ fn http(
         .write_all(request.as_bytes())
         .map_err(|e| format!("write: {e}"))?;
     // Cap the response: a compromised node must not be able to OOM the miner
-    // with an unbounded body. 16 MiB matches the pool/API line caps.
-    const MAX_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
+    // with an unbounded body. 9 MiB matches the pool line cap: a template
+    // carries block_hex for at most a 4 MiB block (8M hex chars) plus envelope.
+    const MAX_RESPONSE_BYTES: u64 = 9 * 1024 * 1024;
     let mut buf = Vec::new();
     // A refusal may arrive before the whole body is written; that is the
     // server doing its job, not a failure of this client.
     let _ = stream.take(MAX_RESPONSE_BYTES + 1).read_to_end(&mut buf);
     if buf.len() as u64 > MAX_RESPONSE_BYTES {
-        return Err("response over the 16 MiB cap".to_string());
+        return Err("response over the 9 MiB cap".to_string());
     }
     let text = String::from_utf8_lossy(&buf).into_owned();
     let status = text
@@ -173,6 +174,33 @@ fn http(
         .map(|(_, b)| b.to_string())
         .ok_or_else(|| "malformed HTTP response (no header terminator)".to_string())?;
     Ok((status, body))
+}
+
+/// H1: the template's coinbase must pay this miner's `--miner` address.
+/// Consensus pins the shape (first transaction, exactly one output), so a
+/// template that pays anyone else is either a network attacker rewriting the
+/// coinbase on the path or a node bug — grinding it burns our hash power for
+/// somebody else's reward. Refuse before solving, not after submitting.
+fn template_pays_miner(template: &Block, miner_hex: &str) -> Result<(), String> {
+    let want = srct_core::hash::address_from_hex(miner_hex)
+        .map_err(|e| format!("--miner address: {e}"))?;
+    let coinbase = template
+        .txs
+        .first()
+        .ok_or_else(|| "template has no transactions".to_string())?;
+    let payee = coinbase
+        .outputs
+        .first()
+        .map(|o| o.address)
+        .ok_or_else(|| "template coinbase has no outputs".to_string())?;
+    if payee != want {
+        return Err(format!(
+            "template coinbase pays {} instead of --miner {miner_hex}: \
+             refusing to grind (possible template tampering on the path)",
+            srct_core::hash::address_to_hex(&payee),
+        ));
+    }
+    Ok(())
 }
 
 fn main() {
@@ -216,6 +244,12 @@ fn mine_once(args: &Args) -> Result<(), String> {
     let raw = hex::decode(block_hex.trim().trim_start_matches("0x"))
         .map_err(|e| format!("template block hex: {e}"))?;
     let template = Block::deserialize(&raw).map_err(|e| format!("template block decode: {e}"))?;
+    // H1: the template arrives over plain HTTP, so a network attacker can
+    // rewrite it — including the coinbase address — and the node would accept
+    // the solved block while the miner's hash power pays the attacker. The
+    // coinbase shape is strict (txs[0], exactly one output: chain.rs), so
+    // refuse any template that does not pay --miner before grinding it.
+    template_pays_miner(&template, &args.miner)?;
     let height = template.header.height;
     let difficulty = template.header.difficulty;
 
@@ -262,7 +296,9 @@ fn mine_once(args: &Args) -> Result<(), String> {
         sol.header.nonce, sol.attempts
     );
 
-    // 3. Submit: the solved header back into the template block.
+    // 3. Submit: the solved header back into the template block. The
+    // coinbase was verified to pay us before grinding, so the solved block
+    // still pays us — the header swap above cannot move the payout.
     let mut solved = template;
     solved.header = sol.header;
     let solved_hex = hex::encode(solved.serialize());
@@ -296,4 +332,65 @@ fn mine_once(args: &Args) -> Result<(), String> {
     }
     println!("srct-miner: accepted height {chain_height}: {body}");
     Ok(())
+}
+
+#[cfg(test)]
+mod coinbase_check_tests {
+    use super::*;
+    use srct_core::chain::Chain;
+    use srct_core::params::NetworkParams;
+
+    fn wallet(seed: u8) -> srct_core::wallet::Wallet {
+        srct_core::wallet::Wallet::from_private_key_bytes(&[seed; 32], "coinbase-check")
+            .unwrap()
+    }
+
+    fn template_paying(miner_hex: &str) -> Block {
+        let params = NetworkParams::mini();
+        let mut chain = Chain::new(params).unwrap();
+        let miner = srct_core::hash::address_from_hex(miner_hex).unwrap();
+        let h = chain.height() + 1;
+        chain
+            .mine_block(
+                miner,
+                vec![],
+                srct_core::block::GENESIS_TIMESTAMP_MS + h * 1_000,
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn template_paying_our_address_is_accepted() {
+        let w = wallet(11);
+        let me = srct_core::hash::address_to_hex(&w.address().unwrap());
+        let template = template_paying(&me);
+        template_pays_miner(&template, &me).expect("our own template must pass");
+    }
+
+    #[test]
+    fn rewritten_coinbase_is_refused_before_grinding() {
+        // H1: a network attacker rewrites the coinbase to their own address
+        // and recomputes the Merkle root. The block is otherwise a perfectly
+        // valid template — only the payee differs.
+        let w = wallet(11);
+        let me = srct_core::hash::address_to_hex(&w.address().unwrap());
+        let attacker = srct_core::hash::address_to_hex(&wallet(12).address().unwrap());
+        let mut template = template_paying(&me);
+        template.txs[0].outputs[0].address =
+            srct_core::hash::address_from_hex(&attacker).unwrap();
+        let err = template_pays_miner(&template, &me).unwrap_err();
+        assert!(
+            err.contains("instead of --miner"),
+            "refusal must name the mismatch, got: {err}"
+        );
+    }
+
+    #[test]
+    fn empty_template_is_refused() {
+        let w = wallet(11);
+        let me = srct_core::hash::address_to_hex(&w.address().unwrap());
+        let mut template = template_paying(&me);
+        template.txs.clear();
+        assert!(template_pays_miner(&template, &me).is_err());
+    }
 }

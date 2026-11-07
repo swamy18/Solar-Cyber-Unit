@@ -220,14 +220,14 @@ pub fn solve_header(
                             Err(e) => {
                                 // Record, signal, stop: the error is global
                                 // (bad spec or target), not this nonce.
-                                *first_err.lock().unwrap() = Some(e);
+                                *first_err.lock().unwrap_or_else(|e| e.into_inner()) = Some(e);
                                 found.store(true, Ordering::Relaxed);
                                 return;
                             }
                         };
                         if ok {
                             if !found.swap(true, Ordering::Relaxed) {
-                                *solution.lock().unwrap() = Some(header.clone());
+                                *solution.lock().unwrap_or_else(|e| e.into_inner()) = Some(header.clone());
                             }
                             return;
                         }
@@ -256,10 +256,10 @@ pub fn solve_header(
 
     // A recorded verification error outranks "no solution": the caller must
     // see the broken spec/target, not an empty nonce space.
-    if let Some(e) = first_err.lock().unwrap().take() {
+    if let Some(e) = first_err.lock().unwrap_or_else(|e| e.into_inner()).take() {
         return Err(e);
     }
-    let header = solution.lock().unwrap().clone();
+    let header = solution.lock().unwrap_or_else(|e| e.into_inner()).clone();
     match header {
         Some(header) => Ok(Some(MineSolution {
             header,

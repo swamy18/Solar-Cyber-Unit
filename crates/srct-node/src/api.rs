@@ -6079,6 +6079,12 @@ struct AuthConfig {
 /// Per-IP token bucket. Refills at `RATE_LIMIT_RATE` tokens/sec up to
 /// `RATE_LIMIT_CAPACITY`, so a client that bursts can proceed but a flood is
 /// shed to the server rather than through it. Holds only counters keyed by IP.
+///
+/// M2: the key is the socket address (unspoofable). Behind a reverse proxy
+/// every client shares that address and one abusive client throttles the
+/// rest — do not "fix" this by trusting `X-Forwarded-For` (client-spoofable).
+/// Run rate limiting at the proxy when proxying, and never disable this
+/// limiter to work around proxy sharing.
 #[derive(Clone)]
 struct RateLimiter {
     inner: Arc<Mutex<HashMap<IpAddr, Bucket>>>,
@@ -10268,6 +10274,18 @@ pub fn spawn_with_options(
              set SRCT_API_TOKEN and supply --api-listen, or bind loopback \
              (SPEC.md §19.2)"
         ));
+    }
+    // H2: the exposed API is plain HTTP with no TLS in this stack, so the
+    // bearer token travels in cleartext to anyone on the network path — and it
+    // grants full control of the node. Loud on every exposed bind, not just
+    // the first: terminate TLS in front (reverse proxy / VPN) or an on-path
+    // observer owns the API.
+    if !listen.ip().is_loopback() {
+        eprintln!(
+            "warning: API bound to non-loopback {listen} over plain HTTP: the bearer \
+             token is visible to the network path. Put TLS termination (or a VPN) \
+             in front, or bind loopback."
+        );
     }
     let std_listener =
         std::net::TcpListener::bind(listen).map_err(|e| format!("api bind {listen}: {e}"))?;

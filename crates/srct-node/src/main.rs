@@ -1544,6 +1544,29 @@ fn cmd_verify(args: &Args) -> Result<(), String> {
         a.applied_count(),
         a.skipped().len()
     );
+    // C1 tripwire: an exit claim the chain released without L2 backing means
+    // the committed root lied and consensus accepted it. A healthy replay has
+    // none (the API asserts the same); any entry here fails the command
+    // instead of printing "ok" over a drained sink.
+    for u in a.unbacked_claims().iter().take(10) {
+        println!(
+            "  UNBACKED height {:>6}  owner {}  nonce {}  {}",
+            u.height,
+            address_to_hex(&u.owner),
+            u.nonce,
+            u.error
+        );
+    }
+    if a.unbacked_claims().len() > 10 {
+        println!("  ... and {} more", a.unbacked_claims().len() - 10);
+    }
+    if !a.unbacked_claims().is_empty() {
+        return Err(format!(
+            "l2 integrity failure: {} exit claim(s) released without L2 backing \
+             (fabricated-state-root drain suspected); refusing to report ok",
+            a.unbacked_claims().len()
+        ));
+    }
     // Joint conservation (Decisions 7 and 10, SPEC.md §19.4–§19.5): L2 holds
     // at most genesis plus matured deposits, and L1 live supply plus
     // everything L2 ever held, minus what sits identifiably in the deposit
@@ -2141,6 +2164,24 @@ fn cmd_serve(args: &Args) -> Result<(), String> {
                         .into(),
                 );
             }
+        }
+        // C3 tripwire (non-consensus, operator-facing): the first recorded
+        // bond retires the whole 21-key bootstrap set with no minimum
+        // validator count, so finality can rest on a handful of keys — or one
+        // (quorum of one). Serving on such a chain is allowed, but it must be
+        // loud: anyone relying on binding finality or exits should know how
+        // few keys currently secure them.
+        let live_committee = chain.committee_keys();
+        if live_committee != store.params.genesis_validators
+            && live_committee.len() < store.params.genesis_validators.len()
+        {
+            eprintln!(
+                "warning: mainnet finality currently rests on {} bonded key(s) \
+                 (bootstrap was {} public keys): exits and binding checkpoints \
+                 are secured by that set alone until more validators bond",
+                live_committee.len(),
+                store.params.genesis_validators.len(),
+            );
         }
     }
     let mut signed_epochs = std::collections::BTreeSet::new();
