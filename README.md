@@ -749,7 +749,10 @@ The wallet around them is safer than a normal crypto wallet by construction
    (`GET /v1/audit` reports `chain_valid`; `GET /v1/risk/policy` exports the
    live envelope). The chain exports as auditor/insurer-readable JSON
    (`AuditLog::export_json`, re-checked by `verify_export_json`, MCP
-   `audit.verify`).
+   `audit.verify`). Audit receipts are node-local over loopback and
+   export-verifiable, never chain-anchored — so routine interactions are
+   audited without paying a chain fee each; only final settlement settles
+   on chain.
 
 ---
 
