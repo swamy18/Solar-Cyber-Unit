@@ -2171,13 +2171,15 @@ impl L2State {
         self.burned.saturating_add(self.slash_vault.total_burned)
     }
 
-    /// The vesting half still held by the M2 vault.
+    /// The vesting half still held by the M2 vault. Saturating, like every
+    /// other conservation leg: a plain sum would wrap on absurd record
+    /// counts and misreport the conservation total instead of capping it.
     pub fn vault_remaining(&self) -> u64 {
         self.slash_vault
             .records()
             .iter()
             .map(|r| r.remaining_vest)
-            .sum()
+            .fold(0u64, u64::saturating_add)
     }
 
     /// Every satoshi still inside the system, in whatever bucket. Compared

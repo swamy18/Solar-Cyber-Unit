@@ -2270,6 +2270,13 @@ fn cmd_serve(args: &Args) -> Result<(), String> {
     // The final flush runs after the loop, in the shutdown block.
     let mut last_state_save = std::time::Instant::now();
     let mut last_state_blob: Option<Vec<u8>> = None;
+    // Chain/meta persist retry flag: a failed save must be retried even if
+    // no new block arrives (the batch gate below keys off height change),
+    // and a freshly mined block must not be relayed until it has survived
+    // to disk — peers building on a block we cannot restart from opens
+    // the confirmed-effects-lost window the retry paths would then fill
+    // with replacements.
+    let mut persist_dirty = false;
 
     // Chain thread: mine + relay loop
     while running.load(Ordering::SeqCst) {
@@ -2363,14 +2370,23 @@ fn cmd_serve(args: &Args) -> Result<(), String> {
             if let Ok(block) = mined {
                 let hash = block.block_hash();
                 let height = block.header.height;
+                // Durability gates relay (see `persist_dirty` above).
+                let mut ok = true;
                 if let Err(e) = store.save_chain(&sh.chain) {
                     eprintln!("warning: chain persist failed: {e}");
+                    ok = false;
                 }
                 if let Err(e) = store.write_meta(&sh.chain) {
                     eprintln!("warning: meta persist failed: {e}");
+                    ok = false;
                 }
+                persist_dirty = !ok;
                 println!("mined height {height}  {}", &hash512_to_hex(&hash)[..16]);
-                node.broadcast_block(hash, None);
+                if ok {
+                    node.broadcast_block(hash, None);
+                } else {
+                    eprintln!("warning: mined block held back: persist failed, retrying");
+                }
             }
 
             // Sign and broadcast a checkpoint at an epoch boundary (M5,
@@ -2542,7 +2558,11 @@ fn cmd_serve(args: &Args) -> Result<(), String> {
             let committee = sh.chain.committee_keys();
             let proposals = srct_node::mediation::live_proposals(&votes, &committee, sh.l2.state());
             for p in proposals {
-                sh.l2_to_include.push(p.tx);
+                // Internal re-derivation, retried every tick: skip rather
+                // than grow past the cap the API enforces.
+                if sh.l2_to_include.len() < srct_node::api::MAX_L2_QUEUE {
+                    sh.l2_to_include.push(p.tx);
+                }
                 println!(
                     "arbitration    quorum reached for task {}",
                     &hash_to_hex(&p.task_id)[..16]
@@ -2550,14 +2570,20 @@ fn cmd_serve(args: &Args) -> Result<(), String> {
             }
         }
 
-        // Blocks from peers are persisted per batch, not per event.
-        if sh.chain.height() != before {
+        // Blocks from peers are persisted per batch, not per event — plus any
+        // batch while a previous save is still dirty, so one failed write
+        // cannot strand the chain behind its files until the next block.
+        if sh.chain.height() != before || persist_dirty {
+            let mut ok = true;
             if let Err(e) = store.save_chain(&sh.chain) {
                 eprintln!("warning: chain persist failed: {e}");
+                ok = false;
             }
             if let Err(e) = store.write_meta(&sh.chain) {
                 eprintln!("warning: meta persist failed: {e}");
+                ok = false;
             }
+            persist_dirty = !ok;
         }
         // Binding finality can advance without a height change.
         if let Err(e) = store.persist_finality(&sh.chain) {

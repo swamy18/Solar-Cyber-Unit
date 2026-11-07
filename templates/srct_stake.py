@@ -89,12 +89,26 @@ def bond_facts():
 
 
 def live_offers(node, principal_sat=0):
-    """Signed loan offers fitting `principal_sat`, cheapest rate first."""
-    status, body = _http_get(
-        node, _OFFERS + f"?principal={principal_sat}&limit=100")
-    if status != 200:
-        raise SrctError(f"node answered {status} for loan offers")
-    return body.get("offers", [])
+    """Signed loan offers fitting `principal_sat`, cheapest rate first.
+
+    Follows `next_cursor` until the registry is exhausted: picking the
+    cheapest rate from a truncated first page would lock the operator
+    into worse terms on a busy node.
+    """
+    offers = []
+    cursor = None
+    while True:
+        path = _OFFERS + f"?principal={principal_sat}&limit=1000"
+        if cursor is not None:
+            path += f"&cursor={cursor}"
+        status, body = _http_get(node, path)
+        if status != 200:
+            raise SrctError(f"node answered {status} for loan offers")
+        offers.extend(body.get("offers", []))
+        cursor = body.get("next_cursor")
+        if cursor is None:
+            break
+    return offers
 
 
 def best_offer_for(offers, principal_sat):
@@ -184,8 +198,15 @@ def _selftest():
 
         def fake_get(node, path):
             if path.startswith(_OFFERS):
-                return 200, {"count": 2, "total": 2, "truncated": False,
-                             "offers": list(offers)}
+                # Two pages: the cheapest offer sits on page 2, so only
+                # cursor-following selection finds it.
+                if "cursor=" in path:
+                    return 200, {"count": 1, "total": 2,
+                                 "truncated": False, "next_cursor": None,
+                                 "offers": [offers[0]]}
+                return 200, {"count": 1, "total": 2,
+                             "truncated": True, "next_cursor": 1,
+                             "offers": [offers[1]]}
             if path == _DASHBOARD:
                 return 200, {"exposure_by_lender": {"ll": 5_000},
                              "due_soon": [], "expected_interest_sat": 100}

@@ -30,7 +30,10 @@ use crate::ser::{Reader, Writer};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 
-pub const TREATS_VERSION: u8 = 2;
+/// v3 adds the per-account last event kind (novelty damping input); v1/v2
+/// blobs decode with it unset, which only grants full novelty — the safe
+/// direction.
+pub const TREATS_VERSION: u8 = 3;
 pub const DOM_TREAT_EVENT: &[u8] = b"srct/treat-event/v1";
 pub const DOM_TREAT_ACC: &[u8] = b"srct/treat-acc/v1";
 pub const DOM_TREAT_GIFT: &[u8] = b"srct/treat-gift/v1";
@@ -203,6 +206,7 @@ pub enum TreatError {
     VoucherConsumed,
     VoucherExpired,
     KindMismatch,
+    WrongRecipient,
     AlreadyClaimed,
 }
 
@@ -240,6 +244,7 @@ impl fmt::Display for TreatError {
             TreatError::VoucherConsumed => write!(f, "treat voucher already consumed"),
             TreatError::VoucherExpired => write!(f, "treat voucher expired"),
             TreatError::KindMismatch => write!(f, "voucher kind does not match this use"),
+            TreatError::WrongRecipient => write!(f, "treat voucher names another recipient"),
             TreatError::AlreadyClaimed => write!(f, "work already claimed for treats"),
         }
     }
@@ -256,7 +261,8 @@ pub struct TreatEvent {
     pub height: u64,
     pub source: Hash,
     pub prev: Hash,
-    /// Repeats with the same counterparty so far (novelty damping input).
+    /// Consecutive repeats of [`TreatAccount::last_kind`] so far (novelty
+    /// damping input): same kind again increments, anything else resets.
     pub repeats: u32,
     /// Consecutive verified epochs (streak bonus input).
     pub streak: u32,
@@ -436,6 +442,11 @@ pub struct TreatAccount {
     pub lifetime_redeemed: u64,
     pub streak: u32,
     pub repeats: u32,
+    /// Kind of the most recent committed event. Novelty damping counts
+    /// *consecutive* repeats of one kind: without remembering what the
+    /// last event was, `repeats` could never advance and every repeat
+    /// paid full novelty.
+    pub last_kind: Option<TreatKind>,
     pub last_height: u64,
     pub events: u64,
 }
@@ -531,7 +542,12 @@ impl TreatLedger {
         }
         let acc = self.accounts.get(&subject);
         let prev = acc.map(|a| a.accumulator).unwrap_or([0u8; 32]);
-        let repeats = acc.map(|a| a.repeats).unwrap_or(0);
+        // Novelty damping counts *consecutive* repeats of one kind: same
+        // kind again increments, anything else (or a fresh account) resets.
+        let repeats = match acc {
+            Some(a) if a.last_kind == Some(kind) => a.repeats.saturating_add(1),
+            _ => 0,
+        };
         let streak = match kind {
             TreatKind::VerifiedWork | TreatKind::ServiceCompleted | TreatKind::DisputeWon => {
                 acc.map(|a| a.streak.saturating_add(1)).unwrap_or(1)
@@ -666,6 +682,7 @@ impl TreatLedger {
             lifetime_redeemed: current.lifetime_redeemed,
             streak,
             repeats,
+            last_kind: Some(event.kind),
             last_height: event.height.max(current.last_height),
             events,
         };
@@ -947,12 +964,14 @@ impl TreatLedger {
     }
 
     /// Consume a voucher exactly once. Returns its sat value.
-    pub fn consume_voucher(
-        &mut self,
+    /// Read-only voucher validation shared by preview and burn, so the two
+    /// can never disagree about what counts as usable.
+    fn voucher_valid(
+        &self,
         id: &Hash,
         height: u64,
         want: Option<VoucherKind>,
-    ) -> Result<u64, TreatError> {
+    ) -> Result<TreatVoucher, TreatError> {
         let v = self
             .vouchers
             .get(id)
@@ -969,8 +988,35 @@ impl TreatLedger {
                 return Err(TreatError::KindMismatch);
             }
         }
-        self.consumed.insert(*id);
+        Ok(v)
+    }
+
+    /// What a voucher would cover, without burning it. The recipient is
+    /// part of the check: a voucher names its beneficiary, and naming
+    /// someone else's voucher id must not spend their discount.
+    pub fn voucher_cover(
+        &self,
+        id: &Hash,
+        height: u64,
+        want: Option<VoucherKind>,
+        recipient: &AgentId,
+    ) -> Result<u64, TreatError> {
+        let v = self.voucher_valid(id, height, want)?;
+        if v.recipient != *recipient {
+            return Err(TreatError::WrongRecipient);
+        }
         Ok(v.value_sat)
+    }
+
+    pub fn consume_voucher(
+        &mut self,
+        id: &Hash,
+        height: u64,
+        want: Option<VoucherKind>,
+    ) -> Result<u64, TreatError> {
+        let value = self.voucher_valid(id, height, want)?.value_sat;
+        self.consumed.insert(*id);
+        Ok(value)
     }
 
     /// Encode for `state.bin` persistence (trailing section, versioned v2).
@@ -992,6 +1038,7 @@ impl TreatLedger {
                 .u64le(a.lifetime_redeemed)
                 .u32le(a.streak)
                 .u32le(a.repeats)
+                .u8(a.last_kind.map(|k| k.as_u8()).unwrap_or(255))
                 .u64le(a.last_height)
                 .u64le(a.events);
         }
@@ -1035,7 +1082,10 @@ impl TreatLedger {
 
     pub fn decode_reader(r: &mut Reader) -> Result<Self, TreatError> {
         let v = r.u8().map_err(|_| TreatError::Malformed("version"))?;
-        if v != 1 && v != TREATS_VERSION {
+        // v1 (accounts only), v2 (full book, no last-kind), v3 (current).
+        // Old persisted state must keep loading: v2 accounts simply start
+        // novelty tracking fresh.
+        if v != 1 && v != 2 && v != TREATS_VERSION {
             return Err(TreatError::UnsupportedVersion(v));
         }
         let n = r
@@ -1059,8 +1109,18 @@ impl TreatLedger {
                 cap: DEFAULT_MAX_SUBJECTS,
             });
         }
+        if outstanding > MAX_TREAT_OUTSTANDING {
+            return Err(TreatError::Malformed("outstanding over cap"));
+        }
         let mut ledger = TreatLedger::with_capacity(network_id, DEFAULT_MAX_SUBJECTS);
         ledger.outstanding = outstanding;
+        // Every mint/gift path credits `outstanding` alongside the balance
+        // it creates, and every burn/slash debits both together, so the
+        // outstanding supply always covers the account balances. A blob
+        // claiming less (crafted small to inflate `redeem_quote` payouts
+        // against the chain reserve) or more than the cap refuses here
+        // instead of poisoning the node that loads it.
+        let mut balance_sum = 0u64;
         for _ in 0..count {
             let id = r.fixed::<20>().map_err(|_| TreatError::Malformed("id"))?;
             let accumulator = r.fixed::<32>().map_err(|_| TreatError::Malformed("acc"))?;
@@ -1069,8 +1129,25 @@ impl TreatLedger {
             let lifetime_redeemed = r.u64le().map_err(|_| TreatError::Malformed("redeemed"))?;
             let streak = r.u32le().map_err(|_| TreatError::Malformed("streak"))?;
             let repeats = r.u32le().map_err(|_| TreatError::Malformed("repeats"))?;
+            // v3 carries the last event kind; older blobs predate novelty
+            // tracking and decode with it unset (full novelty — the safe
+            // direction, never a surprise penalty).
+            let last_kind = if v >= 3 {
+                match r.u8().map_err(|_| TreatError::Malformed("last_kind"))? {
+                    255 => None,
+                    b => Some(TreatKind::from_u8(b).ok_or(TreatError::Malformed("last_kind"))?),
+                }
+            } else {
+                None
+            };
             let last_height = r.u64le().map_err(|_| TreatError::Malformed("height"))?;
             let events = r.u64le().map_err(|_| TreatError::Malformed("events"))?;
+            balance_sum = balance_sum
+                .checked_add(balance)
+                .ok_or(TreatError::Malformed("balances overflow"))?;
+            if balance_sum > outstanding {
+                return Err(TreatError::Malformed("outstanding below account balances"));
+            }
             ledger.accounts.insert(
                 id,
                 TreatAccount {
@@ -1080,6 +1157,7 @@ impl TreatLedger {
                     lifetime_redeemed,
                     streak,
                     repeats,
+                    last_kind,
                     last_height,
                     events,
                 },
@@ -1453,6 +1531,59 @@ mod tests {
     }
 
     #[test]
+    fn voucher_preview_binds_recipient_and_burns_nothing() {
+        // A voucher names its beneficiary: previewing for anyone else
+        // refuses, and previewing never consumes — a failed payment must
+        // not destroy the discount.
+        let mut l = TreatLedger::new(NET);
+        let v = l
+            .issue_voucher(NET, [7u8; 20], 900, VoucherKind::Trial, 100)
+            .unwrap();
+        assert_eq!(
+            l.voucher_cover(&v.id, 50, Some(VoucherKind::Trial), &[9u8; 20]),
+            Err(TreatError::WrongRecipient)
+        );
+        assert_eq!(
+            l.voucher_cover(&v.id, 50, Some(VoucherKind::Trial), &[7u8; 20]),
+            Ok(900)
+        );
+        // Still unconsumed after two previews: the burn happens only in
+        // `consume_voucher`, which the node calls after payment verifies.
+        assert_eq!(
+            l.voucher_cover(&v.id, 50, Some(VoucherKind::Trial), &[7u8; 20]),
+            Ok(900)
+        );
+    }
+
+    #[test]
+    fn novelty_damps_consecutive_repeats_and_resets_on_change() {
+        // Same kind twice: the second mint pays damped novelty.
+        let mut l = TreatLedger::new(NET);
+        let e1 = l
+            .event_for([3u8; 20], TreatKind::ServiceCompleted, 5, [4u8; 32])
+            .unwrap();
+        assert_eq!(e1.repeats, 0);
+        let m1 = e1.mint_amount();
+        l.commit(&e1).unwrap();
+        let e2 = l
+            .event_for([3u8; 20], TreatKind::ServiceCompleted, 6, [5u8; 32])
+            .unwrap();
+        assert_eq!(e2.repeats, 1, "same kind again increments");
+        assert!(e2.mint_amount() < m1, "novelty damps the repeat");
+        l.commit(&e2).unwrap();
+        // A different kind resets the run: full novelty again, so the
+        // reset mint beats the damped repeat mint.
+        let e3 = l
+            .event_for([3u8; 20], TreatKind::PaymentCompleted, 7, [6u8; 32])
+            .unwrap();
+        assert_eq!(e3.repeats, 0, "kind change resets");
+        assert!(
+            e3.mint_amount() >= e2.mint_amount(),
+            "reset restores novelty"
+        );
+    }
+
+    #[test]
     fn encode_decode_round_trip_v2_and_legacy_v1() {
         let mut l = TreatLedger::new(NET);
         let ev = l
@@ -1489,5 +1620,53 @@ mod tests {
         let legacy = TreatLedger::decode(&w.into_vec()).unwrap();
         assert_eq!(legacy.outstanding(), l.outstanding());
         assert_eq!(legacy.voucher_liability(6), 0);
+
+        // A v2 blob (accounts without the last-kind byte) decodes with
+        // novelty unset: full novelty going forward, never a surprise
+        // penalty for pre-tracking balances.
+        let mut v2 = Writer::with_capacity(128);
+        v2.u8(2);
+        v2.u16le(NET.len() as u16).raw(NET.as_bytes());
+        v2.u64le(1000);
+        v2.u32le(1);
+        v2.fixed(&[3u8; 20])
+            .fixed(&[9u8; 32])
+            .u64le(500)
+            .u64le(500)
+            .u64le(0)
+            .u32le(2)
+            .u32le(4)
+            .u64le(7)
+            .u64le(3);
+        v2.u32le(0).u32le(0).u32le(0);
+        v2.u64le(0).u32le(0).u32le(0);
+        let old = TreatLedger::decode(&v2.into_vec()).unwrap();
+        assert_eq!(old.balance(&[3u8; 20]), 500);
+        // Full novelty: repeats reset on the next event of any kind.
+        let next = old
+            .event_for([3u8; 20], TreatKind::ServiceCompleted, 8, [7u8; 32])
+            .unwrap();
+        assert_eq!(next.repeats, 0, "legacy accounts restart novelty");
+
+        // A forged blob whose outstanding cannot cover its balances
+        // refuses instead of loading a drain-ready ledger.
+        let mut bad = Writer::with_capacity(128);
+        bad.u8(3);
+        bad.u16le(NET.len() as u16).raw(NET.as_bytes());
+        bad.u64le(10);
+        bad.u32le(1);
+        bad.fixed(&[3u8; 20])
+            .fixed(&[9u8; 32])
+            .u64le(500)
+            .u64le(500)
+            .u64le(0)
+            .u32le(0)
+            .u32le(0)
+            .u8(255)
+            .u64le(7)
+            .u64le(3);
+        bad.u32le(0).u32le(0).u32le(0);
+        bad.u64le(0).u32le(0).u32le(0);
+        assert!(TreatLedger::decode(&bad.into_vec()).is_err());
     }
 }

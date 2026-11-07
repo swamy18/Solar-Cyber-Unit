@@ -33,6 +33,15 @@ settle signature covers (intent id + outcome) so only the quoted provider
 closes its own intent. Exchange integrations implement the provider side
 against these four calls: publish, list, accept, settle.
 
+Intent creation is intentionally open (the registry is a bulletin board,
+not a vault), which has one consequence: intent ids bind
+(quote, user, provider, fill_ref), so a *guessable* `fill_ref` can be
+pre-squatted and the victim's accept returns `duplicate:true`. No money
+moves on a squat — settlement still needs the provider's signature — but
+use unguessable references (the `srct_fund.py` default carries 64 random
+bits) and treat a surprise `duplicate:true` as a cue to re-quote, not an
+error to force through.
+
 Agent-side funding is one call: `templates/srct_fund.py` lists live
 `stable_to_srct` quotes, picks the cheapest fee covering the target,
 opens the intent and polls the registry trail until it is `filled`

@@ -110,6 +110,11 @@ pub struct SwapIntent {
 }
 
 impl SwapIntent {
+    /// Audit identity: every economic term, not just the total. Two quotes
+    /// with the same `sat_due` but different rates, fees, slippage or
+    /// expiry are different deals and must never share an id — otherwise
+    /// the off-protocol stablecoin leg and the on-protocol SRCT leg can
+    /// reference different economics under one reference.
     pub fn id(&self) -> Hash {
         sha256_dom(
             DOM_SWAP_INTENT,
@@ -118,7 +123,13 @@ impl SwapIntent {
                 &self.payer,
                 self.stable_asset.as_bytes(),
                 &self.stable_minor.to_le_bytes(),
+                self.quote.base.as_bytes(),
+                &self.quote.amount_minor.to_le_bytes(),
                 &self.quote.sat_due.to_le_bytes(),
+                &self.quote.fee_sat.to_le_bytes(),
+                &self.quote.slippage_bps.to_le_bytes(),
+                &self.quote.rate_sat_per_minor.to_le_bytes(),
+                &self.quote.expires_height.to_le_bytes(),
                 self.stable_ref.as_bytes(),
                 &self.nonce.to_le_bytes(),
             ],
@@ -185,17 +196,29 @@ pub fn quote_usd(
     if fee_bps > BPS || slippage_bps > BPS {
         return Err(FxError::Malformed("bps over 100%"));
     }
+    // A zero lifetime encodes an instantly-expired quote: refuse it rather
+    // than minting paper no one can settle.
+    if ttl_blocks == 0 {
+        return Err(FxError::Malformed("ttl_blocks must be > 0"));
+    }
     let gross = (amount_minor as u128)
         .checked_mul(rate.sat_per_minor as u128)
         .ok_or(FxError::Overflow)?;
+    // Fee and slippage round UP: the dust remainder (< 1 sat) belongs to
+    // the quoter, not the payer. Flooring biases every quote the same
+    // way; the operator would bleed a sat per leg forever.
     let fee = gross
         .checked_mul(fee_bps as u128)
+        .ok_or(FxError::Overflow)?
+        .checked_add(BPS as u128 - 1)
         .ok_or(FxError::Overflow)?
         / BPS as u128;
     // Slippage headroom is reserved inside sat_due so the payment still
     // covers the service if the next rate ticks against the payer.
     let slip = gross
         .checked_mul(slippage_bps as u128)
+        .ok_or(FxError::Overflow)?
+        .checked_add(BPS as u128 - 1)
         .ok_or(FxError::Overflow)?
         / BPS as u128;
     let total = gross
@@ -248,5 +271,41 @@ mod tests {
             Err(FxError::StaleRate)
         );
         assert!(quote_usd(&rate(), u64::MAX, 0, 0, 500, 60).is_err());
+    }
+
+    #[test]
+    fn dust_rounds_up_and_zero_ttl_refuses() {
+        // 1 minor at 1000 sat/minor, 1.51% fee: gross 1000, fee 15.1 -> 16.
+        let q = quote_usd(&rate(), 1, 151, 0, 500, 60).unwrap();
+        assert_eq!(q.fee_sat, 16, "dust belongs to the quoter");
+        assert_eq!(q.sat_due, 1016);
+        // A zero lifetime is an instantly-expired quote: refuse it.
+        assert!(quote_usd(&rate(), 100, 100, 50, 500, 0).is_err());
+    }
+
+    #[test]
+    fn swap_id_covers_all_economics() {
+        // Same total, different deal: must never share an audit id.
+        let a = SwapIntent {
+            network_id: "srct/testnet".to_string(),
+            payer: [1u8; 20],
+            stable_asset: "USDC".to_string(),
+            stable_minor: 100,
+            quote: Quote {
+                base: "USDC".to_string(),
+                amount_minor: 100,
+                sat_due: 101_500,
+                fee_sat: 1_000,
+                slippage_bps: 50,
+                rate_sat_per_minor: 1_000,
+                expires_height: 560,
+            },
+            stable_ref: "r".to_string(),
+            nonce: 7,
+        };
+        let mut b = a.clone();
+        b.quote.fee_sat = 900;
+        b.quote.slippage_bps = 150;
+        assert_ne!(a.id(), b.id(), "different economics, different id");
     }
 }

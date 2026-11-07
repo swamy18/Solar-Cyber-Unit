@@ -50,6 +50,11 @@ class SrctGuard:
     `policy_portable_json` (from `srct-worker grant` / `policy.export`) is
     the usual grant shape; `policy_hex` + `policy_sigs_hex` +
     `policy_keys_hex` is the raw alternative. One of the two is required.
+
+    Budget semantics mirror `SpendPolicy`: an allow-list that is `None`
+    means unbounded on that axis; a present list — even an empty one —
+    must contain the recipient/service. Untagged calls pass the client
+    service check and let the node decide (a tagged policy denies them).
     """
 
     def __init__(self, node, agent_id_hex, policy_portable_json=None,
@@ -138,14 +143,14 @@ class SrctGuard:
 
 def guarded(guard, amount_sat, recipient_hex, service_hex=None):
     """Decorator: run the guard before the function, every call."""
+    import functools
 
     def wrap(fn):
+        @functools.wraps(fn)
         def inner(*args, **kwargs):
             guard.check(amount_sat, recipient_hex, service_hex)
             return fn(*args, **kwargs)
 
-        inner.__name__ = getattr(fn, "__name__", "srct_guarded")
-        inner.__doc__ = fn.__doc__
         return inner
 
     return wrap
@@ -185,11 +190,18 @@ def crewai_tool(fn, *, guard, amount_sat, recipient_hex,
         guard.check(amount_sat, recipient_hex, service_hex)
         return fn(*args, **kwargs)
 
-    return type("SrctGuardedTool", (BaseTool,), {
+    # The documented CrewAI shape is class attributes plus no-arg
+    # construction; stricter BaseTool generations want the identity as
+    # constructor kwargs instead. Try the documented shape first.
+    tool_cls = type("SrctGuardedTool", (BaseTool,), {
         "name": name,
         "description": description,
         "_run": _run,
-    })()
+    })
+    try:
+        return tool_cls()
+    except TypeError:
+        return tool_cls(name=name, description=description)
 
 
 def llamaindex_tool(fn, *, guard, amount_sat, recipient_hex,
@@ -316,6 +328,18 @@ def _selftest():
         ct = crewai_tool(lambda: "crew", guard=guard, amount_sat=50,
                          recipient_hex="rr", name="ct", description="d")
         assert ct.name == "ct" and ct.description == "d", ct
+
+        # Stricter BaseTool generations want kwargs: the factory adapts.
+        class StrictBaseTool:
+            def __init__(self, *args, **kwargs):
+                if not kwargs:
+                    raise TypeError("identity required as kwargs")
+                self.__dict__.update(kwargs)
+
+        crewai_mod.BaseTool = StrictBaseTool
+        ct2 = crewai_tool(lambda: "crew2", guard=guard, amount_sat=50,
+                          recipient_hex="rr", name="ct2", description="d2")
+        assert ct2.name == "ct2" and ct2.description == "d2", ct2
     finally:
         del sys.modules["crewai"]
         del sys.modules["crewai.tools"]

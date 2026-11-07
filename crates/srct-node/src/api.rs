@@ -65,9 +65,9 @@
 //! POST /v1/streams/open        open a pay-as-you-use stream channel
 //! POST /v1/streams/settle      accept one stream voucher receipt
 //! GET  /v1/streams/{id}        stream accounting + claimable at this height
-//! GET /v1/payments/unsettled  recorded payments with no settlement bound
-//! GET /v1/receipts/orphans    receipts claiming unrecorded payments
-//! GET /v1/audit               tamper-evident audit ring + chain check
+//! GET /v1/payments/unsettled  recorded payments with no settlement bound (cursor-paged)
+//! GET /v1/receipts/orphans    receipts claiming unrecorded payments (cursor-paged)
+//! GET /v1/audit               tamper-evident audit ring + chain check (cursor-paged)
 //! GET /v1/risk/policy         safety knobs: thresholds, velocity, test mode
 //! POST /v1/reputation/passport/attest  assemble verifiable history events
 //! POST /v1/reputation/batch   register an issuer-signed passport batch
@@ -79,7 +79,7 @@
 //! GET /v1/jobs/{id}           job record + escrow state + hold flag
 //! GET /v1/payments/{id}/receipt_status  recorded/receipt/settlement state
 //! POST /v1/fx/rates           register an operator-signed USD rate
-//! GET /v1/fx/rates/list       live rates at this height
+//! GET /v1/fx/rates/list       live rates at this height (cursor-paged)
 //! POST /v1/fx/quote           lock a dollar price into exact satoshis
 //! POST /v1/fx/swap            record a stablecoin-in SRCT settlement
 //! POST /v1/ramp/quote         register a provider-signed ramp quote
@@ -88,7 +88,7 @@
 //! POST /v1/ramp/intent/{id}/settle  provider closes filled/refunded
 //! GET /v1/ramp/intents        registry trail for entry and exit (cursor-paged)
 //! POST /v1/loans/offers       lender publishes signed standard terms
-//! GET /v1/loans/offers/list   discover live offers, cheapest first
+//! GET /v1/loans/offers/list   discover live offers, cheapest first (cursor-paged)
 //! POST /v1/loans/accept       open a position on signed offer terms
 //! GET /v1/lending/borrower/{a} verified history + suggested ceiling
 //! GET /v1/lending/dashboard   exposure, due-soon, defaults, interest
@@ -594,9 +594,25 @@ pub struct SharedNode {
     /// P2P node and announces them to peers.
     pub tx_to_relay: Vec<Hash512>,
     /// L2 transactions that passed the dry-run; drained by the serve loop
-    /// into the next mined block's trailer.
+    /// into the next mined block's trailer. Bounded: pushes refuse past
+    /// [`MAX_L2_QUEUE`] instead of growing a flood without limit — the
+    /// dry-run is cheap to request and the queue is memory, so an
+    /// unbounded one is a remote OOM button.
     pub l2_to_include: Vec<L2Transaction>,
 }
+
+/// Cap for [`SharedNode::l2_to_include`]. The miner drains the queue into
+/// block space and the serve loop drops it every tick on relay-only
+/// nodes, but intake can outrun both under flood; past this the node
+/// refuses with 503 and the submitter retries.
+pub const MAX_L2_QUEUE: usize = 4096;
+
+/// Cap for [`SharedNode::tx_to_relay`]. Entries are 64-byte hashes drained
+/// every batch, so this only binds when the serve loop stalls while the
+/// API keeps accepting — past it, admission still succeeds (the pool
+/// holds the tx and blocks propagate it) but the announcement is
+/// skipped instead of queueing forever.
+pub const MAX_RELAY_QUEUE: usize = 16_384;
 
 impl SharedNode {
     pub fn new(chain: Chain, l2: NodeL2) -> Self {
@@ -3352,7 +3368,13 @@ async fn tx_broadcast(State(state): State<ApiState>, Json(req): Json<TxBroadcast
             );
             match outcome {
                 Ok(txid) => {
-                    sh.tx_to_relay.push(txid);
+                    // Relay announcements are best-effort: the pool holds
+                    // the admitted tx and blocks propagate it, so a full
+                    // relay queue skips the announcement instead of
+                    // refusing an acceptance or growing without bound.
+                    if sh.tx_to_relay.len() < MAX_RELAY_QUEUE {
+                        sh.tx_to_relay.push(txid);
+                    }
                     Ok(Json(json!({ "tx_hash": hash512_to_hex(&txid) })))
                 }
                 Err(srct_core::mempool::MempoolError::AlreadyKnown) => Ok(Json(
@@ -3394,6 +3416,13 @@ async fn l2_broadcast(State(state): State<ApiState>, Json(req): Json<L2Broadcast
         sh.l2
             .check(&sh.chain, &tx, sh.chain.height() + 1)
             .map_err(|e| fail(StatusCode::CONFLICT, "l2_refused", format!("{e}")))?;
+        if sh.l2_to_include.len() >= MAX_L2_QUEUE {
+            return Err(fail(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "l2_queue_full",
+                "inclusion queue is full; retry shortly",
+            ));
+        }
         sh.l2_to_include.push(tx);
         Ok(Json(
             json!({ "txid": hash512_to_hex(&txid), "queued": true }),
@@ -5663,6 +5692,13 @@ async fn escrow_settle(
         sh.l2
             .check(&sh.chain, &tx, sh.chain.height() + 1)
             .map_err(|e| fail(StatusCode::CONFLICT, "l2_refused", format!("{e}")))?;
+        if sh.l2_to_include.len() >= MAX_L2_QUEUE {
+            return Err(fail(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "l2_queue_full",
+                "inclusion queue is full; retry shortly",
+            ));
+        }
         sh.l2_to_include.push(tx);
         sh.escrow_exit.insert(
             id,
@@ -6851,35 +6887,33 @@ async fn stream_get(State(state): State<ApiState>, Path(raw): Path<String>) -> A
 // flight (`unsettled`) and what claims nothing recorded (`orphans`) before
 // retrying, and the audit ring gives developers the complete trail.
 
-/// `GET /v1/payments/unsettled` — recorded payments with no settlement tx
-/// bound and not yet expired. Retry these idempotently; do not rebuild them.
+/// `GET /v1/payments/unsettled[?limit=&cursor=]` — recorded payments with
+/// no settlement tx bound and not yet expired, in payment-id order. Retry
+/// these idempotently; do not rebuild them.
 async fn payments_unsettled(
     State(state): State<ApiState>,
     Query(query): Query<HashMap<String, String>>,
 ) -> ApiResult {
     let limit = page_limit(&query);
+    let cursor = page_cursor(&query);
     with_shared(&state, |sh| {
         let height = sh.chain.height();
         let settled: std::collections::BTreeSet<Hash> = sh.payment_tx.keys().copied().collect();
-        let mut out = Vec::new();
-        let mut total = 0usize;
+        let mut all = Vec::new();
         for (id, payment) in &sh.payment_store {
             if settled.contains(id) || height >= payment.expires_at_height {
                 continue;
             }
-            total += 1;
-            if out.len() < limit {
-                out.push(json!({
-                    "payment_id": hash_to_hex(id),
-                    "amount_sat": payment.amount_sat,
-                    "recipient": address_to_hex(&payment.recipient),
-                    "expires_at_height": payment.expires_at_height,
-                }));
-            }
+            all.push(json!({
+                "payment_id": hash_to_hex(id),
+                "amount_sat": payment.amount_sat,
+                "recipient": address_to_hex(&payment.recipient),
+                "expires_at_height": payment.expires_at_height,
+            }));
         }
-        let truncated = total > out.len();
+        let (out, total, truncated, next) = page_slice(&all, cursor, limit);
         Ok(Json(
-            json!({ "count": out.len(), "total": total, "truncated": truncated, "payments": out }),
+            json!({ "count": out.len(), "total": total, "truncated": truncated, "next_cursor": next, "payments": out }),
         ))
     })?
 }
@@ -6901,39 +6935,60 @@ fn page_limit(query: &HashMap<String, String>) -> usize {
         .min(MAX_PAGE)
 }
 
-/// `GET /v1/receipts/orphans` — receipts claiming payments this node never
-/// recorded. Investigate, never auto-settle.
+/// Resolve `?cursor=` for a list endpoint: an offset into that endpoint's
+/// documented order. Unparseable means the first page.
+fn page_cursor(query: &HashMap<String, String>) -> usize {
+    query
+        .get("cursor")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(0)
+}
+
+/// Slice a fully-collected page. Returns the page, the full match count,
+/// whether another page follows this one, and `next_cursor` (null on the
+/// last page). Every paged endpoint iterates a deterministically ordered
+/// source, so a cursor offset means the same thing on every node and
+/// every call — page N never silently skips or repeats entries.
+fn page_slice(items: &[Value], cursor: usize, limit: usize) -> (Vec<Value>, usize, bool, Value) {
+    let total = items.len();
+    let start = cursor.min(total);
+    let end = start.saturating_add(limit).min(total);
+    let more = end < total;
+    let next = if more { json!(end as u64) } else { Value::Null };
+    (items[start..end].to_vec(), total, more, next)
+}
+
+/// `GET /v1/receipts/orphans[?limit=&cursor=]` — receipts claiming payments
+/// this node never recorded, in receipt-id order. Investigate, never
+/// auto-settle.
 async fn receipts_orphans(
     State(state): State<ApiState>,
     Query(query): Query<HashMap<String, String>>,
 ) -> ApiResult {
     let limit = page_limit(&query);
+    let cursor = page_cursor(&query);
     with_shared(&state, |sh| {
         let known: std::collections::BTreeSet<Hash> = sh.payment_store.keys().copied().collect();
-        let mut out = Vec::new();
-        let mut total = 0usize;
+        let mut all = Vec::new();
         for receipt in sh.receipts.iter() {
             if !known.contains(&receipt.payment_id) {
-                total += 1;
-                if out.len() < limit {
-                    out.push(json!({
-                        "receipt_id": hash_to_hex(&receipt.receipt_id()),
-                        "payment_id": hash_to_hex(&receipt.payment_id),
-                        "amount_sat": receipt.amount_sat,
-                    }));
-                }
+                all.push(json!({
+                    "receipt_id": hash_to_hex(&receipt.receipt_id()),
+                    "payment_id": hash_to_hex(&receipt.payment_id),
+                    "amount_sat": receipt.amount_sat,
+                }));
             }
         }
-        let truncated = total > out.len();
+        let (out, total, truncated, next) = page_slice(&all, cursor, limit);
         Ok(Json(
-            json!({ "count": out.len(), "total": total, "truncated": truncated, "orphans": out }),
+            json!({ "count": out.len(), "total": total, "truncated": truncated, "next_cursor": next, "orphans": out }),
         ))
     })?
 }
 
-/// `GET /v1/audit[?limit=]` — the tamper-evident audit ring (newest last),
-/// plus chain verification. Full history lives in the payment/receipt
-/// stores; the ring is the index over them.
+/// `GET /v1/audit[?limit=&cursor=]` — the tamper-evident audit ring, newest
+/// first, plus chain verification. Full history lives in the
+/// payment/receipt stores; the ring is the index over them.
 async fn audit_list(
     State(state): State<ApiState>,
     Query(query): Query<HashMap<String, String>>,
@@ -6943,26 +6998,33 @@ async fn audit_list(
         .and_then(|v| v.parse().ok())
         .unwrap_or(100)
         .min(512);
+    let cursor = page_cursor(&query);
     with_shared(&state, |sh| {
         let valid = sh.audit.verify_chain().is_ok();
-        let entries: Vec<Value> = sh
+        let all: Vec<Value> = sh
             .audit
             .iter()
             .rev()
-            .take(limit)
             .map(|e| {
                 json!({
                     "seq": e.seq,
                     "kind": e.kind,
                     "payment_id": e.payment_id.map(|h| hash_to_hex(&h)),
                     "amount_sat": e.amount_sat,
-                    "detail": e.detail,
+                    "detail": e.detail
                 })
             })
             .collect();
+        let (entries, total, truncated, next) = page_slice(&all, cursor, limit);
         Ok(Json(json!({
             "chain_valid": valid,
+            // Completeness is separate from integrity: a valid chain that
+            // dropped writes has a blind tail, not a broken chain.
+            "complete": sh.audit.dropped() == 0,
             "count": entries.len(),
+            "total": total,
+            "truncated": truncated,
+            "next_cursor": next,
             "dropped": sh.audit.dropped(),
             "entries": entries,
         })))
@@ -8006,13 +8068,14 @@ async fn fx_rates(
     Query(query): Query<HashMap<String, String>>,
 ) -> ApiResult {
     let limit = page_limit(&query);
+    let cursor = page_cursor(&query);
     with_shared(&state, |sh| {
         let height = sh.chain.height();
-        let rates: Vec<Value> = sh
+        // BTreeMap order (by base): deterministic across nodes and calls.
+        let all: Vec<Value> = sh
             .fx_rates
             .values()
             .filter(|r| r.live_at(height))
-            .take(limit)
             .map(|r| {
                 json!({
                     "base": r.base,
@@ -8024,11 +8087,10 @@ async fn fx_rates(
             })
             .collect();
         // The rate book is trustee-curated and tiny (bounded by
-        // `MAX_FX_RATES`); the cap here is uniformity, not load.
-        let total = sh.fx_rates.values().filter(|r| r.live_at(height)).count();
-        let truncated = total > rates.len();
+        // `MAX_FX_RATES`); paging here is uniformity, not load.
+        let (rates, total, truncated, next) = page_slice(&all, cursor, limit);
         Ok(Json(
-            json!({ "height": height, "count": rates.len(), "total": total, "truncated": truncated, "rates": rates }),
+            json!({ "height": height, "count": rates.len(), "total": total, "truncated": truncated, "next_cursor": next, "rates": rates }),
         ))
     })?
 }
@@ -8641,13 +8703,14 @@ async fn loan_offers(
     Query(query): Query<HashMap<String, String>>,
 ) -> ApiResult {
     let limit = page_limit(&query);
+    let cursor = page_cursor(&query);
     with_shared(&state, |sh| {
         let height = sh.chain.height();
         let principal: u64 = query
             .get("principal")
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
-        let mut out: Vec<(&Hash, &srct_core::lending::LoanOffer)> = sh
+        let mut matches: Vec<(&Hash, &srct_core::lending::LoanOffer)> = sh
             .loan_offers
             .iter()
             .filter(|(_, (o, _, _))| {
@@ -8655,11 +8718,9 @@ async fn loan_offers(
             })
             .map(|(id, (o, _, _))| (id, o))
             .collect();
-        let total = out.len();
-        out.sort_by_key(|(_, o)| (o.rate_bps_per_window, o.id()));
-        out.truncate(limit);
-        let truncated = total > out.len();
-        let offers: Vec<Value> = out
+        // Cheapest rate first, id tiebreak: deterministic across nodes.
+        matches.sort_by_key(|(_, o)| (o.rate_bps_per_window, o.id()));
+        let all: Vec<Value> = matches
             .iter()
             .map(|(id, o)| {
                 json!({
@@ -8677,8 +8738,9 @@ async fn loan_offers(
                 })
             })
             .collect();
+        let (offers, total, truncated, next) = page_slice(&all, cursor, limit);
         Ok(Json(
-            json!({ "count": offers.len(), "total": total, "truncated": truncated, "offers": offers }),
+            json!({ "count": offers.len(), "total": total, "truncated": truncated, "next_cursor": next, "offers": offers }),
         ))
     })?
 }
@@ -9541,12 +9603,40 @@ async fn trial_repay(State(state): State<ApiState>, Json(req): Json<TrialTxReq>)
                 "one L1 payment repays at most one trial",
             ));
         }
-        // Trial benefit path: a Trial-kind voucher covers part of the
-        // repayment; the L1 payment covers the rest.
+        // Trial benefit path: a Trial-kind voucher naming this trial's
+        // agent covers part of the repayment; the L1 payment covers the
+        // rest. Preview first, burn last: the payment is verified against
+        // the discounted due *before* the voucher is consumed, so a failed
+        // payment cannot destroy someone's single-use discount — and a
+        // voucher naming another agent cannot be spent here at all.
         let mut voucher_cover = 0u64;
+        let mut voucher_id = None;
         if let Some(vhex) = req.voucher_id.as_deref() {
             let vid = decode_hash(vhex)?;
             voucher_cover = sh
+                .treats
+                .voucher_cover(
+                    &vid,
+                    sh.chain.height(),
+                    Some(srct_core::treats::VoucherKind::Trial),
+                    &trial.agent,
+                )
+                .map_err(|e| fail(StatusCode::CONFLICT, "voucher_refused", e.to_string()))?;
+            voucher_id = Some(vid);
+        }
+        let due = trial.amount_sat.saturating_sub(voucher_cover);
+        if !confirmed_payment_to(&sh.chain, &txid, &trial.sponsor, due) {
+            return Err(fail(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "trial_unpaid",
+                "no confirmed L1 payment covering the trial amount minus voucher back to the sponsor in that tx",
+            ));
+        }
+        // Burn only on the success path: the payment is confirmed, so the
+        // consume below cannot fail (same lock, same height, just
+        // previewed) and returns the same cover the preview priced.
+        if let Some(vid) = voucher_id {
+            let burned = sh
                 .treats
                 .consume_voucher(
                     &vid,
@@ -9554,17 +9644,7 @@ async fn trial_repay(State(state): State<ApiState>, Json(req): Json<TrialTxReq>)
                     Some(srct_core::treats::VoucherKind::Trial),
                 )
                 .map_err(|e| fail(StatusCode::CONFLICT, "voucher_refused", e.to_string()))?;
-        }
-        let due = trial.amount_sat.saturating_sub(voucher_cover);
-        if !confirmed_payment_to(&sh.chain, &txid, &trial.sponsor, due) {
-            // Voucher was consumed above but the payment failed: the burn is
-            // final by design (single-use), matching how a spent discount
-            // code stays spent when the order is abandoned.
-            return Err(fail(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "trial_unpaid",
-                "no confirmed L1 payment covering the trial amount minus voucher back to the sponsor in that tx",
-            ));
+            debug_assert_eq!(burned, voucher_cover);
         }
         let mut updated = trial.clone();
         updated.state = TrialState::Repaid;

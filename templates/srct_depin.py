@@ -110,10 +110,20 @@ def advertise(board, provider_hex, device, compute_units, unit,
 
 def discover(board, unit=None, min_units=0, max_price_sat=None,
              device=None, renewable_only=False):
-    """Live offers, cheapest unit price first. Discovery commits nothing."""
+    """Live offers, cheapest unit price first. Discovery commits nothing.
+
+    Hand-edited boards can hold malformed rows; entries missing the four
+    priced fields are skipped (never crash a match) — the trail keeps
+    them, discovery ignores them.
+    """
     doc = _load_board(board)
     out = []
     for o in _live(doc["offers"], _now()):
+        if not isinstance(o, dict):
+            continue
+        if any(k not in o for k in ("provider", "device",
+                                   "compute_units", "price_sat_per_unit")):
+            continue
         if unit is not None and o.get("unit") != unit:
             continue
         if o.get("compute_units", 0) < min_units:
@@ -219,10 +229,14 @@ def _selftest():
         # Expired offers are invisible, never deleted.
         doc = _load_board(board)
         doc["offers"][0]["expires_at"] = _now() - 1
+        # A malformed hand-edit is skipped by discovery, kept by the trail.
+        doc["offers"].append({"provider": "pp-broken"})
         _save_board(board, doc)
-        assert len(_load_board(board)["offers"]) == 3, "trail preserved"
+        assert len(_load_board(board)["offers"]) == 4, "trail preserved"
         assert all(o["provider"] != "pp-datacenter"
                    for o in discover(board, unit="gpu-hour")), "expired hidden"
+        assert all(o["provider"] != "pp-broken"
+                   for o in discover(board)), "malformed skipped"
     finally:
         if os.path.exists(board):
             os.remove(board)

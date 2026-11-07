@@ -819,6 +819,20 @@ impl Chain {
             return Err(e);
         }
 
+        // Committee inputs are pure reads: resolve them before any tail
+        // mutation (coinbase insert, vault advance, reserve credits) so a
+        // lookup failure unwinds through the body/stake/claims pattern
+        // above instead of leaving tail writes behind. Unreachable on a
+        // processable chain — seed snapshots are never pruned and the seed
+        // block is always applied — but ordered here so even the
+        // theoretical failure is a clean refusal.
+        let committee_keys = self
+            .committee_keys_at(height)
+            .ok_or(Error::StakeInvalid("missing seed snapshot"))?;
+        let committee_records = self
+            .committee_records_at(height)
+            .ok_or(Error::StakeInvalid("missing seed snapshot"))?;
+
         // Apply the coinbase last so its output is the freshest. A zero-value
         // coinbase is not recorded at all: `check_tx` refuses to spend a
         // zero-value output, so recording it would only grow the UTXO set with
@@ -939,17 +953,17 @@ impl Chain {
         // key set now that canonical state advanced. Side branches never reach
         // here (only canonical advancement applies blocks). The epoch set is
         // derived from seed-height bond state (P0-1), so it stays stable for
-        // the whole epoch.
-        let keys = self
-            .committee_keys_at(height)
-            .ok_or(Error::StakeInvalid("missing seed snapshot"))?;
-        self.finality.set_keys(keys);
-        let records = self
-            .committee_records_at(height)
-            .ok_or(Error::StakeInvalid("missing seed snapshot"))?;
+        // the whole epoch. Inputs were resolved above, before any tail
+        // mutation; the refresh itself cannot fail on them — bond admission
+        // already validated every key and refused every duplicate, so
+        // `derive_set` sees only clean records. The remaining `?` arms in
+        // this tail (fee-capped checked arithmetic) are unreachable by
+        // construction for the same reason: refusing them would also be
+        // correct, unwinding them is provably never needed.
+        self.finality.set_keys(committee_keys);
         self.finality
             .refresh_committee(
-                &records,
+                &committee_records,
                 height,
                 self.params.checkpoint_interval_blocks,
                 crate::validators::EPOCH_LOOKBACK_DEFAULT,

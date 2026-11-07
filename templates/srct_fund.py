@@ -26,6 +26,7 @@ Stdlib only: urllib + json + time. No new dependencies.
 """
 
 import json
+import os
 import sys
 import time
 import urllib.request
@@ -197,13 +198,17 @@ def ensure_funded(node, user_hex, min_sat, asset="USDC",
     """One call: cheapest live quote -> intent -> wait for the fill.
 
     Returns the settled intent dict. `fill_ref` defaults to a timestamped
-    reference the operator matches against the provider's out-of-band
-    receipt (bank reference, stablecoin tx hash). A quote that expires
-    between listing and intent is re-quoted once automatically — the
-    retry lists fresh quotes and skips the dead one, so no intent is
-    ever opened twice for the same fill.
+    reference with 64 random bits, which the operator matches against the
+    provider's out-of-band receipt (bank reference, stablecoin tx hash).
+    Uniqueness matters, not just readability: intent ids bind
+    (quote, user, provider, fill_ref), and anyone can pre-squat a
+    guessable reference on the open registry — randomness makes the
+    squat miss. A quote that expires between listing and intent is
+    re-quoted once automatically — the retry lists fresh quotes and
+    skips the dead one, so no intent is ever opened twice for the same
+    fill.
     """
-    ref = fill_ref or f"srct-fund-{int(time.time())}"
+    ref = fill_ref or f"srct-fund-{int(time.time())}-{os.urandom(8).hex()}"
     dead = set()
     for _ in range(2):
         quotes = [q for q in live_quotes(node, direction=direction,
