@@ -212,7 +212,7 @@ const MAX_BODY_BYTES: usize = 5 * 1024 * 1024;
 /// would mix scopes that must never meet. Version 10 appends the Smart Gate
 /// sections (grant registry, revocations, capability book) last; v8/v9 files
 /// migrate with empty gate state.
-const STATE_ENVELOPE_VERSION: u8 = 11;
+const STATE_ENVELOPE_VERSION: u8 = 12;
 
 /// Largest entry count any single map section in the state envelope may
 /// declare, checked before allocation. Real books are bounded by their own
@@ -927,9 +927,9 @@ impl SharedNode {
         // v8 files lack the trailing trials section and v9 files lack the
         // Smart Gate sections: migrate them with empty books instead of
         // refusing to boot.
-        if version != STATE_ENVELOPE_VERSION && version != 10 && version != 9 && version != 8 {
+        if version != STATE_ENVELOPE_VERSION && version != 11 && version != 10 && version != 9 && version != 8 {
             return Err(format!(
-                "state envelope version {version}, this build reads {STATE_ENVELOPE_VERSION} (and migrates 8/9)"
+                "state envelope version {version}, this build reads {STATE_ENVELOPE_VERSION} (and migrates 8/9/10/11)"
             ));
         }
 
@@ -1479,6 +1479,7 @@ impl SharedNode {
         })?;
         // v8 files end here: no trials section. v9 appends trials last.
         // v10 appends the Smart Gate sections after trials. v11 appends Treats last.
+        // v12 extends the Treats section (nonce guards, claims, vouchers); older files migrate with empty new stores.
         let (trials, guard_registry, guard_revoked, guards, treats) = if version == 8 {
             r.expect_end().map_err(|e| format!("state envelope: {e}"))?;
             (
@@ -1660,7 +1661,7 @@ impl SharedNode {
             let guards = decode_section(&mut r, "guards", |sr| {
                 srct_core::guard::GuardBook::decode(sr).map_err(|e| format!("guards: {e}"))
             })?;
-            let treats = if version == 10 {
+            let treats = if version <= 10 {
                 r.expect_end().map_err(|e| format!("state envelope: {e}"))?;
                 srct_core::treats::TreatLedger::new(mine.clone())
             } else {
@@ -2025,8 +2026,8 @@ async fn status(State(state): State<ApiState>) -> ApiResult {
             "pscb_reserve_sat": sh.chain.pscb_reserve(),
             "bsaver_reserve_sat": sh.chain.bsaver_reserve(),
             "treat_reserve_sat": sh.chain.treat_reserve(),
-            "treat_reserve_sat": sh.chain.treat_reserve(),
             "treats_outstanding": sh.treats.outstanding(),
+            "treats_voucher_liability_sat": sh.treats.voucher_liability(sh.chain.height()),
             "finalized_height": sh.chain.finalized_height(),
             "finality_activation_height": p.finality_activation_height,
             "finality_depth": p.finality_depth,
@@ -2081,6 +2082,8 @@ async fn conservation(State(state): State<ApiState>) -> ApiResult {
             "sink_held_sat": report.supply.sink_held_sat,
             "pscb_reserve_sat": sh.chain.pscb_reserve(),
             "bsaver_reserve_sat": sh.chain.bsaver_reserve(),
+            "treat_reserve_sat": sh.chain.treat_reserve(),
+            "treats_outstanding": sh.treats.outstanding(),
             "burned_fees_sat": sh.chain.burned_fees_total(),
             // Exit-outflow watch (lesson: the sink is a honeypot). An operator
             // alerts when the window fills faster than legitimate use: the
@@ -2295,9 +2298,23 @@ async fn metrics(
         gauge(
             &mut out,
             "srct_treat_reserve_sat",
-            "SRCT Treats reserve, in satoshi (10% of fee PSCB leg backing non-transferable agent Treats).",
+            "SRCT Treats reserve, in satoshi (10% of fee PSCB leg backing transferable agent Treats).",
             &net,
             sh.chain.treat_reserve(),
+        );
+        gauge(
+            &mut out,
+            "srct_treats_outstanding",
+            "Outstanding SRCT Treats across all holders.",
+            &net,
+            sh.treats.outstanding(),
+        );
+        gauge(
+            &mut out,
+            "srct_treats_voucher_liability_sat",
+            "Unconsumed Treats voucher liability, in satoshi.",
+            &net,
+            sh.treats.voucher_liability(sh.chain.height()),
         );
         gauge(
             &mut out,
@@ -4898,6 +4915,33 @@ async fn receipt_submit(
         }
         match sh.receipts.accept(&receipt, &network) {
             Ok(outcome) => {
+                if outcome == ReceiptOutcome::Inserted {
+                    // Fee-based Treats path 1: verified settlement mints.
+                    // Payer earns PaymentCompleted, the service earns
+                    // ServiceCompleted, each with a capped fee bonus from the
+                    // settled amount. Caller input cannot mint: the subject,
+                    // kind, source (receipt id) and height all come from the
+                    // accepted receipt and this node's tip.
+                    let height = sh.chain.height();
+                    let service_subject =
+                        derive_agent_id(&network, AgentRole::Service, &receipt.recipient);
+                    if let Ok(ev) = sh.treats.event_for(
+                        service_subject,
+                        srct_core::treats::TreatKind::ServiceCompleted,
+                        height,
+                        receipt.receipt_id(),
+                    ) {
+                        let _ = sh.treats.commit_with_fee(&ev, receipt.amount_sat);
+                    }
+                    if let Ok(ev) = sh.treats.event_for(
+                        receipt.agent_id,
+                        srct_core::treats::TreatKind::PaymentCompleted,
+                        height,
+                        receipt.receipt_id(),
+                    ) {
+                        let _ = sh.treats.commit_with_fee(&ev, receipt.amount_sat);
+                    }
+                }
                 audit_push(
                     sh,
                     "receipt_settled",
@@ -9146,6 +9190,7 @@ struct TrialAgentReq {
 struct TrialTxReq {
     agent_hex: String,
     txid_hex: String,
+    voucher_id: Option<String>,
 }
 
 /// `POST /v1/trials/request` — record a sponsored first task. No coin moves
@@ -9441,11 +9486,25 @@ async fn trial_repay(State(state): State<ApiState>, Json(req): Json<TrialTxReq>)
                 "one L1 payment repays at most one trial",
             ));
         }
-        if !confirmed_payment_to(&sh.chain, &txid, &trial.sponsor, trial.amount_sat) {
+        // Trial benefit path: a Trial-kind voucher covers part of the
+        // repayment; the L1 payment covers the rest.
+        let mut voucher_cover = 0u64;
+        if let Some(vhex) = req.voucher_id.as_deref() {
+            let vid = decode_hash(vhex)?;
+            voucher_cover = sh
+                .treats
+                .consume_voucher(&vid, sh.chain.height(), Some(srct_core::treats::VoucherKind::Trial))
+                .map_err(|e| fail(StatusCode::CONFLICT, "voucher_refused", e.to_string()))?;
+        }
+        let due = trial.amount_sat.saturating_sub(voucher_cover);
+        if !confirmed_payment_to(&sh.chain, &txid, &trial.sponsor, due) {
+            // Voucher was consumed above but the payment failed: the burn is
+            // final by design (single-use), matching how a spent discount
+            // code stays spent when the order is abandoned.
             return Err(fail(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "trial_unpaid",
-                "no confirmed L1 payment of the trial amount back to the sponsor in that tx",
+                "no confirmed L1 payment covering the trial amount minus voucher back to the sponsor in that tx",
             ));
         }
         let mut updated = trial.clone();
@@ -9476,20 +9535,40 @@ async fn trial_repay(State(state): State<ApiState>, Json(req): Json<TrialTxReq>)
 // every test uses, stay unauthenticated by design.
 
 
-// --- SRCT Treats: dopamine reward claims for agents/machines/robots ---
+// --- SRCT Treats: transferable reward claims for agents/machines/robots ---
+//
+// Exactly two acquisition paths: (1) fee-based auto-mint from verified
+// settlement artifacts the node itself observed (receipt acceptance,
+// claimed VWCs) — never from caller input; (2) owner-signed free gifts.
+// There is no generic mint route: the old `POST /v1/treats/mint` was
+// removed, so no API can print Treats from nothing. Transfers move claims
+// between holders under sender signatures; redemption burns Treats and
+// pays from the Treat reserve via single-use vouchers.
+fn treats_role(role: Option<&str>) -> Result<srct_core::agent::AgentRole, (StatusCode, Json<ErrorBody>)> {
+    match role.unwrap_or("machine") {
+        "machine" => Ok(srct_core::agent::AgentRole::Machine),
+        "human" => Ok(srct_core::agent::AgentRole::Human),
+        "service" => Ok(srct_core::agent::AgentRole::Service),
+        _ => Err(bad("role must be machine, human or service")),
+    }
+}
+
 async fn treats_balance(
     State(state): State<ApiState>,
     Path(raw): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
 ) -> ApiResult {
     let addr = decode_address(&raw)?;
+    let role = treats_role(query.get("role").map(|s| s.as_str()))?;
     with_shared(&state, |sh| {
         let network = sh.chain.params().network_id.clone();
-        let subject = derive_agent_id(&network, AgentRole::Machine, &addr);
+        let subject = derive_agent_id(&network, role, &addr);
         let bal = sh.treats.balance(&subject);
         let acc = sh.treats.account(&subject).cloned().unwrap_or_default();
         Ok(Json(json!({
             "agent_id": hex::encode(subject),
             "address": hex::encode(addr),
+            "role": format!("{role:?}"),
             "network_id": network,
             "balance": bal,
             "lifetime_earned": acc.lifetime_earned,
@@ -9502,35 +9581,129 @@ async fn treats_balance(
 }
 
 #[derive(Deserialize)]
-struct TreatsMintReq {
-    agent_hex: String,
-    kind: String,
-    source_hex: String,
-    height: Option<u64>,
+struct TreatsGiftReq {
+    giver_hex: String,
+    recipient_hex: String,
+    role: Option<String>,
+    amount: u64,
+    nonce: u64,
+    expiry_height: u64,
+    sigs_hex: String,
+    keys_hex: String,
 }
 
-async fn treats_mint(State(state): State<ApiState>, Json(req): Json<TreatsMintReq>) -> ApiResult {
-    let addr = decode_address(&req.agent_hex)?;
-    let source = decode_hash(&req.source_hex)?;
-    let kind = match req.kind.as_str() {
-        "verified_work" => srct_core::treats::TreatKind::VerifiedWork,
-        "service_completed" => srct_core::treats::TreatKind::ServiceCompleted,
-        "payment_completed" => srct_core::treats::TreatKind::PaymentCompleted,
-        "dispute_won" => srct_core::treats::TreatKind::DisputeWon,
-        "dispute_lost" => srct_core::treats::TreatKind::DisputeLost,
-        _ => return Err(bad("kind must be verified_work, service_completed, payment_completed, dispute_won or dispute_lost")),
-    };
+/// `POST /v1/treats/gift` — human/system free reward. The giver signs the
+/// exact recipient, amount, nonce and expiry; the node verifies and applies.
+async fn treats_gift(State(state): State<ApiState>, Json(req): Json<TreatsGiftReq>) -> ApiResult {
+    if req.amount == 0 {
+        return Err(bad("amount must be > 0"));
+    }
+    let giver = decode_address(&req.giver_hex)?;
+    let recipient_addr = decode_address(&req.recipient_hex)?;
+    let role = treats_role(req.role.as_deref())?;
+    let sigs = decode_bundle(&req.sigs_hex, "sigs")?;
+    let keys = decode_bundle(&req.keys_hex, "keys")?;
     with_shared(&state, |sh| {
         let network = sh.chain.params().network_id.clone();
-        let subject = derive_agent_id(&network, AgentRole::Machine, &addr);
-        let height = req.height.unwrap_or_else(|| sh.chain.height());
-        if sh.treats.network_id() != network {
-            sh.treats = srct_core::treats::TreatLedger::new(network.clone());
-        }
-        let ev = sh.treats.event_for(subject, kind, height, source).map_err(|e| bad(e.to_string()))?;
-        let applied = sh.treats.commit(&ev).map_err(|e| bad(e.to_string()))?;
+        let recipient = derive_agent_id(&network, role, &recipient_addr);
+        let cert = srct_core::treats::GiftCertificate {
+            network_id: network.clone(),
+            giver,
+            recipient,
+            amount: req.amount,
+            nonce: req.nonce,
+            expiry_height: req.expiry_height,
+        };
+        let height = sh.chain.height();
+        let balance = sh
+            .treats
+            .apply_gift(&cert, &keys, &sigs, height)
+            .map_err(|e| bad(e.to_string()))?;
         Ok(Json(json!({
-            "agent_id": hex::encode(subject),
+            "agent_id": hex::encode(recipient),
+            "gifted": req.amount,
+            "balance": balance,
+            "outstanding": sh.treats.outstanding(),
+        })))
+    })?
+}
+
+#[derive(Deserialize)]
+struct TreatsTransferReq {
+    sender_hex: String,
+    recipient_hex: String,
+    role: Option<String>,
+    amount: u64,
+    nonce: u64,
+    expiry_height: u64,
+    sigs_hex: String,
+    keys_hex: String,
+}
+
+/// `POST /v1/treats/transfer` — agent-to-agent move under the sender's key.
+async fn treats_transfer(State(state): State<ApiState>, Json(req): Json<TreatsTransferReq>) -> ApiResult {
+    if req.amount == 0 {
+        return Err(bad("amount must be > 0"));
+    }
+    let sender = decode_address(&req.sender_hex)?;
+    let recipient_addr = decode_address(&req.recipient_hex)?;
+    let role = treats_role(req.role.as_deref())?;
+    let sigs = decode_bundle(&req.sigs_hex, "sigs")?;
+    let keys = decode_bundle(&req.keys_hex, "keys")?;
+    with_shared(&state, |sh| {
+        let network = sh.chain.params().network_id.clone();
+        let sender_subject = derive_agent_id(&network, role, &sender);
+        let recipient = derive_agent_id(&network, role, &recipient_addr);
+        let cert = srct_core::treats::TransferCertificate {
+            network_id: network.clone(),
+            sender,
+            sender_subject,
+            recipient,
+            amount: req.amount,
+            nonce: req.nonce,
+            expiry_height: req.expiry_height,
+        };
+        let height = sh.chain.height();
+        let (sbal, rbal) = sh
+            .treats
+            .apply_transfer(&cert, &keys, &sigs, height)
+            .map_err(|e| bad(e.to_string()))?;
+        Ok(Json(json!({
+            "sender": hex::encode(sender_subject),
+            "sender_balance": sbal,
+            "recipient": hex::encode(recipient),
+            "recipient_balance": rbal,
+            "moved": req.amount,
+        })))
+    })?
+}
+
+#[derive(Deserialize)]
+struct TreatsClaimWorkReq {
+    task_id: String,
+}
+
+/// `POST /v1/treats/claim-work` — fee-based path 2. The node looks up the
+/// VWC for the task in its own L2 state and mints VerifiedWork once.
+/// No certificate, no claim; already-claimed tasks refuse.
+async fn treats_claim_work(State(state): State<ApiState>, Json(req): Json<TreatsClaimWorkReq>) -> ApiResult {
+    let task_id = decode_hash(&req.task_id)?;
+    with_shared(&state, |sh| {
+        let network = sh.chain.params().network_id.clone();
+        let cert = sh
+            .l2
+            .state()
+            .vwc(&task_id)
+            .ok_or_else(|| not_found("no certificate for task"))?;
+        let worker = derive_agent_id(&network, AgentRole::Machine, &cert.worker);
+        let height = sh.chain.height();
+        let applied = sh
+            .treats
+            .claim_verified_work(task_id, cert.id, worker, cert.payment_sat, height)
+            .map_err(|e| bad(e.to_string()))?;
+        Ok(Json(json!({
+            "agent_id": hex::encode(worker),
+            "task_id": hash_to_hex(&task_id),
             "minted": applied.minted,
             "balance": applied.balance,
             "event_id": hex::encode(applied.event_id),
@@ -9541,17 +9714,26 @@ async fn treats_mint(State(state): State<ApiState>, Json(req): Json<TreatsMintRe
 #[derive(Deserialize)]
 struct TreatsRedeemReq {
     agent_hex: String,
+    role: Option<String>,
     treats: u64,
+    kind: Option<String>,
 }
 
+/// `POST /v1/treats/redeem` — burn Treats, debit the reserve, and issue a
+/// single-use voucher toward one benefit: `fee_credit` (default),
+/// `discount`, `trial`, or `service_credit`. The voucher, not raw sats,
+/// is what benefit paths consume, so every spend is exactly-once.
 async fn treats_redeem(State(state): State<ApiState>, Json(req): Json<TreatsRedeemReq>) -> ApiResult {
     if req.treats == 0 {
         return Err(bad("treats must be > 0"));
     }
     let addr = decode_address(&req.agent_hex)?;
+    let role = treats_role(req.role.as_deref())?;
+    let kind = srct_core::treats::VoucherKind::parse_kind(req.kind.as_deref().unwrap_or("fee_credit"))
+        .ok_or_else(|| bad("kind must be fee_credit, discount, trial or service_credit"))?;
     with_shared(&state, |sh| {
         let network = sh.chain.params().network_id.clone();
-        let subject = derive_agent_id(&network, AgentRole::Machine, &addr);
+        let subject = derive_agent_id(&network, role, &addr);
         let outstanding = sh.treats.outstanding().max(1);
         let reserve = sh.chain.treat_reserve();
         let quote = srct_core::treats::redeem_quote(req.treats, reserve, outstanding).ok_or_else(|| bad("quote overflow"))?;
@@ -9560,13 +9742,51 @@ async fn treats_redeem(State(state): State<ApiState>, Json(req): Json<TreatsRede
         }
         sh.treats.burn_for_redeem(&subject, req.treats).map_err(|e| bad(e.to_string()))?;
         sh.chain.spend_treat_reserve(quote).map_err(|e| bad(e.to_string()))?;
+        let height = sh.chain.height();
+        let voucher = sh
+            .treats
+            .issue_voucher(&network, subject, quote, kind, height)
+            .map_err(|e| bad(e.to_string()))?;
         Ok(Json(json!({
             "agent_id": hex::encode(subject),
             "burned": req.treats,
             "payout_sat": quote,
+            "voucher_id": hex::encode(voucher.id),
+            "voucher_kind": req.kind.as_deref().unwrap_or("fee_credit"),
+            "voucher_expiry_height": voucher.expiry_height,
             "balance": sh.treats.balance(&subject),
             "reserve_sat": sh.chain.treat_reserve(),
         })))
+    })?
+}
+
+#[derive(Deserialize)]
+struct TreatsVoucherConsumeReq {
+    voucher_id: String,
+    kind: Option<String>,
+}
+
+/// `POST /v1/treats/voucher/consume` — spend a voucher directly (wallets,
+/// discount and service-credit paths). Trial repay consumes internally.
+async fn treats_voucher_consume(
+    State(state): State<ApiState>,
+    Json(req): Json<TreatsVoucherConsumeReq>,
+) -> ApiResult {
+    let vid = decode_hash(&req.voucher_id)?;
+    let want = match req.kind.as_deref() {
+        None => None,
+        Some(k) => Some(
+            srct_core::treats::VoucherKind::parse_kind(k)
+                .ok_or_else(|| bad("kind must be fee_credit, discount, trial or service_credit"))?,
+        ),
+    };
+    with_shared(&state, |sh| {
+        let height = sh.chain.height();
+        let value = sh
+            .treats
+            .consume_voucher(&vid, height, want)
+            .map_err(|e| bad(e.to_string()))?;
+        Ok(Json(json!({ "voucher_id": hash_to_hex(&vid), "value_sat": value })))
     })?
 }
 
@@ -9576,6 +9796,7 @@ async fn treats_reserve(State(state): State<ApiState>) -> ApiResult {
             "reserve_sat": sh.chain.treat_reserve(),
             "outstanding": sh.treats.outstanding(),
             "subjects": sh.treats.subjects(),
+            "voucher_liability_sat": sh.treats.voucher_liability(sh.chain.height()),
             "bps": srct_core::treats::TREAT_BPS,
         })))
     })?
@@ -9690,8 +9911,11 @@ pub fn router(state: ApiState, cfg: &ApiConfig) -> Router {
         .route("/v1/trials/{agent}", get(trial_get))
         .route("/v1/trials/repay", post(trial_repay))
         .route("/v1/treats/balance/{agent}", get(treats_balance))
-        .route("/v1/treats/mint", post(treats_mint))
+        .route("/v1/treats/gift", post(treats_gift))
+        .route("/v1/treats/transfer", post(treats_transfer))
+        .route("/v1/treats/claim-work", post(treats_claim_work))
         .route("/v1/treats/redeem", post(treats_redeem))
+        .route("/v1/treats/voucher/consume", post(treats_voucher_consume))
         .route("/v1/treats/reserve", get(treats_reserve));
     // The stack stays `Router<ApiState>` (no state yet) until the end, where a
     // single `with_state` resolves it to the servable `Router<()>`.

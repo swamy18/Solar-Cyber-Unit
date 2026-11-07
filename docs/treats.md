@@ -1,66 +1,64 @@
 # SRCT Treats
 
-Non-transferable dopamine reward claims for AI agents, machines and robots.
-Third value component next to liquid SRCT (UTXO) and committed SRCT (L2
-escrow): Treats never live in the UTXO set, are never transferable, and are
-never spendable as coin.
+Transferable reward claims for AI agents, machines and robots. Third value
+component next to liquid SRCT (UTXO) and committed SRCT (L2 escrow): Treats
+never live in the UTXO set and are never spendable as coin. Value leaves the
+system only as satoshis, when Treats are burned and the backing Treat
+reserve pays out.
 
-## Funding
+## Acquisition: exactly two paths, both verified
 
-Each block's base-fee portion splits 50/50 into burn and the PSCB leg. The
-leg subdivides, all integer-floored:
+There is no generic mint route. The old `POST /v1/treats/mint` was removed,
+so no API can print Treats from nothing.
 
-```text
-full_base -> burn (ceil 50%) + PSCB leg (floor 50%)
-PSCB leg  -> retained PSCB + B-Saver (5%, cap 10%) + Treats (10%, cap 20%)
-```
+1. **Fee-based auto-mint.** The node mints by itself when it observes
+   verified settlement:
+   - an accepted service receipt mints `ServiceCompleted` to the service
+     and `PaymentCompleted` to the payer (source = receipt id);
+   - `POST /v1/treats/claim-work {task_id}` mints `VerifiedWork` once per
+     task when the node's own L2 state holds the VWC (source = VWC id).
+   
+   Each mint is base weight plus a capped fee bonus:
+   `mint = base + min(fee_sat / 1000, 50)`. Wash trading is bounded by
+   real fees paid, per-event caps, and dispute slashing.
+2. **Owner-signed gifts.** `POST /v1/treats/gift` applies a gift only with
+   the giver's signature over the exact recipient, amount, nonce and
+   expiry. Replay (same or lower nonce), forgery, expiry, and cap
+   violations all refuse before anything mutates.
 
-Invariant: `burned + pscb_retained + bsaver + treat == full_base`.
-`Chain::treat_reserve` is credited per canonical block and rewound per
-rolled-back block, checked by `verify_canonical_chain`, and counted in
-`base_removed_total` (net-supply reporting). Redemption never mints: an
-empty reserve refuses.
+Fixed base weights: VerifiedWork 20, ServiceCompleted/PaymentCompleted 5,
+DisputeWon 10, DisputeLost slashes the holder to zero.
 
-## Mint (service layer, `srct-core::treats`)
+## Storage and transfers
 
-`TreatLedger` is node-local, keyed by `AgentId`, accumulator-chained with a
-bounded per-subject source ring (one source counts once). Weights are a
-fixed table in code — an event carries no amount and no weight:
+Treats are storable and accumulate for later use. Growth is bounded, not
+decayed: a per-holder ceiling (1,000,000) and a global outstanding
+ceiling (500,000,000) refuse further mints.
 
-| Event | Base Treats |
-|---|---|
-| VerifiedWork | 20 |
-| ServiceCompleted | 5 |
-| PaymentCompleted | 5 |
-| DisputeWon | 10 |
-| DisputeLost | 0 + balance slashed to zero |
+Holders move claims with `POST /v1/treats/transfer`: the sender signs the
+exact recipient, amount, nonce and expiry. Nonce-per-sender replay guards
+persist across restarts, so a transfer certificate spends exactly once and
+verifies anywhere.
 
-Dopamine shaping, integer-only: novelty damps repeats with the same
-counterparty (floor 10%), streak adds up to +50% for consecutive verified
-epochs, and balances decay 1% per 1,000 blocks of inactivity.
+## Redemption: sell, discounts, trials, credits
 
-## Redemption
+`POST /v1/treats/redeem {agent, treats, kind}` burns Treats, debits the
+Treat reserve at the proportional quote
+(`payout_sat = treats * reserve / outstanding`, floored), and issues a
+single-use voucher toward one benefit kind: `fee_credit` (default),
+`discount`, `trial`, or `service_credit`. Vouchers live 1,440 blocks and
+spend exactly once (`POST /v1/treats/voucher/consume`, or internally by
+trial repay, where a Trial-kind voucher covers part of the L1 repayment).
 
-Burn Treats, receive fee-credit sats at the proportional quote:
+Free gifts dilute the quote rather than draining fixed value: new claims
+raise `outstanding` against the same reserve, so each Treat redeems for
+fewer sats. The reserve is never minted into and an empty reserve refuses.
 
-```text
-payout_sat = treats * treat_reserve_sat / outstanding_treats (floored)
-```
+## Money rules
 
-`payout_sat == 0` or above the reserve is refused. No transfer endpoint
-exists by design.
-
-## API
-
-- `GET /v1/treats/balance/{agent}` — balance, lifetime earned/redeemed, streak, outstanding, reserve.
-- `POST /v1/treats/mint` — `{agent_hex, kind, source_hex, height?}`; kinds `verified_work`, `service_completed`, `payment_completed`, `dispute_won`, `dispute_lost`.
-- `POST /v1/treats/redeem` — `{agent_hex, treats}`; burns and pays from the reserve.
-- `GET /v1/treats/reserve` — reserve, outstanding, subjects.
-- `status`, `conservation`, `/metrics` also report `treat_reserve_sat`.
-
-## What Treats are not
-
-Not a currency, not a UTXO asset, not consensus money. Consensus tracks
-only the backing sat reserve; balances are this node's view (persisted in
-`state.bin` v11) like reputation. A fork or another node may disagree on a
-balance; no node can disagree on the reserve.
+- Funding: 10% of each block's PSCB leg → `treat_reserve` (cap 20%).
+  Invariant: `burned + pscb_retained + bsaver + treat == full_base`.
+- `Chain::treat_reserve` is credited and rewound per block and re-derived
+  by `verify_canonical_chain`. Transfers and gifts never touch it.
+- Balances are this node's view (persisted in `state.bin` v12); the
+  reserve and the UTXO set are the cross-node truth.

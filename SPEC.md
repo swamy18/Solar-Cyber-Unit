@@ -553,7 +553,9 @@ PSCB. Invariant: `burned + pscb_retained + bsaver + treat == base_fee_total`.
 `Chain::treat_reserve` and `Chain::bsaver_reserve` are credited and rewound
 per block exactly like PSCB and are likewise re-derived by
 `verify_canonical_chain`. Redemption from the Treat reserve never mints: an
-empty reserve refuses.
+empty reserve refuses. Treat transfers and owner-signed gifts move claims in
+the node service layer only and never touch the reserve; redemption burns
+claims and pays from it via single-use vouchers.
 
 ```
 gas_per_tx  = 16 000 + 1 000 × input_count + 250 × output_count

@@ -150,6 +150,16 @@ class SrctAgent:
             raise SrctError(f"grant refused:\n{out}")
         return out
 
+    def treats(self, address_hex):
+        """Read this agent's Treats balance (fee rewards + gifts, storable)."""
+        try:
+            status, body = self._get(f"/v1/treats/balance/{address_hex}")
+        except SrctError:
+            raise
+        if status != 200:
+            raise SrctError(f"node answered {status} for treats")
+        return body
+
     # -- the loop ---------------------------------------------------------
 
     def serve(self, task_fn, poll_secs=10, max_tasks=0, max_polls=0):

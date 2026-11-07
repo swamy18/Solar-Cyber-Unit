@@ -165,7 +165,7 @@ Every piece of jargon, in one line each:
 | Term | What it is |
 |---|---|
 | `PSCB` | Protocol-owned leg: half of every base fee (retained PSCB plus the B-Saver floor and the Treats backing); pays whistleblower bounties and vesting. |
-| `Treats` | Non-transferable dopamine reward claims for agents/machines/robots, backed by 10% of the PSCB leg and redeemable only for fee-credit sats. Never a UTXO, never transferable. |
+| `Treats` | Transferable reward claims for agents/machines/robots, backed by 10% of the PSCB leg and redeemable via single-use vouchers (fee credit, discount, trial, service credit). Never a UTXO, never spendable as coin. |
 | `VWC` | Verified-work certificate: a credential derived from a *settled* task — proof work was paid for, never a self-claim. |
 | `TopN` | Committee rule: the N largest bonds form the validator set (N = 21). |
 | `PPLNS` | Pool payout rule: pay per last N shares — rewards recent work, resists pool-hopping. |
@@ -935,7 +935,7 @@ from revenue (`POST /v1/lending/autorepay`, revocable, capped, expiring;
 
 ### SRCT Treats
 
-[`docs/treats.md`](docs/treats.md). Non-transferable dopamine reward claims for agents, machines and robots — the third value component next to liquid SRCT and committed escrow. Backed by 10% of each block's PSCB leg (`Chain::treat_reserve`, reorg-rewound, reported in `status` / `conservation` / `/metrics`). Mint weights are fixed in code (VerifiedWork 20, ServiceCompleted/PaymentCompleted 5, DisputeWon 10, DisputeLost slashes to zero) with novelty damping, streak bonus and inactivity decay. Redemption burns Treats for fee-credit sats at `reserve * treats / outstanding`. `GET /v1/treats/balance/{agent}`, `POST /v1/treats/mint`, `POST /v1/treats/redeem`, `GET /v1/treats/reserve`.
+[`docs/treats.md`](docs/treats.md). Transferable reward claims for agents, machines and robots — the third value component next to liquid SRCT and committed escrow. Backed by 10% of each block's PSCB leg (`Chain::treat_reserve`, reorg-rewound, reported in `status` / `conservation` / `/metrics`). No open mint: Treats accrue only from verified settlement (receipt auto-mint, VWC claim) with base weight plus capped fee bonus, or from owner-signed gifts. Storable and capped (per-holder + global ceilings, no decay); agent-to-agent transfers move under sender signatures; redemption burns Treats for single-use vouchers (fee credit, discount, trial, service credit). `GET /v1/treats/balance/{agent}`, `POST /v1/treats/gift`, `POST /v1/treats/transfer`, `POST /v1/treats/claim-work`, `POST /v1/treats/redeem`, `GET /v1/treats/reserve`. `srct-worker treats-balance` shows the balance.
 
 Demo covering reputation, tiers, jobs, USD quotes, ramps and lending:
 `python sim/agent_economy_demo.py`.

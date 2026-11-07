@@ -99,6 +99,7 @@ fn usage() -> String {
                        [--network <name>]
   srct-worker trial-status --node <base-url> --agent <agent-hex> [--network <name>]
   srct-worker trial-repay --node <base-url> --agent <agent-hex> --txid <txid-hex>
+  srct-worker treats-balance --node <base-url> --agent <agent-hex> [--role <role>]
                        [--network <name>]
   verify-cert defaults: --network mini.
   pay defaults: --network mini, --expiry-blocks 10 (guard caps the window at 30).
@@ -140,6 +141,7 @@ fn run(args: &[String]) -> Result<i32, String> {
         "trial-fund" => cmd_trial_fund(args),
         "trial-status" => cmd_trial_status(args),
         "trial-repay" => cmd_trial_repay(args),
+        "treats-balance" => cmd_treats_balance(args),
         "verify-cert" => cmd_verify_cert(args),
         other => Err(format!("unknown command `{other}`\n{}", usage())),
     }
@@ -1067,6 +1069,24 @@ fn cmd_trial_repay(args: &[String]) -> Result<i32, String> {
         .and_then(serde_json::Value::as_str)
         .unwrap_or("?");
     println!("trial       {state}");
+    Ok(0)
+}
+
+fn cmd_treats_balance(args: &[String]) -> Result<i32, String> {
+    let (view, agent) = trial_node(args, "treats-balance")?;
+    let role = str_arg(args, "--role").map(|s| s.as_str()).unwrap_or("machine");
+    let (code, doc) = view
+        .get_full_json(&format!("/v1/treats/balance/{}?role={}", hex::encode(agent), role))
+        .map_err(|e| format!("could not read treats: {e}"))?;
+    if !(200..300).contains(&code) {
+        let why = HttpNode::refusal_detail(&doc).unwrap_or_else(|| format!("HTTP {code}"));
+        return Err(format!("treats balance refused: {why}"));
+    }
+    for key in ["balance", "lifetime_earned", "lifetime_redeemed", "streak", "outstanding", "reserve_sat"] {
+        if let Some(v) = doc.get(key) {
+            println!("{key:<16} {v}");
+        }
+    }
     Ok(0)
 }
 
