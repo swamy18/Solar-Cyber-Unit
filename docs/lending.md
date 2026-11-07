@@ -274,3 +274,21 @@ wallet balances and the `credit_locked` pool:
 The lender is always the original counterparty named in the position —
 repayments and defaults always pay that address, never a pool or a different
 lender.
+
+## Staking & yield tracker
+
+Locking has two legs. **Validator bonds** lock stake for consensus
+security: the committee is always the 21 highest-staked bonds, unbonding
+takes 1008 blocks, equivocation slashes the full bond into the vault —
+`templates/srct_stake.py` reports these consensus facts (`bond_facts()`)
+for operators planning a bond. **Productive lending** is the live yield
+leg: locked principal earns chain-capped simple interest (10% per window)
+from collateralized borrowers. The same template drives it end to end —
+`live_offers` / `best_offer_for` (cheapest rate covering the principal),
+`estimate_yield` (projection under the chain cap), `position_summary`
+(one call: offer + projection), `dashboard` (live exposure and expected
+interest), `autorepay_status` (the borrower's standing instruction).
+`python templates/srct_stake.py --selftest` exercises it offline.
+Redirecting protocol revenue (fees, slash vesting) to stakers is not
+included: that is a monetary-policy decision needing a consensus change,
+not a template.

@@ -448,6 +448,12 @@ spend policy is checked before it runs
 Funding is one call too: `templates/srct_fund.py` picks the cheapest live
 ramp quote, opens the intent and waits for the provider's fill
 (`ensure_funded(...)`; `python templates/srct_fund.py --selftest`).
+Surplus compute earns through `templates/srct_depin.py` — advertise GPU /
+CPU / solar-edge capacity, discover the cheapest fitting offer, match it
+to a payable L2 task (`python templates/srct_depin.py --selftest`) — and
+locked tokens are tracked by `templates/srct_stake.py`: validator-bond
+facts plus the lending yield leg with projections and the live risk
+dashboard (`python templates/srct_stake.py --selftest`).
 
 **Trial faucet (operator setup).** Trials stay disabled until a sponsor is
 configured — with no sponsor there is no money behind a trial, so every

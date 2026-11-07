@@ -49,3 +49,17 @@ provider, so the guarantee is structural: `GET /v1/payments/{id}/receipt_status`
 reports `{recorded, receipt_present, settlement_tx}` and agents poll it —
 treating a payment as complete before its receipt appears is a client bug,
 and the endpoint makes that check one call.
+
+## Capacity discovery (DePIN)
+
+Jobs assume the hirer already knows a worker. `templates/srct_depin.py`
+closes that gap: providers advertise surplus compute — datacenter GPU,
+home CPU, NPU box, or a solar-powered edge device — with units, unit
+price, and expiry on a local JSON board (`advertise`); consumers filter
+by unit, price, device class, or renewable-only (`discover`, cheapest
+first) and take the best fit plus the payable L2 task shape (`match`).
+Discovery commits nothing and custody never enters the picture — money
+moves only through the task economy's verified-work certificates, so an
+offer that cannot deliver simply never earns. This is the intrinsic-demand
+story: real compute buys and sells for SRCT, not speculation.
+`python templates/srct_depin.py --selftest` exercises it offline.
