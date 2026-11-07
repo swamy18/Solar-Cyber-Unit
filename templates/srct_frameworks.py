@@ -310,9 +310,7 @@ def _selftest():
             pass
 
     crewai_mod.BaseTool = FakeBaseTool
-    crewai_pkg = types.ModuleType("crewai")
-    crewai_tools_pkg = types.ModuleType("crewai.tools")
-    sys.modules["crewai"] = crewai_pkg
+    sys.modules["crewai"] = types.ModuleType("crewai")
     sys.modules["crewai.tools"] = crewai_mod
     try:
         ct = crewai_tool(lambda: "crew", guard=guard, amount_sat=50,

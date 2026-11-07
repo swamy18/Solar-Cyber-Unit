@@ -89,6 +89,15 @@ pub fn block_reward_sat(params: &NetworkParams, height: u64) -> u64 {
 /// Getting this off-by-one wrong makes a node over-report issuance by a full
 /// block reward, which is exactly the number someone would publish as
 /// "coins mined".
+///
+/// Overflow posture: the accumulation saturates rather than wraps or traps.
+/// That is deliberate — consensus must never halt on arithmetic of a
+/// configured schedule — but it means a profile whose schedule integral
+/// reaches `u64::MAX` stops bounding (bound == MAX admits everything).
+/// Profile authors own schedule sanity: every decided profile's millennium
+/// issuance is pinned by test below `u64::MAX / 2`, so saturation is
+/// unreachable there. Do not raise `start_reward_sat` orders of magnitude
+/// without re-pinning those tests.
 pub fn cumulative_supply_sat(params: &NetworkParams, mined_blocks: u64) -> u64 {
     let mut total: u64 = 0;
     let mut start = 1u64;

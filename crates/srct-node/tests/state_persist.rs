@@ -165,7 +165,9 @@ fn populate(node: &mut SharedNode) {
     node.policies.authorize(&p, NET, &req).expect("grant");
     node.policy_registry.insert(p.hash(), p.clone());
     node.revoked_policies.insert([3u8; 32]);
-    node.delegations.record_root(&p);
+    node.delegations
+        .record_root(&p)
+        .expect("grant root records");
 
     let pay = machine_payment();
     let payment_id: Hash = pay.signing_hash();

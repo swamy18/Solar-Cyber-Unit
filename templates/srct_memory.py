@@ -39,12 +39,22 @@ class SrctError(Exception):
 
 
 def _hash(prev_hash_hex, agent_hex, context_hex, at):
+    # Inputs arrive from untrusted stores and hostile peers: every decode
+    # failure is a clean SrctError (merge refused / chain broken), never a
+    # leaked ValueError/TypeError/OverflowError.
+    try:
+        prev_raw = bytes.fromhex(prev_hash_hex)
+        agent_raw = agent_hex.encode("utf-8")
+        context_raw = bytes.fromhex(context_hex)
+        at_raw = at.to_bytes(8, "big")
+    except (ValueError, TypeError, AttributeError, OverflowError) as e:
+        raise SrctError(f"bad entry bytes: {e}")
     h = hashlib.sha256()
     h.update(DOMAIN.encode("utf-8"))
-    h.update(bytes.fromhex(prev_hash_hex))
-    h.update(agent_hex.encode("utf-8"))
-    h.update(bytes.fromhex(context_hex))
-    h.update(at.to_bytes(8, "big"))
+    h.update(prev_raw)
+    h.update(agent_raw)
+    h.update(context_raw)
+    h.update(at_raw)
     return h.hexdigest()
 
 
@@ -77,7 +87,10 @@ def tip(doc_entries):
     """Tip hash: `00..00` for empty memory, else the last entry's hash."""
     if not doc_entries:
         return "00" * 32
-    return doc_entries[-1]["entry_hash"]
+    h = doc_entries[-1].get("entry_hash")
+    if not isinstance(h, str) or not h:
+        raise SrctError("tip entry malformed: store corrupt, verify it")
+    return h
 
 
 def append(store, agent_hex, context_hex):
@@ -149,13 +162,16 @@ def sync(store, peer_entries):
     if not isinstance(peer_entries, list):
         raise SrctError("peer_entries must be a list")
     doc = _load_store(store)
-    known = {e["entry_hash"] for e in doc["entries"]}
+    known = {e.get("entry_hash") for e in doc["entries"]}
+    cur_tip = tip(doc["entries"])
     added = 0
     for e in peer_entries:
+        if not isinstance(e, dict):
+            raise SrctError("peer entry must be an object; merge refused")
         h = e.get("entry_hash")
         if not h or h in known:
             continue
-        if e.get("prev_hash") != tip(doc["entries"]):
+        if e.get("prev_hash") != cur_tip:
             raise SrctError(f"peer entry {h[:12]} forks our tip; "
                             "merge refused")
         want = _hash(e["prev_hash"], e.get("agent_hex", ""),
@@ -167,9 +183,10 @@ def sync(store, peer_entries):
         e["seq"] = len(doc["entries"])
         doc["entries"].append(e)
         known.add(h)
+        cur_tip = h
         added += 1
     _save_store(store, doc)
-    return {"added": added, "tip": tip(doc["entries"])}
+    return {"added": added, "tip": cur_tip}
 
 
 def anchor(store):
@@ -242,6 +259,20 @@ def _selftest():
             raise AssertionError("forked merge must refuse")
         except SrctError:
             pass
+
+        # Malformed peer bytes refuse cleanly (SrctError, never a leak).
+        for bad in (["not-a-dict"],
+                    [{"entry_hash": "zz", "prev_hash": "00" * 32,
+                      "agent_hex": "aa", "context_hex": "not-hex!!",
+                      "at": 1}],
+                    [{"entry_hash": "zz", "prev_hash": "00" * 32,
+                      "agent_hex": "aa", "context_hex": "beef",
+                      "at": "yesterday"}]):
+            try:
+                sync(a_store, bad)
+                raise AssertionError(f"malformed merge accepted: {bad}")
+            except SrctError:
+                pass
 
         # Bad inputs refuse at the door.
         for bad in (dict(agent_hex="", context_hex="beef"),

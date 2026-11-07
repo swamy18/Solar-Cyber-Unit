@@ -532,8 +532,8 @@ mod tests {
         // answer the same payment the same way: both allow here.
         let budget = X402Budget {
             max_amount_sat: 600,
-            allowed_recipients: vec![[1u8; 20]],
-            allowed_services: vec![],
+            allowed_recipients: Some(vec![[1u8; 20]]),
+            allowed_services: Some(vec![]),
         };
         let grant = budget
             .check_guarded(500, &[1u8; 20], &None, 100, 110)

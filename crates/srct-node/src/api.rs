@@ -83,10 +83,10 @@
 //! POST /v1/fx/quote           lock a dollar price into exact satoshis
 //! POST /v1/fx/swap            record a stablecoin-in SRCT settlement
 //! POST /v1/ramp/quote         register a provider-signed ramp quote
-//! GET /v1/ramp/quotes         live entry/exit quotes
+//! GET /v1/ramp/quotes         live entry/exit quotes (cursor-paged)
 //! POST /v1/ramp/intent        accept a quote; provider fills out of band
 //! POST /v1/ramp/intent/{id}/settle  provider closes filled/refunded
-//! GET /v1/ramp/intents        registry trail for entry and exit
+//! GET /v1/ramp/intents        registry trail for entry and exit (cursor-paged)
 //! POST /v1/loans/offers       lender publishes signed standard terms
 //! GET /v1/loans/offers/list   discover live offers, cheapest first
 //! POST /v1/loans/accept       open a position on signed offer terms
@@ -1689,6 +1689,15 @@ impl SharedNode {
         self.reservations = reservations;
         self.policies = policies;
         self.credit = credit;
+        // Restart recovery for the reservation replay guard (see
+        // `CreditBook::mark_outstanding`): the outstanding set is
+        // runtime-only, so re-mark every reservation the persisted map
+        // still holds. Consumed ids stay decided by the outcome log, which
+        // is consulted first — a stale map entry can only re-mark an id
+        // the log already closed.
+        for reservation in self.reservations.values() {
+            self.credit.mark_outstanding(&reservation.id);
+        }
         self.delegations = delegations;
         // Prune dangling references: a restart must not pin credit or
         // escrow state for payments/escrows that are no longer in the book.
@@ -5117,23 +5126,16 @@ async fn credit_deposit(
                     .is_ok()
             {
                 if let Some(position) = sh.credit.position(&instr.position_id) {
+                    // One debt definition everywhere: the book's own
+                    // `debt_at` (incremental interest since last settlement).
+                    // Recomputing here with the original principal over the
+                    // whole life overstates the debt after any partial
+                    // repay — which then trips the book's overpayment
+                    // refusal and autorepay fails spuriously. An
+                    // uncomputable debt skips this round, never moves money.
                     let debt_now: Option<u64> = match &position.state {
-                        srct_core::credit::PositionState::Drawn {
-                            repaid_principal_sat,
-                            repaid_interest_sat,
-                            ..
-                        } => {
-                            let interest = position
-                                .charge
-                                .accrued_interest(
-                                    position.amount_sat,
-                                    position.drawn_at_height,
-                                    height,
-                                )
-                                .unwrap_or(0);
-                            let total = position.amount_sat.saturating_add(interest);
-                            let paid = repaid_principal_sat.saturating_add(*repaid_interest_sat);
-                            Some(total.saturating_sub(paid))
+                        srct_core::credit::PositionState::Drawn { .. } => {
+                            position.debt_at(height).ok()
                         }
                         _ => None,
                     };
@@ -8260,16 +8262,21 @@ async fn ramp_quote(State(state): State<ApiState>, Json(req): Json<RampQuoteReq>
     })?
 }
 
-/// `GET /v1/ramp/quotes[?direction=&limit=]` — live quotes for entry and exit.
+/// `GET /v1/ramp/quotes[?direction=&limit=&cursor=]` — live quotes for entry
+/// and exit. Sorted by quote id with cursor paging (`next_cursor` is null
+/// on the last page), so page N means the same on every node and call.
 async fn ramp_quotes(
     State(state): State<ApiState>,
     Query(query): Query<HashMap<String, String>>,
 ) -> ApiResult {
     let limit = page_limit(&query);
+    let cursor = query
+        .get("cursor")
+        .and_then(|c| c.parse::<usize>().ok())
+        .unwrap_or(0);
     with_shared(&state, |sh| {
         let height = sh.chain.height();
-        let mut out = Vec::new();
-        let mut total = 0usize;
+        let mut matched: Vec<(srct_core::hash::Hash, Value)> = Vec::new();
         for (id, (q, _, _)) in &sh.ramp_quotes {
             if q.expires_height < height {
                 continue;
@@ -8286,9 +8293,9 @@ async fn ramp_quotes(
                     continue;
                 }
             }
-            total += 1;
-            if out.len() < limit {
-                out.push(json!({
+            matched.push((
+                *id,
+                json!({
                     "quote_id": hash_to_hex(id),
                     "provider": address_to_hex(&q.provider),
                     "asset": q.asset,
@@ -8296,12 +8303,29 @@ async fn ramp_quotes(
                     "sat_amount": q.sat_amount,
                     "fee_sat": q.fee_sat,
                     "expires_height": q.expires_height,
-                }));
-            }
+                }),
+            ));
         }
-        let truncated = total > out.len();
+        // Quote-id order, not `HashMap` iteration order: the cursor's
+        // offsets must mean the same thing on every node and every call.
+        matched.sort_by_key(|(id, _)| *id);
+        let total = matched.len();
+        let start = cursor.min(total);
+        let end = start.saturating_add(limit).min(total);
+        let next = if end < total {
+            json!(end as u64)
+        } else {
+            Value::Null
+        };
+        let out: Vec<Value> = matched
+            .into_iter()
+            .skip(start)
+            .take(end - start)
+            .map(|(_, v)| v)
+            .collect();
+        let truncated = end < total;
         Ok(Json(
-            json!({ "count": out.len(), "total": total, "truncated": truncated, "quotes": out }),
+            json!({ "count": out.len(), "total": total, "truncated": truncated, "next_cursor": next, "quotes": out }),
         ))
     })?
 }
@@ -8459,29 +8483,54 @@ async fn ramp_intent_settle(
     })?
 }
 
-/// `GET /v1/ramp/intents[?limit=]` — the registry trail for entry and exit.
+/// `GET /v1/ramp/intents[?limit=&cursor=]` — the registry trail for entry
+/// and exit. Sorted by intent id with cursor paging (`next_cursor` is
+/// null on the last page), so page N means the same on every call.
 async fn ramp_intents(
     State(state): State<ApiState>,
     Query(query): Query<HashMap<String, String>>,
 ) -> ApiResult {
     let limit = page_limit(&query);
+    let cursor = query
+        .get("cursor")
+        .and_then(|c| c.parse::<usize>().ok())
+        .unwrap_or(0);
     with_shared(&state, |sh| {
-        let total = sh.ramp_intents.len();
-        let mut out = Vec::new();
-        for (id, intent) in sh.ramp_intents.iter().take(limit) {
-            out.push(json!({
-                "intent_id": hash_to_hex(id),
-                "quote_id": hash_to_hex(&intent.quote_id),
-                "user": address_to_hex(&intent.user),
-                "provider": address_to_hex(&intent.provider),
-                "fill_ref": intent.fill_ref,
-                "filled": intent.filled,
-                "refunded": intent.refunded,
-            }));
+        let mut matched: Vec<(srct_core::hash::Hash, Value)> = Vec::new();
+        for (id, intent) in sh.ramp_intents.iter() {
+            matched.push((
+                *id,
+                json!({
+                    "intent_id": hash_to_hex(id),
+                    "quote_id": hash_to_hex(&intent.quote_id),
+                    "user": address_to_hex(&intent.user),
+                    "provider": address_to_hex(&intent.provider),
+                    "fill_ref": intent.fill_ref,
+                    "filled": intent.filled,
+                    "refunded": intent.refunded,
+                }),
+            ));
         }
-        let truncated = total > out.len();
+        // Intent-id order, not `HashMap` iteration order: the cursor's
+        // offsets must mean the same thing on every node and every call.
+        matched.sort_by_key(|(id, _)| *id);
+        let total = matched.len();
+        let start = cursor.min(total);
+        let end = start.saturating_add(limit).min(total);
+        let next = if end < total {
+            json!(end as u64)
+        } else {
+            Value::Null
+        };
+        let out: Vec<Value> = matched
+            .into_iter()
+            .skip(start)
+            .take(end - start)
+            .map(|(_, v)| v)
+            .collect();
+        let truncated = end < total;
         Ok(Json(
-            json!({ "count": out.len(), "total": total, "truncated": truncated, "intents": out }),
+            json!({ "count": out.len(), "total": total, "truncated": truncated, "next_cursor": next, "intents": out }),
         ))
     })?
 }

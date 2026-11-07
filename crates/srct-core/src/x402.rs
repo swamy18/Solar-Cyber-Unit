@@ -186,12 +186,14 @@ pub struct X402Response {
 }
 
 /// A bounded-spend budget the agent client enforces *before* signing.
-/// Mirrors `SpendPolicy` allow-lists without moving consensus.
+/// A present allow-list mirrors `SpendPolicy` exactly (empty present list =
+/// deny-all; a tagged-services list refuses untagged spending); an absent
+/// (`None`) list means unbounded on that axis.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct X402Budget {
     pub max_amount_sat: u64,
-    pub allowed_recipients: Vec<Address>,
-    pub allowed_services: Vec<[u8; 32]>,
+    pub allowed_recipients: Option<Vec<Address>>,
+    pub allowed_services: Option<Vec<[u8; 32]>>,
 }
 
 impl X402Budget {
@@ -211,13 +213,23 @@ impl X402Budget {
                 max: self.max_amount_sat,
             });
         }
-        if !self.allowed_recipients.is_empty() && !self.allowed_recipients.contains(recipient) {
-            return Err(X402Error::RecipientNotAllowed);
+        // Recipient allow-list (a present but empty list denies everything,
+        // exactly like `SpendPolicy`).
+        if let Some(allowed) = &self.allowed_recipients {
+            if !allowed.contains(recipient) {
+                return Err(X402Error::RecipientNotAllowed);
+            }
         }
-        if let Some(svc) = service {
-            if !self.allowed_services.is_empty() && !self.allowed_services.contains(svc) {
+        // Service allow-list (a tagged list refuses untagged spending:
+        // the tag is how the owner restricts *what* the money buys).
+        match (service, &self.allowed_services) {
+            (None, Some(allowed)) if !allowed.is_empty() => {
                 return Err(X402Error::ServiceNotAllowed);
             }
+            (Some(svc), Some(allowed)) if !allowed.contains(svc) => {
+                return Err(X402Error::ServiceNotAllowed);
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -682,8 +694,8 @@ mod tests {
     fn budget_refuses_overrun_and_allowlist() {
         let budget = X402Budget {
             max_amount_sat: 600,
-            allowed_recipients: vec![[1u8; 20]],
-            allowed_services: vec![[2u8; 32]],
+            allowed_recipients: Some(vec![[1u8; 20]]),
+            allowed_services: Some(vec![[2u8; 32]]),
         };
         assert!(budget.check(500, &[1u8; 20], &Some([2u8; 32])).is_ok());
         assert!(matches!(
@@ -701,11 +713,56 @@ mod tests {
     }
 
     #[test]
+    fn budget_mirrors_spend_policy_allow_lists() {
+        // A present-but-empty recipient list denies everything (deny-all,
+        // exactly like `SpendPolicy`), while an absent list is unbounded.
+        let deny_all = X402Budget {
+            max_amount_sat: 600,
+            allowed_recipients: Some(vec![]),
+            allowed_services: None,
+        };
+        assert_eq!(
+            deny_all.check(500, &[1u8; 20], &None),
+            Err(X402Error::RecipientNotAllowed)
+        );
+        let open = X402Budget {
+            max_amount_sat: 600,
+            allowed_recipients: None,
+            allowed_services: None,
+        };
+        assert!(open.check(500, &[1u8; 20], &None).is_ok());
+
+        // A tagged-services list refuses untagged spending (the tag is how
+        // the owner restricts *what* the money buys); untagged lists allow
+        // plain payments.
+        let tagged = X402Budget {
+            max_amount_sat: 600,
+            allowed_recipients: None,
+            allowed_services: Some(vec![[2u8; 32]]),
+        };
+        assert_eq!(
+            tagged.check(500, &[1u8; 20], &None),
+            Err(X402Error::ServiceNotAllowed)
+        );
+        assert!(tagged.check(500, &[1u8; 20], &Some([2u8; 32])).is_ok());
+        let untagged_ok = X402Budget {
+            max_amount_sat: 600,
+            allowed_recipients: None,
+            allowed_services: Some(vec![]),
+        };
+        assert!(untagged_ok.check(500, &[1u8; 20], &None).is_ok());
+        assert_eq!(
+            untagged_ok.check(500, &[1u8; 20], &Some([2u8; 32])),
+            Err(X402Error::ServiceNotAllowed)
+        );
+    }
+
+    #[test]
     fn guard_is_short_lived_and_evm_routes_parse() {
         let budget = X402Budget {
             max_amount_sat: 600,
-            allowed_recipients: vec![[1u8; 20]],
-            allowed_services: vec![],
+            allowed_recipients: Some(vec![[1u8; 20]]),
+            allowed_services: Some(vec![]),
         };
         let grant = budget
             .check_guarded(500, &[1u8; 20], &None, 100, 110)

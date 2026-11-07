@@ -100,10 +100,11 @@ def register_line(board, parent_hex, sub_agent_hex, offer_id, cap_sat,
     """Register a parent's credit line for its sub-agent.
 
     Anchored to the parent's on-chain `LoanOffer`: when `node` is given,
-    the offer is fetched and the cap must fit its principal range, so the
-    line cannot promise what the offer cannot lend. Without `node` the
-    line stores `"verified": False` — usable for planning, never trusted
-    for execution.
+    the offer is fetched, its lender must equal `parent_hex`, and the cap
+    must fit its principal range, so the line cannot promise what the
+    offer cannot lend — or borrow against a stranger's offer. Without
+    `node` the line stores `"verified": False` — usable for planning,
+    never trusted for execution.
     """
     if cap_sat <= 0:
         raise SrctError("cap_sat must be > 0")
@@ -118,6 +119,10 @@ def register_line(board, parent_hex, sub_agent_hex, offer_id, cap_sat,
         offer = offers.get(offer_id)
         if offer is None:
             raise SrctError(f"offer {offer_id[:12]} not live on this node")
+        if offer.get("lender") != parent_hex:
+            raise SrctError(f"offer {offer_id[:12]} belongs to "
+                            f"{offer.get('lender')}, not the registering "
+                            "parent: a line may only anchor to its own offer")
         if not (offer.get("min_principal_sat", 1) <= cap_sat
                 <= offer.get("max_principal_sat", 0)):
             raise SrctError(f"cap {cap_sat} outside offer range "
@@ -294,6 +299,14 @@ def _selftest():
                 raise AssertionError("over-range cap must refuse")
             except SrctError:
                 pass
+
+            # Another lender's offer cannot anchor this parent's line.
+            try:
+                register_line(board, "qq-stranger", "sub-broke",
+                              "oo-parent", 1_000, node="http://fake")
+                raise AssertionError("stranger-anchored line must refuse")
+            except SrctError as e:
+                assert "own offer" in str(e), e
 
             # Trail recorded both trips.
             trail = _load_board(board)["trips"]

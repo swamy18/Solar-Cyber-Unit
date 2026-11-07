@@ -519,6 +519,18 @@ impl BoundAuthorization {
         if self.version != PORTABLE_POLICY_VERSION {
             return Err(PortableError::UnsupportedVersion(self.version));
         }
+        // The grant itself must be structurally sound (version, network,
+        // recipient/identity bounds, sane window): an offline verifier that
+        // skips this accepts malformed grants the engine would never issue.
+        policy.validate().map_err(PortableError::Policy)?;
+        // Cross-network replay ends here: the payment carries the network
+        // it pays on, the grant carries the network it was issued for, and
+        // a testnet grant never authorizes a mainnet payment.
+        if policy.network_id != payment.network_id {
+            return Err(PortableError::Binding(
+                "policy and payment are for different networks",
+            ));
+        }
         if self.keys.address()? != self.auth.owner {
             return Err(PortableError::Binding(
                 "binding keys are not the grant owner's",
@@ -1131,5 +1143,62 @@ mod tests {
             payment.signing_hash(),
         )
         .is_err());
+    }
+
+    #[test]
+    fn a_bound_authorization_refuses_cross_network_payment() {
+        // A testnet grant never authorizes a mainnet payment: the offline
+        // verifier checks the grant's network against the payment's before
+        // any signature work, so a replayed grant cannot cross networks.
+        let w = owner_wallet();
+        let owner = w.address().unwrap();
+        let policy = root_policy(&owner);
+        let mut book = PolicyBook::default();
+        let auth = book
+            .authorize(
+                &policy,
+                NET,
+                &AuthorizationRequest {
+                    agent_id: policy.agent_id,
+                    recipient: [1u8; 20],
+                    amount_sat: 400,
+                    service: None,
+                    height: 100,
+                    nonce: 1,
+                },
+            )
+            .unwrap();
+        let auth_sigs = Auth::sigs_for(&w, &auth.signing_hash()).unwrap();
+        let auth_keys = Auth::keys_for(&w).unwrap();
+        let payment = crate::payment::build_signed_payment(
+            &w,
+            &auth,
+            NET,
+            AgentRole::Machine,
+            0,
+            9_000,
+            [3u8; 32],
+            &[],
+        )
+        .unwrap();
+        let bound = BoundAuthorization::issue(
+            &w,
+            &auth,
+            &auth_sigs,
+            &auth_keys,
+            110,
+            payment.signing_hash(),
+        )
+        .unwrap();
+        bound.verify(&policy, &payment, 105).unwrap();
+        // The same bytes relabeled to another network: the offline
+        // verifier compares the grant's network against the payment's
+        // before any signature work, so a replayed grant cannot cross.
+        let mut foreign = payment.clone();
+        foreign.network_id = "srct/mainnet".to_string();
+        assert!(matches!(
+            bound.verify(&policy, &foreign, 105),
+            Err(PortableError::Binding(_))
+        ));
     }
 }

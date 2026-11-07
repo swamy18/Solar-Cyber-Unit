@@ -61,10 +61,9 @@ struct Snapshot {
     slash_undo: HashMap<Hash512, SlashVault>,
     /// Latest verified-work-certificate id committed to by VWC-linked mining
     /// (puzzle_id = 3). The first 16 bytes go into `header.extra_nonce` so
-    /// stage 3 binds the block to useful L2 compute. Rewound on reorg like
-    /// every other chain-state field.
+    /// stage 3 binds the block to useful L2 compute. Saved/restored by
+    /// `snapshot`/`restore` on reorg; the node re-feeds it after L2 replay.
     latest_vwc_hash: Option<Hash>,
-    latest_vwc_undo: HashMap<Hash512, Option<Hash>>,
     finality: FinalityManager,
 }
 
@@ -147,9 +146,10 @@ pub struct Chain {
     /// no undo because there is nothing to restore.
     slash_undo: HashMap<Hash512, SlashVault>,
     /// Latest VWC id for VWC-linked mining. See `Snapshot` comment above.
+    /// Set by the node after L2 application (never by `apply_block`);
+    /// reorgs restore it via `snapshot`/`restore`, and the node re-feeds it
+    /// after every reorg, so no per-block undo map is kept.
     latest_vwc_hash: Option<Hash>,
-    /// Pre-block VWC states for reorg correctness.
-    latest_vwc_undo: HashMap<Hash512, Option<Hash>>,
     /// Non-coinbase transactions the most recent successful reorg rolled back,
     /// oldest block first. Drained by the caller so the mempool can re-admit
     /// them.
@@ -172,7 +172,11 @@ impl Chain {
     pub fn new(params: NetworkParams) -> Result<Self> {
         params.validate()?;
         let registry = PuzzleRegistry::genesis();
-        registry.get(params.puzzle_id)?;
+        // The cached solver must run the profile's active puzzle: a
+        // hybrid-built solver rejects VWC-linked headers (and vice versa),
+        // so constructing the wrong one bricks the profile at genesis.
+        let solver_spec = registry.get(params.puzzle_id)?.clone();
+        let solver = PuzzleSolver::new(solver_spec);
         let genesis = genesis_block(params.genesis_difficulty);
         let hash = genesis.block_hash();
         debug_assert_eq!(hash, {
@@ -183,7 +187,7 @@ impl Chain {
         let mut chain = Chain {
             params,
             registry,
-            solver: PuzzleSolver::new(PuzzleSpec::hybrid_v1()),
+            solver,
             blocks: HashMap::new(),
             work: HashMap::new(),
             canon: Vec::new(),
@@ -203,7 +207,6 @@ impl Chain {
             slash_vault: SlashVault::new(),
             slash_undo: HashMap::new(),
             latest_vwc_hash: None,
-            latest_vwc_undo: HashMap::new(),
             released_exits: HashSet::new(),
             exit_undo: HashMap::new(),
             disconnected_txs: Vec::new(),
@@ -457,6 +460,27 @@ impl Chain {
                         self.solver.spec().id,
                         header.puzzle_id
                     )));
+                }
+                if spec.kind == PuzzleKind::VwcLinked {
+                    // The VWC commitment is real, not decorative: the header
+                    // must commit to exactly the chain-acknowledged latest
+                    // verified-work certificate (zeros before the first VWC
+                    // settles). Templates emit these exact bytes, so honest
+                    // miners are unaffected; arbitrary bytes never validate.
+                    // The node feeds `latest_vwc_hash` after L2 application
+                    // (and re-feeds it after every reorg); without a feed
+                    // the rule pins extra_nonce to zero, which is what the
+                    // template builder emits in that case.
+                    let mut expected = [0u8; 16];
+                    if let Some(h) = self.latest_vwc_hash {
+                        expected.copy_from_slice(&h[..16]);
+                    }
+                    if header.extra_nonce != expected {
+                        return Err(Error::BadPuzzleSpec(
+                            "vwc-v1 header does not commit to the latest verified-work certificate"
+                                .into(),
+                        ));
+                    }
                 }
                 self.solver.satisfies(header)
             }
@@ -1707,11 +1731,18 @@ impl Chain {
                 .checked_sub(delta)
                 .ok_or(Error::ValueOverflow)?;
         }
+        // Treat unwinds by saturation, not by checked subtraction like the
+        // PSCB/B-Saver/burn legs above: redemptions debit `treat_reserve`
+        // live through `spend_treat_reserve`, so the reserve can hold less
+        // than this block credited. Subtracting the credit back then lands
+        // exactly on `pre_block_reserve - redemptions_since`, floored at
+        // zero — the credit is gone, the redemption stands, and the reserve
+        // is empty rather than negative. Refusing here (`Err`) would reject
+        // a valid heavier branch on redeemed nodes while clean nodes adopt
+        // it: a consensus split over bookkeeping. The voucher liability
+        // stands in the Treats book either way.
         if let Some(delta) = self.treat_undo.remove(hash) {
-            self.treat_reserve = self
-                .treat_reserve
-                .checked_sub(delta)
-                .ok_or(Error::ValueOverflow)?;
+            self.treat_reserve = self.treat_reserve.saturating_sub(delta);
         }
         // Undo the burn debit the same way, or a reorg would leave phantom
         // removal behind and net-supply reporting would drift from replay.
@@ -1784,7 +1815,6 @@ impl Chain {
             slash_vault: self.slash_vault.clone(),
             slash_undo: self.slash_undo.clone(),
             latest_vwc_hash: self.latest_vwc_hash,
-            latest_vwc_undo: self.latest_vwc_undo.clone(),
             finality: self.finality.clone(),
         }
     }
@@ -1809,7 +1839,6 @@ impl Chain {
         self.slash_vault = s.slash_vault;
         self.slash_undo = s.slash_undo;
         self.latest_vwc_hash = s.latest_vwc_hash;
-        self.latest_vwc_undo = s.latest_vwc_undo;
         self.finality = s.finality;
     }
 
@@ -2605,11 +2634,21 @@ impl Chain {
             }
         }
 
+        // Every per-block undo map is pruned together: entries only exist
+        // for applied (canonical) blocks, which are never in `dropped`,
+        // so these removes are no-ops today — but leaving any map out
+        // would leak it the day a stored non-canonical block records undo.
         for hash in &dropped {
             self.blocks.remove(hash);
             self.work.remove(hash);
             self.undo.remove(hash);
             self.pscb_undo.remove(hash);
+            self.bsaver_undo.remove(hash);
+            self.treat_undo.remove(hash);
+            self.burned_undo.remove(hash);
+            self.exit_undo.remove(hash);
+            self.bond_undo.remove(hash);
+            self.slash_undo.remove(hash);
         }
         dropped.len()
     }

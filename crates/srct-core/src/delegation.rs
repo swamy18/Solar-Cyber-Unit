@@ -347,10 +347,14 @@ impl DelegationBook {
     }
 
     /// Record a **root** policy — one whose owner authorized it directly, with
-    /// no parent. A root has no link to check, so this is what lets a node
-    /// reconstruct the ancestry of a policy that was delegated from it.
-    pub fn record_root(&mut self, policy: &SpendPolicy) {
+    /// no parent. A root has no link to check, so structural soundness is
+    /// checked here instead: a malformed or versioned-out root is refused
+    /// rather than stored, so the registry only ever holds policies the
+    /// node verified.
+    pub fn record_root(&mut self, policy: &SpendPolicy) -> Result<(), DelegationError> {
+        policy.validate().map_err(DelegationError::Policy)?;
         self.policies.insert(policy.hash(), policy.clone());
+        Ok(())
     }
 
     /// Every policy this book has recorded, root-first by hash order.

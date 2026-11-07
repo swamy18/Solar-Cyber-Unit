@@ -389,11 +389,15 @@ fn cmd_pay(args: &[String]) -> Result<i32, String> {
     if max_amount == 0 {
         return Err("--max-amount <sat> is required".into());
     }
-    let mut recipients = Vec::new();
+    // Absent flag = unbounded recipients (None); a present flag is an
+    // exact allow-list, exactly like `SpendPolicy` (empty = deny-all).
+    let mut recipients: Option<Vec<[u8; 20]>> = None;
     if let Some(list) = str_arg(args, "--recipients") {
+        let mut parsed = Vec::new();
         for part in list.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-            recipients.push(address_from_hex(part).map_err(|e| format!("--recipients: {e}"))?);
+            parsed.push(address_from_hex(part).map_err(|e| format!("--recipients: {e}"))?);
         }
+        recipients = Some(parsed);
     }
     let service_name = str_arg(args, "--service-name")
         .ok_or("pay needs --service-name <name> (the grant must name this service)")?;
@@ -451,7 +455,7 @@ fn cmd_pay(args: &[String]) -> Result<i32, String> {
         let budget = X402Budget {
             max_amount_sat: max_amount,
             allowed_recipients: recipients.clone(),
-            allowed_services: vec![tag],
+            allowed_services: Some(vec![tag]),
         };
         let Ok(offer) = select_accept(&required, &budget, &pay_to, &Some(tag)) else {
             continue;
@@ -482,7 +486,7 @@ fn cmd_pay(args: &[String]) -> Result<i32, String> {
     let budget = X402Budget {
         max_amount_sat: max_amount,
         allowed_recipients: recipients,
-        allowed_services: vec![tag],
+        allowed_services: Some(vec![tag]),
     };
     budget
         .check_guarded(amount, &recipient, &Some(tag), height, expires_at)

@@ -39,6 +39,10 @@ class SrctError(Exception):
     """Anything that stops funding from completing."""
 
 
+class SrctExpiredQuote(SrctError):
+    """The picked quote expired between listing and intent; re-quote."""
+
+
 # -- transport (no keys anywhere near here) -----------------------------
 
 
@@ -85,12 +89,25 @@ def _http_post(node, path, payload):
 
 
 def live_quotes(node, direction="stable_to_srct", asset=None):
-    """Live (unexpired) quotes for one direction, optionally one asset."""
-    status, body = _http_get(
-        node, _QUOTES + f"?direction={direction}&limit=100")
-    if status != 200:
-        raise SrctError(f"node answered {status} for ramp quotes")
-    quotes = body.get("quotes", [])
+    """Live (unexpired) quotes for one direction, optionally one asset.
+
+    Follows `next_cursor` until the registry is exhausted: picking the
+    cheapest fee from a truncated first page would silently overpay on a
+    busy node.
+    """
+    quotes = []
+    cursor = None
+    while True:
+        path = _QUOTES + f"?direction={direction}&limit=1000"
+        if cursor is not None:
+            path += f"&cursor={cursor}"
+        status, body = _http_get(node, path)
+        if status != 200:
+            raise SrctError(f"node answered {status} for ramp quotes")
+        quotes.extend(body.get("quotes", []))
+        cursor = body.get("next_cursor")
+        if cursor is None:
+            break
     if asset is not None:
         quotes = [q for q in quotes if q.get("asset") == asset]
     return quotes
@@ -119,22 +136,36 @@ def open_intent(node, quote_id, user_hex, fill_ref):
         "user_hex": user_hex,
         "fill_ref": fill_ref,
     })
-    if status == 409 and "expired" in str(body.get("reason", "")):
-        raise SrctError("quote expired before the intent landed; re-quote")
+    detail = str(body.get("detail", ""))
+    if status == 409 and "expired" in detail:
+        raise SrctExpiredQuote("quote expired before the intent landed")
     if status != 200:
         raise SrctError(f"node answered {status} for ramp intent: "
-                        f"{body.get('reason', body)}")
+                        f"{body.get('detail', body)}")
     return body["intent_id"]
 
 
 def intent_status(node, intent_id):
-    """Current registry state for one intent. Raises if unknown."""
-    status, body = _http_get(node, _INTENTS + "?limit=1000")
-    if status != 200:
-        raise SrctError(f"node answered {status} for ramp intents")
-    for intent in body.get("intents", []):
-        if intent.get("intent_id") == intent_id:
-            return intent
+    """Current registry state for one intent. Raises if unknown.
+
+    Follows `next_cursor` until the registry is exhausted: stopping at
+    the first page would misreport a live intent as missing on a busy
+    node.
+    """
+    cursor = None
+    while True:
+        path = _INTENTS + "?limit=1000"
+        if cursor is not None:
+            path += f"&cursor={cursor}"
+        status, body = _http_get(node, path)
+        if status != 200:
+            raise SrctError(f"node answered {status} for ramp intents")
+        for intent in body.get("intents", []):
+            if intent.get("intent_id") == intent_id:
+                return intent
+        cursor = body.get("next_cursor")
+        if cursor is None:
+            break
     raise SrctError(f"intent {intent_id[:12]} not on this node; "
                     "verify against your own node")
 
@@ -167,14 +198,27 @@ def ensure_funded(node, user_hex, min_sat, asset="USDC",
 
     Returns the settled intent dict. `fill_ref` defaults to a timestamped
     reference the operator matches against the provider's out-of-band
-    receipt (bank reference, stablecoin tx hash).
+    receipt (bank reference, stablecoin tx hash). A quote that expires
+    between listing and intent is re-quoted once automatically — the
+    retry lists fresh quotes and skips the dead one, so no intent is
+    ever opened twice for the same fill.
     """
-    quotes = live_quotes(node, direction=direction, asset=asset)
-    quote = pick_quote(quotes, min_sat, asset=asset)
     ref = fill_ref or f"srct-fund-{int(time.time())}"
-    intent_id = open_intent(node, quote["quote_id"], user_hex, ref)
-    return wait_settled(node, intent_id, poll_secs=poll_secs,
-                        timeout_secs=timeout_secs)
+    dead = set()
+    for _ in range(2):
+        quotes = [q for q in live_quotes(node, direction=direction,
+                                         asset=asset)
+                  if q.get("quote_id") not in dead]
+        quote = pick_quote(quotes, min_sat, asset=asset)
+        try:
+            intent_id = open_intent(node, quote["quote_id"], user_hex, ref)
+        except SrctExpiredQuote:
+            dead.add(quote["quote_id"])
+            continue
+        return wait_settled(node, intent_id, poll_secs=poll_secs,
+                            timeout_secs=timeout_secs)
+    raise SrctError("two quotes expired in a row; the provider feed is "
+                    "moving faster than intents land — retry shortly")
 
 
 def _selftest():
@@ -196,21 +240,29 @@ def _selftest():
              "asset_minor": 100, "sat_amount": 100, "fee_sat": 1,
              "expires_height": 9000},
         ]
-        state = {"posted": [], "polls": 0, "refund": False}
+        state = {"posted": [], "polls": 0, "refund": False,
+                 "expire_first": False}
 
         def fake_get(node, path):
             if path.startswith(_QUOTES):
-                return 200, {"count": 3, "total": 3, "truncated": False,
-                             "quotes": list(quotes)}
+                # Two pages: cursor paging must be followed, and the
+                # cheapest quote sits on page 2.
+                if "cursor=" in path:
+                    return 200, {"count": 1, "total": 3,
+                                 "truncated": False, "next_cursor": None,
+                                 "quotes": [quotes[2]]}
+                return 200, {"count": 2, "total": 3,
+                             "truncated": True, "next_cursor": 2,
+                             "quotes": [quotes[0], quotes[1]]}
             if path.startswith(_INTENTS):
                 state["polls"] += 1
                 if state["refund"]:
-                    return 200, {"intents": [{
+                    return 200, {"next_cursor": None, "intents": [{
                         "intent_id": "ii-1", "quote_id": "qq-cheap",
                         "user": "uu", "provider": "pp", "fill_ref": "r",
                         "filled": False, "refunded": True}]}
                 filled = state["polls"] >= 2
-                return 200, {"intents": [{
+                return 200, {"next_cursor": None, "intents": [{
                     "intent_id": "ii-1", "quote_id": "qq-cheap",
                     "user": "uu", "provider": "pp", "fill_ref": "r",
                     "filled": filled, "refunded": False}]}
@@ -219,10 +271,16 @@ def _selftest():
         def fake_post(node, path, payload):
             assert path == _INTENT, path
             state["posted"].append(payload)
+            if state["expire_first"]:
+                state["expire_first"] = False
+                # Real node envelope: {"error": ..., "detail": ...}.
+                return 409, {"error": "ramp_refused",
+                             "detail": "quote expired"}
             return 200, {"intent_id": "ii-1", "duplicate": False}
 
         mod._http_get, mod._http_post = fake_get, fake_post
 
+        # Pages followed: all 3 quotes seen though page 1 held 2.
         got = live_quotes("http://fake", asset="USDC")
         assert len(got) == 3, got
         # Cheapest fee among quotes covering the target — not the biggest.
@@ -237,6 +295,21 @@ def _selftest():
         settled = wait_settled("http://fake", "ii-1", poll_secs=0,
                                timeout_secs=30)
         assert settled["filled"] and state["polls"] >= 2, settled
+
+        # Expired quote between list and intent: re-quoted once, same
+        # fill_ref, exactly one intent opened per quote.
+        state["expire_first"] = True
+        state["polls"] = 0
+        before = len(state["posted"])
+        settled = ensure_funded("http://fake", "uu", 1_000_000,
+                                poll_secs=0, timeout_secs=30)
+        assert settled["filled"], settled
+        fresh_posts = state["posted"][before:]
+        assert len(fresh_posts) == 2, fresh_posts
+        assert fresh_posts[0]["quote_id"] != fresh_posts[1]["quote_id"], \
+            "retry must skip the dead quote"
+        assert fresh_posts[0]["fill_ref"] == fresh_posts[1]["fill_ref"], \
+            "retry keeps the operator's reference"
 
         # Refunded intents refuse instead of hanging.
         state["polls"] = 0

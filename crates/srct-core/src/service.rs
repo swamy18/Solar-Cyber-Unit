@@ -576,7 +576,9 @@ pub fn authorize_request_with_chain(
                 })?;
             }
         }
-        delegations.record_root(&chain[0]);
+        delegations
+            .record_root(&chain[0])
+            .map_err(|e| SessionError::Payment(PaymentError::ChainRefused(e.to_string())))?;
         // The spend rule runs on the leaf, exactly as `authorize_request` runs
         // it on a root policy: one engine, one set of budget rules, reached
         // through the narrowing rule instead of through identity derivation.
@@ -669,13 +671,17 @@ pub fn admit_payment(
 
     // 3. the policy is live at this height.
     //
-    // Revocation is deliberately not checked here: `revoked` is inside the
-    // canonical encoding, so a revoked policy is a *different hash* from the one
-    // the engine issued under. A gate handed a revoked variant sees a policy the
-    // engine has never issued under, and refuses it on (2) — the right outcome
-    // for the wrong reason, and the original authorization is left standing.
-    // Killing that one is the record-keeper's job, because only the
-    // record-keeper knows which hash a revocation statement was aimed at.
+    // The revoked flag is checked even though revocation also changes the
+    // hash: a gate handed a revoked variant refuses it here by name rather
+    // than on (2) "for the wrong reason", and a caller holding a stale
+    // object cannot lean on the record-keeper having forgotten the state
+    // yet. Killing the original authorization remains the record-keeper's
+    // job (node `revoked_policies` set, worker authority book), because
+    // only the record-keeper knows which hash a revocation aimed at — this
+    // check is the fail-closed backstop, not the mechanism.
+    if policy.revoked {
+        return Err(SessionError::Policy(PolicyError::PolicyRevoked));
+    }
     if height < policy.not_before_height {
         return Err(SessionError::Policy(PolicyError::NotYetValid {
             not_before: policy.not_before_height,

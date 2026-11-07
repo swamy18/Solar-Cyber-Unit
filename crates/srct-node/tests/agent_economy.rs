@@ -709,6 +709,109 @@ fn ramp_quote_intent_and_provider_settle() {
 }
 
 #[test]
+fn ramp_lists_page_deterministically() {
+    let node = start();
+    let provider = wallet(53, "ramp-pager");
+    let provider_addr = provider.address().unwrap();
+    // Three live quotes; distinct nonces give distinct ids.
+    for nonce in 1..=3u64 {
+        let quote = srct_core::ramp::RampQuote {
+            network_id: NET.to_string(),
+            provider: provider_addr,
+            direction: srct_core::ramp::RampDirection::StableToSrct,
+            asset: "USDC".to_string(),
+            asset_minor: 100,
+            sat_amount: 101_500,
+            fee_sat: 1_000 * nonce,
+            expires_height: 9_000,
+            nonce,
+        };
+        let (sigs, keys) = srct_core::ramp::sign_quote(&provider, &quote).unwrap();
+        let (s, b) = post(
+            &node,
+            "/v1/ramp/quote",
+            &json!({
+                "network_id": NET,
+                "provider_hex": address_to_hex(&provider_addr),
+                "direction": "stable_to_srct",
+                "asset": "USDC",
+                "asset_minor": 100,
+                "sat_amount": 101_500,
+                "fee_sat": 1_000 * nonce,
+                "expires_height": 9000,
+                "nonce": nonce,
+                "provider_sigs_hex": hex::encode(sigs.to_bytes()),
+                "provider_keys_hex": hex::encode(keys.to_bytes()),
+            }),
+        );
+        assert_eq!(s, 200, "ramp quote refused: {b}");
+    }
+
+    // Page 1 of 2.
+    let (s, p1) = get(&node, "/v1/ramp/quotes?direction=stable_to_srct&limit=2");
+    assert_eq!(s, 200);
+    assert_eq!(p1["total"], 3);
+    assert_eq!(p1["quotes"].as_array().unwrap().len(), 2);
+    let cursor = p1["next_cursor"]
+        .as_u64()
+        .expect("a non-final page must carry next_cursor");
+    // Same page twice: identical order (quote-id order, not HashMap order).
+    let (s, p1b) = get(&node, "/v1/ramp/quotes?direction=stable_to_srct&limit=2");
+    assert_eq!(s, 200);
+    assert_eq!(p1["quotes"], p1b["quotes"], "pages must be deterministic");
+    // Page 2: the remaining quote, cursor closed at the end.
+    let (s, p2) = get(
+        &node,
+        &format!("/v1/ramp/quotes?direction=stable_to_srct&limit=2&cursor={cursor}"),
+    );
+    assert_eq!(s, 200);
+    assert_eq!(p2["quotes"].as_array().unwrap().len(), 1);
+    assert!(
+        p2["next_cursor"].is_null(),
+        "last page must close the cursor"
+    );
+    // Union covers all three, disjoint.
+    let mut ids: Vec<String> = p1["quotes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .chain(p2["quotes"].as_array().unwrap().iter())
+        .map(|q| q["quote_id"].as_str().unwrap().to_string())
+        .collect();
+    ids.sort();
+    ids.dedup();
+    assert_eq!(ids.len(), 3, "pages must partition the registry");
+
+    // Intents page the same way: two intents on the first quote.
+    let first_quote = &ids[0];
+    for (n, seed) in [(54u8, "ramp-intent-a"), (55u8, "ramp-intent-b")] {
+        let user = wallet(n, seed).address().unwrap();
+        let (s, intent) = post(
+            &node,
+            "/v1/ramp/intent",
+            &json!({ "quote_id": first_quote, "user_hex": address_to_hex(&user), "fill_ref": seed }),
+        );
+        assert_eq!(s, 200, "intent refused: {intent}");
+    }
+    let (s, i1) = get(&node, "/v1/ramp/intents?limit=1");
+    assert_eq!(s, 200);
+    assert_eq!(i1["total"], 2);
+    let icursor = i1["next_cursor"]
+        .as_u64()
+        .expect("a non-final page must carry next_cursor");
+    let (s, i2) = get(&node, &format!("/v1/ramp/intents?limit=1&cursor={icursor}"));
+    assert_eq!(s, 200);
+    assert!(
+        i2["next_cursor"].is_null(),
+        "last page must close the cursor"
+    );
+    assert_ne!(
+        i1["intents"][0]["intent_id"], i2["intents"][0]["intent_id"],
+        "pages must not repeat"
+    );
+}
+
+#[test]
 fn productive_lending_from_offer_to_autorepay() {
     let node = start();
     let lender = wallet(61, "lender");

@@ -95,8 +95,15 @@ def open_round(store, tx_hash, required_roles=("auditor", "budget",
     if ttl_hours <= 0:
         raise SrctError("ttl_hours must be > 0")
     now = _now()
-    seed = f"{tx_hash}|{'/'.join(roles)}|{now}".encode("utf-8")
-    round_id = hashlib.sha256(seed).hexdigest()[:32]
+    doc = _load_store(store)
+    taken = {r.get("round_id") for r in doc["rounds"]}
+    salt = 0
+    while True:
+        seed = f"{tx_hash}|{'/'.join(roles)}|{now}|{salt}".encode("utf-8")
+        round_id = hashlib.sha256(seed).hexdigest()[:32]
+        if round_id not in taken:
+            break
+        salt += 1
     rnd = {
         "round_id": round_id,
         "tx_hash": tx_hash,
@@ -107,7 +114,6 @@ def open_round(store, tx_hash, required_roles=("auditor", "budget",
         "expires_at": now + int(ttl_hours * 3600),
         "decided": None,
     }
-    doc = _load_store(store)
     doc["rounds"].append(rnd)
     _save_store(store, doc)
     return round_id

@@ -899,7 +899,10 @@ impl Pool {
                     Error::BadPuzzleSpec("hbm proof without an hbm config".into())
                 })?;
                 cfg.validate()?;
-                let mh = srct_core::hbm_pow::memory_hash(header, cfg.lanes, cfg.accesses);
+                let Some(mh) = srct_core::hbm_pow::memory_hash(header, cfg.lanes, cfg.accesses)
+                else {
+                    return Ok(false);
+                };
                 Ok(srct_core::u256::U256::from_be_bytes(mh) <= target)
             }
             other => Err(Error::BadPuzzleSpec(format!(

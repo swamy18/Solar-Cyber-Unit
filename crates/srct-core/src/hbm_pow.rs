@@ -64,15 +64,19 @@ pub const LANES: usize = SCRATCHPAD_BYTES / 32;
 /// - Each access address = `u64::from_le_bytes(state[..8]) % LANES`
 /// - `state` depends on the previous read, so you cannot compute access[N+1]
 ///   without finishing access[N].
-pub fn memory_hash(header: &Header, lanes: usize, accesses: usize) -> Hash {
-    // Defensive: `lanes == 0` would panic on the modular index in `mix_accesses`.
-    // Real callers go through `HbmConfig` (which validates), but `memory_hash` is
-    // public, so guard the invariant explicitly.
-    debug_assert!(lanes > 0, "HBM scratchpad must have at least one lane");
-    debug_assert!(accesses > 0, "HBM accesses must be > 0");
+pub fn memory_hash(header: &Header, lanes: usize, accesses: usize) -> Option<Hash> {
+    // Degenerate parameters are refused, not panicked on: `lanes == 0`
+    // would divide by zero on the modular index in `mix_accesses` (a
+    // `debug_assert` does not fire in release). Real callers go through
+    // `HbmConfig::validate`, but `memory_hash` is public, so the
+    // invariant is enforced at the value level. `None` means "no proof
+    // can be computed", which every caller treats as unsatisfied.
+    if lanes == 0 || accesses == 0 {
+        return None;
+    }
     let seed = build_seed(header);
     let scratchpad = build_scratchpad(&seed, lanes);
-    mix_accesses(&scratchpad, &seed, lanes, accesses)
+    Some(mix_accesses(&scratchpad, &seed, lanes, accesses))
 }
 
 /// Build a 64-bit seed from the block header (deterministic, covers all fields).
@@ -139,7 +143,9 @@ fn mix_accesses(pad: &[Hash], seed: &Hash, lanes: usize, accesses: usize) -> Has
 /// blocks. The `lanes` and `accesses` parameters should come from a validated
 /// `HbmConfig` (in production, carried by `NetworkParams`).
 pub fn hbm_satisfies(header: &Header, difficulty: u128, lanes: usize, accesses: usize) -> bool {
-    let mh = memory_hash(header, lanes, accesses);
+    let Some(mh) = memory_hash(header, lanes, accesses) else {
+        return false;
+    };
     let Ok(target) = target_for_difficulty(difficulty) else {
         return false;
     };
@@ -266,10 +272,22 @@ mod tests {
     }
 
     #[test]
+    fn memory_hash_refuses_degenerate_params() {
+        let h = genesis_header();
+        assert_eq!(memory_hash(&h, 0, 8), None, "zero lanes must refuse");
+        assert_eq!(memory_hash(&h, 8, 0), None, "zero accesses must refuse");
+        assert_eq!(memory_hash(&h, 0, 0), None, "both zero must refuse");
+        assert!(
+            !hbm_satisfies(&h, 1, 0, 8),
+            "no proof computes: unsatisfied"
+        );
+    }
+
+    #[test]
     fn memory_hash_differs_from_plain_block_hash() {
         let block = genesis_block(1);
         let cfg = test_cfg();
-        let mh = memory_hash(&block.header, cfg.lanes, cfg.accesses);
+        let mh = memory_hash(&block.header, cfg.lanes, cfg.accesses).expect("valid cfg");
         let bh = block.block_hash();
         assert_ne!(mh, bh[..32], "HBM hash and block hash must differ");
     }
@@ -278,9 +296,9 @@ mod tests {
     fn nonce_change_changes_memory_hash() {
         let mut h = genesis_header();
         let cfg = test_cfg();
-        let mh1 = memory_hash(&h, cfg.lanes, cfg.accesses);
+        let mh1 = memory_hash(&h, cfg.lanes, cfg.accesses).expect("valid cfg");
         h.nonce ^= 1;
-        let mh2 = memory_hash(&h, cfg.lanes, cfg.accesses);
+        let mh2 = memory_hash(&h, cfg.lanes, cfg.accesses).expect("valid cfg");
         assert_ne!(mh1, mh2, "nonce change must change the memory hash");
     }
 
@@ -288,9 +306,9 @@ mod tests {
     fn extra_nonce_change_changes_memory_hash() {
         let mut h = genesis_header();
         let cfg = test_cfg();
-        let mh1 = memory_hash(&h, cfg.lanes, cfg.accesses);
+        let mh1 = memory_hash(&h, cfg.lanes, cfg.accesses).expect("valid cfg");
         h.extra_nonce[0] ^= 0xFF;
-        let mh2 = memory_hash(&h, cfg.lanes, cfg.accesses);
+        let mh2 = memory_hash(&h, cfg.lanes, cfg.accesses).expect("valid cfg");
         assert_ne!(mh1, mh2, "extra_nonce change must propagate");
     }
 

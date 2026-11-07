@@ -281,6 +281,12 @@ pub enum PositionState {
         repaid_principal_sat: u64,
         /// Interest already repaid.
         repaid_interest_sat: u64,
+        /// The height up to which interest has been charged. Interest is
+        /// charged once per window on the balance that was outstanding, so
+        /// two instalments do not each pay for the whole elapsed time.
+        /// Advanced to the repayment height on every non-terminal repay;
+        /// starts at `drawn_at_height` on open.
+        interest_settled_height: u64,
     },
     /// Paid off. Collateral returns to the borrower, untouched.
     Repaid {
@@ -401,6 +407,16 @@ pub struct CreditBook {
     /// instead of trusting the caller to call once. Bounded: the log is a FIFO
     /// cap-with-eviction, so a flood of reservations cannot grow it forever.
     reservation_log: BTreeMap<Hash, ReservationOutcome>,
+    /// Reservations created and not yet consumed.
+    ///
+    /// The outcome log alone cannot tell "consumed long ago, evicted" from
+    /// "never existed": after an eviction both read as absent, and a replay
+    /// would debit again. Settle and release therefore require membership
+    /// here (removed on consume); the log only decides replays of ids it
+    /// still holds. Runtime-only on purpose: on restart the node re-marks
+    /// every reservation its persisted map still holds, so no format change
+    /// is needed and an upgrade never strands in-flight reservations.
+    outstanding: std::collections::BTreeSet<Hash>,
     /// Insertion order for the reservation log, so eviction is deterministic.
     reservation_order: std::collections::VecDeque<Hash>,
     /// Monotonic reservation counter. Every reservation gets its own id, so two
@@ -823,11 +839,13 @@ impl CreditPosition {
                 at_height,
                 repaid_principal_sat,
                 repaid_interest_sat,
+                interest_settled_height,
             } => {
-                w.u8(WIRE_DRAWN)
+                w.u8(WIRE_DRAWN_V2)
                     .u64le(*at_height)
                     .u64le(*repaid_principal_sat)
-                    .u64le(*repaid_interest_sat);
+                    .u64le(*repaid_interest_sat)
+                    .u64le(*interest_settled_height);
             }
             PositionState::Repaid {
                 at_height,
@@ -868,10 +886,26 @@ impl CreditPosition {
         let drawn_at_height = r.u64le()?;
         let deadline_height = r.u64le()?;
         let state = match r.u8()? {
-            WIRE_DRAWN => PositionState::Drawn {
+            // Pre-settlement-marker blobs settle interest from draw: that
+            // reproduces exactly the debt those blobs computed, so loading
+            // old state never jumps what anyone owes — later repays settle
+            // forward from there.
+            WIRE_DRAWN => {
+                let at_height = r.u64le()?;
+                let repaid_principal_sat = r.u64le()?;
+                let repaid_interest_sat = r.u64le()?;
+                PositionState::Drawn {
+                    at_height,
+                    repaid_principal_sat,
+                    repaid_interest_sat,
+                    interest_settled_height: drawn_at_height,
+                }
+            }
+            WIRE_DRAWN_V2 => PositionState::Drawn {
                 at_height: r.u64le()?,
                 repaid_principal_sat: r.u64le()?,
                 repaid_interest_sat: r.u64le()?,
+                interest_settled_height: r.u64le()?,
             },
             WIRE_REPAID => PositionState::Repaid {
                 at_height: r.u64le()?,
@@ -912,6 +946,9 @@ impl CreditPosition {
 const WIRE_DRAWN: u8 = 0;
 const WIRE_REPAID: u8 = 1;
 const WIRE_DEFAULTED: u8 = 2;
+/// `Drawn` with the interest-settlement marker. Old `WIRE_DRAWN` blobs still
+/// decode (settling from draw), so persisted books load without migration.
+const WIRE_DRAWN_V2: u8 = 3;
 
 /// Maximum entries the book codec will read back per map. The book is bounded by
 /// what a node's own depositors created, but a decoded count still has to be
@@ -1230,6 +1267,7 @@ impl CreditPosition {
                 at_height: spec.drawn_at_height,
                 repaid_principal_sat: 0,
                 repaid_interest_sat: 0,
+                interest_settled_height: spec.drawn_at_height,
             },
         })
     }
@@ -1259,11 +1297,23 @@ impl CreditPosition {
 
     /// The debt at `height`: outstanding principal plus accrued interest less
     /// whatever has already been repaid.
+    ///
+    /// Interest accrues on the outstanding balance *since the last
+    /// settlement*, not since draw: interest on repaid principal stops the
+    /// moment that principal is repaid, exactly like the L2 book (the two
+    /// implementations of the same rule must agree — L2 settles the marker
+    /// forward on every repay, and so does this).
+    ///
+    /// `repaid_interest_sat` is a receipt total, not a subtrahend: each
+    /// repay settles its window, so only the current window's accrual is
+    /// ever owed. A partial interest payment settles the window too (the
+    /// remainder is forgiven, as in L2) — the borrower still cannot pay
+    /// more than the debt, and the lender's receipt total stays exact.
     pub fn debt_at(&self, height: u64) -> Result<u64> {
         match self.state {
             PositionState::Drawn {
                 repaid_principal_sat,
-                repaid_interest_sat,
+                interest_settled_height,
                 ..
             } => {
                 let outstanding_principal = self
@@ -1272,12 +1322,10 @@ impl CreditPosition {
                     .ok_or(Error::Malformed("repaid more principal than borrowed"))?;
                 let accrued = self.charge.accrued_interest(
                     outstanding_principal,
-                    self.drawn_at_height,
+                    interest_settled_height,
                     height,
                 )?;
                 accrued
-                    .checked_sub(repaid_interest_sat)
-                    .ok_or(Error::Malformed("repaid more interest than accrued"))?
                     .checked_add(outstanding_principal)
                     .ok_or(Error::ValueOverflow)
             }
@@ -1308,12 +1356,20 @@ impl CreditPosition {
 
         // Interest first, then principal. Paying principal down before the
         // lender's own charge would leave that charge unpaid, and the borrower
-        // does not get to choose the order.
+        // does not get to choose the order. The window settles here: whatever
+        // of this window's accrual the payment covers is paid, the window
+        // closes, and later windows accrue on the new outstanding balance.
         let outstanding_principal = self.outstanding_principal();
-        let accrued_interest = self
-            .charge
-            .accrued_interest(outstanding_principal, self.drawn_at_height, height)?
-            .saturating_sub(repaid_interest);
+        let settled = match self.state {
+            PositionState::Drawn {
+                interest_settled_height,
+                ..
+            } => interest_settled_height,
+            _ => self.drawn_at_height,
+        };
+        let accrued_interest =
+            self.charge
+                .accrued_interest(outstanding_principal, settled, height)?;
         let interest_paid = payment_sat.min(accrued_interest);
         let principal_paid = payment_sat - interest_paid;
 
@@ -1324,20 +1380,28 @@ impl CreditPosition {
             .checked_add(principal_paid)
             .ok_or(Error::ValueOverflow)?;
 
-        let remaining_debt = debt.saturating_sub(payment_sat);
-
-        self.state = if remaining_debt == 0 {
-            PositionState::Repaid {
+        // The window settled with this payment, so the remainder is priced
+        // from the *new* state, not as old-debt-minus-payment: with the
+        // marker advanced, a fresh `debt_at` is the only number that agrees
+        // with what any later caller computes.
+        if payment_sat == debt {
+            self.state = PositionState::Repaid {
                 at_height: height,
                 interest_paid_sat: repaid_interest,
-            }
-        } else {
-            PositionState::Drawn {
-                at_height: height,
-                repaid_principal_sat: repaid_principal,
-                repaid_interest_sat: repaid_interest,
-            }
+            };
+            return Ok(Repayment {
+                interest_paid_sat: interest_paid,
+                principal_paid_sat: principal_paid,
+                remaining_debt_sat: 0,
+            });
+        }
+        self.state = PositionState::Drawn {
+            at_height: height,
+            repaid_principal_sat: repaid_principal,
+            repaid_interest_sat: repaid_interest,
+            interest_settled_height: height,
         };
+        let remaining_debt = self.debt_at(height)?;
 
         Ok(Repayment {
             interest_paid_sat: interest_paid,
@@ -1623,6 +1687,7 @@ impl CreditGate for CreditBook {
             let r = self.reserved.entry(*payer).or_insert(0);
             *r = r.checked_add(amount_sat).ok_or(Error::ValueOverflow)?;
             self.reservation_seq = seq;
+            self.outstanding.insert(id);
             return Ok(Reservation {
                 id,
                 debtor: *payer,
@@ -1718,6 +1783,7 @@ impl CreditGate for CreditBook {
         }
         debug_assert_eq!(to_encumber, 0);
         self.reservation_seq = seq;
+        self.outstanding.insert(id);
         Ok(Reservation {
             id,
             debtor: *payer,
@@ -1747,7 +1813,14 @@ impl CreditGate for CreditBook {
                     "this reservation was released and cannot be settled",
                 ))
             }
-            None => {}
+            // Unknown means either never issued or consumed so long ago the
+            // outcome log evicted it: both refuse. Without membership here a
+            // replayed receipt re-debits the moment the debtor re-reserves.
+            None => {
+                if !self.outstanding.remove(&reservation.id) {
+                    return Err(Error::Malformed("unknown or already-consumed reservation"));
+                }
+            }
         }
         // A draw against position headroom is capacity, not value: the debit is
         // a position-lifecycle event (repay), so there is no outstanding free
@@ -1798,7 +1871,13 @@ impl CreditGate for CreditBook {
                     "this reservation was settled and cannot be released",
                 ))
             }
-            None => {}
+            // Same rule as `settle`: an id the book never issued — or one
+            // whose outcome was evicted — releases nothing.
+            None => {
+                if !self.outstanding.remove(&reservation.id) {
+                    return Err(Error::Malformed("unknown or already-consumed reservation"));
+                }
+            }
         }
         // Return the swept free balance, exactly what admission moved.
         if reservation.from_free_sat > 0 {
@@ -1871,6 +1950,18 @@ impl CreditBook {
     /// caller (and a test) can assert the replay guard directly.
     pub fn reservation_outcome(&self, id: &Hash) -> Option<ReservationOutcome> {
         self.reservation_log.get(id).copied()
+    }
+
+    /// Mark a reservation id as outstanding (created, not yet consumed).
+    ///
+    /// `reserve` does this itself; this exists for restart recovery, where
+    /// the node re-marks every reservation its persisted map still holds
+    /// (the outstanding set itself is runtime-only, like that map). Marking
+    /// an already-consumed id is harmless: the outcome log is consulted
+    /// first, so a settle still returns idempotent-Ok and a release still
+    /// refuses — the mark only admits ids the log has never seen.
+    pub fn mark_outstanding(&mut self, id: &Hash) {
+        self.outstanding.insert(*id);
     }
 }
 
@@ -2058,17 +2149,40 @@ mod tests {
         // charge and comes first. The principal is untouched.
         assert_eq!(r.interest_paid_sat, 50_000);
         assert_eq!(r.principal_paid_sat, 0);
+        // The window settles on every repay (L2 parity): the 50 000 of this
+        // window's 100 000 charge that went unpaid is forgiven, exactly as
+        // the L2 book does — the debt is the outstanding principal plus the
+        // current window's accrual, never a remembered remainder.
         assert_eq!(
-            r.remaining_debt_sat, 1_050_000,
-            "1 000 000 principal + 50 000 left of interest"
+            r.remaining_debt_sat, 1_000_000,
+            "1 000 000 principal, window settled"
         );
 
         // Paying the rest settles it, and the collateral returns whole.
-        let r2 = p.repay(1_050_000, 100).unwrap();
+        let r2 = p.repay(1_000_000, 100).unwrap();
         assert_eq!(r2.remaining_debt_sat, 0);
         assert!(p.is_terminal());
         assert!(
-            matches!(p.state, PositionState::Repaid { interest_paid_sat, .. } if interest_paid_sat == 100_000)
+            matches!(p.state, PositionState::Repaid { interest_paid_sat, .. } if interest_paid_sat == 50_000)
+        );
+    }
+
+    #[test]
+    fn partial_principal_repay_stops_interest_on_what_left() {
+        // 1 000 000 at 10 %/window: at h=100 the full 100 000 interest plus
+        // 500 000 principal goes in. Later windows charge only the 500 000
+        // still out — interest on repaid principal stops at repayment.
+        let mut p = drawn(0);
+        let r = p.repay(600_000, 100).unwrap();
+        assert_eq!(r.interest_paid_sat, 100_000);
+        assert_eq!(r.principal_paid_sat, 500_000);
+        // One more window on 500 000: 50 000 interest, 550 000 debt.
+        assert_eq!(p.debt_at(200).unwrap(), 550_000);
+        let r2 = p.repay(550_000, 200).unwrap();
+        assert_eq!(r2.remaining_debt_sat, 0);
+        assert!(p.is_terminal());
+        assert!(
+            matches!(p.state, PositionState::Repaid { interest_paid_sat, .. } if interest_paid_sat == 150_000)
         );
     }
 
@@ -2145,6 +2259,7 @@ mod tests {
             at_height: 0,
             repaid_principal_sat: 0,
             repaid_interest_sat: 0,
+            interest_settled_height: 0,
         };
         p2.collateral_sat = 250_000;
         let s2 = p2.default(0).unwrap();
@@ -2194,6 +2309,7 @@ mod tests {
             at_height: 0,
             repaid_principal_sat: 1_000_000,
             repaid_interest_sat: 0,
+            interest_settled_height: 0,
         };
         assert!(
             p.default(0).is_err(),
@@ -2407,11 +2523,19 @@ mod tests {
         let mut r = crate::ser::Reader::new(&bytes);
         let mut restored = CreditBook::decode(&mut r).unwrap();
         assert_eq!(r.remaining(), 0, "the codec is self-delimiting");
-        assert_eq!(restored, book, "every bucket round-trips");
+        // Every value bucket round-trips; the outstanding set is
+        // runtime-only by design, so it comes back empty and the node
+        // re-marks what its reservations map still holds (below).
+        let mut expect = book.clone();
+        expect.outstanding.clear();
+        assert_eq!(restored, expect, "every value bucket round-trips");
         restored.check_conservation().unwrap();
 
-        // And the restored book can finish the job: the reservation still
-        // settles exactly once, and the position still repays to zero.
+        // And the restored book can finish the job once the live
+        // reservation is re-marked: it settles exactly once, and the
+        // position still repays to zero.
+        assert!(restored.settle(&res).is_err(), "unmarked id refuses");
+        restored.mark_outstanding(&res.id);
         restored.settle(&res).unwrap();
         restored.settle(&res).unwrap();
         assert_eq!(restored.total_settled(), 400_000);
@@ -2477,6 +2601,38 @@ mod tests {
         let mut r = crate::ser::Reader::new(&bytes);
         assert_eq!(CreditPosition::decode(&mut r).unwrap(), p);
         assert_eq!(r.remaining(), 0);
+
+        // Pre-marker (tag 0) blobs still decode: interest settles from
+        // draw, reproducing exactly the debt those blobs computed, so
+        // loading persisted books never jumps what anyone owes.
+        let mut legacy = crate::ser::Writer::with_capacity(256);
+        let q = CreditPosition::open(&spec(1_000_000, 50_000, 10, 100)).unwrap();
+        legacy
+            .fixed(&q.borrower)
+            .fixed(&q.agent_id)
+            .fixed(&q.lender);
+        legacy.raw(&q.terms.encode());
+        legacy
+            .u32le(q.charge.rate_bps_per_window)
+            .u64le(q.charge.window_blocks)
+            .u64le(q.amount_sat)
+            .u64le(q.bond_sat)
+            .u64le(q.collateral_sat)
+            .u64le(q.drawn_at_height)
+            .u64le(q.deadline_height);
+        legacy.u8(0).u64le(10).u64le(0).u64le(0);
+        let bytes = legacy.into_vec();
+        let mut r = crate::ser::Reader::new(&bytes);
+        let old = CreditPosition::decode(&mut r).unwrap();
+        assert_eq!(r.remaining(), 0);
+        match old.state {
+            PositionState::Drawn {
+                interest_settled_height,
+                ..
+            } => assert_eq!(interest_settled_height, 10),
+            _ => panic!("legacy blob must decode as drawn"),
+        }
+        assert_eq!(old.debt_at(110).unwrap(), q.debt_at(110).unwrap());
 
         // A spec round-trips too, and keeps the id the position was opened
         // under: a node can serve one and a worker can read the same position.
@@ -2557,6 +2713,66 @@ mod tests {
         // A settled reservation cannot be released either: the value has moved.
         assert!(book.release(&res).is_err());
         book.check_conservation().unwrap();
+    }
+
+    #[test]
+    fn unknown_and_evicted_reservations_settle_nothing() {
+        // A fabricated reservation — one the book never issued — must not
+        // debit, even when the named debtor currently has cover.
+        let payer = [12u8; 20];
+        let mut book = CreditBook::new();
+        book.deposit(payer, 500_000).unwrap();
+        let fake = Reservation {
+            id: [9u8; 32],
+            debtor: payer,
+            amount_sat: 100_000,
+            from_free_sat: 100_000,
+            position_draws: Vec::new(),
+            position_id: None,
+        };
+        assert!(book.settle(&fake).is_err(), "unknown id settles nothing");
+        assert!(book.release(&fake).is_err(), "unknown id releases nothing");
+        assert_eq!(book.total_settled(), 0);
+        book.check_conservation().unwrap();
+
+        // The real one settles once, then 4096 further consumptions evict
+        // its outcome from the bounded log. A replay after eviction must
+        // refuse — not debit the debtor's refilled line a second time.
+        let res = book.reserve(&payer, 200_000, 3).unwrap();
+        book.settle(&res).unwrap();
+        let filler = [13u8; 20];
+        book.deposit(filler, 10_000_000_000).unwrap();
+        let mut last = book.reserve(&filler, 1_000, 4).unwrap();
+        book.settle(&last).unwrap();
+        for h in 5..(5 + 4_099) {
+            let r = book.reserve(&filler, 1_000, h).unwrap();
+            book.settle(&r).unwrap();
+            last = r;
+        }
+        assert!(book.reservation_outcome(&res.id).is_none(), "evicted");
+        book.deposit(payer, 200_000).unwrap();
+        assert!(book.settle(&res).is_err(), "evicted replay refuses");
+        assert_eq!(book.total_settled(), 200_000 + 4_100_000, "no second debit");
+        book.check_conservation().unwrap();
+
+        // Restart recovery: the outstanding set is runtime-only, so a
+        // persisted-and-reloaded book cannot settle a live reservation
+        // until the node re-marks it from its persisted reservations map.
+        // Re-marking a consumed id stays decided by the outcome log.
+        let live = book.reserve(&payer, 50_000, 99_999).unwrap();
+        let bytes = book.encode();
+        let mut rebooted = CreditBook::decode(&mut crate::ser::Reader::new(&bytes)).unwrap();
+        assert!(rebooted.settle(&live).is_err(), "unmarked id refuses");
+        rebooted.mark_outstanding(&live.id);
+        rebooted.settle(&live).unwrap();
+        rebooted.settle(&live).unwrap();
+        assert_eq!(rebooted.total_settled(), 200_000 + 4_100_000 + 50_000);
+        // Re-marking a consumed id changes nothing: the outcome log is
+        // consulted first, so settle stays idempotent and release refused.
+        rebooted.mark_outstanding(&last.id);
+        rebooted.settle(&last).unwrap();
+        assert!(rebooted.release(&last).is_err(), "settled stays settled");
+        rebooted.check_conservation().unwrap();
     }
 
     #[test]

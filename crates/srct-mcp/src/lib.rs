@@ -957,31 +957,36 @@ fn session_error(e: SessionError) -> McpError {
 }
 
 /// Parse an `X402Budget` from `max_amount_sat` + optional hex allow-lists.
-/// An absent list means unbounded on that axis (same as `X402Budget::check`).
+/// An absent list means unbounded on that axis (`None`); a present list —
+/// even an empty one — is enforced exactly like `SpendPolicy` (empty
+/// present = deny-all on that axis).
 fn budget_from(v: &Value) -> Result<srct_core::x402::X402Budget, McpError> {
     let max_amount_sat = v
         .get("max_amount_sat")
         .and_then(Value::as_u64)
         .ok_or_else(|| McpError::bad("missing integer field `max_amount_sat`"))?;
-    let mut allowed_recipients = Vec::new();
+    let mut allowed_recipients = None;
     if let Some(list) = v.get("allowed_recipients_hex") {
         let arr = list
             .as_array()
             .ok_or_else(|| McpError::bad("`allowed_recipients_hex` must be an array"))?;
+        let mut parsed = Vec::new();
         for item in arr {
             let s = item
                 .as_str()
                 .ok_or_else(|| McpError::bad("recipient entry must be a string"))?;
-            allowed_recipients.push(
+            parsed.push(
                 address_from_hex(s.trim()).map_err(|e| McpError::bad(format!("recipient: {e}")))?,
             );
         }
+        allowed_recipients = Some(parsed);
     }
-    let mut allowed_services = Vec::new();
+    let mut allowed_services = None;
     if let Some(list) = v.get("allowed_services_hex") {
         let arr = list
             .as_array()
             .ok_or_else(|| McpError::bad("`allowed_services_hex` must be an array"))?;
+        let mut parsed = Vec::new();
         for item in arr {
             let s = item
                 .as_str()
@@ -991,8 +996,9 @@ fn budget_from(v: &Value) -> Result<srct_core::x402::X402Budget, McpError> {
             let tag: [u8; 32] = bytes
                 .try_into()
                 .map_err(|_| McpError::bad("service tag must be 32 bytes"))?;
-            allowed_services.push(tag);
+            parsed.push(tag);
         }
+        allowed_services = Some(parsed);
     }
     Ok(srct_core::x402::X402Budget {
         max_amount_sat,

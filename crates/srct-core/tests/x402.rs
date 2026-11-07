@@ -80,8 +80,8 @@ fn agent_paid_api_roundtrip() {
     };
     let budget = X402Budget {
         max_amount_sat: 600,
-        allowed_recipients: vec![provider_addr],
-        allowed_services: vec![service],
+        allowed_recipients: Some(vec![provider_addr]),
+        allowed_services: Some(vec![service]),
     };
     // A greedy server asking for more than the budget is refused locally.
     let greedy = build_required(
