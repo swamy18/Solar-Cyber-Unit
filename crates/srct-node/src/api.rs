@@ -588,7 +588,7 @@ pub struct SharedNode {
     /// Smart Gate accounting: tumbling-window calls and nonces per grant.
     /// Persisted, so a restart is not a replay window.
     pub guards: srct_core::guard::GuardBook,
-    /// SRCT Treats ledger: non-transferable dopamine reward claims for agents/machines/robots. Node-local, persisted.
+    /// SRCT Treats ledger: transferable reward claims for agents/machines/robots. Node-local, persisted.
     pub treats: srct_core::treats::TreatLedger,
     /// L1 txids the API accepted; drained by the serve loop, which owns the
     /// P2P node and announces them to peers.

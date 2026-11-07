@@ -95,7 +95,7 @@ pub struct Chain {
     /// Per-block B-Saver deltas, keyed by block hash.
     bsaver_undo: HashMap<Hash512, u64>,
     /// SRCT Treats reserve: 10% carve-out from the fee PSCB leg (cap 20%).
-    /// Backs non-transferable agent Treat redemptions; rewound like PSCB.
+    /// Backs transferable agent Treat redemptions; rewound like PSCB.
     treat_reserve: u64,
     /// Per-block Treat deltas, keyed by block hash.
     treat_undo: HashMap<Hash512, u64>,

@@ -17,7 +17,7 @@ so no API can print Treats from nothing.
      and `PaymentCompleted` to the payer (source = receipt id);
    - `POST /v1/treats/claim-work {task_id}` mints `VerifiedWork` once per
      task when the node's own L2 state holds the VWC (source = VWC id).
-   
+
    Each mint is base weight plus a capped fee bonus:
    `mint = base + min(fee_sat / 1000, 50)`. Wash trading is bounded by
    real fees paid, per-event caps, and dispute slashing.
@@ -29,11 +29,16 @@ so no API can print Treats from nothing.
 Fixed base weights: VerifiedWork 20, ServiceCompleted/PaymentCompleted 5,
 DisputeWon 10, DisputeLost slashes the holder to zero.
 
+Request fields for gifts and transfers: `{*_hex, recipient_hex, role?,
+amount, nonce, expiry_height, sigs_hex, keys_hex}` with `role` one of
+`machine` (default), `human`, `service`. Limits: one gift at most 10,000
+Treats, one transfer at most 100,000, holder ceiling 1,000,000, global
+outstanding ceiling 500,000,000. Certificates expire within 10,000 blocks.
+
 ## Storage and transfers
 
 Treats are storable and accumulate for later use. Growth is bounded, not
-decayed: a per-holder ceiling (1,000,000) and a global outstanding
-ceiling (500,000,000) refuse further mints.
+decayed: the per-holder and global ceilings above refuse further mints.
 
 Holders move claims with `POST /v1/treats/transfer`: the sender signs the
 exact recipient, amount, nonce and expiry. Nonce-per-sender replay guards
@@ -42,17 +47,22 @@ verifies anywhere.
 
 ## Redemption: sell, discounts, trials, credits
 
-`POST /v1/treats/redeem {agent, treats, kind}` burns Treats, debits the
-Treat reserve at the proportional quote
+`POST /v1/treats/redeem {agent_hex, role?, treats, kind?}` burns Treats,
+debits the Treat reserve at the proportional quote
 (`payout_sat = treats * reserve / outstanding`, floored), and issues a
 single-use voucher toward one benefit kind: `fee_credit` (default),
 `discount`, `trial`, or `service_credit`. Vouchers live 1,440 blocks and
-spend exactly once (`POST /v1/treats/voucher/consume`, or internally by
-trial repay, where a Trial-kind voucher covers part of the L1 repayment).
+spend exactly once: directly via
+`POST /v1/treats/voucher/consume {voucher_id, kind?}`, or internally by
+trial repay — `POST /v1/trials/repay` accepts an optional `voucher_id` and
+a Trial-kind voucher covers part of the L1 repayment.
 
 Free gifts dilute the quote rather than draining fixed value: new claims
 raise `outstanding` against the same reserve, so each Treat redeems for
 fewer sats. The reserve is never minted into and an empty reserve refuses.
+
+Read the balance with `GET /v1/treats/balance/{agent}?role=` (also in
+`status`, `conservation`, `/metrics`, and `srct-worker treats-balance`).
 
 ## Money rules
 
