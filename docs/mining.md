@@ -90,6 +90,33 @@ A profile opts in by setting `puzzle_id: 3` (and ensuring at least one VWC
 has settled, or `extra_nonce` stays zero — which is still a valid proof).
 `hbm-v1` remains the fallback upgrade route if ASIC pressure ever appears.
 
+## Photonic & custom silicon (attestation, not multipliers)
+
+The PoW is integer-only so every chip computes bit-identical results,
+and `srct-miner` exposes one `ComputeBackend` contract: a new chip
+(photonic, neuromorphic, custom ASIC) joins by implementing the contract
+and passing the differential test against `CpuBackend` on every
+candidate — never by forking consensus. `templates/srct_silicon.py` is
+the process around a port: `attest` records measured candidates/sec and
+wall watts per puzzle, `efficiency` derives candidates/joule plus a
+class, `verify_attestation` re-checks schema, spec dims and physical
+plausibility, and `port_checklist` prints the exact path to a merged
+backend. There is deliberately no mining multiplier or bonus yield for
+new hardware: the coinbase is a consensus rule, and paying newest-fab
+first would centralize on whoever buys silicon fastest. The fastest
+truthful chip wins blocks the honest way — more candidates per joule.
+
+## Auto-tuning boundary
+
+Consensus parameters (target spacing, fee base, epoch length and
+weights, difficulty clamp) are profile constants every node enforces
+identically — no node auto-tunes them, gradient-free or otherwise,
+because two nodes that tune differently are two chains. What operators
+do tune locally: miner `--threads` / `--batch` / `--backend` (same
+blocks, different speed), pool fee and PPLNS window (same payouts,
+different accounting), seed-box relay flags. Self-tuning ends where
+consensus begins.
+
 ## Upgrade route: hbm-v1
 
 A second puzzle, `hbm-v1` (`puzzle_id = 2`), is designed and registered in

@@ -459,7 +459,13 @@ lines anchored to live loan offers, exact accept payload on trip
 (`python templates/srct_shield.py --selftest`) — and high-value spends
 clear an ephemeral multi-agent vote first via `templates/srct_swarm.py`
 (auditor + budget + compliance must each approve;
-`python templates/srct_swarm.py --selftest`).
+`python templates/srct_swarm.py --selftest`). New silicon ports carry a
+checkable benchmark attestation (`templates/srct_silicon.py`, no bonus
+yield — the fastest truthful chip wins blocks honestly;
+`python templates/srct_silicon.py --selftest`), and agents share memory
+without bloating L1 through `templates/srct_memory.py` — a hash-chained
+syncable log whose tip anchors task claims
+(`python templates/srct_memory.py --selftest`).
 
 **Trial faucet (operator setup).** Trials stay disabled until a sponsor is
 configured — with no sponsor there is no money behind a trial, so every
@@ -864,6 +870,11 @@ answered as `allow / deny / needs_approval` anywhere, settled as trust on Solar.
   Anything else needs `SRCT_MCP_TRUSTED_ENDPOINTS` + `SRCT_MCP_ALLOW_REMOTE=1`
   and still never receives the token over this plaintext transport; redirects
   are refused, never followed.
+- **Quantum-resistant by construction:** every signature the gate, the
+  policy engine and x402 payments verify travels as a hybrid bundle
+  (`sig.rs`: scheme 1 ECDSA + scheme 3 ML-DSA-65, FIPS 204 level 3), and a
+  bundle carrying both is quantum-safe — Shor breaking secp256k1 alone
+  forges nothing. SPEC §1.2 is the reference.
 - **How others use it:** free verify, paid trust. Any platform calls
   `srct-policy::guard_verify`, MCP `guard.check` (stateless, `cap_hex` signed,
   `action_hash_hex`) / `guard.authorize` (stateful, plus

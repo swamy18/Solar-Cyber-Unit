@@ -63,3 +63,18 @@ moves only through the task economy's verified-work certificates, so an
 offer that cannot deliver simply never earns. This is the intrinsic-demand
 story: real compute buys and sells for SRCT, not speculation.
 `python templates/srct_depin.py --selftest` exercises it offline.
+
+## Shared memory without bloating L1
+
+Agents need memory — past interactions, context windows, agreed facts —
+and L1 UTXOs are the wrong place for it. `templates/srct_memory.py`
+keeps a hash-chained log beside the chain: `append` writes one entry
+committing to the previous tip, `sync` merges a peer's entries by hash
+(union semantics — two agents exchanging entries converge with no
+server, forks refused, duplicates collapsed), `verify` re-checks every
+link fail-closed, and `anchor` returns the tip hash. Agents attach the
+tip to task results and VWC attestations, so verifiers and the policy
+engine release funds against memory proven continuous, not merely
+claimed. Hashes travel, megabytes do not — the shared brain without the
+chain bloat. `python templates/srct_memory.py --selftest` exercises it
+offline.
