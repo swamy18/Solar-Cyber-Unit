@@ -1,0 +1,9 @@
+{
+  "detail": {
+    "append_50x_ms": 2,
+    "blocks_indexed": 312,
+    "set_tip_50x_ms": 334
+  },
+  "mode": "persist-profile",
+  "tool": "srct-bench"
+}

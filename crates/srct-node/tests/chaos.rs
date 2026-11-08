@@ -439,6 +439,10 @@ fn restart_recovery_from_a_torn_tail_drops_the_incomplete_block() {
     };
     bs.append_block(&block).unwrap();
     bs.set_tip(&block.block_hash()).unwrap();
+    // The premise of this test is a *durable* tip inside the torn tail:
+    // without the flush, batching would (correctly) fall back to genesis
+    // instead of refusing, since nothing was ever claimed durable.
+    bs.flush_meta().unwrap();
     bs.sync().unwrap();
 
     let log_path = dir.join("blocks.log");

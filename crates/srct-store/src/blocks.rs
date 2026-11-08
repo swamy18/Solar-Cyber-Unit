@@ -31,6 +31,16 @@ use crate::{Recovery, StoreError};
 pub const TAG_BLOCK: u8 = 0x00;
 pub const TAG_UTXO: u8 = 0x01;
 
+/// Blocks of tip advancement between durable metadata flushes. The tip moves
+/// in memory on every `set_tip`; the `meta.json` file (plus the log fsync
+/// that must precede it) is rewritten at most this often, on finality
+/// changes, on reorgs, and on shutdown — never less often than the node
+/// needs to restart without replaying more than this many blocks past the
+/// recorded tip. Crash recovery re-adopts the logged extension (see
+/// `BlockStore::open`), so a deferred flush loses no decisions, only
+/// re-derives them.
+pub const META_FLUSH_INTERVAL: u64 = 10;
+
 /// The directory holding `blocks.log` and `meta.json`.
 #[derive(Debug)]
 pub struct BlockStore {
@@ -47,6 +57,17 @@ pub struct BlockStore {
     /// capped — a peer feeding unconnectable side branches must not grow RAM
     /// without bound.
     orphans: Vec<Hash512>,
+    /// Tip advances since the last durable metadata flush. Only the fast
+    /// (linear-extension) path defers; reorgs, finality and shutdown flush
+    /// synchronously, so this counter only ever covers a short linear tail
+    /// that open-time recovery re-derives deterministically.
+    tip_writes_since_flush: u64,
+    /// Append-only record of every tip decision (`"<height> <hexhash>\\n"`
+    /// per line). `meta.json` only catches up on flush; the journal lets a
+    /// restart re-adopt exactly the recorded choice instead of guessing.
+    /// Never fsync'd per write — durability comes from `flush_meta`, and a
+    /// torn tail line is dropped on read.
+    journal_path: std::path::PathBuf,
 }
 
 /// List-only cap for [`BlockStore::orphans`]. The block bytes stay in the log;
@@ -90,7 +111,12 @@ impl BlockStore {
         let (mut log, recovery) = RecordLog::open(&log_path)?;
 
         let meta_file = MetaFile::new(dir.join("meta.json"));
-        let meta = match meta_file.load()? {
+        // Whether the metadata file existed and parsed. A missing file means
+        // a fresh store (or operator-deleted metadata): the tip journal is
+        // ignored and the chain honestly starts at genesis rather than
+        // adopting history no metadata vouches for. The journal only ever
+        // fast-forwards a *loaded* tip.
+        let (mut meta, loaded_meta) = match meta_file.load()? {
             Some(m) => {
                 // A store opened against another network's data would feed this
                 // node a foreign chain's blocks, so it is refused by name.
@@ -102,7 +128,7 @@ impl BlockStore {
                         ),
                     });
                 }
-                m
+                (m, true)
             }
             None => {
                 // Fresh store: genesis is implied, not stored. The canonical
@@ -112,7 +138,7 @@ impl BlockStore {
                 let genesis = srct_core::block::genesis_block(params.genesis_difficulty);
                 let m = Meta::new(&params.network_id, genesis.block_hash());
                 meta_file.save(&m)?;
-                m
+                (m, false)
             }
         };
 
@@ -160,7 +186,100 @@ impl BlockStore {
         // Height index: walk from the tip to genesis via parent hashes. Only
         // this walk reaches `by_height`, so "canonical" means exactly "provable
         // from the recorded tip", not whatever the log happens to contain.
-        let by_height = rebuild_height_index(&mut log, &log_path, &by_hash, &meta)?;
+        let mut by_height = rebuild_height_index(&mut log, &log_path, &by_hash, &meta)?;
+        // Genesis is height 0 of every chain: index it explicitly so the
+        // fast-tip path's induction hypothesis (`by_height[tip] == tip`)
+        // holds from a fresh store, instead of forcing one slow walk.
+        // `rebuild_height_index` returns empty for a height-0 store because
+        // there is nothing to walk; the entry below states the same fact the
+        // walk would prove for the degenerate chain.
+        by_height.entry(0).or_insert(meta.genesis);
+        // Adopt an unflushed tip extension: `set_tip` batches durability (the
+        // journal in `tip.journal` records every tip decision; `meta.json`
+        // only catches up on flush), so after a crash the log can hold
+        // canonical blocks above the recorded tip. Adoption replays the
+        // journal newest-first and takes the first entry that provably
+        // extends the recorded tip — a decision the node already made, never
+        // a guess: a missing journal, a torn tail, garbage, or an entry that
+        // does not chain contiguously from the recorded tip all fall back to
+        // the recorded tip, which is always valid canonical history.
+        // In-memory only; the next `flush_meta` persists it. Runs before the
+        // orphan computation so adopted blocks count as canonical.
+        // Skipped entirely for fresh stores: with no loaded metadata there is
+        // nothing to fast-forward, and history starts honestly at genesis.
+        // Adopted-but-unflushed heights count toward the batch budget, exactly
+        // like fast-path advances made live: the bytes are durable in the log
+        // but `meta.json` does not name them yet, so the first flush must not
+        // wait a full interval.
+        let mut adopted_unflushed = 0u64;
+        if loaded_meta {
+            // Newest journal entry first: a torn tip (power loss mid-append)
+            // falls back to the newest complete decision, not all the way to
+            // metadata. Entries at or below the recorded height, or entries
+            // that do not chain contiguously down to it, are skipped.
+            if let Some(entries) = read_journal(&dir.join("tip.journal")) {
+                for (jh, jhash) in entries.iter().rev() {
+                    let (jh, jhash) = (*jh, *jhash);
+                    if jh <= meta.height {
+                        continue;
+                    }
+                    // Walk down from the journaled tip. The recorded tip
+                    // itself needs no lookup — it is already proven, and
+                    // genesis is implied rather than stored, so the check
+                    // comes first and the log is only read for the suffix.
+                    let mut chain: Vec<(u64, Hash512)> = Vec::new();
+                    let mut cur = jhash;
+                    let mut h = jh;
+                    let mut ok = false;
+                    let mut guard = 0usize;
+                    loop {
+                        if cur == meta.tip && h == meta.height {
+                            ok = true;
+                            break;
+                        }
+                        guard += 1;
+                        if guard > by_hash.len() + 1 {
+                            break;
+                        }
+                        let &r = match by_hash.get(&cur) {
+                            Some(r) => r,
+                            None => break,
+                        };
+                        let bytes = match log.read(r) {
+                            Ok(b) => b,
+                            Err(_) => break,
+                        };
+                        let block = match Block::deserialize(block_payload(&bytes)) {
+                            Ok(b) => b,
+                            Err(_) => break,
+                        };
+                        if block.header.height != h {
+                            break;
+                        }
+                        chain.push((h, cur));
+                        if h == 0 {
+                            break;
+                        }
+                        cur = block.header.prev_hash;
+                        h -= 1;
+                    }
+                    if ok {
+                        // Count the adoption toward the batch budget: these
+                        // heights are durable in the log but not yet in
+                        // `meta.json`, exactly like unflushed fast-path
+                        // advances, so the next flush must account for them.
+                        let adopted = chain.len() as u64;
+                        for (height, hash) in chain {
+                            by_height.insert(height, hash);
+                        }
+                        meta.tip = jhash;
+                        meta.height = jh;
+                        adopted_unflushed = adopted;
+                        break;
+                    }
+                }
+            }
+        }
         // A side branch that forked at genesis has no parent in common with the
         // canonical walk; anything whose parent is unknown is an orphan.
         // The canonical set is built once: scanning it per candidate is
@@ -179,6 +298,7 @@ impl BlockStore {
             orphans.drain(..orphans.len() - MAX_ORPHANS);
         }
 
+        let journal_path = dir.join("tip.journal");
         let store = BlockStore {
             log,
             meta_file,
@@ -186,6 +306,8 @@ impl BlockStore {
             by_hash,
             by_height,
             orphans,
+            tip_writes_since_flush: adopted_unflushed,
+            journal_path,
         };
         Ok((store, recovery))
     }
@@ -250,8 +372,15 @@ impl BlockStore {
         }
         self.meta.finalized_height = height;
         self.meta.finalized_hash = hash;
-        self.meta_file.save(&self.meta)?;
-        Ok(())
+        // Synchronous, like a reorg save: finality is always durable
+        // immediately, and it carries the current tip with it. The full
+        // flush (log sync first) is required, not just the metadata write:
+        // finality frequently lands on a tip whose blocks have only been
+        // appended since the last batched flush, and a meta file naming
+        // not-yet-stable blocks turns a power loss into an unopenable store
+        // (recorded tip missing from the log). Order is the guarantee.
+        // (`flush_meta` also resets the batch counter.)
+        self.flush_meta()
     }
 
     /// Look up a block by its hash.
@@ -320,10 +449,20 @@ impl BlockStore {
 
     /// Mark a block as the canonical tip. A reorg is this call and nothing else.
     ///
-    /// The new tip's ancestry is walked first; if the walk cannot reach genesis,
-    /// metadata is left untouched, so a failed reorg can never leave the store
-    /// pointing at a chain it cannot prove. Only after the walk succeeds is the
-    /// metadata replaced atomically.
+    /// Two paths, one guarantee: the metadata file is only ever replaced
+    /// atomically, and only after the new tip's ancestry is proven.
+    ///
+    /// Fast path: the new tip extends the recorded tip directly, possibly
+    /// across several heights at once (batched appends). It walks back only
+    /// until the recorded tip, checking prev-links *and* height continuity,
+    /// so reaching it proves exactly the ancestry the full walk would prove
+    /// for the new suffix — O(batch), not O(history). The metadata file is
+    /// *not* rewritten here; it follows at the next [`BlockStore::flush_meta`]
+    /// (or on reorg/finality/shutdown, which flush synchronously).
+    ///
+    /// Slow path: anything else (reorg, gap, unknown block) takes the full
+    /// walk to genesis exactly as before, then saves synchronously: a fork
+    /// decision is always durable immediately.
     pub fn set_tip(&mut self, new_tip: &Hash512) -> Result<(), StoreError> {
         if *new_tip == self.meta.genesis {
             // Resetting to genesis is a legal decision the node can make after
@@ -331,8 +470,40 @@ impl BlockStore {
             self.meta.tip = *new_tip;
             self.meta.height = 0;
             self.by_height.clear();
-            self.meta_file.save(&self.meta)?;
+            self.append_journal(0, &self.meta.genesis)?;
+            self.flush_meta()?;
             return Ok(());
+        }
+        if *new_tip == self.meta.tip {
+            // Idempotent re-mark: the index already covers this tip and the
+            // journal already names it (the first call recorded the
+            // decision). No walk, no write — the batched flush will persist
+            // it with the rest of the window.
+            return Ok(());
+        }
+
+        // Fast-path induction hypothesis: the recorded tip is indexed. After
+        // a genesis reset `by_height` is empty, so that path always takes
+        // the slow walk below; after a full walk or a fast advance the
+        // hypothesis holds by construction.
+        if self.by_height.get(&self.meta.height) == Some(&self.meta.tip) {
+            if let Some(suffix) = self.direct_extension(new_tip)? {
+                // Suffix is tip-first with contiguous heights
+                // meta.height+1 ..= new tip height (checked inside).
+                for (height, h) in suffix.iter().rev() {
+                    self.by_height.insert(*height, *h);
+                }
+                let advanced = suffix.len() as u64;
+                let &(tip_height, tip_hash) = &suffix[0];
+                self.meta.tip = tip_hash;
+                self.meta.height = tip_height;
+                // Journal first: the decision is recorded even though the
+                // metadata file waits for the next flush (see `flush_meta`).
+                // A crash before the flush replays this exact entry on open.
+                self.append_journal(tip_height, &tip_hash)?;
+                self.tip_writes_since_flush = self.tip_writes_since_flush.saturating_add(advanced);
+                return Ok(());
+            }
         }
 
         // Walk the candidate's ancestry to genesis, collecting the heights.
@@ -389,13 +560,175 @@ impl BlockStore {
         // Commit: in-memory index first, then metadata. If the metadata write
         // fails, the in-memory state is stale but the file is not half-written
         // (rename is atomic); the error propagates so the caller decides.
+        // Synchronous flush: fork decisions are durable immediately, journal
+        // entry included, so reopening never has to guess which branch won.
         self.by_height.clear();
         for (height, h) in &chain {
             self.by_height.insert(*height, *h);
         }
         self.meta.tip = *new_tip;
         self.meta.height = tip_height;
+        self.append_journal(tip_height, new_tip)?;
+        self.flush_meta()?;
+        Ok(())
+    }
+
+    /// Walk back from `new_tip` toward the recorded tip. Returns the suffix
+    /// (tip-first) when every step prev-links to its parent with contiguous
+    /// heights ending exactly at the recorded tip — i.e. a direct linear
+    /// extension. Returns `Ok(None)` for anything else (gap, fork, unknown
+    /// block, height jump, cycle); the caller then takes the slow path,
+    /// which produces the legacy errors for those cases.
+    ///
+    /// Only fully decoded block headers are trusted for height/prev; the
+    /// walk is bounded by the store size exactly like the full walk.
+    fn direct_extension(
+        &mut self,
+        new_tip: &Hash512,
+    ) -> Result<Option<Vec<(u64, Hash512)>>, StoreError> {
+        let mut suffix: Vec<(u64, Hash512)> = Vec::new();
+        let mut seen: std::collections::HashSet<Hash512> = std::collections::HashSet::new();
+        let mut cur = *new_tip;
+        loop {
+            if cur == self.meta.tip {
+                break;
+            }
+            if !seen.insert(cur) {
+                return Ok(None);
+            }
+            if suffix.len() > self.by_hash.len() {
+                return Ok(None);
+            }
+            let &r = match self.by_hash.get(&cur) {
+                Some(r) => r,
+                None => return Ok(None),
+            };
+            let bytes = self.log.read(r)?;
+            let block =
+                Block::deserialize(block_payload(&bytes)).map_err(|e| StoreError::BadBlock {
+                    detail: format!("stored block {}: {e}", crate::hex(&cur)),
+                })?;
+            suffix.push((block.header.height, cur));
+            if block.header.prev_hash == self.meta.genesis && self.meta.height != 0 {
+                // Reached genesis without passing through the recorded tip:
+                // a different history, not an extension of ours.
+                return Ok(None);
+            }
+            cur = block.header.prev_hash;
+        }
+        if suffix.is_empty() {
+            // `new_tip == meta.tip` is handled before this is called; an
+            // empty suffix here would mean advancing zero blocks.
+            return Ok(None);
+        }
+        // Contiguity: tip-first suffix must read tip_height, tip_height-1,
+        // ..., exactly down to meta.height + 1.
+        let tip_height = suffix[0].0;
+        if tip_height != self.meta.height + suffix.len() as u64 {
+            return Ok(None);
+        }
+        for (i, (height, _)) in suffix.iter().enumerate() {
+            if *height + i as u64 != tip_height {
+                return Ok(None);
+            }
+        }
+        Ok(Some(suffix))
+    }
+
+    /// Make the recorded tip durable: fsync the log, then the journal, then
+    /// atomically replace `meta.json`. The order is the guarantee — the
+    /// metadata file can never name blocks whose bytes are not already on
+    /// stable storage, and a crash can only lose the unflushed tail, which
+    /// the torn-tail scan drops and the open-time journal replay re-derives.
+    /// Flushes happen at most every [`META_FLUSH_INTERVAL`] tip advances
+    /// (plus reorgs, finality and shutdown, which flush synchronously).
+    pub fn flush_meta(&mut self) -> Result<(), StoreError> {
+        self.log.sync()?;
+        self.sync_journal()?;
         self.meta_file.save(&self.meta)?;
+        // The flushed tip is durable in meta.json now, so the journal entries
+        // that led to it are redundant: truncate to keep the file O(lag
+        // window) instead of O(history). Any crash order stays consistent —
+        // truncation only ever discards decisions meta.json already records.
+        self.truncate_journal()?;
+        self.tip_writes_since_flush = 0;
+        Ok(())
+    }
+
+    /// Flush only when [`META_FLUSH_INTERVAL`] tip advances have accumulated
+    /// since the last flush. Returns whether a flush happened. A failed
+    /// flush propagates with the counter untouched, so the next call retries.
+    pub fn flush_meta_if_due(&mut self) -> Result<bool, StoreError> {
+        if self.tip_writes_since_flush < META_FLUSH_INTERVAL {
+            return Ok(false);
+        }
+        self.flush_meta()?;
+        Ok(true)
+    }
+
+    /// Tip advances since the last durable flush. The node uses it (with
+    /// [`BlockStore::flush_meta_if_due`]) to bound how far the file can lag
+    /// the in-memory tip; crash-recovery tests use it to assert batching
+    /// actually batches.
+    pub fn tip_writes_since_flush(&self) -> u64 {
+        self.tip_writes_since_flush
+    }
+
+    /// Record a tip decision in `tip.journal`, one `"<height> <hexhash>\\n"`
+    /// line per call. Unflushed and unfsync'd by design: the entry only has
+    /// to survive a *process* crash (OS page cache), because a *power* loss
+    /// that tears the journal tail also tears the unflushed log tail it
+    /// describes — and then the torn-tail scan plus the older journal/meta
+    /// consistently describe the older prefix. A torn final line is dropped
+    /// on read; anything else malformed fails the whole journal (fail closed
+    /// to the recorded metadata tip).
+    fn append_journal(&self, height: u64, hash: &Hash512) -> Result<(), StoreError> {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.journal_path)
+            .map_err(|e| StoreError::io(&self.journal_path, e))?;
+        writeln!(f, "{height} {}", crate::hex(hash))
+            .map_err(|e| StoreError::io(&self.journal_path, e))?;
+        Ok(())
+    }
+
+    /// Fsync the journal file. Runs inside [`BlockStore::flush_meta`], after
+    /// the log sync and before the metadata save — the same ordering that
+    /// makes power loss consistent.
+    fn sync_journal(&self) -> Result<(), StoreError> {
+        // Missing journal (old datadir, or no tip ever set) is fine: there is
+        // nothing to make durable yet.
+        if !self.journal_path.exists() {
+            return Ok(());
+        }
+        // Write access is required: on Windows, flushing a read-only handle
+        // fails with Access Denied instead of syncing.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&self.journal_path)
+            .and_then(|f| f.sync_all())
+            .map_err(|e| StoreError::io(&self.journal_path, e))
+    }
+
+    /// Truncate the journal after a successful flush: every decision in it
+    /// is now recorded in `meta.json`, so the file restarts empty and stays
+    /// bounded by the batch window instead of growing with history. Crash
+    /// order is safe either way — losing the truncation only leaves
+    /// already-recorded decisions to be skipped on open (`jh <= height`),
+    /// and losing part of the truncation itself is impossible (a file size
+    /// change is atomic; there is no partial new content to misread).
+    fn truncate_journal(&self) -> Result<(), StoreError> {
+        if !self.journal_path.exists() {
+            return Ok(());
+        }
+        std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&self.journal_path)
+            .and_then(|f| f.sync_all())
+            .map_err(|e| StoreError::io(&self.journal_path, e))?;
         Ok(())
     }
 
@@ -475,6 +808,45 @@ fn block_payload(bytes: &[u8]) -> &[u8] {
 
 fn payload_is_utxo(bytes: &[u8]) -> bool {
     bytes.first() == Some(&TAG_UTXO)
+}
+
+/// Read the tip journal, newest entry last: `Some(entries)`, or `None` when
+/// the file is missing (old datadir, or no tip ever set — legacy behavior,
+/// no adoption), torn beyond a single tail line, or malformed anywhere else
+/// (fail closed to the recorded metadata tip: a corrupt journal must never
+/// promote a guess).
+///
+/// A power loss mid-append leaves a partial last line, which is dropped —
+/// the previous line is still a complete, valid decision. Callers walk the
+/// entries newest-first so a torn tip falls back to the newest complete
+/// decision, not all the way to metadata.
+fn read_journal(path: &Path) -> Option<Vec<(u64, Hash512)>> {
+    let bytes = std::fs::read(path).ok()?;
+    let mut text = String::from_utf8(bytes).ok()?;
+    if !text.ends_with('\n') {
+        let pos = text.rfind('\n')?;
+        text.truncate(pos + 1);
+    }
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let mut parts = line.split_whitespace();
+        let (h, hh) = match (parts.next(), parts.next()) {
+            (Some(h), Some(hex)) if parts.next().is_none() => (h, hex),
+            _ => return None,
+        };
+        let height: u64 = h.parse().ok()?;
+        if hh.len() != 128 {
+            return None;
+        }
+        let raw = hh.as_bytes();
+        let mut hash = [0u8; 64];
+        for (i, chunk) in raw.chunks(2).enumerate() {
+            let s = std::str::from_utf8(chunk).ok()?;
+            hash[i] = u8::from_str_radix(s, 16).ok()?;
+        }
+        out.push((height, hash));
+    }
+    Some(out)
 }
 
 fn rebuild_height_index(
@@ -830,6 +1202,11 @@ mod tests {
     /// The tail rule and the metadata interact honestly: if recovery drops a
     /// tail, and the metadata's tip was inside that tail, the store refuses
     /// rather than silently reopening at a tip it cannot prove.
+    ///
+    /// The explicit flush is the test's premise, not boilerplate: only a
+    /// flushed tip makes the metadata file name the block, and only a named
+    /// block can be missed. Unflushed tips live in the journal and fall back
+    /// to the recorded tip instead (see the `persist_crash` suite).
     #[test]
     fn a_dropped_tail_that_held_the_tip_refuses_to_open() {
         let dir = tmp_dir("tailtip");
@@ -840,7 +1217,7 @@ mod tests {
             let b = Block::deserialize(&blocks[0].1).unwrap();
             store.append_block(&b).unwrap();
             store.set_tip(&blocks[0].0).unwrap();
-            store.sync().unwrap();
+            store.flush_meta().unwrap();
         }
         // Damage the only record — the tip is inside what recovery will drop.
         let mut bytes = std::fs::read(dir.join("blocks.log")).unwrap();

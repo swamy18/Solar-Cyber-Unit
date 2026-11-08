@@ -378,12 +378,6 @@ impl Store {
         self.dir.join("validators")
     }
 
-    fn meta_path(&self) -> PathBuf {
-        // The srct-store metadata. blocks.json is legacy; this is what the
-        // append-only store reads.
-        self.dir.join("meta.json")
-    }
-
     /// Open the append-only store, migrating `blocks.json` if it exists and
     /// the store does not.
     fn ensure_block_store(&mut self) -> Result<&mut BlockStore, String> {
@@ -411,7 +405,11 @@ impl Store {
                 if let Some(last) = blocks.last() {
                     bs.set_tip(&last.block_hash()).map_err(|e| e.to_string())?;
                 }
-                bs.sync().map_err(|e| e.to_string())?;
+                // Forced flush (log + journal + atomic meta): migration must
+                // leave the metadata naming the migrated tip, not genesis —
+                // adoption would re-derive it, but a migration must not depend
+                // on the crash-recovery path.
+                bs.flush_meta().map_err(|e| e.to_string())?;
                 println!(
                     "migrated {} blocks from blocks.json into the append-only store",
                     blocks.len()
@@ -462,7 +460,17 @@ impl Store {
         Ok(chain)
     }
 
-    /// Append new blocks and move the canonical tip. O(new blocks), not O(chain).
+    /// Append new blocks and move the canonical tip. O(new blocks), not O(chain):
+    /// each `set_tip` is a fast-path direct extension (one block decoded to
+    /// prove the link) instead of one full ancestry walk per block, and each
+    /// advance is journaled so a crash replays the exact decisions.
+    ///
+    /// Durability note: this only stages bytes plus the in-memory tip —
+    /// nothing here is fsync-proven. Every caller must follow with a flush
+    /// decision: `flush_meta` for one-shot commands and anything gated on
+    /// durability (mined-block relay), `flush_meta_if_due` for the looping
+    /// serve path. A crash before a flush loses nothing committed: the torn
+    /// tail is dropped on open and the journaled extension is re-adopted.
     fn save_chain(&mut self, chain: &Chain) -> Result<(), String> {
         let bs = self.ensure_block_store()?;
         let (_, stored_height) = bs.tip();
@@ -470,8 +478,7 @@ impl Store {
             let block = chain
                 .block_at(h)
                 .ok_or_else(|| format!("chain has no block at height {h}"))?;
-            let outcome = bs.append_block(block).map_err(|e| e.to_string())?;
-            match outcome {
+            match bs.append_block(block).map_err(|e| e.to_string())? {
                 AppendOutcome::Stored | AppendOutcome::Duplicate => {
                     bs.set_tip(&block.block_hash()).map_err(|e| e.to_string())?;
                 }
@@ -482,7 +489,26 @@ impl Store {
                 }
             }
         }
-        bs.sync().map_err(|e| e.to_string())
+        Ok(())
+    }
+
+    /// Make staged blocks durable: fsync the log, then atomically replace
+    /// the metadata file. The order is the guarantee — meta.json can never
+    /// name blocks whose bytes are not already on stable storage.
+    fn flush_meta(&mut self) -> Result<(), String> {
+        self.ensure_block_store()?
+            .flush_meta()
+            .map_err(|e| e.to_string())
+    }
+
+    /// Flush only when [`srct_store::blocks::META_FLUSH_INTERVAL`] tip
+    /// advances have accumulated since the last flush. The serve loop calls
+    /// this after every batch; bulk syncs and idling between blocks flush
+    /// at most once per interval instead of once per block.
+    fn flush_meta_if_due(&mut self) -> Result<bool, String> {
+        self.ensure_block_store()?
+            .flush_meta_if_due()
+            .map_err(|e| e.to_string())
     }
 
     /// Read the wallet file — encrypted when it was saved that way.
@@ -549,17 +575,6 @@ impl Store {
             }
         };
         wallet_store::write_private(&self.wallets_path(), &payload)
-    }
-
-    fn write_meta(&self, chain: &Chain) -> Result<(), String> {
-        fs::create_dir_all(&self.dir).map_err(|e| e.to_string())?;
-        let meta = serde_json::json!({
-            "network": self.params.name,
-            "genesis_hash": hash512_to_hex(&chain.block_hash_at(0).unwrap_or([0u8; 64])),
-            "height": chain.height(),
-        });
-        let text = serde_json::to_string_pretty(&meta).map_err(|e| e.to_string())?;
-        fs::write(self.meta_path(), text).map_err(|e| e.to_string())
     }
 
     /// Persist the chain's binding-finalized point if it advanced (Decision 12).
@@ -726,7 +741,8 @@ fn cmd_init(args: &Args) -> Result<(), String> {
     store.save_wallets(&wallets)?;
 
     store.save_chain(&chain)?;
-    store.write_meta(&chain)?;
+    // One-shot command: its blocks must be durable before it exits.
+    store.flush_meta()?;
 
     println!();
     println!("network        {}", store.params.name);
@@ -791,7 +807,8 @@ fn cmd_mine(args: &Args) -> Result<(), String> {
         }
     }
     store.save_chain(&chain)?;
-    store.write_meta(&chain)?;
+    // One-shot command: its blocks must be durable before it exits.
+    store.flush_meta()?;
     println!("mined {mined} block(s); tip height {}", chain.height());
     print_l2_summary(&l2, &chain);
     Ok(())
@@ -954,7 +971,8 @@ fn cmd_send(args: &Args) -> Result<(), String> {
     chain.submit(block).map_err(|e| e.to_string())?;
     let l2 = NodeL2::replay_from(&chain, &store.params).map_err(|e| e.to_string())?;
     store.save_chain(&chain)?;
-    store.write_meta(&chain)?;
+    // One-shot command: its blocks must be durable before it exits.
+    store.flush_meta()?;
 
     println!("txid    {txid}");
     println!("height  {height}");
@@ -1040,7 +1058,8 @@ fn mine_l2_tx(
     let mined = block.header.height;
     chain.submit(block).map_err(|e| e.to_string())?;
     store.save_chain(chain)?;
-    store.write_meta(chain)?;
+    // One-shot command: its blocks must be durable before it exits.
+    store.flush_meta()?;
     Ok(mined)
 }
 
@@ -2411,13 +2430,15 @@ fn cmd_serve(args: &Args) -> Result<(), String> {
             if let Ok(block) = mined {
                 let hash = block.block_hash();
                 let height = block.header.height;
-                // Durability gates relay (see `persist_dirty` above).
+                // Durability gates relay (see `persist_dirty` above): the
+                // mined block is broadcast only after its bytes are fsynced
+                // and the metadata naming it is atomically saved.
                 let mut ok = true;
                 if let Err(e) = store.save_chain(&sh.chain) {
                     eprintln!("warning: chain persist failed: {e}");
                     ok = false;
                 }
-                if let Err(e) = store.write_meta(&sh.chain) {
+                if let Err(e) = store.flush_meta() {
                     eprintln!("warning: meta persist failed: {e}");
                     ok = false;
                 }
@@ -2614,13 +2635,18 @@ fn cmd_serve(args: &Args) -> Result<(), String> {
         // Blocks from peers are persisted per batch, not per event — plus any
         // batch while a previous save is still dirty, so one failed write
         // cannot strand the chain behind its files until the next block.
+        // The metadata file itself is batched: at most one atomic rewrite
+        // per META_FLUSH_INTERVAL tip advances (plus finality, reorgs and
+        // shutdown, which flush synchronously). A crash between flushes
+        // loses nothing committed: the torn tail is dropped on open and the
+        // logged extension is re-adopted.
         if sh.chain.height() != before || persist_dirty {
             let mut ok = true;
             if let Err(e) = store.save_chain(&sh.chain) {
                 eprintln!("warning: chain persist failed: {e}");
                 ok = false;
             }
-            if let Err(e) = store.write_meta(&sh.chain) {
+            if let Err(e) = store.flush_meta_if_due() {
                 eprintln!("warning: meta persist failed: {e}");
                 ok = false;
             }
@@ -2676,8 +2702,10 @@ fn cmd_serve(args: &Args) -> Result<(), String> {
         store
             .save_chain(&sh.chain)
             .map_err(|e| format!("shutdown flush failed (chain): {e}"))?;
+        // Forced flush: shutdown must leave the metadata file naming the
+        // in-memory tip, so a restart never replays from a stale height.
         store
-            .write_meta(&sh.chain)
+            .flush_meta()
             .map_err(|e| format!("shutdown flush failed (meta): {e}"))?;
         store
             .persist_finality(&sh.chain)

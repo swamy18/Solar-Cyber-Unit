@@ -562,11 +562,108 @@ fn run_stages(workload: &str, blocks: u64, dir: &Path) -> Vec<Stage> {
 
 fn print_usage() -> ! {
     eprintln!("usage: srct-bench run --workload empty|realistic|adversarial --blocks N --dir PATH [--json OUT] [--markdown OUT]");
+    eprintln!("       srct-bench persist-profile --blocks N --dir PATH [--json OUT]");
     std::process::exit(2);
+}
+
+/// Phase B micro-profile: isolate the per-block persist cost on a prebuilt
+/// chain. Builds N empty blocks in memory once, then times 50 sequential
+/// `set_tip` calls (the production persist path: fast-path link proof plus
+/// batched journal append) against 50 plain `append_block` calls.
+/// No consensus, storage-format or wire changes: all store calls are the
+/// production `BlockStore` API on a scratch dir.
+fn persist_profile(blocks: u64, dir: &Path) -> serde_json::Value {
+    use std::time::Instant;
+    let (mut chain, _, miner) = base_chain(1, 12);
+    for _ in 0..blocks {
+        let h = chain.height() + 1;
+        let b = chain.mine_block(miner, vec![], ts(h)).unwrap();
+        chain.submit(b).unwrap();
+    }
+    let tip0 = chain.height();
+    assert!(
+        tip0 >= 112,
+        "need a tall-enough chain for the walk to matter"
+    );
+
+    // Fresh store, all blocks appended once (not timed beyond setup).
+    let store_dir = dir.join("store");
+    let _ = std::fs::remove_dir_all(&store_dir);
+    let (mut store, _) = srct_store::BlockStore::open(&store_dir, &NetworkParams::mini()).unwrap();
+    for h in 1..=tip0 {
+        let block = chain.block_at(h).unwrap();
+        store.append_block(block).unwrap();
+    }
+    store.sync().unwrap();
+
+    // set_tip per direct child on a tall chain: fast path verifies one link
+    // per call, so this measures the O(1)-per-tip persist path directly
+    // (compare against pre-Phase-B runs for the old full-walk cost).
+    let t0 = Instant::now();
+    for h in 1..=50u64 {
+        let block = chain.block_at(h).unwrap();
+        store.set_tip(&block.block_hash()).unwrap();
+    }
+    let set_tip_ms = t0.elapsed().as_millis();
+
+    // append_block alone (no tip moves, no sync): fresh store, same blocks.
+    let dir2 = dir.join("store2");
+    let (mut store2, _) = srct_store::BlockStore::open(&dir2, &NetworkParams::mini()).unwrap();
+    let t0 = Instant::now();
+    for h in 1..=50u64 {
+        let block = chain.block_at(h).unwrap();
+        store2.append_block(block).unwrap();
+    }
+    let append_ms = t0.elapsed().as_millis();
+
+    serde_json::json!({
+        "blocks_indexed": tip0,
+        "set_tip_50x_ms": set_tip_ms,
+        "append_50x_ms": append_ms,
+    })
 }
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(|s| s.as_str()) == Some("persist-profile") {
+        let mut blocks: u64 = 300;
+        let mut dir = PathBuf::from("./target/bench-persist-profile");
+        let mut json_out: Option<PathBuf> = None;
+        let mut i = 2;
+        while i < args.len() {
+            match args[i].as_str() {
+                "--blocks" => {
+                    blocks = args
+                        .get(i + 1)
+                        .unwrap_or_else(|| print_usage())
+                        .parse()
+                        .unwrap_or_else(|_| print_usage());
+                    i += 2;
+                }
+                "--dir" => {
+                    dir = PathBuf::from(args.get(i + 1).unwrap_or_else(|| print_usage()));
+                    i += 2;
+                }
+                "--json" => {
+                    json_out = Some(PathBuf::from(
+                        args.get(i + 1).unwrap_or_else(|| print_usage()),
+                    ));
+                    i += 2;
+                }
+                _ => print_usage(),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let detail = persist_profile(blocks, &dir);
+        let doc =
+            serde_json::json!({"tool": "srct-bench", "mode": "persist-profile", "detail": detail});
+        let pretty = serde_json::to_string_pretty(&doc).unwrap();
+        let json_path = json_out.unwrap_or_else(|| dir.join("results.json"));
+        std::fs::write(&json_path, &pretty).unwrap();
+        println!("{pretty}");
+        return;
+    }
     if args.get(1).map(|s| s.as_str()) != Some("run") {
         print_usage();
     }
