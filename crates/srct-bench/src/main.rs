@@ -40,24 +40,159 @@ struct Stage {
     detail: serde_json::Value,
 }
 
-/// Peak resident set size of this process, Linux only (`VmHWM`).
-/// Bench boxes are Linux; elsewhere this is `None` and the report says so
-/// instead of inventing a number.
-fn peak_rss_bytes() -> Option<u64> {
+/// Point-in-time process resource usage. Every field is `None` on platforms
+/// where it cannot be measured; the report says "unavailable" instead of
+/// inventing a number (never report a missing measurement as zero).
+#[derive(Clone, Copy, Default)]
+struct ProcStats {
+    peak_rss_bytes: Option<u64>,
+    rss_bytes: Option<u64>,
+    peak_pagefile_bytes: Option<u64>,
+    pagefile_bytes: Option<u64>,
+    user_cpu_ms: Option<u64>,
+    kernel_cpu_ms: Option<u64>,
+}
+
+impl ProcStats {
+    fn json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "peak_rss_bytes": self.peak_rss_bytes,
+            "rss_bytes": self.rss_bytes,
+            "peak_pagefile_bytes": self.peak_pagefile_bytes,
+            "pagefile_bytes": self.pagefile_bytes,
+            "user_cpu_ms": self.user_cpu_ms,
+            "kernel_cpu_ms": self.kernel_cpu_ms,
+        })
+    }
+}
+
+/// Raw Windows process APIs, declared by hand so the harness needs no new
+/// dependencies. Layouts follow the documented `PROCESS_MEMORY_COUNTERS_EX`
+/// and `FILETIME` structs; `GetCurrentProcess` returns a pseudo-handle that
+/// must not be closed.
+#[cfg(windows)]
+mod win {
+    #[repr(C)]
+    pub struct ProcessMemoryCountersEx {
+        pub cb: u32,
+        pub page_fault_count: u32,
+        pub peak_working_set_size: usize,
+        pub working_set_size: usize,
+        pub quota_peak_paged_pool_usage: usize,
+        pub quota_paged_pool_usage: usize,
+        pub quota_peak_non_paged_pool_usage: usize,
+        pub quota_non_paged_pool_usage: usize,
+        pub pagefile_usage: usize,
+        pub peak_pagefile_usage: usize,
+        pub private_usage: usize,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    pub struct FileTime {
+        pub dw_low_date_time: u32,
+        pub dw_high_date_time: u32,
+    }
+
+    impl FileTime {
+        pub fn as_millis(&self) -> u64 {
+            // 100-nanosecond intervals since 1601-01-01.
+            (((self.dw_high_date_time as u64) << 32) | self.dw_low_date_time as u64) / 10_000
+        }
+    }
+
+    pub type Handle = *mut core::ffi::c_void;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        pub fn GetCurrentProcess() -> Handle;
+        pub fn GetProcessTimes(
+            h_process: Handle,
+            lp_creation_time: *mut FileTime,
+            lp_exit_time: *mut FileTime,
+            lp_kernel_time: *mut FileTime,
+            lp_user_time: *mut FileTime,
+        ) -> i32;
+    }
+
+    #[link(name = "psapi")]
+    extern "system" {
+        pub fn GetProcessMemoryInfo(
+            h_process: Handle,
+            ppsmem_counters: *mut ProcessMemoryCountersEx,
+            cb: u32,
+        ) -> i32;
+    }
+}
+
+fn proc_stats() -> ProcStats {
+    // 64-bit pointers: the FFI structs above use `usize` for SIZE_T fields.
+    const _: () = assert!(std::mem::size_of::<usize>() == 8);
+
     #[cfg(target_os = "linux")]
     {
-        let text = std::fs::read_to_string("/proc/self/status").ok()?;
-        for line in text.lines() {
-            if let Some(rest) = line.strip_prefix("VmHWM:") {
-                let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
-                return Some(kb * 1024);
+        let mut st = ProcStats::default();
+        if let Ok(text) = std::fs::read_to_string("/proc/self/status") {
+            for line in text.lines() {
+                let mut it = line.split_whitespace();
+                match it.next() {
+                    Some("VmHWM:") => {
+                        st.peak_rss_bytes = it.next().and_then(|v| v.parse::<u64>().ok()).map(|kb| kb * 1024);
+                    }
+                    Some("VmRSS:") => {
+                        st.rss_bytes = it.next().and_then(|v| v.parse::<u64>().ok()).map(|kb| kb * 1024);
+                    }
+                    _ => {}
+                }
             }
         }
-        None
+        // utime (field 14) and stime (field 15) in clock ticks; the tick is
+        // 100 Hz on Linux, so each tick is 10 ms.
+        if let Ok(stat) = std::fs::read_to_string("/proc/self/stat") {
+            if let Some(end) = stat.rfind(')') {
+                let fields: Vec<&str> = stat[end + 1..].split_whitespace().collect();
+                // fields[0] is the field after `comm` (field 2 overall), so
+                // utime (14) is at index 11 and stime (15) at index 12.
+                if fields.len() > 12 {
+                    st.user_cpu_ms = fields[11].parse::<u64>().ok().map(|t| t * 10);
+                    st.kernel_cpu_ms = fields[12].parse::<u64>().ok().map(|t| t * 10);
+                }
+            }
+        }
+        st
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(windows)]
     {
-        None
+        use std::mem::{size_of, zeroed};
+        let mut st = ProcStats::default();
+        // SAFETY: fixed-layout OS structs, valid pseudo-handle, checked
+        // return codes before reading any out-param.
+        unsafe {
+            let h = win::GetCurrentProcess();
+            let mut mc: win::ProcessMemoryCountersEx = zeroed();
+            mc.cb = size_of::<win::ProcessMemoryCountersEx>() as u32;
+            if win::GetProcessMemoryInfo(h, &mut mc, mc.cb) != 0 {
+                st.peak_rss_bytes = Some(mc.peak_working_set_size as u64);
+                st.rss_bytes = Some(mc.working_set_size as u64);
+                st.peak_pagefile_bytes = Some(mc.peak_pagefile_usage as u64);
+                st.pagefile_bytes = Some(mc.pagefile_usage as u64);
+            }
+            let (mut c, mut e, mut k, mut u) = (
+                win::FileTime::default(),
+                win::FileTime::default(),
+                win::FileTime::default(),
+                win::FileTime::default(),
+            );
+            if win::GetProcessTimes(h, &mut c, &mut e, &mut k, &mut u) != 0 {
+                st.kernel_cpu_ms = Some(k.as_millis());
+                st.user_cpu_ms = Some(u.as_millis());
+            }
+        }
+        st
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
+    {
+        ProcStats::default()
     }
 }
 
@@ -386,13 +521,48 @@ fn dir_bytes(dir: &Path) -> u64 {
     total
 }
 
-fn run_stages(workload: &str, blocks: u64, dir: &Path) -> Vec<Stage> {
+/// Abort the run early when the process working set exceeds the safety
+/// budget. Returns true when the run must stop: the caller records a final
+/// `aborted` stage with the partial results instead of pushing through into
+/// swap/OOM-killer territory on a small box.
+fn over_budget(max_rss_bytes: Option<u64>, context: &str) -> bool {
+    let Some(max) = max_rss_bytes else {
+        return false;
+    };
+    match proc_stats().rss_bytes {
+        Some(rss) if rss > max => {
+            eprintln!(
+                "srct-bench: stopping gracefully at {context}: working set {rss} B exceeds --max-rss budget {max} B"
+            );
+            true
+        }
+        // Unmeasurable on this platform: never abort on a missing reading
+        // (a missing measurement must not be treated as zero usage either).
+        _ => false,
+    }
+}
+
+fn run_stages(workload: &str, blocks: u64, dir: &Path, max_rss_bytes: Option<u64>) -> Vec<Stage> {
     let mut stages = Vec::new();
+
+    // Safety gate before the heavy in-memory build: never push a small box
+    // into swap/OOM-killer territory. An abort is recorded, not silent.
+    if over_budget(max_rss_bytes, "startup") {
+        stages.push(Stage {
+            name: "aborted",
+            wall_ms: 0,
+            detail: serde_json::json!({
+                "at": "startup",
+                "reason": "working set already over --max-rss budget",
+            }),
+        });
+        return stages;
+    }
 
     // Stage 1: build + validate in memory (mine + submit together, as a node
     // would when producing).
     let t0 = Instant::now();
-    let rss_before = peak_rss_bytes();
+    let stats_before = proc_stats();
     let built = match workload {
         "empty" => build_empty(blocks),
         // ~14 spends ~= the 250k gas target: fees stay flat, so this
@@ -442,11 +612,31 @@ fn run_stages(workload: &str, blocks: u64, dir: &Path) -> Vec<Stage> {
     });
 
     // Stage 3: cold open — RecordLog recovery + full index rebuild + height
-    // walk. This is the price of having no index file.
+    // walk + journal adoption (Phase B). This is the price of having no
+    // index file.
+    if over_budget(max_rss_bytes, "reopen") {
+        stages.push(Stage {
+            name: "aborted",
+            wall_ms: 0,
+            detail: serde_json::json!({
+                "at": "store_reopen_index_rebuild",
+                "reason": "working set over --max-rss budget",
+                "chain_height": height,
+            }),
+        });
+        return stages;
+    }
     let t0 = Instant::now();
     let (mut store2, recovery) =
         srct_store::BlockStore::open(&store_dir, &NetworkParams::mini()).unwrap();
     let reopen_ms = t0.elapsed().as_millis();
+    // Recovery correctness at scale: the reopened tip must be exactly the
+    // persisted tip (journal adoption re-derives unflushed advances).
+    assert_eq!(
+        store2.tip(),
+        (chain.tip_hash(), height),
+        "reopened tip must match the persisted tip"
+    );
     stages.push(Stage {
         name: "store_reopen_index_rebuild",
         wall_ms: reopen_ms,
@@ -454,6 +644,7 @@ fn run_stages(workload: &str, blocks: u64, dir: &Path) -> Vec<Stage> {
             "records": recovery.records,
             "discarded_tail_bytes": recovery.discarded_tail_bytes,
             "blocks_indexed": store2.block_count(),
+            "journal_adopted": store2.tip().1 == height,
         }),
     });
 
@@ -543,7 +734,12 @@ fn run_stages(workload: &str, blocks: u64, dir: &Path) -> Vec<Stage> {
         detail: serde_json::json!({ "admitted": admitted, "pool_len": pool.len() }),
     });
 
-    let rss_after = peak_rss_bytes();
+    let stats_after = proc_stats();
+    // Storage growth: every file the node actually keeps on disk.
+    let meta_bytes = std::fs::metadata(store_dir.join("meta.json")).map(|m| m.len()).unwrap_or(0);
+    let journal_bytes = std::fs::metadata(store_dir.join("tip.journal")).map(|m| m.len()).unwrap_or(0);
+    let dir_bytes_total = dir_bytes(&store_dir);
+    let parallelism = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0);
     stages.push(Stage {
         name: "totals",
         wall_ms: stages.iter().map(|s| s.wall_ms).sum(),
@@ -553,15 +749,20 @@ fn run_stages(workload: &str, blocks: u64, dir: &Path) -> Vec<Stage> {
             "chain_height": height,
             "utxo_entries": utxo_entries,
             "log_bytes": log_bytes,
-            "peak_rss_bytes_before": rss_before,
-            "peak_rss_bytes_after": rss_after,
+            "meta_json_bytes": meta_bytes,
+            "tip_journal_bytes": journal_bytes,
+            "store_dir_bytes": dir_bytes_total,
+            "bytes_per_block": log_bytes / height.max(1),
+            "stats_before": stats_before.json(),
+            "stats_after": stats_after.json(),
+            "available_parallelism": parallelism,
         }),
     });
     stages
 }
 
 fn print_usage() -> ! {
-    eprintln!("usage: srct-bench run --workload empty|realistic|adversarial --blocks N --dir PATH [--json OUT] [--markdown OUT]");
+    eprintln!("usage: srct-bench run --workload empty|realistic|adversarial --blocks N --dir PATH [--json OUT] [--markdown OUT] [--max-rss-gb N]");
     eprintln!("       srct-bench persist-profile --blocks N --dir PATH [--json OUT]");
     std::process::exit(2);
 }
@@ -672,6 +873,10 @@ fn main() {
     let mut dir = PathBuf::from("./target/bench");
     let mut json_out: Option<PathBuf> = None;
     let mut md_out: Option<PathBuf> = None;
+    // Optional safety budget in GiB: stop gracefully (partial results kept)
+    // instead of pushing a small box into swap/OOM-killer territory.
+    // Unset = no limit; unmeasurable platforms never trip it.
+    let mut max_rss_bytes: Option<u64> = None;
     let mut i = 2;
     while i < args.len() {
         match args[i].as_str() {
@@ -703,12 +908,42 @@ fn main() {
                 ));
                 i += 2;
             }
+            "--max-rss-gb" => {
+                let gb: u64 = args
+                    .get(i + 1)
+                    .unwrap_or_else(|| print_usage())
+                    .parse()
+                    .unwrap_or_else(|_| print_usage());
+                max_rss_bytes = Some(gb * 1024 * 1024 * 1024);
+                i += 2;
+            }
             _ => print_usage(),
+        }
+    }
+    // The hardware-protection rule: benchmark data lives in a scratch dir,
+    // never near real chain data or source trees. Refuse a --dir that looks
+    // like a node data directory (blocks.log/meta.json/state.bin markers)
+    // or like a repo/checkout (Cargo/rust markers) rather than a scratch dir.
+    for marker in [
+        "blocks.log",
+        "meta.json",
+        "state.bin",
+        "tip.journal",
+        "wallets",
+        "Cargo.toml",
+        "Cargo.lock",
+        ".git",
+        "crates",
+        "src",
+    ] {
+        if dir.join(marker).exists() {
+            eprintln!("refusing --dir {}: looks like real data or a source tree (found {marker}), not a scratch dir", dir.display());
+            std::process::exit(2);
         }
     }
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    let stages = run_stages(&workload, blocks, &dir);
+    let stages = run_stages(&workload, blocks, &dir, max_rss_bytes);
 
     let rows: Vec<serde_json::Value> = stages
         .iter()
@@ -743,4 +978,8 @@ fn main() {
     std::fs::write(&md_path, md).unwrap();
     println!("{pretty}");
     eprintln!("wrote {} and {}", json_path.display(), md_path.display());
+    if stages.iter().any(|s| s.name == "aborted") {
+        eprintln!("run aborted on --max-rss budget; partial results kept above");
+        std::process::exit(2);
+    }
 }

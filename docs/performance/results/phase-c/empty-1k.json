@@ -1,0 +1,103 @@
+{
+  "blocks": 1000,
+  "note": "mini profile, deterministic seeds; no consensus/storage/wire changes",
+  "stages": [
+    {
+      "blocks": 1000,
+      "detail": {
+        "chain_height": 1012,
+        "measured_blocks": 1000,
+        "mine_plus_submit_ms": 634,
+        "setup_blocks_included": 12,
+        "sign_ms_included": 0,
+        "utxo_entries": 1012
+      },
+      "stage": "build_and_validate",
+      "wall_ms": 634,
+      "workload": "empty"
+    },
+    {
+      "blocks": 1000,
+      "detail": {
+        "log_bytes": 545969
+      },
+      "stage": "store_persist",
+      "wall_ms": 404,
+      "workload": "empty"
+    },
+    {
+      "blocks": 1000,
+      "detail": {
+        "blocks_indexed": 1012,
+        "discarded_tail_bytes": 0,
+        "journal_adopted": true,
+        "records": 1012
+      },
+      "stage": "store_reopen_index_rebuild",
+      "wall_ms": 29,
+      "workload": "empty"
+    },
+    {
+      "blocks": 1000,
+      "detail": {
+        "replayed_blocks": 1012
+      },
+      "stage": "chain_replay_validate",
+      "wall_ms": 480,
+      "workload": "empty"
+    },
+    {
+      "blocks": 1000,
+      "detail": {},
+      "stage": "l2_replay",
+      "wall_ms": 9,
+      "workload": "empty"
+    },
+    {
+      "blocks": 1000,
+      "detail": {
+        "admitted": 1003,
+        "pool_len": 1003
+      },
+      "stage": "mempool_admit_2000",
+      "wall_ms": 1771,
+      "workload": "empty"
+    },
+    {
+      "blocks": 1000,
+      "detail": {
+        "available_parallelism": 8,
+        "bytes_per_block": 539,
+        "chain_height": 1012,
+        "log_bytes": 545969,
+        "measured_blocks": 1000,
+        "meta_json_bytes": 588,
+        "stats_after": {
+          "kernel_cpu_ms": 468,
+          "pagefile_bytes": 10530816,
+          "peak_pagefile_bytes": 11137024,
+          "peak_rss_bytes": 14995456,
+          "rss_bytes": 14348288,
+          "user_cpu_ms": 2812
+        },
+        "stats_before": {
+          "kernel_cpu_ms": 0,
+          "pagefile_bytes": 716800,
+          "peak_pagefile_bytes": 737280,
+          "peak_rss_bytes": 4198400,
+          "rss_bytes": 4198400,
+          "user_cpu_ms": 15
+        },
+        "store_dir_bytes": 545969,
+        "tip_journal_bytes": 134501,
+        "utxo_entries": 1012,
+        "workload": "empty"
+      },
+      "stage": "totals",
+      "wall_ms": 3327,
+      "workload": "empty"
+    }
+  ],
+  "tool": "srct-bench",
+  "workload": "empty"
+}
