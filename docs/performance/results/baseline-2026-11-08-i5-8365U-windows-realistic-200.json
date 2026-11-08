@@ -1,0 +1,83 @@
+{
+  "blocks": 200,
+  "note": "mini profile, deterministic seeds; no consensus/storage/wire changes",
+  "stages": [
+    {
+      "blocks": 200,
+      "detail": {
+        "chain_height": 234,
+        "measured_blocks": 200,
+        "mine_plus_submit_ms": 11149,
+        "setup_blocks_included": 34,
+        "sign_ms_included": 7616,
+        "utxo_entries": 3201
+      },
+      "stage": "build_and_validate",
+      "wall_ms": 11149,
+      "workload": "realistic"
+    },
+    {
+      "blocks": 200,
+      "detail": {
+        "log_bytes": 1086202
+      },
+      "stage": "store_persist",
+      "wall_ms": 1834,
+      "workload": "realistic"
+    },
+    {
+      "blocks": 200,
+      "detail": {
+        "blocks_indexed": 234,
+        "discarded_tail_bytes": 0,
+        "records": 234
+      },
+      "stage": "store_reopen_index_rebuild",
+      "wall_ms": 43,
+      "workload": "realistic"
+    },
+    {
+      "blocks": 200,
+      "detail": {
+        "replayed_blocks": 234
+      },
+      "stage": "chain_replay_validate",
+      "wall_ms": 1308,
+      "workload": "realistic"
+    },
+    {
+      "blocks": 200,
+      "detail": {},
+      "stage": "l2_replay",
+      "wall_ms": 6,
+      "workload": "realistic"
+    },
+    {
+      "blocks": 200,
+      "detail": {
+        "admitted": 242,
+        "pool_len": 242
+      },
+      "stage": "mempool_admit_2000",
+      "wall_ms": 694,
+      "workload": "realistic"
+    },
+    {
+      "blocks": 200,
+      "detail": {
+        "chain_height": 234,
+        "log_bytes": 1086202,
+        "measured_blocks": 200,
+        "peak_rss_bytes_after": null,
+        "peak_rss_bytes_before": null,
+        "utxo_entries": 3201,
+        "workload": "realistic"
+      },
+      "stage": "totals",
+      "wall_ms": 15034,
+      "workload": "realistic"
+    }
+  ],
+  "tool": "srct-bench",
+  "workload": "realistic"
+}

@@ -1,0 +1,83 @@
+{
+  "blocks": 10,
+  "note": "mini profile, deterministic seeds; no consensus/storage/wire changes",
+  "stages": [
+    {
+      "blocks": 10,
+      "detail": {
+        "chain_height": 109,
+        "measured_blocks": 10,
+        "mine_plus_submit_ms": 3687,
+        "setup_blocks_included": 99,
+        "sign_ms_included": 2500,
+        "utxo_entries": 2523
+      },
+      "stage": "build_and_validate",
+      "wall_ms": 3687,
+      "workload": "adversarial"
+    },
+    {
+      "blocks": 10,
+      "detail": {
+        "log_bytes": 470788
+      },
+      "stage": "store_persist",
+      "wall_ms": 597,
+      "workload": "adversarial"
+    },
+    {
+      "blocks": 10,
+      "detail": {
+        "blocks_indexed": 109,
+        "discarded_tail_bytes": 0,
+        "records": 109
+      },
+      "stage": "store_reopen_index_rebuild",
+      "wall_ms": 26,
+      "workload": "adversarial"
+    },
+    {
+      "blocks": 10,
+      "detail": {
+        "replayed_blocks": 109
+      },
+      "stage": "chain_replay_validate",
+      "wall_ms": 555,
+      "workload": "adversarial"
+    },
+    {
+      "blocks": 10,
+      "detail": {},
+      "stage": "l2_replay",
+      "wall_ms": 4,
+      "workload": "adversarial"
+    },
+    {
+      "blocks": 10,
+      "detail": {
+        "admitted": 111,
+        "pool_len": 111
+      },
+      "stage": "mempool_admit_2000",
+      "wall_ms": 264,
+      "workload": "adversarial"
+    },
+    {
+      "blocks": 10,
+      "detail": {
+        "chain_height": 109,
+        "log_bytes": 470788,
+        "measured_blocks": 10,
+        "peak_rss_bytes_after": null,
+        "peak_rss_bytes_before": null,
+        "utxo_entries": 2523,
+        "workload": "adversarial"
+      },
+      "stage": "totals",
+      "wall_ms": 5133,
+      "workload": "adversarial"
+    }
+  ],
+  "tool": "srct-bench",
+  "workload": "adversarial"
+}

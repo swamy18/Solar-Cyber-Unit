@@ -1,0 +1,20 @@
+[package]
+publish = false
+name = "srct-bench"
+description = "SRCT Phase A performance harness: deterministic chain workloads, staged timing, JSON results and Markdown reports. Measurement only — no consensus, storage-format or protocol changes."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+srct-core.workspace = true
+srct-l2.workspace = true
+srct-node = { path = "../srct-node" }
+srct-store.workspace = true
+serde_json.workspace = true
+
+[[bin]]
+name = "srct-bench"
+path = "src/main.rs"

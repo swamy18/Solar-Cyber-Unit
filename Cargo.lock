@@ -1111,6 +1111,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a0219bd7d979d58245a4f41f695e1ac9f8befdffadd7f61f1bae9e39abc6620"
 
 [[package]]
+name = "srct-bench"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "srct-core",
+ "srct-l2",
+ "srct-node",
+ "srct-store",
+]
+
+[[package]]
 name = "srct-core"
 version = "0.1.0"
 dependencies = [

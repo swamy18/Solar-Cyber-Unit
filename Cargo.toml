@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/srct-core", "crates/srct-l2", "crates/srct-mcp", "crates/srct-miner", "crates/srct-net", "crates/srct-node", "crates/srct-store", "crates/srct-worker", "crates/srct-policy"]
+members = ["crates/srct-core", "crates/srct-l2", "crates/srct-mcp", "crates/srct-miner", "crates/srct-net", "crates/srct-node", "crates/srct-store", "crates/srct-worker", "crates/srct-policy", "crates/srct-bench"]
 
 [workspace.package]
 version = "0.1.0"
