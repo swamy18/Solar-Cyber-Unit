@@ -599,7 +599,20 @@ pub struct SharedNode {
     /// dry-run is cheap to request and the queue is memory, so an
     /// unbounded one is a remote OOM button.
     pub l2_to_include: Vec<L2Transaction>,
+    /// Confirmed L1 txids this node has already located, by the height of
+    /// the block that held them: memo for [`confirmed_payment_to_cached`].
+    /// Pure cache, never persisted and never consensus — dropping an entry
+    /// only costs a rescan, and every hit re-verifies the block that backs
+    /// it, so a reorg that orphans the payment lands as a miss, never as
+    /// stale trust. Bounded by [`MAX_CONFIRMED_TX_CACHE`].
+    pub confirmed_tx_height: BTreeMap<Hash512, u64>,
 }
+
+/// Cap for [`SharedNode::confirmed_tx_height`]. Entries arrive only for txids
+/// callers actually ask about; past the cap the lowest keys drop first
+/// (arbitrary but deterministic). The map is a pure cache, so eviction is
+/// always safe — worst case the next lookup rescans.
+const MAX_CONFIRMED_TX_CACHE: usize = 4096;
 
 /// Cap for [`SharedNode::l2_to_include`]. The miner drains the queue into
 /// block space and the serve loop drops it every tick on relay-only
@@ -653,6 +666,7 @@ impl SharedNode {
             attestations_used: BTreeMap::new(),
             tx_to_relay: Vec::new(),
             l2_to_include: Vec::new(),
+            confirmed_tx_height: BTreeMap::new(),
         }
     }
 
@@ -6905,19 +6919,20 @@ async fn payments_unsettled(
     with_shared(&state, |sh| {
         let height = sh.chain.height();
         let settled: std::collections::BTreeSet<Hash> = sh.payment_tx.keys().copied().collect();
-        let mut all = Vec::new();
-        for (id, payment) in &sh.payment_store {
-            if settled.contains(id) || height >= payment.expires_at_height {
-                continue;
-            }
-            all.push(json!({
-                "payment_id": hash_to_hex(id),
-                "amount_sat": payment.amount_sat,
-                "recipient": address_to_hex(&payment.recipient),
-                "expires_at_height": payment.expires_at_height,
-            }));
-        }
-        let (out, total, truncated, next) = page_slice(&all, cursor, limit);
+        let matches: Vec<_> = sh
+            .payment_store
+            .iter()
+            .filter(|(id, payment)| !settled.contains(*id) && height < payment.expires_at_height)
+            .collect();
+        let (out, total, truncated, next) =
+            page_render(&matches, cursor, limit, |(id, payment)| {
+                json!({
+                    "payment_id": hash_to_hex(id),
+                    "amount_sat": payment.amount_sat,
+                    "recipient": address_to_hex(&payment.recipient),
+                    "expires_at_height": payment.expires_at_height,
+                })
+            });
         Ok(Json(
             json!({ "count": out.len(), "total": total, "truncated": truncated, "next_cursor": next, "payments": out }),
         ))
@@ -6950,18 +6965,29 @@ fn page_cursor(query: &HashMap<String, String>) -> usize {
         .unwrap_or(0)
 }
 
-/// Slice a fully-collected page. Returns the page, the full match count,
-/// whether another page follows this one, and `next_cursor` (null on the
-/// last page). Every paged endpoint iterates a deterministically ordered
-/// source, so a cursor offset means the same thing on every node and
-/// every call — page N never silently skips or repeats entries.
-fn page_slice(items: &[Value], cursor: usize, limit: usize) -> (Vec<Value>, usize, bool, Value) {
+/// Build one page over an already-ordered match list without materializing
+/// every match as JSON first. Returns the page, the full match count,
+/// whether another page follows, and `next_cursor` (null on the last page).
+/// `items` are cheap references in endpoint order; only rows inside
+/// `[cursor, cursor+limit)` pay for `render`. Every paged endpoint iterates
+/// a deterministically ordered source, so a cursor offset means the same
+/// thing on every node and every call — page N never silently skips or
+/// repeats entries — while the intermediate allocation stays O(page), not
+/// O(table), so a loopback caller gets the same bytes for a fraction of
+/// the node's work.
+fn page_render<T>(
+    items: &[T],
+    cursor: usize,
+    limit: usize,
+    render: impl Fn(&T) -> Value,
+) -> (Vec<Value>, usize, bool, Value) {
     let total = items.len();
     let start = cursor.min(total);
     let end = start.saturating_add(limit).min(total);
+    let out = items[start..end].iter().map(render).collect();
     let more = end < total;
     let next = if more { json!(end as u64) } else { Value::Null };
-    (items[start..end].to_vec(), total, more, next)
+    (out, total, more, next)
 }
 
 /// `GET /v1/receipts/orphans[?limit=&cursor=]` — receipts claiming payments
@@ -6975,17 +7001,18 @@ async fn receipts_orphans(
     let cursor = page_cursor(&query);
     with_shared(&state, |sh| {
         let known: std::collections::BTreeSet<Hash> = sh.payment_store.keys().copied().collect();
-        let mut all = Vec::new();
-        for receipt in sh.receipts.iter() {
-            if !known.contains(&receipt.payment_id) {
-                all.push(json!({
-                    "receipt_id": hash_to_hex(&receipt.receipt_id()),
-                    "payment_id": hash_to_hex(&receipt.payment_id),
-                    "amount_sat": receipt.amount_sat,
-                }));
-            }
-        }
-        let (out, total, truncated, next) = page_slice(&all, cursor, limit);
+        let matches: Vec<_> = sh
+            .receipts
+            .iter()
+            .filter(|receipt| !known.contains(&receipt.payment_id))
+            .collect();
+        let (out, total, truncated, next) = page_render(&matches, cursor, limit, |receipt| {
+            json!({
+                "receipt_id": hash_to_hex(&receipt.receipt_id()),
+                "payment_id": hash_to_hex(&receipt.payment_id),
+                "amount_sat": receipt.amount_sat,
+            })
+        });
         Ok(Json(
             json!({ "count": out.len(), "total": total, "truncated": truncated, "next_cursor": next, "orphans": out }),
         ))
@@ -7007,21 +7034,17 @@ async fn audit_list(
     let cursor = page_cursor(&query);
     with_shared(&state, |sh| {
         let valid = sh.audit.verify_chain().is_ok();
-        let all: Vec<Value> = sh
-            .audit
-            .iter()
-            .rev()
-            .map(|e| {
-                json!({
-                    "seq": e.seq,
-                    "kind": e.kind,
-                    "payment_id": e.payment_id.map(|h| hash_to_hex(&h)),
-                    "amount_sat": e.amount_sat,
-                    "detail": e.detail
-                })
+        let mut matches: Vec<_> = sh.audit.iter().collect();
+        matches.reverse();
+        let (entries, total, truncated, next) = page_render(&matches, cursor, limit, |e| {
+            json!({
+                "seq": e.seq,
+                "kind": e.kind,
+                "payment_id": e.payment_id.map(|h| hash_to_hex(&h)),
+                "amount_sat": e.amount_sat,
+                "detail": e.detail
             })
-            .collect();
-        let (entries, total, truncated, next) = page_slice(&all, cursor, limit);
+        });
         Ok(Json(json!({
             "chain_valid": valid,
             // Completeness is separate from integrity: a valid chain that
@@ -8078,23 +8101,19 @@ async fn fx_rates(
     with_shared(&state, |sh| {
         let height = sh.chain.height();
         // BTreeMap order (by base): deterministic across nodes and calls.
-        let all: Vec<Value> = sh
-            .fx_rates
-            .values()
-            .filter(|r| r.live_at(height))
-            .map(|r| {
-                json!({
-                    "base": r.base,
-                    "sat_per_minor": r.sat_per_minor,
-                    "valid_from_height": r.valid_from_height,
-                    "valid_until_height": r.valid_until_height,
-                    "source": r.source,
-                })
-            })
-            .collect();
+        let matches: Vec<_> = sh.fx_rates.values().filter(|r| r.live_at(height)).collect();
         // The rate book is trustee-curated and tiny (bounded by
-        // `MAX_FX_RATES`); paging here is uniformity, not load.
-        let (rates, total, truncated, next) = page_slice(&all, cursor, limit);
+        // `MAX_FX_RATES`); paging here is uniformity, not load — same
+        // windowed shape as every other endpoint anyway.
+        let (rates, total, truncated, next) = page_render(&matches, cursor, limit, |r| {
+            json!({
+                "base": r.base,
+                "sat_per_minor": r.sat_per_minor,
+                "valid_from_height": r.valid_from_height,
+                "valid_until_height": r.valid_until_height,
+                "source": r.source,
+            })
+        });
         Ok(Json(
             json!({ "height": height, "count": rates.len(), "total": total, "truncated": truncated, "next_cursor": next, "rates": rates }),
         ))
@@ -8344,7 +8363,7 @@ async fn ramp_quotes(
         .unwrap_or(0);
     with_shared(&state, |sh| {
         let height = sh.chain.height();
-        let mut matched: Vec<(srct_core::hash::Hash, Value)> = Vec::new();
+        let mut matched: Vec<(&srct_core::hash::Hash, &srct_core::ramp::RampQuote)> = Vec::new();
         for (id, (q, _, _)) in &sh.ramp_quotes {
             if q.expires_height < height {
                 continue;
@@ -8361,37 +8380,24 @@ async fn ramp_quotes(
                     continue;
                 }
             }
-            matched.push((
-                *id,
-                json!({
-                    "quote_id": hash_to_hex(id),
-                    "provider": address_to_hex(&q.provider),
-                    "asset": q.asset,
-                    "asset_minor": q.asset_minor,
-                    "sat_amount": q.sat_amount,
-                    "fee_sat": q.fee_sat,
-                    "expires_height": q.expires_height,
-                }),
-            ));
+            matched.push((id, q));
         }
         // Quote-id order, not `HashMap` iteration order: the cursor's
         // offsets must mean the same thing on every node and every call.
-        matched.sort_by_key(|(id, _)| *id);
-        let total = matched.len();
-        let start = cursor.min(total);
-        let end = start.saturating_add(limit).min(total);
-        let next = if end < total {
-            json!(end as u64)
-        } else {
-            Value::Null
-        };
-        let out: Vec<Value> = matched
-            .into_iter()
-            .skip(start)
-            .take(end - start)
-            .map(|(_, v)| v)
-            .collect();
-        let truncated = end < total;
+        // The sort needs the full lightweight match list; only the JSON
+        // build below is windowed.
+        matched.sort_by_key(|(id, _)| **id);
+        let (out, total, truncated, next) = page_render(&matched, cursor, limit, |(id, q)| {
+            json!({
+                "quote_id": hash_to_hex(id),
+                "provider": address_to_hex(&q.provider),
+                "asset": q.asset,
+                "asset_minor": q.asset_minor,
+                "sat_amount": q.sat_amount,
+                "fee_sat": q.fee_sat,
+                "expires_height": q.expires_height,
+            })
+        });
         Ok(Json(
             json!({ "count": out.len(), "total": total, "truncated": truncated, "next_cursor": next, "quotes": out }),
         ))
@@ -8564,39 +8570,26 @@ async fn ramp_intents(
         .and_then(|c| c.parse::<usize>().ok())
         .unwrap_or(0);
     with_shared(&state, |sh| {
-        let mut matched: Vec<(srct_core::hash::Hash, Value)> = Vec::new();
+        let mut matched: Vec<(&srct_core::hash::Hash, &srct_core::ramp::RampIntent)> = Vec::new();
         for (id, intent) in sh.ramp_intents.iter() {
-            matched.push((
-                *id,
-                json!({
-                    "intent_id": hash_to_hex(id),
-                    "quote_id": hash_to_hex(&intent.quote_id),
-                    "user": address_to_hex(&intent.user),
-                    "provider": address_to_hex(&intent.provider),
-                    "fill_ref": intent.fill_ref,
-                    "filled": intent.filled,
-                    "refunded": intent.refunded,
-                }),
-            ));
+            matched.push((id, intent));
         }
         // Intent-id order, not `HashMap` iteration order: the cursor's
         // offsets must mean the same thing on every node and every call.
-        matched.sort_by_key(|(id, _)| *id);
-        let total = matched.len();
-        let start = cursor.min(total);
-        let end = start.saturating_add(limit).min(total);
-        let next = if end < total {
-            json!(end as u64)
-        } else {
-            Value::Null
-        };
-        let out: Vec<Value> = matched
-            .into_iter()
-            .skip(start)
-            .take(end - start)
-            .map(|(_, v)| v)
-            .collect();
-        let truncated = end < total;
+        // The sort needs the full lightweight match list; only the JSON
+        // build below is windowed.
+        matched.sort_by_key(|(id, _)| **id);
+        let (out, total, truncated, next) = page_render(&matched, cursor, limit, |(id, intent)| {
+            json!({
+                "intent_id": hash_to_hex(id),
+                "quote_id": hash_to_hex(&intent.quote_id),
+                "user": address_to_hex(&intent.user),
+                "provider": address_to_hex(&intent.provider),
+                "fill_ref": intent.fill_ref,
+                "filled": intent.filled,
+                "refunded": intent.refunded,
+            })
+        });
         Ok(Json(
             json!({ "count": out.len(), "total": total, "truncated": truncated, "next_cursor": next, "intents": out }),
         ))
@@ -8725,26 +8718,24 @@ async fn loan_offers(
             .map(|(id, (o, _, _))| (id, o))
             .collect();
         // Cheapest rate first, id tiebreak: deterministic across nodes.
+        // The sort needs the full lightweight match list; only the JSON
+        // build is windowed.
         matches.sort_by_key(|(_, o)| (o.rate_bps_per_window, o.id()));
-        let all: Vec<Value> = matches
-            .iter()
-            .map(|(id, o)| {
-                json!({
-                    "offer_id": hash_to_hex(id),
-                    "lender": address_to_hex(&o.lender),
-                    "min_principal_sat": o.min_principal_sat,
-                    "max_principal_sat": o.max_principal_sat,
-                    "rate_bps_per_window": o.rate_bps_per_window,
-                    "window_blocks": o.window_blocks,
-                    "base_collateral_bps": o.base_collateral_bps,
-                    "max_discount_bps": o.max_discount_bps,
-                    "bond_ratio_bps": o.bond_ratio_bps,
-                    "min_collateral_bps": o.min_collateral_bps,
-                    "expires_height": o.expires_height,
-                })
+        let (offers, total, truncated, next) = page_render(&matches, cursor, limit, |(id, o)| {
+            json!({
+                "offer_id": hash_to_hex(id),
+                "lender": address_to_hex(&o.lender),
+                "min_principal_sat": o.min_principal_sat,
+                "max_principal_sat": o.max_principal_sat,
+                "rate_bps_per_window": o.rate_bps_per_window,
+                "window_blocks": o.window_blocks,
+                "base_collateral_bps": o.base_collateral_bps,
+                "max_discount_bps": o.max_discount_bps,
+                "bond_ratio_bps": o.bond_ratio_bps,
+                "min_collateral_bps": o.min_collateral_bps,
+                "expires_height": o.expires_height,
             })
-            .collect();
-        let (offers, total, truncated, next) = page_slice(&all, cursor, limit);
+        });
         Ok(Json(
             json!({ "count": offers.len(), "total": total, "truncated": truncated, "next_cursor": next, "offers": offers }),
         ))
@@ -9259,36 +9250,78 @@ fn trial_json(t: &TrialRecord) -> Value {
     })
 }
 
-/// A confirmed L1 payment of at least `amount_sat` to `to`, by txid. The scan
-/// is the same canonical O(tip) walk `tx_lookup` pays for a node with no tx
-/// index. Only confirmed blocks count: a trial funded by a mempool payment
-/// could vanish on a reorg and leave the books claiming money moved.
-fn confirmed_payment_to(
-    chain: &srct_core::chain::Chain,
+/// Whether one tx output set pays `to` at least `amount_sat`. Pure over the
+/// transaction bytes: the caller decides which chain state to trust.
+fn tx_pays_enough(tx: &srct_core::tx::Transaction, to: &Address, amount_sat: u64) -> bool {
+    let mut paid = 0u64;
+    for out in &tx.outputs {
+        if &out.address == to {
+            paid = paid.saturating_add(out.value);
+        }
+    }
+    paid >= amount_sat
+}
+
+/// A confirmed L1 payment of at least `amount_sat` to `to`, by txid. Only
+/// confirmed blocks count: a trial funded by a mempool payment could vanish
+/// on a reorg and leave the books claiming money moved.
+///
+/// Cost control: the full canonical walk is O(tip), and fund/repay/status
+/// ask about the *same* txids over and over (idempotent re-confirmation,
+/// conflict checks). The node's [`SharedNode::confirmed_tx_height`] memo
+/// turns repeats into one block lookup: a hit re-verifies the backing block
+/// (same rule as the walk, not a shortcut), and a reorg-orphaned payment
+/// fails that check, drops from the memo, and falls through to a fresh walk.
+fn confirmed_payment_to_cached(
+    sh: &mut SharedNode,
     txid: &Hash512,
     to: &Address,
     amount_sat: u64,
 ) -> bool {
-    for height in 1..=chain.height() {
-        let Some(block) = chain.block_at(height) else {
+    if let Some(&height) = sh.confirmed_tx_height.get(txid) {
+        let still_there = sh
+            .chain
+            .block_at(height)
+            .map(|block| {
+                block
+                    .txs
+                    .iter()
+                    .any(|tx| &tx.txid() == txid && tx_pays_enough(tx, to, amount_sat))
+            })
+            .unwrap_or(false);
+        if still_there {
+            return true;
+        }
+        sh.confirmed_tx_height.remove(txid);
+    }
+    let tip = sh.chain.height();
+    let mut found = None;
+    for height in 1..=tip {
+        let Some(block) = sh.chain.block_at(height) else {
             continue;
         };
         for tx in &block.txs {
             if &tx.txid() != txid {
                 continue;
             }
-            let mut paid = 0u64;
-            for out in &tx.outputs {
-                if &out.address == to {
-                    paid = paid.saturating_add(out.value);
-                }
-            }
-            if paid >= amount_sat {
-                return true;
+            if tx_pays_enough(tx, to, amount_sat) {
+                found = Some(height);
+                break;
             }
         }
+        if found.is_some() {
+            break;
+        }
     }
-    false
+    if let Some(height) = found {
+        while sh.confirmed_tx_height.len() >= MAX_CONFIRMED_TX_CACHE {
+            sh.confirmed_tx_height.pop_first();
+        }
+        sh.confirmed_tx_height.insert(*txid, height);
+        true
+    } else {
+        false
+    }
 }
 
 /// A txid is single-use across the whole trial book: one L1 payment funds or
@@ -9445,12 +9478,12 @@ async fn trial_fund(State(state): State<ApiState>, Json(req): Json<TrialTxReq>) 
                 // payment orphaned off the chain. A live funding cannot be
                 // replaced by pointing at another payment.
                 if trial.fund_txid == Some(txid)
-                    && confirmed_payment_to(&sh.chain, &txid, &agent, trial.amount_sat)
+                    && confirmed_payment_to_cached(sh, &txid, &agent, trial.amount_sat)
                 {
                     return Ok(Json(trial_json(&trial)));
                 }
                 if let Some(old) = trial.fund_txid {
-                    if confirmed_payment_to(&sh.chain, &old, &agent, trial.amount_sat) {
+                    if confirmed_payment_to_cached(sh, &old, &agent, trial.amount_sat) {
                         return Err(fail(
                             StatusCode::CONFLICT,
                             "trial_funded",
@@ -9486,7 +9519,7 @@ async fn trial_fund(State(state): State<ApiState>, Json(req): Json<TrialTxReq>) 
                 "one L1 payment funds at most one trial",
             ));
         }
-        if !confirmed_payment_to(&sh.chain, &txid, &agent, trial.amount_sat) {
+        if !confirmed_payment_to_cached(sh, &txid, &agent, trial.amount_sat) {
             return Err(fail(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "trial_unfunded",
@@ -9564,12 +9597,12 @@ async fn trial_repay(State(state): State<ApiState>, Json(req): Json<TrialTxReq>)
                 // Idempotent re-confirm after restart, or replacement after
                 // the recorded repayment orphaned. Matches `trial_fund`.
                 if trial.repay_txid == Some(txid)
-                    && confirmed_payment_to(&sh.chain, &txid, &trial.sponsor, trial.amount_sat)
+                    && confirmed_payment_to_cached(sh, &txid, &trial.sponsor, trial.amount_sat)
                 {
                     return Ok(Json(trial_json(&trial)));
                 }
                 if let Some(old) = trial.repay_txid {
-                    if confirmed_payment_to(&sh.chain, &old, &trial.sponsor, trial.amount_sat) {
+                    if confirmed_payment_to_cached(sh, &old, &trial.sponsor, trial.amount_sat) {
                         return Err(fail(
                             StatusCode::CONFLICT,
                             "trial_closed",
@@ -9588,11 +9621,11 @@ async fn trial_repay(State(state): State<ApiState>, Json(req): Json<TrialTxReq>)
             TrialState::Funded => {
                 if let Some(old) = trial.repay_txid {
                     if old == txid
-                        && confirmed_payment_to(&sh.chain, &txid, &trial.sponsor, trial.amount_sat)
+                        && confirmed_payment_to_cached(sh, &txid, &trial.sponsor, trial.amount_sat)
                     {
                         return Ok(Json(trial_json(&trial)));
                     }
-                    if confirmed_payment_to(&sh.chain, &old, &trial.sponsor, trial.amount_sat) {
+                    if confirmed_payment_to_cached(sh, &old, &trial.sponsor, trial.amount_sat) {
                         return Err(fail(
                             StatusCode::CONFLICT,
                             "trial_repaid",
@@ -9631,7 +9664,7 @@ async fn trial_repay(State(state): State<ApiState>, Json(req): Json<TrialTxReq>)
             voucher_id = Some(vid);
         }
         let due = trial.amount_sat.saturating_sub(voucher_cover);
-        if !confirmed_payment_to(&sh.chain, &txid, &trial.sponsor, due) {
+        if !confirmed_payment_to_cached(sh, &txid, &trial.sponsor, due) {
             return Err(fail(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "trial_unpaid",
@@ -10603,6 +10636,81 @@ mod trial_expiry_tests {
         assert_eq!(
             expired_trial_requests(&trials, u64::MAX - 1, 10_000),
             Vec::<Address>::new()
+        );
+    }
+}
+
+#[cfg(test)]
+mod confirmed_payment_memo_tests {
+    use super::*;
+
+    fn funded_node() -> SharedNode {
+        let params = srct_core::params::NetworkParams::mini();
+        let mut chain = srct_core::chain::Chain::new(params.clone()).unwrap();
+        let miner = [7u8; 20];
+        for h in 1..=3u64 {
+            let b = chain
+                .mine_block(
+                    miner,
+                    vec![],
+                    srct_core::block::GENESIS_TIMESTAMP_MS + h * 1_000,
+                )
+                .unwrap();
+            chain.submit(b).unwrap();
+        }
+        let l2 = crate::l2::NodeL2::fresh(&params).unwrap();
+        SharedNode::new(chain, l2)
+    }
+
+    fn coinbase_at(sh: &SharedNode, height: u64) -> (Hash512, Address, u64) {
+        let tx = &sh.chain.block_at(height).unwrap().txs[0];
+        (tx.txid(), tx.outputs[0].address, tx.outputs[0].value)
+    }
+
+    #[test]
+    fn memo_hit_returns_true_without_growing() {
+        let mut sh = funded_node();
+        let (txid, payee, amount) = coinbase_at(&sh, 2);
+        // Cold: the full walk finds it and memos the height.
+        assert!(confirmed_payment_to_cached(&mut sh, &txid, &payee, amount));
+        assert_eq!(sh.confirmed_tx_height.get(&txid), Some(&2));
+        // Warm: same answer from the memo (one block lookup, no walk).
+        assert!(confirmed_payment_to_cached(&mut sh, &txid, &payee, amount));
+        assert_eq!(sh.confirmed_tx_height.len(), 1);
+        // Unknown txid: miss, and the miss is not cached.
+        assert!(!confirmed_payment_to_cached(
+            &mut sh, &[9u8; 64], &payee, amount
+        ));
+        assert_eq!(sh.confirmed_tx_height.len(), 1);
+    }
+
+    #[test]
+    fn stale_memo_entry_is_dropped_never_trusted() {
+        let mut sh = funded_node();
+        // Plant a bogus entry as if a reorg orphaned the payment: height 2
+        // is real but never held this txid.
+        let bogus = [8u8; 64];
+        sh.confirmed_tx_height.insert(bogus, 2);
+        assert!(!confirmed_payment_to_cached(&mut sh, &bogus, &[7u8; 20], 1));
+        assert!(
+            !sh.confirmed_tx_height.contains_key(&bogus),
+            "a reorg-orphaned entry must be evicted, never trusted"
+        );
+    }
+
+    #[test]
+    fn memo_is_bounded() {
+        let mut sh = funded_node();
+        for i in 0..(MAX_CONFIRMED_TX_CACHE + 10) {
+            let mut id = [0u8; 64];
+            id[0..8].copy_from_slice(&(i as u64).to_le_bytes());
+            sh.confirmed_tx_height.insert(id, 1);
+        }
+        let (txid, payee, amount) = coinbase_at(&sh, 1);
+        assert!(confirmed_payment_to_cached(&mut sh, &txid, &payee, amount));
+        assert!(
+            sh.confirmed_tx_height.len() <= MAX_CONFIRMED_TX_CACHE,
+            "the memo must stay capped under flood"
         );
     }
 }
