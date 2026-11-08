@@ -137,10 +137,16 @@ fn proc_stats() -> ProcStats {
                 let mut it = line.split_whitespace();
                 match it.next() {
                     Some("VmHWM:") => {
-                        st.peak_rss_bytes = it.next().and_then(|v| v.parse::<u64>().ok()).map(|kb| kb * 1024);
+                        st.peak_rss_bytes = it
+                            .next()
+                            .and_then(|v| v.parse::<u64>().ok())
+                            .map(|kb| kb * 1024);
                     }
                     Some("VmRSS:") => {
-                        st.rss_bytes = it.next().and_then(|v| v.parse::<u64>().ok()).map(|kb| kb * 1024);
+                        st.rss_bytes = it
+                            .next()
+                            .and_then(|v| v.parse::<u64>().ok())
+                            .map(|kb| kb * 1024);
                     }
                     _ => {}
                 }
@@ -736,10 +742,16 @@ fn run_stages(workload: &str, blocks: u64, dir: &Path, max_rss_bytes: Option<u64
 
     let stats_after = proc_stats();
     // Storage growth: every file the node actually keeps on disk.
-    let meta_bytes = std::fs::metadata(store_dir.join("meta.json")).map(|m| m.len()).unwrap_or(0);
-    let journal_bytes = std::fs::metadata(store_dir.join("tip.journal")).map(|m| m.len()).unwrap_or(0);
+    let meta_bytes = std::fs::metadata(store_dir.join("meta.json"))
+        .map(|m| m.len())
+        .unwrap_or(0);
+    let journal_bytes = std::fs::metadata(store_dir.join("tip.journal"))
+        .map(|m| m.len())
+        .unwrap_or(0);
     let dir_bytes_total = dir_bytes(&store_dir);
-    let parallelism = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0);
+    let parallelism = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(0);
     stages.push(Stage {
         name: "totals",
         wall_ms: stages.iter().map(|s| s.wall_ms).sum(),
