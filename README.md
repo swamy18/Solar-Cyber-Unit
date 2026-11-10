@@ -23,6 +23,11 @@ and redistribute.
   - [Portable policy interface](docs/portable-policy.md)
 - [Mining](#mining)
 - [Supply](#supply)
+- [Cryptography and quantum](#cryptography-and-quantum)
+- [P2P and storage](#p2p-and-storage)
+- [API index](#api-index)
+- [Templates](#templates)
+- [Performance and verification](#performance-and-verification)
 - [What the chain is for](#what-the-chain-is-for)
 - [Use cases](#use-cases)
 - [Agent payments (x402)](#agent-payments-x402)
@@ -250,7 +255,10 @@ trusting any number in it:
   TLS-terminating proxy. Gate audit receipts are node-local and
   export-verifiable, not chain-anchored; managed-cluster admission webhooks
   are designed but not implemented (the worker SDK's in-process
-  `GuardGate::execute` is the implemented reference boundary).
+   `GuardGate::execute` is the implemented reference boundary).
+- **Slash vault is empty by construction (for now).** M2 (`slash.rs`, 50% burn + 50% vest) is defined and tested, but nothing creates a slash record yet — see `SPEC §14.6` / `mainnet-readiness.md`.
+- **Mainnet L2 settlement is fail-closed.** Its validator set starts empty, so settlements refuse until configured; testnet/mini use deterministic keys.
+- **HBM is staged, VWC is opt-in, PQ spend is off.** `hbm-v1` (`puzzle_id = 2`) is registered, never active; `vwc-v1` (`puzzle_id = 3`) mines only where a profile sets it, and consensus enforces the VWC commitment there; `pq_activation_height = 0` on every profile (age-gated when flipped, testnet rehearsal first).
 
 ---
 
@@ -575,8 +583,15 @@ well (multithreaded, `--threads N` with `0` = one per CPU and a cap of 1024,
 The `--miner` address need not belong to any wallet on the node — it is just
 where the coinbase pays out.
 
-Seed boxes, the pool protocol, hardware backends and the `hbm-v1` upgrade
-route: [`docs/mining.md`](docs/mining.md).
+Pools speak stratum-lite JSON-lines (`getjob`/`submit`, single-use job ids,
+anti-theft template pinning, share vs network difficulty) with PPLNS over the
+last-N shares (N ≈ two blocks, `fee_bps`, dust carry, `mark_paid`,
+recorded-before-paid, `PPLNS_MAX_WINDOW` = 1M). `hbm-v1` (`puzzle_id = 2`) is
+the staged ASIC-pressure route — memory-hard scratchpad (mainnet 16 384
+lanes / 64 accesses, `production()` 8 MiB / 256), deterministic from
+`header.serialize()` — never active on any profile; see
+[`docs/mining.md`](docs/mining.md) and
+[`docs/security-review-hbm-2026-10-12.md`](docs/security-review-hbm-2026-10-12.md).
 
 ---
 
@@ -637,6 +652,67 @@ not mean nothing was stolen — a thief's exit conserves perfectly — so
 `/v1/conservation` also reports the exit-outflow watch (`exit_window_total`
 vs cap, `pending_exit_sat`): alert on a window filling fast, not on the
 invariant staying green.
+
+Small consensus rules worth knowing: `lock_time` is enforced — a
+transaction with `lock_time > height` is refused, so a timelocked payment
+cannot mine early. A full mempool evicts the single lowest-fee-rate entry
+when a strictly higher-rate transaction arrives (`reconcile_mempool` evicts
+what the canonical chain confirms). Difficulty retargets every block
+(LWMA, ±10%, solve-time clamp `[T/4, 5T]`); the future-timestamp ceiling is
+policy at admission (`validate_local_clock`, one block time), never a
+consensus split. Exit claims need exact funding — sink outputs summing
+*exactly* to `amount + fees`, no change or tip — or the exit waits.
+
+---
+
+## Cryptography and quantum
+
+| Primitive | What it is | Where |
+|---|---|---|
+| Hash | SHA-256 internal, SHA-512 64-byte `txid`/`block_hash` — ~128-bit Grover + ~85-bit BHT margin on the two ids attackers want most | `SPEC.md §0` |
+| Signatures | `1` secp256k1 ECDSA (low-s), `2` Schnorr, `3` ML-DSA-65 FIPS-204 level 3; hybrid bundle `1+3` is quantum-safe (Shor on secp256k1 alone forges nothing) | `SPEC §1.2`, `sig.rs` |
+| Domains | Every hash input carries a frozen ASCII tag (`DOM_BLOCK512`, `DOM_S1`, `DOM_S3_VWC`, …) — tags never change for a `/v1` suffix | `SPEC.md §0` |
+| PQ migration | `verify_input_pq` refuses bundles without scheme 3; activation is age-gated (`pq_activation_height`, `0` = off) so history is never stranded | Decision 24, `pq_signature` / `pq_migrate` tests |
+| Checkpoints | BLS12-381 min-pk via `blst` (G1 48B, G2 96B, DST) stays; ML-DSA-65 sidecar carries the same decision per signer, verified as clause-7 shape on checkpoints and VWC `Quorum` certs | `bls_checkpoint.rs`, `validators::check_sidecar`, `pq_checkpoint` / `pq_settle` tests |
+
+Rejected, on record: BLS -> ML-DSA multisig (3 KB x N explosion), SPHINCS+ in the checkpoint envelope (8-30 KB, unrelayable). SPHINCS+ stays an idea for cold evidence only.
+
+## P2P and storage
+
+**P2P (`crates/srct-net`).** Framing is `magic || type || length` with the magic re-checked on every frame; handshake exchanges magic + network id + protocol version + nonce (proof-of-socket, 20 s timeout). v0.2 has no ADDR gossip — bootnodes plus `peers.json` are the only peer sources. Relay is `INV -> GETDATA -> TX/BLOCK`; bad magic after handshake is an immediate ban, handshake failures score per IP, in-flight counts are capped. A handshake is never authentication.
+
+**Storage (`crates/srct-store`).** Append-only checksummed block log plus atomic metadata and a canonical index — no consensus rules inside. `flush` vs `sync` is an explicit durability contract; a crash mid-append leaves a partial last line that recovery drops. Covered by 30 `persist_crash` tests.
+
+## API index
+
+105 `/v1/` routes. The guide sections above show the main flows; the full set:
+
+- Node: `GET /v1/health`, `/v1/status`, `/v1/finality`, `/v1/fees`, `/v1/mempool`, `/v1/block/{hash}`, `/v1/block/latest`, `/v1/balance/{address}`, `/metrics`
+- Money: `GET /v1/conservation`, `POST /v1/l2/broadcast`, `GET /v1/l2/state`, `POST /v1/credit/open|repay|default|deposit|bond|mint`, `GET /v1/credit/*`, `GET /v1/exit/crankable`
+- Escrow: `POST /v1/escrow/open`, `GET /v1/escrow/{id}`, `POST /v1/escrow/{id}/release|settle` (release binds the delivered result hash; dispute freezes via `held_escrows`)
+- Guard/policy: `POST /v1/policy/decide`, `/v1/policies*`, `/v1/guard/grant|decide|authorize|revoke`, `POST /v1/delegation/link|verify`, `POST /v1/authorize`
+- Full list is the router in `crates/srct-node/src/api.rs` — SPEC §19 is normative when they disagree.
+
+## Templates
+
+Off-chain Python helpers (`templates/*.py`, each with `--selftest`). No template touches consensus.
+
+| Template | What it does | Invariant |
+|---|---|---|
+| `srct_depin.py` | DePIN capacity board: advertise/discover/match surplus GPU/CPU/`solar-edge` into a payable L2 task | Board is off-chain JSON; no watts in consensus |
+| `srct_silicon.py` | Photonic/custom-silicon benchmark attestation | No bonus yield — fastest truthful chip wins honestly |
+| `srct_stake.py` | Validator-bond facts + lending-yield leg + risk dashboard | Tracker only, never mints |
+| `srct_shield.py` | Insolvent sub-agent self-heal via parent credit lines | Exact accept payload, terms come from the offer |
+| `srct_swarm.py` | Ephemeral auditor + budget + compliance vote for high-value spends | All three must approve |
+| `srct_memory.py` | Hash-chained syncable agent log whose tip anchors task claims | Keeps memory off L1 |
+| `srct_frameworks.py` | `langchain_tool` / `crewai_tool` / `llamaindex_tool` spend-policy guard | Policy checked before the function runs |
+| `srct_fund.py` | `ensure_funded()` — cheapest live ramp quote, open intent, wait for provider fill | Custody never touches the node |
+
+## Performance and verification
+
+- **Bench:** `crates/srct-bench` (10th crate) builds deterministic chains — `run --workload empty|realistic|adversarial --blocks N`, mini profile, `GENESIS + h*1000` timestamps, RSS budgets. Production `Chain::submit` + public `BlockStore` API on a scratch dir.
+- **Reports (measurement only):** `docs/performance/README.md`, `baseline-2026-11-08-i5-8365U-windows.md`, `phase-c-scalability-report.md` + `results/*.json`. Known harness limit: realistic/adversarial 1k runs can panic on fee-drifted outputs — a bench-harness sizing bug, not a consensus bug.
+- **More reading:** `docs/final-report.md` (round summaries), `docs/fuzz.md` (17 cargo-fuzz targets over wire/mempool/store/L2/worker), `docs/security-review-hbm-2026-10-12.md` (HBM scope: 1 MiB vs 8-64 MiB production sizing, `lanes==0` pub-path note, bandwidth-bound is design argument not proof), `paper/srct-settlement-layer.tex` (protocol paper: hashes, PQ, domain separation, PoW diversity, settlement layers).
 
 ---
 
@@ -1255,13 +1331,15 @@ not expose it directly, but the worker SDK does (`add_credit_collateral`).
 | `crates/srct-worker/` | Worker-side SDK. Client only, no consensus. |
 | `crates/srct-mcp/` | Keyless MCP surface over agent identity, payments — and the agent wallet guard. |
 | `crates/srct-policy/` | Chain-agnostic policy engine: portable grants, delegation proofs, bound grants, JSON decisions + TS/Python bindings. No consensus imports — but still compiles all of `srct-core` (see crate docs); outsiders use HTTP or the bindings. |
+| `crates/srct-bench/` | Deterministic bench harness: `empty\|realistic\|adversarial` workloads, mini profile, scratch-dir stores. Measurement only. |
 | `fuzz/` | 17 cargo-fuzz targets over the attacker-controlled boundaries. |
 | `verification/sim/` | Independent Python reference, attack simulations, and feature demos (`x402_paid_api_demo.py`, `micropayment_benchmark.py`, `agent_economy_demo.py`). |
 | `verification/tests/vectors/` | Consensus vectors. Generated from source, never hand-edited. |
-| `docs/` | Design records, verification status and readiness reports — plus per-feature guides: `portable-policy.md`, `universal-security.md`, `x402.md`, `micropayments.md`, `wallet-safety.md`, `smart-gate-architecture.md`, `reputation.md`, `agent-jobs.md`, `usd-settlement.md`, `ramps.md`, `lending.md`. |
+| `docs/` | Design records, verification status and readiness reports — plus per-feature guides: `portable-policy.md`, `universal-security.md`, `x402.md`, `micropayments.md`, `wallet-safety.md`, `smart-gate-architecture.md`, `reputation.md`, `agent-jobs.md`, `usd-settlement.md`, `ramps.md`, `lending.md`, `treats.md`, `agent-credits.md`. |
+| `docs/performance/` | Bench baselines + Phase-C scalability report + raw JSON results. |
 | `paper/` | The Solar Cyber Unit protocol paper (LaTeX + PDF). |
 
-Nine crates in one workspace. **All consensus logic lives in `srct-core`**, which
+Ten crates in one workspace. **All consensus logic lives in `srct-core`**, which
 has no I/O, no clock and no network. The service-layer feature modules
 live beside it without touching consensus: `x402.rs` (x402
 adapter, budget guard, Base rail options), `micro.rs` (batch/stream/sponsored), `safety.rs` (session budgets,
@@ -1286,7 +1364,12 @@ and the feature guides listed in the `docs/` row above
 [x402](docs/x402.md), [micro-payments](docs/micropayments.md),
 [wallet safety](docs/wallet-safety.md), [reputation](docs/reputation.md),
 [jobs](docs/agent-jobs.md), [USD settlement](docs/usd-settlement.md),
-[ramps](docs/ramps.md), [lending](docs/lending.md)).
+[ramps](docs/ramps.md), [lending](docs/lending.md),
+[treats](docs/treats.md), [agent credits](docs/agent-credits.md),
+[mining](docs/mining.md), [fuzz](docs/fuzz.md),
+[HBM review](docs/security-review-hbm-2026-10-12.md),
+[final report](docs/final-report.md),
+[performance](docs/performance/README.md)).
 
 ---
 
