@@ -119,6 +119,71 @@ fn wallet(seed: u8, label: &str) -> Wallet {
     Wallet::from_private_key_bytes(&[seed; 32], label).unwrap()
 }
 
+fn signed_credit_fields(wallet: &Wallet, message: &[u8; 32]) -> Value {
+    json!({
+        "sigs_hex": hex::encode(Auth::sigs_for(wallet, message).unwrap().to_bytes()),
+        "keys_hex": hex::encode(Auth::keys_for(wallet).unwrap().to_bytes()),
+    })
+}
+
+fn signed_credit_open(
+    spec: &srct_core::credit::PositionSpec,
+    lender: &Wallet,
+    borrower: &Wallet,
+) -> Value {
+    let bytes = spec.encode();
+    let hash = srct_core::hash::sha256_dom(b"srct/node-credit-open/v1", &[NET.as_bytes(), &bytes]);
+    let lender_auth = Auth::sign(lender, &hash).unwrap();
+    let borrower_auth = Auth::sign(borrower, &hash).unwrap();
+    json!({
+        "spec_hex": hex::encode(bytes),
+        "lender_sigs_hex": hex::encode(lender_auth.sigs.to_bytes()),
+        "lender_keys_hex": hex::encode(lender_auth.keys.to_bytes()),
+        "borrower_sigs_hex": hex::encode(borrower_auth.sigs.to_bytes()),
+        "borrower_keys_hex": hex::encode(borrower_auth.keys.to_bytes()),
+    })
+}
+
+fn signed_credit_bond(wallet: &Wallet, address: &[u8; 20], action: &str, amount: u64) -> Value {
+    let hash = srct_core::hash::sha256_dom(
+        b"srct/node-credit-bond/v1",
+        &[
+            NET.as_bytes(),
+            address,
+            action.as_bytes(),
+            &amount.to_le_bytes(),
+        ],
+    );
+    let mut body = json!({
+        "address_hex": address_to_hex(address),
+        "action": action,
+        "amount_sat": amount,
+    });
+    body.as_object_mut().unwrap().extend(
+        signed_credit_fields(wallet, &hash)
+            .as_object()
+            .unwrap()
+            .clone(),
+    );
+    body
+}
+
+fn signed_credit_repay(wallet: &Wallet, position_id: &str, amount: u64) -> Value {
+    let id: [u8; 32] = hex::decode(position_id).unwrap().try_into().unwrap();
+    let hash = srct_core::hash::sha256_dom(
+        b"srct/node-credit-repay/v1",
+        &[NET.as_bytes(), &id, &amount.to_le_bytes()],
+    );
+    let mut body = json!({ "position_id": position_id, "amount_sat": amount });
+    body.as_object_mut().unwrap().extend(
+        signed_credit_fields(wallet, &hash)
+            .as_object()
+            .unwrap()
+            .clone(),
+    );
+    body
+}
+
 /// A raw HTTP exchange over a fresh connection. `Connection: close` makes the
 /// server close after the response, so `read_to_end` is the whole body.
 fn http(addr: SocketAddr, method: &str, path: &str, body: Option<&str>) -> (u16, String) {
@@ -227,6 +292,23 @@ fn health_status_fees_and_finality_answer() {
 }
 
 #[test]
+fn max_wire_block_hex_is_not_rejected_by_the_generic_json_body_limit() {
+    let node = start();
+    // The documented block wire cap is 4 MiB, which becomes 8 MiB in hex.
+    // A 5.5 MiB request body must reach the block decoder; it is malformed
+    // block data, not an HTTP body-limit rejection.
+    let block_hex = "00".repeat(5_500 * 1024 / 2);
+    let (status, body) = post_text(&node, "/v1/mine/submit", &json!({ "block_hex": block_hex }));
+    assert_eq!(
+        status, 400,
+        "bounded malformed block should reach decoder: {body}"
+    );
+    let parsed = json(&body);
+    assert_eq!(parsed["error"], "bad_request");
+    assert!(parsed["detail"].as_str().unwrap().contains("block decode"));
+}
+
+#[test]
 fn utxo_listing_pages_with_a_stable_cursor() {
     let params = NetworkParams::mini();
     let miner = wallet(71, "page-miner");
@@ -275,6 +357,207 @@ fn utxo_listing_pages_with_a_stable_cursor() {
     assert_eq!(past["count"], 15);
     assert!(past["utxos"].as_array().unwrap().is_empty());
     assert!(past["next_cursor"].is_null());
+}
+
+#[test]
+fn direct_voucher_consumption_requires_the_named_beneficiary() {
+    let node = start();
+    let owner = wallet(111, "voucher-owner");
+    let owner_addr = owner.address().unwrap();
+    let subject = derive_agent_id(NET, AgentRole::Machine, &owner_addr);
+    let voucher = node
+        .shared
+        .lock()
+        .unwrap()
+        .treats
+        .issue_voucher(NET, subject, 900, srct_core::treats::VoucherKind::Trial, 0)
+        .unwrap();
+    let voucher_id = hash_to_hex(&voucher.id);
+    let message = srct_core::hash::sha256_dom(
+        b"srct/treat-voucher-consume/v1",
+        &[NET.as_bytes(), &voucher.id, &subject],
+    );
+    let legitimate = Auth::sign(&owner, &message).unwrap();
+
+    let stranger = wallet(112, "voucher-stranger");
+    let stranger_addr = stranger.address().unwrap();
+    let (status, body) = post(
+        &node,
+        "/v1/treats/voucher/consume",
+        &json!({
+            "voucher_id": voucher_id,
+            "agent_hex": address_to_hex(&stranger_addr),
+            "sigs_hex": hex::encode(legitimate.sigs.to_bytes()),
+            "keys_hex": hex::encode(legitimate.keys.to_bytes()),
+        }),
+    );
+    assert_eq!(status, 403, "a copied voucher id is not authority: {body}");
+
+    let (status, body) = post(
+        &node,
+        "/v1/treats/voucher/consume",
+        &json!({
+            "voucher_id": voucher_id,
+            "agent_hex": address_to_hex(&owner_addr),
+            "sigs_hex": hex::encode(legitimate.sigs.to_bytes()),
+            "keys_hex": hex::encode(legitimate.keys.to_bytes()),
+        }),
+    );
+    assert_eq!(status, 200, "the named beneficiary can consume: {body}");
+    assert_eq!(body["value_sat"], 900);
+    let (status, _) = post(
+        &node,
+        "/v1/treats/voucher/consume",
+        &json!({
+            "voucher_id": voucher_id,
+            "agent_hex": address_to_hex(&owner_addr),
+            "sigs_hex": hex::encode(legitimate.sigs.to_bytes()),
+            "keys_hex": hex::encode(legitimate.keys.to_bytes()),
+        }),
+    );
+    assert_eq!(status, 409, "successful consume stays single-use");
+}
+
+#[test]
+fn exposed_passport_registration_requires_a_trusted_issuer() {
+    let params = NetworkParams::mini();
+    let l2 = NodeL2::fresh(&params).unwrap();
+    let shared = Arc::new(Mutex::new(SharedNode::new(Chain::new(params).unwrap(), l2)));
+    let peers = Arc::new(AtomicUsize::new(0));
+    let addr = spawn_with_options(
+        Arc::clone(&shared),
+        peers,
+        "127.0.0.1:0".parse().unwrap(),
+        Some("integration-token".to_string()),
+        Vec::new(),
+        Vec::new(),
+    )
+    .unwrap();
+    let issuer = srct_core::bls::SecretKey::derive(&[113u8; 32]).unwrap();
+    let batch = srct_core::passport::PassportBatch {
+        network_id: NET.to_string(),
+        subject: [1u8; 20],
+        events: vec![srct_core::passport::PassportEvent {
+            kind: srct_core::passport::PassportEventKind::TaskCompleted,
+            height: 0,
+            source: [2u8; 32],
+            counterparty: [3u8; 20],
+            amount_sat: 1,
+        }],
+        issuer: issuer.public_key(),
+        issued_height: 0,
+        expires_height: 10,
+        sig: srct_core::bls_checkpoint::BlsSignature([0u8; 96]),
+    };
+    let mut batch = batch;
+    batch.sig = issuer.sign(&batch.signing_hash());
+    let request = json!({
+        "network_id": batch.network_id,
+        "subject_hex": hex::encode(batch.subject),
+        "events": [{
+            "kind": "TaskCompleted",
+            "height": 0,
+            "source_hex": hex::encode(batch.events[0].source),
+            "counterparty_hex": hex::encode(batch.events[0].counterparty),
+            "amount_sat": 1,
+        }],
+        "issuer_hex": hex::encode(batch.issuer.0),
+        "issued_height": 0,
+        "expires_height": 10,
+        "sig_hex": hex::encode(batch.sig.0),
+    });
+    let raw = request.to_string();
+    let request = format!(
+        "POST /v1/reputation/batch HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAuthorization: Bearer integration-token\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        addr.port(), raw.len(), raw
+    );
+    let mut stream = TcpStream::connect(addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    stream.write_all(request.as_bytes()).unwrap();
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).unwrap();
+    let response = String::from_utf8_lossy(&response);
+    let status = response
+        .split_whitespace()
+        .nth(1)
+        .unwrap()
+        .parse::<u16>()
+        .unwrap();
+    let body = json(response.split_once("\r\n\r\n").unwrap().1);
+    assert_eq!(
+        status, 403,
+        "untrusted issuer refused on exposed API: {body}"
+    );
+    assert_eq!(body["error"], "passport_untrusted");
+}
+
+#[test]
+fn malformed_credit_authorization_cannot_open_or_repay_a_position() {
+    let node = start();
+    let borrower = wallet(101, "auth-borrower");
+    let lender = wallet(102, "auth-lender");
+    let borrower_addr = borrower.address().unwrap();
+    let stranger = wallet(103, "auth-stranger");
+    let params = NetworkParams::mini();
+    let (s, b) = post(
+        &node,
+        "/v1/credit/deposit",
+        &json!({ "address_hex": address_to_hex(&borrower_addr), "amount_sat": 2_000_000u64 }),
+    );
+    assert_eq!(s, 200, "{b}");
+
+    let bond_hash = srct_core::hash::sha256_dom(
+        b"srct/node-credit-bond/v1",
+        &[
+            params.network_id.as_bytes(),
+            &borrower_addr,
+            b"post",
+            &50_000u64.to_le_bytes(),
+        ],
+    );
+    let mut bond = signed_credit_bond(&stranger, &borrower_addr, "post", 50_000);
+    // The certificate names the borrower, but the signature comes from a stranger.
+    bond["sigs_hex"] = json!(hex::encode(
+        Auth::sigs_for(&stranger, &bond_hash).unwrap().to_bytes()
+    ));
+    bond["keys_hex"] = json!(hex::encode(Auth::keys_for(&stranger).unwrap().to_bytes()));
+    let (s, b) = post(&node, "/v1/credit/bond", &bond);
+    assert_eq!(s, 403, "an unsigned/foreign bond action must refuse: {b}");
+    let (s, balance) = get(
+        &node,
+        &format!("/v1/credit/balance/{}", address_to_hex(&borrower_addr)),
+    );
+    assert_eq!(s, 200);
+    assert_eq!(balance["bond"], 0, "refusal must not mutate the book");
+
+    let spec = srct_core::credit::PositionSpec {
+        terms: srct_core::credit::CreditTerms::default(),
+        charge: srct_core::credit::ChargeSchedule {
+            rate_bps_per_window: 0,
+            window_blocks: 100,
+        },
+        borrower: borrower_addr,
+        agent_id: [0x44; 32],
+        lender: lender.address().unwrap(),
+        amount_sat: 1_000,
+        bond_sat: 0,
+        drawn_at_height: 0,
+        deadline_height: 10,
+    };
+    let mut open = signed_credit_open(&spec, &stranger, &borrower);
+    let (s, b) = post(&node, "/v1/credit/open", &open);
+    assert_eq!(s, 403, "a lender must authorize a position: {b}");
+    open = signed_credit_open(&spec, &lender, &stranger);
+    let (s, b) = post(&node, "/v1/credit/open", &open);
+    assert_eq!(s, 403, "the borrower must authorize collateral: {b}");
+    let (s, balance) = get(
+        &node,
+        &format!("/v1/credit/balance/{}", address_to_hex(&borrower_addr)),
+    );
+    assert_eq!(s, 200);
+    assert!(balance["positions"].as_array().unwrap().is_empty());
 }
 
 #[test]
@@ -1767,10 +2050,11 @@ fn a_position_backed_payment_is_refused_up_front_not_locked_forever() {
         &json!({ "address_hex": addr_hex, "amount_sat": 5_000u64 }),
     );
     assert_eq!(s, 200, "{b}");
+    let borrower = wallet(61, "api-payer");
     let (s, b) = post(
         &node,
         "/v1/credit/bond",
-        &json!({ "address_hex": addr_hex, "action": "post", "amount_sat": 1_000u64 }),
+        &signed_credit_bond(&borrower, &payer_addr, "post", 1_000),
     );
     assert_eq!(s, 200, "{b}");
     let spec = srct_core::credit::PositionSpec {
@@ -1781,16 +2065,17 @@ fn a_position_backed_payment_is_refused_up_front_not_locked_forever() {
         },
         borrower: payer_addr,
         agent_id: [9u8; 32],
-        lender: [2u8; 20],
+        lender: wallet(95, "test-lender").address().unwrap(),
         amount_sat: 5_000,
         bond_sat: 1_000,
         drawn_at_height: 0,
         deadline_height: 100,
     };
+    let lender = wallet(95, "test-lender");
     let (s, b) = post(
         &node,
         "/v1/credit/open",
-        &json!({ "spec_hex": hex::encode(spec.encode()) }),
+        &signed_credit_open(&spec, &lender, &borrower),
     );
     assert_eq!(s, 200, "{b}");
 
@@ -1833,7 +2118,7 @@ fn the_credit_lifecycle_runs_through_the_node() {
     assert_eq!(s, 200, "{b}");
     let (s, b) = post(
         "/v1/credit/bond",
-        json!({ "address_hex": addr_hex, "action": "post", "amount_sat": 50_000u64 }),
+        signed_credit_bond(&wallet(91, "borrower"), &borrower, "post", 50_000),
     );
     assert_eq!(s, 200, "{b}");
     assert_eq!(b["bond"], 50_000);
@@ -1848,7 +2133,7 @@ fn the_credit_lifecycle_runs_through_the_node() {
         },
         borrower,
         agent_id: [9u8; 32],
-        lender: [2u8; 20],
+        lender: wallet(92, "test-lender").address().unwrap(),
         amount_sat: 1_000_000,
         bond_sat: 50_000,
         drawn_at_height: 0,
@@ -1856,7 +2141,7 @@ fn the_credit_lifecycle_runs_through_the_node() {
     };
     let (s, b) = post(
         "/v1/credit/open",
-        json!({ "spec_hex": hex::encode(spec.encode()) }),
+        signed_credit_open(&spec, &wallet(92, "test-lender"), &wallet(91, "borrower")),
     );
     assert_eq!(s, 200, "{b}");
     let position_id = b["position_id"].as_str().unwrap().to_string();
@@ -1871,7 +2156,7 @@ fn the_credit_lifecycle_runs_through_the_node() {
     };
     let (s, _b) = post(
         "/v1/credit/open",
-        json!({ "spec_hex": hex::encode(second.encode()) }),
+        signed_credit_open(&second, &wallet(92, "test-lender"), &wallet(91, "borrower")),
     );
     assert_eq!(s, 409, "one bond cannot secure two obligations");
 
@@ -1885,7 +2170,7 @@ fn the_credit_lifecycle_runs_through_the_node() {
     assert_eq!(s, 200);
     let (s, b) = post(
         "/v1/credit/repay",
-        json!({ "position_id": position_id, "amount_sat": 1_000_000u64 }),
+        signed_credit_repay(&wallet(91, "borrower"), &position_id, 1_000_000),
     );
     assert_eq!(s, 200, "{b}");
     assert_eq!(b["remaining_debt_sat"], 0);
@@ -1902,7 +2187,7 @@ fn the_credit_lifecycle_runs_through_the_node() {
     };
     let (s, _b) = post(
         "/v1/credit/open",
-        json!({ "spec_hex": hex::encode(third.encode()) }),
+        signed_credit_open(&third, &wallet(92, "test-lender"), &wallet(91, "borrower")),
     );
     assert_eq!(s, 200, "the bond is free again");
 }
@@ -1921,7 +2206,7 @@ fn zero_amount_credit_requests_are_refused_not_a_node_kill() {
         let (s, b) = post(
             &node,
             "/v1/credit/bond",
-            &json!({ "address_hex": addr_hex, "action": action, "amount_sat": 0u64 }),
+            &json!({ "address_hex": addr_hex, "action": action, "amount_sat": 0u64, "sigs_hex": "", "keys_hex": "" }),
         );
         assert_eq!(s, 400, "{action} of zero must be a client error: {b}");
         assert_eq!(b["error"], "bad_request");
@@ -1935,7 +2220,7 @@ fn zero_amount_credit_requests_are_refused_not_a_node_kill() {
     let (s, b) = post(
         &node,
         "/v1/credit/repay",
-        &json!({ "position_id": hash_to_hex(&[0u8; 32]), "amount_sat": 0u64 }),
+        &json!({ "position_id": hash_to_hex(&[0u8; 32]), "amount_sat": 0u64, "sigs_hex": "", "keys_hex": "" }),
     );
     assert_eq!(s, 400, "{b}");
     let (s, _b) = get(&node, "/v1/health");

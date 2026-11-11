@@ -20,7 +20,11 @@ that gate on scores should read them from a node they operate.
    binds each event to it: the subject must be the payment's agent (or the
    loan's borrower), the counterparty the other side, and the amounts must
    match, so real-but-unrelated history cannot inflate anyone's score;
-   task/dispute/refund kinds are issuer-attested.
+   task/dispute/refund kinds are issuer-attested. On an exposed API, the node
+   refuses registration unless `SRCT_PASSPORT_ISSUERS` contains a trusted
+   issuer key. Loopback-only development nodes may accept any valid signer.
+   The node-local batch book is capped at 4,096 entries; a duplicate batch is
+   idempotent.
 3. Any service combines live batches into one score + tier
    (`GET /v1/reputation/score/{agent}?role=machine` → `Deny | Throttled |
    Standard | Preferred`).

@@ -118,6 +118,49 @@ fn policy_keys_hex(owner: &Wallet) -> String {
     hex::encode(Auth::keys_for(owner).unwrap().to_bytes())
 }
 
+fn credit_signed_fields(wallet: &Wallet, hash: &[u8; 32]) -> Value {
+    let auth = Auth::sign(wallet, hash).unwrap();
+    json!({
+        "sigs_hex": hex::encode(auth.sigs.to_bytes()),
+        "keys_hex": hex::encode(auth.keys.to_bytes()),
+    })
+}
+
+fn credit_bond_body(wallet: &Wallet, address: &[u8; 20], amount: u64) -> Value {
+    let hash = srct_core::hash::sha256_dom(
+        b"srct/node-credit-bond/v1",
+        &[NET.as_bytes(), address, b"post", &amount.to_le_bytes()],
+    );
+    let mut body = json!({
+        "address_hex": address_to_hex(address),
+        "action": "post",
+        "amount_sat": amount,
+    });
+    body.as_object_mut().unwrap().extend(
+        credit_signed_fields(wallet, &hash)
+            .as_object()
+            .unwrap()
+            .clone(),
+    );
+    body
+}
+
+fn credit_repay_body(wallet: &Wallet, position_id: &str, amount: u64) -> Value {
+    let id: [u8; 32] = hex::decode(position_id).unwrap().try_into().unwrap();
+    let hash = srct_core::hash::sha256_dom(
+        b"srct/node-credit-repay/v1",
+        &[NET.as_bytes(), &id, &amount.to_le_bytes()],
+    );
+    let mut body = json!({ "position_id": position_id, "amount_sat": amount });
+    body.as_object_mut().unwrap().extend(
+        credit_signed_fields(wallet, &hash)
+            .as_object()
+            .unwrap()
+            .clone(),
+    );
+    body
+}
+
 fn machine_policy(owner: &Wallet, provider_addr: &[u8; 20], service: [u8; 32]) -> SpendPolicy {
     let owner_addr = owner.address().unwrap();
     SpendPolicy {
@@ -869,7 +912,7 @@ fn productive_lending_from_offer_to_autorepay() {
         ),
         (
             "/v1/credit/bond",
-            json!({ "address_hex": address_to_hex(&borrower_addr), "action": "post", "amount_sat": 200 }),
+            credit_bond_body(&borrower, &borrower_addr, 200),
         ),
     ] {
         let (s, b) = post(&node, path, &body);
@@ -919,7 +962,7 @@ fn productive_lending_from_offer_to_autorepay() {
     let (s, b) = post(
         &node,
         "/v1/credit/repay",
-        &json!({ "position_id": position_id, "amount_sat": 1000 }),
+        &credit_repay_body(&borrower, &position_id, 1000),
     );
     assert_eq!(s, 200, "repay refused: {b}");
     let (s, history) = get(

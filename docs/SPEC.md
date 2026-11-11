@@ -3377,20 +3377,17 @@ own: settlement still requires a §21 spend the state machine admits.
 
 ### 22.1 Why this section exists
 
-The credit facility of §18.4 was a **node-local** ledger of IOUs. Three
-things were wrong with it, and each was a hole rather than a limitation:
+The earlier §18.4 credit facility was a **node-local** ledger of IOUs: it did
+not move a coin and was not visible to other nodes. That service-layer book
+still exists for API payment gating and remains explicitly non-consensus. Its
+local `/v1/credit/deposit` is not backed by an L1 deposit proof and must not be
+described as funded coin. The original unsigned `/v1/credit/open` endpoint also
+allowed callers to write an arbitrary lender field; the current route requires
+both lender and borrower signatures over the exact spec, while `/credit/bond`
+and `/credit/repay` require the named account's signature. This local book is
+not a substitute for the consensus facility described below.
 
-1. **No coin moved.** `POST /v1/credit/deposit` credited a local balance and
-   the code said so itself: *"This credits the local book only - no coin
-   moves."* A credit line nobody can fund is a number.
-2. **No lender signature.** `POST /v1/credit/open` accepted a `spec_hex` whose
-   `lender` field was just a field. Anybody could open a position naming a
-   lender who had never agreed to lend, and the record would say the lender
-   owed the debt.
-3. **Nobody else could see it.** The book lived in one node's `state.bin`, so
-   a borrower with a line on one node had no line at all on another.
-
-This section makes a loan a chain fact. The vocabulary is four transaction
+This section makes a separate credit facility a chain fact. The vocabulary is four transaction
 types:
 
 | Type | Code | Actor | Purpose |

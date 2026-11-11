@@ -185,11 +185,10 @@ use srct_l2::task_contract::{ContractState, TaskContract};
 use crate::conservation::conservation_report;
 use crate::l2::NodeL2;
 
-/// Largest request body. A block is at most `max_block_bytes` (4 MB on every
-/// profile), and the API only ever accepts transactions, payments, receipts,
-/// policies and requests — none of which approach that. Explicit rather than
-/// framework-default so the bound is visible in this file's docs.
-const MAX_BODY_BYTES: usize = 5 * 1024 * 1024;
+/// Largest request body. `POST /v1/mine/submit` accepts a block up to the
+/// profile's 4 MiB wire limit as hex (8 MiB) plus JSON framing. Keep this
+/// above that encoded maximum; route-level block and hex caps remain tighter.
+const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
 
 /// Version of the node-local state envelope written by
 /// [`SharedNode::encode_state`]. A build that writes a different format writes
@@ -212,7 +211,7 @@ const MAX_BODY_BYTES: usize = 5 * 1024 * 1024;
 /// would mix scopes that must never meet. Version 10 appends the Smart Gate
 /// sections (grant registry, revocations, capability book) last; v8/v9 files
 /// migrate with empty gate state.
-const STATE_ENVELOPE_VERSION: u8 = 12;
+const STATE_ENVELOPE_VERSION: u8 = 13;
 
 /// Largest entry count any single map section in the state envelope may
 /// declare, checked before allocation. Real books are bounded by their own
@@ -226,6 +225,10 @@ const MAX_STATE_ENTRIES: usize = 1 << 20;
 const MAX_FX_RATES: usize = 512;
 const MAX_RAMP_QUOTES: usize = 1024;
 const MAX_RAMP_INTENTS: usize = 1024;
+/// Signed passport batches are retained in the node-local score book. Bound
+/// registrations as well as decode counts so repeated valid issuances cannot
+/// grow state.bin until the node can no longer persist it.
+const MAX_PASSPORT_BATCHES: usize = 4096;
 
 /// Length-prefix one section into the state envelope.
 fn put_section(w: &mut Writer, bytes: &[u8]) {
@@ -958,13 +961,14 @@ impl SharedNode {
         // Smart Gate sections: migrate them with empty books instead of
         // refusing to boot.
         if version != STATE_ENVELOPE_VERSION
+            && version != 12
             && version != 11
             && version != 10
             && version != 9
             && version != 8
         {
             return Err(format!(
-                "state envelope version {version}, this build reads {STATE_ENVELOPE_VERSION} (and migrates 8/9/10/11)"
+                "state envelope version {version}, this build reads {STATE_ENVELOPE_VERSION} (and migrates 8/9/10/11/12)"
             ));
         }
 
@@ -1237,7 +1241,7 @@ impl SharedNode {
             })
         })?;
         let passport_batches = decode_section(&mut r, "passport_batches", |sr| {
-            decode_state_map(sr, "passport_batches", |bytes| {
+            let batches = decode_state_map(sr, "passport_batches", |bytes| {
                 let mut pr = Reader::new(bytes);
                 let net_len = pr.u32le().map_err(|e| format!("passport: {e}"))? as usize;
                 if net_len > 64 {
@@ -1288,7 +1292,14 @@ impl SharedNode {
                     expires_height,
                     sig: srct_core::bls_checkpoint::BlsSignature(sig),
                 })
-            })
+            })?;
+            if batches.len() > MAX_PASSPORT_BATCHES {
+                return Err(format!(
+                    "passport_batches: {} entries over the {MAX_PASSPORT_BATCHES} live cap",
+                    batches.len()
+                ));
+            }
+            Ok(batches)
         })?;
         let fx_rates = decode_section(&mut r, "fx_rates", |sr| {
             let count = sr.u32le().map_err(|e| format!("fx_rates: {e}"))? as usize;
@@ -1514,7 +1525,7 @@ impl SharedNode {
         })?;
         // v8 files end here: no trials section. v9 appends trials last.
         // v10 appends the Smart Gate sections after trials. v11 appends Treats last.
-        // v12 extends the Treats section (nonce guards, claims, vouchers); older files migrate with empty new stores.
+        // v12 extends Treats with last-kind tracking. v13 adds persistent redemption nonces; older Treats sections migrate with empty nonce state.
         let (trials, guard_registry, guard_revoked, guards, treats) = if version == 8 {
             r.expect_end().map_err(|e| format!("state envelope: {e}"))?;
             (
@@ -2019,6 +2030,78 @@ fn decode_hex_bytes(s: &str, what: &str) -> Result<Vec<u8>, (StatusCode, Json<Er
 }
 
 /// Parse and length-check a 48-byte BLS public key hex string.
+fn verify_credit_action(
+    keys: &srct_core::sig::Bundle,
+    sigs: &srct_core::sig::Bundle,
+    expected: &Address,
+    message: &Hash,
+) -> Result<(), (StatusCode, Json<ErrorBody>)> {
+    let signer = keys
+        .address()
+        .map_err(|e| bad(format!("credit action keys: {e}")))?;
+    if &signer != expected {
+        return Err(fail(
+            StatusCode::FORBIDDEN,
+            "credit_authorization",
+            "credit action is not signed by the named account",
+        ));
+    }
+    srct_core::sig::verify_bundle(sigs, keys, message).map_err(|_| {
+        fail(
+            StatusCode::FORBIDDEN,
+            "credit_authorization",
+            "credit action signature is invalid",
+        )
+    })
+}
+
+fn credit_open_signing_hash(network: &str, spec: &[u8]) -> Hash {
+    srct_core::hash::sha256_dom(b"srct/node-credit-open/v1", &[network.as_bytes(), spec])
+}
+
+fn credit_bond_signing_hash(
+    network: &str,
+    address: &Address,
+    action: &str,
+    amount_sat: u64,
+) -> Hash {
+    srct_core::hash::sha256_dom(
+        b"srct/node-credit-bond/v1",
+        &[
+            network.as_bytes(),
+            address,
+            action.as_bytes(),
+            &amount_sat.to_le_bytes(),
+        ],
+    )
+}
+
+fn credit_repay_signing_hash(network: &str, position_id: &Hash, amount_sat: u64) -> Hash {
+    srct_core::hash::sha256_dom(
+        b"srct/node-credit-repay/v1",
+        &[network.as_bytes(), position_id, &amount_sat.to_le_bytes()],
+    )
+}
+
+fn treats_redeem_signing_hash(
+    network: &str,
+    subject: &srct_core::agent::AgentId,
+    amount: u64,
+    nonce: u64,
+    kind: srct_core::treats::VoucherKind,
+) -> Hash {
+    srct_core::hash::sha256_dom(
+        b"srct/treat-redeem/v1",
+        &[
+            network.as_bytes(),
+            subject,
+            &amount.to_le_bytes(),
+            &nonce.to_le_bytes(),
+            &[kind.as_u8()],
+        ],
+    )
+}
+
 fn decode_public_key(
     s: &str,
     what: &str,
@@ -5410,6 +5493,8 @@ struct CreditBondReq {
     /// `post` or `release`.
     action: String,
     amount_sat: u64,
+    sigs_hex: String,
+    keys_hex: String,
 }
 
 async fn credit_bond(State(state): State<ApiState>, Json(req): Json<CreditBondReq>) -> ApiResult {
@@ -5419,7 +5504,20 @@ async fn credit_bond(State(state): State<ApiState>, Json(req): Json<CreditBondRe
             "amount_sat must be positive; a zero bond moves nothing",
         ));
     }
+    let sigs = decode_bundle(&req.sigs_hex, "sigs")?;
+    let keys = decode_bundle(&req.keys_hex, "keys")?;
     with_shared(&state, |sh| {
+        verify_credit_action(
+            &keys,
+            &sigs,
+            &addr,
+            &credit_bond_signing_hash(
+                &sh.chain.params().network_id,
+                &addr,
+                &req.action,
+                req.amount_sat,
+            ),
+        )?;
         match req.action.as_str() {
             "post" => {
                 sh.credit
@@ -5449,6 +5547,10 @@ async fn credit_bond(State(state): State<ApiState>, Json(req): Json<CreditBondRe
 #[derive(Deserialize)]
 struct CreditOpenReq {
     spec_hex: String,
+    lender_sigs_hex: String,
+    lender_keys_hex: String,
+    borrower_sigs_hex: String,
+    borrower_keys_hex: String,
 }
 
 async fn credit_open(State(state): State<ApiState>, Json(req): Json<CreditOpenReq>) -> ApiResult {
@@ -5459,7 +5561,23 @@ async fn credit_open(State(state): State<ApiState>, Json(req): Json<CreditOpenRe
     if r.remaining() != 0 {
         return Err(bad("spec has trailing bytes"));
     }
+    let lender_sigs = decode_bundle(&req.lender_sigs_hex, "lender_sigs")?;
+    let lender_keys = decode_bundle(&req.lender_keys_hex, "lender_keys")?;
+    let borrower_sigs = decode_bundle(&req.borrower_sigs_hex, "borrower_sigs")?;
+    let borrower_keys = decode_bundle(&req.borrower_keys_hex, "borrower_keys")?;
     with_shared(&state, |sh| {
+        let network = sh.chain.params().network_id.clone();
+        let height = sh.chain.height();
+        if spec.drawn_at_height != height || spec.deadline_height <= height {
+            return Err(fail(
+                StatusCode::CONFLICT,
+                "credit_refused",
+                "position draw height must equal the current tip and deadline must be in the future",
+            ));
+        }
+        let open_hash = credit_open_signing_hash(&network, &bytes);
+        verify_credit_action(&lender_keys, &lender_sigs, &spec.lender, &open_hash)?;
+        verify_credit_action(&borrower_keys, &borrower_sigs, &spec.borrower, &open_hash)?;
         let id = sh
             .credit
             .open(&spec)
@@ -5477,6 +5595,8 @@ async fn credit_open(State(state): State<ApiState>, Json(req): Json<CreditOpenRe
 struct CreditRepayReq {
     position_id: String,
     amount_sat: u64,
+    sigs_hex: String,
+    keys_hex: String,
 }
 
 async fn credit_repay(State(state): State<ApiState>, Json(req): Json<CreditRepayReq>) -> ApiResult {
@@ -5486,7 +5606,16 @@ async fn credit_repay(State(state): State<ApiState>, Json(req): Json<CreditRepay
             "amount_sat must be positive; a zero repayment pays nothing",
         ));
     }
+    let sigs = decode_bundle(&req.sigs_hex, "sigs")?;
+    let keys = decode_bundle(&req.keys_hex, "keys")?;
     with_shared(&state, |sh| {
+        let position = sh
+            .credit
+            .position(&id)
+            .ok_or_else(|| fail(StatusCode::CONFLICT, "credit_refused", "no such position"))?;
+        let network = sh.chain.params().network_id.clone();
+        let hash = credit_repay_signing_hash(&network, &id, req.amount_sat);
+        verify_credit_action(&keys, &sigs, &position.borrower, &hash)?;
         let height = sh.chain.height();
         let repayment = sh
             .credit
@@ -7081,6 +7210,18 @@ async fn risk_policy(State(state): State<ApiState>) -> ApiResult {
 }
 
 /// Parse a comma-separated env list of hex BLS public keys (trust anchors).
+fn passport_issuer_allowed(
+    exposed: bool,
+    trusted: &[srct_core::bls_checkpoint::BlsPublicKey],
+    issuer: &srct_core::bls_checkpoint::BlsPublicKey,
+) -> bool {
+    if trusted.is_empty() {
+        !exposed
+    } else {
+        trusted.contains(issuer)
+    }
+}
+
 fn env_bls_keys(var: &str) -> Vec<srct_core::bls_checkpoint::BlsPublicKey> {
     let raw = std::env::var(var).unwrap_or_default();
     let mut out = Vec::new();
@@ -7290,11 +7431,15 @@ async fn passport_batch_register(
             ));
         }
         let trusted = env_bls_keys("SRCT_PASSPORT_ISSUERS");
-        if !trusted.is_empty() && !trusted.contains(&batch.issuer) {
+        if !passport_issuer_allowed(state.exposed, &trusted, &batch.issuer) {
             return Err(fail(
                 StatusCode::FORBIDDEN,
                 "passport_untrusted",
-                "issuer is not trusted by this node",
+                if trusted.is_empty() {
+                    "passport registration is disabled on an exposed API until SRCT_PASSPORT_ISSUERS is configured"
+                } else {
+                    "issuer is not trusted by this node"
+                },
             ));
         }
         let height = sh.chain.height();
@@ -7376,6 +7521,19 @@ async fn passport_batch_register(
             }
         }
         let id = batch.signing_hash();
+        if sh.passport_batches.contains_key(&id) {
+            return Ok(Json(json!({
+                "batch_id": hash_to_hex(&id),
+                "duplicate": true,
+            })));
+        }
+        if sh.passport_batches.len() >= MAX_PASSPORT_BATCHES {
+            return Err(fail(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "passport_book_full",
+                "passport batch book is full",
+            ));
+        }
         let score = srct_core::passport::score_batch(&batch);
         let tier = srct_core::passport::access_tier(score);
         sh.passport_batches.insert(id, batch);
@@ -7388,6 +7546,7 @@ async fn passport_batch_register(
         );
         Ok(Json(json!({
             "batch_id": hash_to_hex(&id),
+            "duplicate": false,
             "score": score,
             "tier": format!("{tier:?}"),
         })))
@@ -9681,6 +9840,7 @@ async fn trial_repay(State(state): State<ApiState>, Json(req): Json<TrialTxReq>)
                     &vid,
                     sh.chain.height(),
                     Some(srct_core::treats::VoucherKind::Trial),
+                    &trial.agent,
                 )
                 .map_err(|e| fail(StatusCode::CONFLICT, "voucher_refused", e.to_string()))?;
             debug_assert_eq!(burned, voucher_cover);
@@ -9902,6 +10062,9 @@ struct TreatsRedeemReq {
     role: Option<String>,
     treats: u64,
     kind: Option<String>,
+    nonce: u64,
+    sigs_hex: String,
+    keys_hex: String,
 }
 
 /// `POST /v1/treats/redeem` — burn Treats, debit the reserve, and issue a
@@ -9920,9 +10083,29 @@ async fn treats_redeem(
     let kind =
         srct_core::treats::VoucherKind::parse_kind(req.kind.as_deref().unwrap_or("fee_credit"))
             .ok_or_else(|| bad("kind must be fee_credit, discount, trial or service_credit"))?;
+    let sigs = decode_bundle(&req.sigs_hex, "sigs")?;
+    let keys = decode_bundle(&req.keys_hex, "keys")?;
     with_shared(&state, |sh| {
         let network = sh.chain.params().network_id.clone();
         let subject = derive_agent_id(&network, role, &addr);
+        if req.nonce == 0 || req.nonce <= sh.treats.redeem_nonce(&subject) {
+            return Err(fail(
+                StatusCode::CONFLICT,
+                "treats_refused",
+                "redemption nonce must increase",
+            ));
+        }
+        if !sh.treats.can_issue_voucher() {
+            return Err(fail(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "treats_refused",
+                "voucher book is full",
+            ));
+        }
+        let redeem_hash =
+            treats_redeem_signing_hash(&network, &subject, req.treats, req.nonce, kind);
+        srct_core::treats::TreatLedger::verify_cert_sig(&keys, &sigs, &addr, &redeem_hash)
+            .map_err(|e| fail(StatusCode::FORBIDDEN, "treats_refused", e.to_string()))?;
         let outstanding = sh.treats.outstanding().max(1);
         let reserve = sh.chain.treat_reserve();
         let quote = srct_core::treats::redeem_quote(req.treats, reserve, outstanding)
@@ -9941,6 +10124,9 @@ async fn treats_redeem(
             .treats
             .issue_voucher(&network, subject, quote, kind, height)
             .map_err(|e| bad(e.to_string()))?;
+        sh.treats
+            .record_redeem_nonce(subject, req.nonce)
+            .map_err(|e| fail(StatusCode::CONFLICT, "treats_refused", e.to_string()))?;
         Ok(Json(json!({
             "agent_id": hex::encode(subject),
             "burned": req.treats,
@@ -9948,6 +10134,7 @@ async fn treats_redeem(
             "voucher_id": hex::encode(voucher.id),
             "voucher_kind": req.kind.as_deref().unwrap_or("fee_credit"),
             "voucher_expiry_height": voucher.expiry_height,
+            "nonce": req.nonce,
             "balance": sh.treats.balance(&subject),
             "reserve_sat": sh.chain.treat_reserve(),
         })))
@@ -9957,32 +10144,42 @@ async fn treats_redeem(
 #[derive(Deserialize)]
 struct TreatsVoucherConsumeReq {
     voucher_id: String,
-    kind: Option<String>,
+    agent_hex: String,
+    role: Option<String>,
+    sigs_hex: String,
+    keys_hex: String,
 }
 
-/// `POST /v1/treats/voucher/consume` — spend a voucher directly (wallets,
-/// discount and service-credit paths). Trial repay consumes internally.
+/// `POST /v1/treats/voucher/consume` — consume a voucher with a signature from
+/// its beneficiary. Trial repay consumes internally after checking its payment.
 async fn treats_voucher_consume(
     State(state): State<ApiState>,
     Json(req): Json<TreatsVoucherConsumeReq>,
 ) -> ApiResult {
     let vid = decode_hash(&req.voucher_id)?;
-    let want = match req.kind.as_deref() {
-        None => None,
-        Some(k) => Some(
-            srct_core::treats::VoucherKind::parse_kind(k)
-                .ok_or_else(|| bad("kind must be fee_credit, discount, trial or service_credit"))?,
-        ),
-    };
+    let address = decode_address(&req.agent_hex)?;
+    let role = treats_role(req.role.as_deref())?;
+    let sigs = decode_bundle(&req.sigs_hex, "sigs")?;
+    let keys = decode_bundle(&req.keys_hex, "keys")?;
     with_shared(&state, |sh| {
+        let network = sh.chain.params().network_id.clone();
+        let subject = derive_agent_id(&network, role, &address);
+        let message = srct_core::hash::sha256_dom(
+            b"srct/treat-voucher-consume/v1",
+            &[network.as_bytes(), &vid, &subject],
+        );
+        srct_core::treats::TreatLedger::verify_cert_sig(&keys, &sigs, &address, &message)
+            .map_err(|e| fail(StatusCode::FORBIDDEN, "voucher_refused", e.to_string()))?;
         let height = sh.chain.height();
         let value = sh
             .treats
-            .consume_voucher(&vid, height, want)
-            .map_err(|e| bad(e.to_string()))?;
-        Ok(Json(
-            json!({ "voucher_id": hash_to_hex(&vid), "value_sat": value }),
-        ))
+            .consume_voucher(&vid, height, None, &subject)
+            .map_err(|e| fail(StatusCode::CONFLICT, "voucher_refused", e.to_string()))?;
+        Ok(Json(json!({
+            "voucher_id": hash_to_hex(&vid),
+            "agent_id": hex::encode(subject),
+            "value_sat": value,
+        })))
     })?
 }
 
@@ -10440,6 +10637,21 @@ pub fn spawn_with_options(
 }
 
 #[cfg(test)]
+mod passport_trust_tests {
+    use super::*;
+
+    #[test]
+    fn exposed_passport_registration_requires_a_configured_trust_anchor() {
+        let key = srct_core::bls_checkpoint::BlsPublicKey([7u8; 48]);
+        assert!(!passport_issuer_allowed(true, &[], &key));
+        assert!(passport_issuer_allowed(false, &[], &key));
+        assert!(passport_issuer_allowed(true, &[key], &key));
+        let other = srct_core::bls_checkpoint::BlsPublicKey([8u8; 48]);
+        assert!(!passport_issuer_allowed(true, &[other], &key));
+    }
+}
+
+#[cfg(test)]
 mod high_value_tests {
     use super::*;
     use srct_core::l2::Auth;
@@ -10572,6 +10784,71 @@ mod high_value_tests {
         // The listed approver passes.
         let (asigs, akeys) = approval_for(&approver, &id);
         require_high_value_approval(&payment, id, Some((&asigs, &akeys))).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod credit_authorization_tests {
+    use super::*;
+    use srct_core::l2::Auth;
+    use srct_core::wallet::Wallet;
+
+    #[test]
+    fn credit_action_hashes_bind_action_and_network() {
+        let address = [4u8; 20];
+        assert_ne!(
+            credit_bond_signing_hash("srct/mini", &address, "post", 10),
+            credit_bond_signing_hash("srct/mini", &address, "release", 10),
+        );
+        assert_ne!(
+            credit_bond_signing_hash("srct/mini", &address, "post", 10),
+            credit_bond_signing_hash("srct/testnet", &address, "post", 10),
+        );
+        assert_ne!(
+            credit_open_signing_hash("srct/mini", b"spec"),
+            credit_open_signing_hash("srct/testnet", b"spec"),
+        );
+    }
+
+    #[test]
+    fn credit_action_requires_the_named_signer() {
+        let owner = Wallet::new_random("credit-owner");
+        let stranger = Wallet::new_random("credit-stranger");
+        let address = owner.address().unwrap();
+        let message = [3u8; 32];
+        let auth = Auth::sign(&stranger, &message).unwrap();
+        assert!(verify_credit_action(&auth.keys, &auth.sigs, &address, &message).is_err());
+    }
+}
+
+#[cfg(test)]
+mod voucher_consume_auth_tests {
+    use super::*;
+    use srct_core::l2::Auth;
+    use srct_core::wallet::Wallet;
+
+    #[test]
+    fn consume_signature_binds_network_voucher_and_beneficiary() {
+        let owner = Wallet::new_random("voucher-owner");
+        let address = owner.address().unwrap();
+        let subject = derive_agent_id("srct/mini", AgentRole::Machine, &address);
+        let voucher = [5u8; 32];
+        let message = srct_core::hash::sha256_dom(
+            b"srct/treat-voucher-consume/v1",
+            &[b"srct/mini", &voucher, &subject],
+        );
+        let auth = Auth::sign(&owner, &message).unwrap();
+        srct_core::treats::TreatLedger::verify_cert_sig(&auth.keys, &auth.sigs, &address, &message)
+            .unwrap();
+        let other_subject = [6u8; 20];
+        let changed = srct_core::hash::sha256_dom(
+            b"srct/treat-voucher-consume/v1",
+            &[b"srct/mini", &voucher, &other_subject],
+        );
+        assert!(srct_core::treats::TreatLedger::verify_cert_sig(
+            &auth.keys, &auth.sigs, &address, &changed,
+        )
+        .is_err());
     }
 }
 

@@ -47,18 +47,21 @@ verifies anywhere.
 
 ## Redemption: sell, discounts, trials, credits
 
-`POST /v1/treats/redeem {agent_hex, role?, treats, kind?}` burns Treats,
-debits the Treat reserve at the proportional quote
+`POST /v1/treats/redeem {agent_hex, role?, treats, kind?, nonce, sigs_hex, keys_hex}`
+burns Treats, debits the Treat reserve at the proportional quote
 (`payout_sat = treats * reserve / outstanding`, floored), and issues a
 single-use voucher toward one benefit kind: `fee_credit` (default),
-`discount`, `trial`, or `service_credit`. Vouchers live 1,440 blocks and
-spend exactly once: directly via
-`POST /v1/treats/voucher/consume {voucher_id, kind?}`, or internally by
-trial repay — `POST /v1/trials/repay` accepts an optional `voucher_id` and
-a Trial-kind voucher covers part of the L1 repayment. Two guarantees:
-the voucher names its recipient and nobody else's id spends it, and the
-node previews the cover before verifying the payment — a failed payment
-never burns the discount (the burn happens only on the success path).
+`discount`, `trial`, or `service_credit`. The holder signs the network-bound
+`(subject, treats, nonce, kind)` tuple; the nonce must strictly increase and
+is persisted, so a redemption cannot be replayed after a balance is refilled.
+Vouchers live 1,440 blocks and spend exactly once: directly via
+`POST /v1/treats/voucher/consume {voucher_id, agent_hex, role?, sigs_hex, keys_hex}`,
+or internally by trial repay — `POST /v1/trials/repay` accepts an optional
+`voucher_id` and a Trial-kind voucher covers part of the L1 repayment. Direct
+consumption requires a signature from the named beneficiary over the
+network-bound voucher id and derived agent identity. Both paths check the
+voucher recipient before consuming it; the trial path previews the cover
+before verifying the payment, so a failed payment never burns the discount.
 
 Novelty damping counts *consecutive* repeats of one kind (tracked per
 account): same kind again pays less, anything else resets to full
@@ -79,5 +82,6 @@ Read the balance with `GET /v1/treats/balance/{agent}?role=` (also in
   Invariant: `burned + pscb_retained + bsaver + treat == full_base`.
 - `Chain::treat_reserve` is credited and rewound per block and re-derived
   by `verify_canonical_chain`. Transfers and gifts never touch it.
-- Balances are this node's view (persisted in `state.bin` v12); the
+- Balances are this node's view (persisted in `state.bin` envelope v13,
+  Treats section v4 with redemption nonces); the
   reserve and the UTXO set are the cross-node truth.

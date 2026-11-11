@@ -85,7 +85,7 @@ fn read_frame_inner<R: Read>(
 ) -> NetResult<(u8, Vec<u8>)> {
     let started = std::time::Instant::now();
     let mut magic = [0u8; 4];
-    r.read_exact(&mut magic).map_err(truncated("magic"))?;
+    read_exact_before_deadline(r, &mut magic, started, deadline, "magic")?;
     if magic != params.network_magic {
         // Checked on EVERY frame, not only at handshake. A peer that starts on
         // the right network and then spews garbage is caught here.
@@ -96,12 +96,11 @@ fn read_frame_inner<R: Read>(
     }
 
     let mut type_buf = [0u8; 1];
-    r.read_exact(&mut type_buf).map_err(truncated("msg_type"))?;
+    read_exact_before_deadline(r, &mut type_buf, started, deadline, "msg_type")?;
     let msg_type = type_buf[0];
 
     let mut len_buf = [0u8; 4];
-    r.read_exact(&mut len_buf)
-        .map_err(truncated("payload_len"))?;
+    read_exact_before_deadline(r, &mut len_buf, started, deadline, "payload_len")?;
     let payload_len = u32::from_le_bytes(len_buf);
     if payload_len > MAX_FRAME_PAYLOAD {
         // Deliberately reject rather than skip. Skipping desynchronises the
@@ -123,11 +122,7 @@ fn read_frame_inner<R: Read>(
         let mut remaining = payload_len;
         while remaining > 0 {
             let want = remaining.min(buf.len());
-            r.read_exact(&mut buf[..want])
-                .map_err(truncated("payload"))?;
-            if started.elapsed() > deadline {
-                return Err(NetError::Truncated("frame read deadline exceeded".into()));
-            }
+            read_exact_before_deadline(r, &mut buf[..want], started, deadline, "payload")?;
             payload.extend_from_slice(&buf[..want]);
             on_chunk(payload.capacity());
             remaining -= want;
@@ -137,8 +132,38 @@ fn read_frame_inner<R: Read>(
     Ok((msg_type, payload))
 }
 
-fn truncated(what: &'static str) -> impl Fn(std::io::Error) -> NetError {
-    move |e| trunc(e, what)
+/// Read exactly one frame field while checking the whole-frame deadline after
+/// every partial read. `Read::read_exact` may loop internally for an
+/// unbounded time when a peer drips bytes often enough to avoid the socket's
+/// per-read timeout; keeping that loop here makes the deadline effective for
+/// both the fixed header and the payload.
+fn read_exact_before_deadline<R: Read>(
+    r: &mut R,
+    mut out: &mut [u8],
+    started: std::time::Instant,
+    deadline: std::time::Duration,
+    what: &'static str,
+) -> NetResult<()> {
+    while !out.is_empty() {
+        if started.elapsed() >= deadline {
+            return Err(NetError::Truncated("frame read deadline exceeded".into()));
+        }
+        match r.read(out) {
+            Ok(0) => return Err(NetError::Truncated(what.to_string())),
+            Ok(n) => {
+                if started.elapsed() >= deadline {
+                    return Err(NetError::Truncated("frame read deadline exceeded".into()));
+                }
+                out = &mut out[n..];
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(trunc(e, what)),
+        }
+    }
+    if started.elapsed() >= deadline {
+        return Err(NetError::Truncated("frame read deadline exceeded".into()));
+    }
+    Ok(())
 }
 
 fn trunc(e: std::io::Error, what: &str) -> NetError {
@@ -279,6 +304,36 @@ mod tests {
 
     // The Reader is the same one `srct_core`'s own serializers use, and the
     // `u16le` writer I added must agree with `Reader::u16le`.
+    #[test]
+    fn a_partial_read_cannot_hide_past_the_frame_deadline() {
+        struct SlowPartial;
+        impl Read for SlowPartial {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                buf[0] = 0xAA;
+                Ok(1)
+            }
+        }
+
+        let started = std::time::Instant::now();
+        let mut field = [0u8; 16];
+        let err = read_exact_before_deadline(
+            &mut SlowPartial,
+            &mut field,
+            started,
+            std::time::Duration::from_millis(25),
+            "payload",
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, NetError::Truncated(ref why) if why == "frame read deadline exceeded")
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(100),
+            "partial reads must not be hidden inside read_exact"
+        );
+    }
+
     #[test]
     fn u16le_round_trips() {
         let mut w = Writer::new();

@@ -30,10 +30,9 @@ use crate::ser::{Reader, Writer};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 
-/// v3 adds the per-account last event kind (novelty damping input); v1/v2
-/// blobs decode with it unset, which only grants full novelty — the safe
-/// direction.
-pub const TREATS_VERSION: u8 = 3;
+/// v3 adds the per-account last event kind (novelty damping input); v4 adds
+/// persisted redemption nonces. Older blobs decode with nonce state empty.
+pub const TREATS_VERSION: u8 = 4;
 pub const DOM_TREAT_EVENT: &[u8] = b"srct/treat-event/v1";
 pub const DOM_TREAT_ACC: &[u8] = b"srct/treat-acc/v1";
 pub const DOM_TREAT_GIFT: &[u8] = b"srct/treat-gift/v1";
@@ -67,6 +66,10 @@ pub const FEE_BONUS_CAP: u64 = 50;
 pub const TREAT_CERT_MAX_LIFETIME: u64 = 10_000;
 /// Fresh redemption vouchers stay usable this many blocks.
 pub const VOUCHER_LIFETIME_BLOCKS: u64 = 1_440;
+/// Bound retained voucher and consumed-id state so redemptions cannot grow
+/// state.bin without limit. Expired vouchers remain auditable until pruning is
+/// implemented, so refuse new issuance at this cap.
+pub const MAX_VOUCHERS: usize = 8_192;
 
 /// Treat cut carved from an already-computed PSCB amount.
 /// `None` when `bps` exceeds [`TREAT_MAX_BPS`]: refuse, never clamp.
@@ -472,6 +475,7 @@ pub struct TreatLedger {
     pub outstanding: u64,
     giver_nonces: BTreeMap<Address, u64>,
     sender_nonces: BTreeMap<Address, u64>,
+    redeem_nonces: BTreeMap<AgentId, u64>,
     claimed_tasks: BTreeSet<Hash>,
     vouchers: BTreeMap<Hash, TreatVoucher>,
     consumed: BTreeSet<Hash>,
@@ -492,6 +496,7 @@ impl TreatLedger {
             outstanding: 0,
             giver_nonces: BTreeMap::new(),
             sender_nonces: BTreeMap::new(),
+            redeem_nonces: BTreeMap::new(),
             claimed_tasks: BTreeSet::new(),
             vouchers: BTreeMap::new(),
             consumed: BTreeSet::new(),
@@ -903,6 +908,26 @@ impl TreatLedger {
         ))
     }
 
+    /// Whether another voucher can be safely issued without mutating state.
+    pub fn can_issue_voucher(&self) -> bool {
+        self.vouchers.len() < MAX_VOUCHERS && self.voucher_seq < u64::MAX
+    }
+
+    /// Last accepted redemption nonce for a Treats subject.
+    pub fn redeem_nonce(&self, subject: &AgentId) -> u64 {
+        self.redeem_nonces.get(subject).copied().unwrap_or(0)
+    }
+
+    /// Record a redemption nonce after the burn and voucher have committed.
+    /// Nonces are strictly increasing and persist across restarts.
+    pub fn record_redeem_nonce(&mut self, subject: AgentId, nonce: u64) -> Result<(), TreatError> {
+        if nonce == 0 || nonce <= self.redeem_nonce(&subject) {
+            return Err(TreatError::NonceReuse);
+        }
+        self.redeem_nonces.insert(subject, nonce);
+        Ok(())
+    }
+
     /// Burn `treats` from `subject` for redemption. Returns the burned amount.
     pub fn burn_for_redeem(&mut self, subject: &AgentId, treats: u64) -> Result<u64, TreatError> {
         if treats == 0 {
@@ -937,8 +962,11 @@ impl TreatLedger {
         if value_sat == 0 {
             return Err(TreatError::BadAmount);
         }
+        if self.vouchers.len() >= MAX_VOUCHERS {
+            return Err(TreatError::Malformed("voucher book is full"));
+        }
         let seq = self.voucher_seq;
-        self.voucher_seq = self
+        let next_seq = self
             .voucher_seq
             .checked_add(1)
             .ok_or(TreatError::Overflow)?;
@@ -959,6 +987,7 @@ impl TreatLedger {
             kind,
             expiry_height,
         };
+        self.voucher_seq = next_seq;
         self.vouchers.insert(id, v.clone());
         Ok(v)
     }
@@ -1013,10 +1042,14 @@ impl TreatLedger {
         id: &Hash,
         height: u64,
         want: Option<VoucherKind>,
+        recipient: &AgentId,
     ) -> Result<u64, TreatError> {
-        let value = self.voucher_valid(id, height, want)?.value_sat;
+        let voucher = self.voucher_valid(id, height, want)?;
+        if voucher.recipient != *recipient {
+            return Err(TreatError::WrongRecipient);
+        }
         self.consumed.insert(*id);
-        Ok(value)
+        Ok(voucher.value_sat)
     }
 
     /// Encode for `state.bin` persistence (trailing section, versioned v2).
@@ -1050,6 +1083,10 @@ impl TreatLedger {
         for (addr, n) in &self.sender_nonces {
             w.fixed(addr).u64le(*n);
         }
+        w.u32le(self.redeem_nonces.len() as u32);
+        for (agent, n) in &self.redeem_nonces {
+            w.fixed(agent).u64le(*n);
+        }
         w.u32le(self.claimed_tasks.len() as u32);
         for h in &self.claimed_tasks {
             w.fixed(h);
@@ -1082,10 +1119,8 @@ impl TreatLedger {
 
     pub fn decode_reader(r: &mut Reader) -> Result<Self, TreatError> {
         let v = r.u8().map_err(|_| TreatError::Malformed("version"))?;
-        // v1 (accounts only), v2 (full book, no last-kind), v3 (current).
-        // Old persisted state must keep loading: v2 accounts simply start
-        // novelty tracking fresh.
-        if v != 1 && v != 2 && v != TREATS_VERSION {
+        // v1 (accounts only), v2 (full book), v3 (last-kind), v4 (redemption nonces).
+        if !(1..=TREATS_VERSION).contains(&v) {
             return Err(TreatError::UnsupportedVersion(v));
         }
         let n = r
@@ -1129,7 +1164,7 @@ impl TreatLedger {
             let lifetime_redeemed = r.u64le().map_err(|_| TreatError::Malformed("redeemed"))?;
             let streak = r.u32le().map_err(|_| TreatError::Malformed("streak"))?;
             let repeats = r.u32le().map_err(|_| TreatError::Malformed("repeats"))?;
-            // v3 carries the last event kind; older blobs predate novelty
+            // v3+ carries the last event kind; older blobs predate novelty
             // tracking and decode with it unset (full novelty — the safe
             // direction, never a surprise penalty).
             let last_kind = if v >= 3 {
@@ -1203,6 +1238,101 @@ impl TreatLedger {
                 .map_err(|_| TreatError::Malformed("sender nonce"))?;
             ledger.sender_nonces.insert(addr, nonce);
         }
+        if v == 2 || v == 3 {
+            let c = r.u32le().map_err(|_| TreatError::Malformed("claimed"))? as usize;
+            if c > 1 << 20 {
+                return Err(TreatError::Malformed("claimed over cap"));
+            }
+            for _ in 0..c {
+                let h = r
+                    .fixed::<32>()
+                    .map_err(|_| TreatError::Malformed("claimed id"))?;
+                ledger.claimed_tasks.insert(h);
+            }
+            ledger.voucher_seq = r
+                .u64le()
+                .map_err(|_| TreatError::Malformed("voucher seq"))?;
+            let vc = r.u32le().map_err(|_| TreatError::Malformed("vouchers"))? as usize;
+            if vc > MAX_VOUCHERS {
+                return Err(TreatError::Malformed("vouchers over cap"));
+            }
+            for _ in 0..vc {
+                let id = r
+                    .fixed::<32>()
+                    .map_err(|_| TreatError::Malformed("voucher id"))?;
+                let nl = r
+                    .u16le()
+                    .map_err(|_| TreatError::Malformed("voucher net len"))?
+                    as usize;
+                if nl == 0 || nl > MAX_TREAT_NETWORK_ID_LEN {
+                    return Err(TreatError::BadNetworkId(nl));
+                }
+                let network_id = std::str::from_utf8(
+                    r.fixed_slice(nl)
+                        .map_err(|_| TreatError::Malformed("voucher net"))?,
+                )
+                .map_err(|_| TreatError::Malformed("voucher net utf8"))?
+                .to_string();
+                let recipient = r
+                    .fixed::<20>()
+                    .map_err(|_| TreatError::Malformed("voucher recipient"))?;
+                let value_sat = r
+                    .u64le()
+                    .map_err(|_| TreatError::Malformed("voucher value"))?;
+                let kind = VoucherKind::from_u8(
+                    r.u8().map_err(|_| TreatError::Malformed("voucher kind"))?,
+                )
+                .ok_or(TreatError::Malformed("voucher kind range"))?;
+                let expiry_height = r
+                    .u64le()
+                    .map_err(|_| TreatError::Malformed("voucher expiry"))?;
+                ledger.vouchers.insert(
+                    id,
+                    TreatVoucher {
+                        id,
+                        network_id,
+                        recipient,
+                        value_sat,
+                        kind,
+                        expiry_height,
+                    },
+                );
+            }
+            let cc = r.u32le().map_err(|_| TreatError::Malformed("consumed"))? as usize;
+            if cc > MAX_VOUCHERS {
+                return Err(TreatError::Malformed("consumed over cap"));
+            }
+            for _ in 0..cc {
+                let h = r
+                    .fixed::<32>()
+                    .map_err(|_| TreatError::Malformed("consumed id"))?;
+                ledger.consumed.insert(h);
+            }
+            r.expect_end()
+                .map_err(|_| TreatError::Malformed("trailing"))?;
+            return Ok(ledger);
+        }
+        if v >= 4 {
+            let rn = r
+                .u32le()
+                .map_err(|_| TreatError::Malformed("redeem nonces"))? as usize;
+            if rn > DEFAULT_MAX_SUBJECTS {
+                return Err(TreatError::SubjectLimit {
+                    cap: DEFAULT_MAX_SUBJECTS,
+                });
+            }
+            for _ in 0..rn {
+                let agent = r
+                    .fixed::<20>()
+                    .map_err(|_| TreatError::Malformed("redeem agent"))?;
+                let nonce = r
+                    .u64le()
+                    .map_err(|_| TreatError::Malformed("redeem nonce"))?;
+                if nonce == 0 || ledger.redeem_nonces.insert(agent, nonce).is_some() {
+                    return Err(TreatError::Malformed("duplicate or zero redeem nonce"));
+                }
+            }
+        }
         let c = r.u32le().map_err(|_| TreatError::Malformed("claimed"))? as usize;
         if c > 1 << 20 {
             return Err(TreatError::Malformed("claimed over cap"));
@@ -1217,7 +1347,7 @@ impl TreatLedger {
             .u64le()
             .map_err(|_| TreatError::Malformed("voucher seq"))?;
         let vc = r.u32le().map_err(|_| TreatError::Malformed("vouchers"))? as usize;
-        if vc > 1 << 20 {
+        if vc > MAX_VOUCHERS {
             return Err(TreatError::Malformed("vouchers over cap"));
         }
         for _ in 0..vc {
@@ -1262,7 +1392,7 @@ impl TreatLedger {
             );
         }
         let cc = r.u32le().map_err(|_| TreatError::Malformed("consumed"))? as usize;
-        if cc > 1 << 20 {
+        if cc > MAX_VOUCHERS {
             return Err(TreatError::Malformed("consumed over cap"));
         }
         for _ in 0..cc {
@@ -1508,12 +1638,17 @@ mod tests {
             .unwrap();
         assert_eq!(l.voucher_liability(100), 900);
         assert_eq!(
-            l.consume_voucher(&v.id, 101, Some(VoucherKind::Trial))
+            l.consume_voucher(&v.id, 101, Some(VoucherKind::Trial), &[8u8; 20]),
+            Err(TreatError::WrongRecipient)
+        );
+        assert_eq!(l.voucher_liability(101), 900);
+        assert_eq!(
+            l.consume_voucher(&v.id, 101, Some(VoucherKind::Trial), &[7u8; 20])
                 .unwrap(),
             900
         );
         assert_eq!(
-            l.consume_voucher(&v.id, 102, Some(VoucherKind::Trial)),
+            l.consume_voucher(&v.id, 102, Some(VoucherKind::Trial), &[7u8; 20]),
             Err(TreatError::VoucherConsumed)
         );
         assert_eq!(l.voucher_liability(102), 0);
@@ -1521,13 +1656,31 @@ mod tests {
             .issue_voucher(NET, [7u8; 20], 100, VoucherKind::Trial, 100)
             .unwrap();
         assert_eq!(
-            l.consume_voucher(&v2.id, 101, Some(VoucherKind::FeeCredit)),
+            l.consume_voucher(&v2.id, 101, Some(VoucherKind::FeeCredit), &[7u8; 20]),
             Err(TreatError::KindMismatch)
         );
         assert_eq!(
-            l.consume_voucher(&v2.id, 10_000, None),
+            l.consume_voucher(&v2.id, 10_000, None, &[7u8; 20]),
             Err(TreatError::VoucherExpired)
         );
+    }
+
+    #[test]
+    fn redemption_nonce_survives_a_round_trip_and_replay_is_refused() {
+        let mut ledger = TreatLedger::new(NET);
+        ledger.record_redeem_nonce([7u8; 20], 3).unwrap();
+        assert_eq!(
+            ledger.record_redeem_nonce([7u8; 20], 3),
+            Err(TreatError::NonceReuse)
+        );
+        assert_eq!(
+            ledger.record_redeem_nonce([7u8; 20], 2),
+            Err(TreatError::NonceReuse)
+        );
+        let bytes = ledger.encode();
+        let restored = TreatLedger::decode(&bytes).unwrap();
+        assert_eq!(restored.redeem_nonce(&[7u8; 20]), 3);
+        assert_eq!(restored.encode(), bytes);
     }
 
     #[test]
