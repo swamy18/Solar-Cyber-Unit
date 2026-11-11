@@ -7,19 +7,11 @@
 //! ```
 
 use srct_core::wallet::Wallet;
+use srct_diloco::backend::{check_backend, local_update_with, CpuBackend};
 use srct_diloco::data::{accuracy, mean_loss, shards, two_moons};
 use srct_diloco::model::Mlp;
 use srct_diloco::round::{RoundConfig, RoundOutcome, RoundState};
 use srct_diloco::update::{SignedUpdate, UpdateClaim};
-
-fn train_local(base: &Mlp, shard: &[srct_diloco::Sample], steps: u32, lr: f32) -> Mlp {
-    let mut local = base.clone();
-    for _ in 0..steps {
-        let (_, grad) = local.loss_and_grad(shard);
-        local.sgd_step(&grad, lr);
-    }
-    local
-}
 
 fn main() {
     let data = two_moons(96, 21);
@@ -28,6 +20,11 @@ fn main() {
         .iter()
         .map(|seed| Wallet::from_private_key_bytes(&[*seed; 32], "diloco-demo").unwrap())
         .collect();
+    let report = check_backend(&CpuBackend).expect("CPU reference must pass conformance");
+    println!(
+        "backend {}  kernel {}  determinism {:?}",
+        report.backend, report.kernel_hash[0], report.determinism
+    );
     let mut global = Mlp::new(21);
     let mut velocity = Mlp::zeros();
     let initial_loss = mean_loss(&global, &data);
@@ -45,7 +42,9 @@ fn main() {
             round
                 .register_worker(worker.address().unwrap(), 10_000, parts[i].len() as u64)
                 .unwrap();
-            let local = train_local(&global, &parts[i], 20, 0.05);
+            let local = local_update_with(&CpuBackend, &global, &parts[i], 20, 0.05)
+                .expect("CPU backend local update")
+                .model;
             let claim = UpdateClaim::new(
                 round_id,
                 &global,

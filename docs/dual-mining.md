@@ -234,10 +234,18 @@ The existing mining `ComputeBackend` in `crates/srct-miner/src/accel.rs` is the
 precedent for the conformance-test style, but training needs backward passes,
 optimizer state, device memory and collectives, so it is a separate seam.
 
+Implemented milestone (H1): the CPU reference now sits behind
+`srct_diloco::backend::TrainBackend`, with `check_backend` running fixed-vector
+forward/loss/gradient/optimizer/round parity and `require_determinism` gating
+consensus use. `CpuBackend` is classified `Reproducible`, so it is explicitly
+refused for `BitExact` consensus finalization. The suite also proves a
+perturbed kernel fails, a `Statistical` kernel can pass tolerance but not the
+consensus gate, and an unavailable device fails closed.
+
 Milestones:
 
-1. Extract the CPU reference behind `TrainBackend`; add conformance vectors
-   with no behavioural change.
+1. Extract the CPU reference behind `TrainBackend` — **done** (7 conformance
+   tests; no behavioural change to rounds).
 2. GPU backend through a vendor-neutral shim (CUDA/ROCm), parity-tested.
 3. Apple Metal/ANE and NPU adapters.
 4. TPU and photonic experiments with an explicit determinism class and a
@@ -253,8 +261,10 @@ work-graph attribution and SDK adapters are **not implemented**. The audit
 above is the base those milestones build on. The ordered plan is:
 
 1. DiLoCo PoUW prototype — **done, non-consensus** (this crate).
-2. Heterogeneous `TrainBackend` seam + CPU reference conformance — next.
-3. GPU, Apple/NPU, TPU and photonic backends under the determinism policy.
+2. Heterogeneous `TrainBackend` seam + CPU reference conformance — **done**
+   (H1, 7 conformance tests).
+3. GPU, Apple/NPU, TPU and photonic backends under the determinism policy —
+   next.
 4. Deterministic training kernel + consensus round object.
 5. TEE execution attestation as an L2 evidence type, with an explicit
    approved-execution vs correctness distinction.

@@ -54,18 +54,24 @@
 //! - Sybil resistance here is stake-capped accounting, not a complete identity
 //!   system. A production design must bind worker keys to bonded stake and to
 //!   the L2 authority/escrow layer.
-//! - **Hardware:** the only implemented compute path is the CPU `f32`
-//!   reference in this crate. GPU, TPU, NPU, Apple-silicon and photonic
-//!   backends are not implemented. The required `TrainBackend` seam, its
-//!   determinism classes and the backend conformance gates are specified in
-//!   `docs/dual-mining.md` section 8; adding a device must not require forking
-//!   the round, validation or reward code.
+//! - **Hardware:** a `TrainBackend` seam now wraps the only implemented
+//!   compute path, the CPU `f32` reference. GPU, TPU, NPU, Apple-silicon and
+//!   photonic backends are not implemented. Adding one means implementing the
+//!   trait and passing `backend::check_backend`; the round, validation and
+//!   reward code does not change. `CpuBackend` is classified `Reproducible`,
+//!   so it is refused by the `BitExact` consensus gate; see
+//!   `docs/dual-mining.md` section 8.
 
+pub mod backend;
 pub mod data;
 pub mod model;
 pub mod round;
 pub mod update;
 
+pub use backend::{
+    check_backend, local_update_with, require_determinism, BackendCapabilities, BackendError,
+    ConformanceReport, CpuBackend, DeterminismClass, DeviceClass, LocalUpdate, TrainBackend,
+};
 pub use data::{accuracy, mean_loss, shards, two_moons, Sample};
 pub use model::{Mlp, MODEL_VERSION};
 pub use round::{Contribution, FinalizedRound, Rejection, RoundConfig, RoundOutcome, RoundState};

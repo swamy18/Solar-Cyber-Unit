@@ -1356,7 +1356,7 @@ not expose it directly, but the worker SDK does (`add_credit_collateral`).
 | `crates/srct-mcp/` | Keyless MCP surface over agent identity, payments — and the agent wallet guard. |
 | `crates/srct-policy/` | Chain-agnostic policy engine: portable grants, delegation proofs, bound grants, JSON decisions + TS/Python bindings. No consensus imports — but still compiles all of `srct-core` (see crate docs); outsiders use HTTP or the bindings. |
 | `crates/srct-bench/` | Deterministic bench harness: `empty\|realistic\|adversarial` workloads, mini profile, scratch-dir stores. Measurement only. |
-| `crates/srct-diloco/` | Non-consensus DiLoCo proof-of-useful-work prototype: real MLP training, signed updates, Byzantine filtering, exact reward math. CPU `f32` reference only; the heterogeneous `TrainBackend` plan is a documented requirement. Hash mining remains the only consensus mechanism. |
+| `crates/srct-diloco/` | Non-consensus DiLoCo proof-of-useful-work prototype: real MLP training, signed updates, Byzantine filtering, exact reward math. A `TrainBackend` seam with conformance gates now wraps the only implemented backend, the CPU `f32` reference; GPU/TPU/NPU/Apple/photonic backends remain future work. Hash mining remains the only consensus mechanism. |
 | `crates/srct-cnnp/` | Non-consensus Cross-Neural Network Protocol core: representation spaces, signed/sealed envelopes, ridge-fit cross-space adapters, capability discovery, metered settlement and plan quoting. |
 | `crates/srct-intent/` | Non-consensus cross-network intent settlement: signed intents, competitive quotes, cross-asset routes, delivery, escrow/refund instructions and dispute resolution. |
 | `fuzz/` | 17 cargo-fuzz targets over the attacker-controlled boundaries. |

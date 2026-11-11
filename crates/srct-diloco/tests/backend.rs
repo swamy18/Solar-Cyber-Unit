@@ -1,0 +1,176 @@
+//! Backend conformance and fail-closed tests.
+//!
+//! These prove the hardware seam's policy, not just its interface: the CPU
+//! reference passes, a perturbed kernel fails, a `Statistical` backend can
+//! pass the tolerance but is still refused for consensus, and an unavailable
+//! device fails closed.
+
+use srct_diloco::backend::{
+    check_backend, local_update_with, require_determinism, BackendCapabilities, BackendError,
+    CpuBackend, DeterminismClass, DeviceClass, TrainBackend,
+};
+use srct_diloco::data::two_moons;
+use srct_diloco::model::Mlp;
+use srct_diloco::Sample;
+
+#[derive(Clone, Copy)]
+struct Perturbed {
+    name: &'static str,
+    delta: f32,
+    determinism: DeterminismClass,
+}
+
+impl TrainBackend for Perturbed {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn capabilities(&self) -> BackendCapabilities {
+        BackendCapabilities {
+            device: DeviceClass::Other,
+            determinism: self.determinism,
+            dtype: "f32",
+            max_batch: 1_024,
+            memory_bytes: 1,
+        }
+    }
+
+    fn forward(&self, model: &Mlp, x: &[f32; 2]) -> Result<f32, BackendError> {
+        CpuBackend.forward(model, x)
+    }
+
+    fn loss_and_grad(&self, model: &Mlp, samples: &[Sample]) -> Result<(f32, Mlp), BackendError> {
+        let (loss, mut grad) = CpuBackend.loss_and_grad(model, samples)?;
+        for v in grad
+            .w1
+            .iter_mut()
+            .chain(grad.b1.iter_mut())
+            .chain(grad.w2.iter_mut())
+            .chain(grad.b2.iter_mut())
+        {
+            *v += self.delta;
+        }
+        Ok((loss + self.delta, grad))
+    }
+
+    fn sgd_step(&self, model: &Mlp, grad: &Mlp, lr: f32) -> Result<Mlp, BackendError> {
+        CpuBackend.sgd_step(model, grad, lr)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Unavailable;
+
+impl TrainBackend for Unavailable {
+    fn name(&self) -> &'static str {
+        "unavailable-device"
+    }
+
+    fn capabilities(&self) -> BackendCapabilities {
+        BackendCapabilities {
+            device: DeviceClass::Gpu,
+            determinism: DeterminismClass::Reproducible,
+            dtype: "f32",
+            max_batch: 1,
+            memory_bytes: 1,
+        }
+    }
+
+    fn forward(&self, _model: &Mlp, _x: &[f32; 2]) -> Result<f32, BackendError> {
+        Err(BackendError::Unavailable("device lost"))
+    }
+
+    fn loss_and_grad(&self, _model: &Mlp, _samples: &[Sample]) -> Result<(f32, Mlp), BackendError> {
+        Err(BackendError::Unavailable("device lost"))
+    }
+
+    fn sgd_step(&self, _model: &Mlp, _grad: &Mlp, _lr: f32) -> Result<Mlp, BackendError> {
+        Err(BackendError::Unavailable("device lost"))
+    }
+}
+
+#[test]
+fn the_cpu_reference_passes_conformance_and_is_reproducible() {
+    let report = check_backend(&CpuBackend).unwrap();
+    assert_eq!(report.determinism, DeterminismClass::Reproducible);
+    assert_eq!(report.max_forward_delta, 0.0);
+    assert_eq!(report.max_gradient_delta, 0.0);
+    assert_eq!(report.max_step_delta, 0.0);
+    assert!(report.checkpoint_match);
+    assert_eq!(report.kernel_hash, CpuBackend.kernel_hash());
+}
+
+#[test]
+fn the_cpu_reference_cannot_be_used_as_a_consensus_kernel() {
+    let caps = CpuBackend.capabilities();
+    assert!(require_determinism(&caps, DeterminismClass::Reproducible).is_ok());
+    assert!(require_determinism(&caps, DeterminismClass::BitExact).is_err());
+}
+
+#[test]
+fn a_perturbed_reproducible_backend_fails_conformance() {
+    let bad = Perturbed {
+        name: "perturbed",
+        delta: 0.5,
+        determinism: DeterminismClass::Reproducible,
+    };
+    assert!(matches!(
+        check_backend(&bad),
+        Err(BackendError::ConformanceFailed { .. })
+    ));
+}
+
+#[test]
+fn a_statistical_backend_can_pass_tolerance_but_not_consensus() {
+    let noisy = Perturbed {
+        name: "statistical",
+        delta: 1e-4,
+        determinism: DeterminismClass::Statistical,
+    };
+    let report = check_backend(&noisy).unwrap();
+    assert_eq!(report.determinism, DeterminismClass::Statistical);
+    assert!(require_determinism(&noisy.capabilities(), DeterminismClass::BitExact).is_err());
+}
+
+#[test]
+fn a_bit_exact_backend_with_any_drift_is_refused() {
+    let almost = Perturbed {
+        name: "almost-bit-exact",
+        delta: 1e-7,
+        determinism: DeterminismClass::BitExact,
+    };
+    assert!(matches!(
+        check_backend(&almost),
+        Err(BackendError::ConformanceFailed { .. })
+    ));
+}
+
+#[test]
+fn an_unavailable_device_fails_closed() {
+    assert!(matches!(
+        check_backend(&Unavailable),
+        Err(BackendError::Unavailable(_))
+    ));
+    let global = Mlp::new(5);
+    let shard = two_moons(4, 5);
+    assert!(matches!(
+        local_update_with(&Unavailable, &global, &shard, 2, 0.1),
+        Err(BackendError::Unavailable(_))
+    ));
+}
+
+#[test]
+fn local_update_through_the_backend_matches_direct_cpu_training() {
+    let global = Mlp::new(7);
+    let shard = two_moons(8, 7);
+    let update = local_update_with(&CpuBackend, &global, &shard, 6, 0.05).unwrap();
+    let mut direct = global.clone();
+    for _ in 0..6 {
+        let (_, grad) = direct.loss_and_grad(&shard);
+        direct.sgd_step(&grad, 0.05);
+    }
+    assert_eq!(update.model.hash(), direct.hash());
+    assert!(update.loss_after <= update.loss_before);
+    assert_eq!(update.samples, shard.len());
+    assert_eq!(update.steps, 6);
+}
