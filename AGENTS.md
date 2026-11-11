@@ -23,6 +23,8 @@ cargo test -p srct-node --test api
 cargo test -p srct-miner
 # DiLoCo proof-of-useful-work prototype (real training + adversarial rounds).
 cargo test -p srct-diloco
+# CNNP representation/adapter/discovery/metering core.
+cargo test -p srct-cnnp
 cargo test -p srct-core --test committee_rotation
 cargo test -p srct-node --test api external_miner
 # Escrow-specific subsets.

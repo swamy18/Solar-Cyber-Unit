@@ -29,6 +29,17 @@ rules in code would have been the wrong order.
 
 ## Verified
 
+- **CNNP interoperability core (non-consensus, `srct-cnnp`).** `cargo test -p
+  srct-cnnp` passes 11 acceptance tests: distinct spaces, signed plaintext
+  envelopes with tamper refusal, sealed envelopes with wrong-key and
+  cross-space AAD refusal, a real 8 -> 16 ridge adapter (training MSE 0.000032
+  vs 0.464712 mean baseline), adapter serialization and tamper refusal,
+  deterministic capability discovery, exact receipt settlement with
+  over-unit/future/mispriced refusals, a per-request replay book, and plan
+  chaining/budget/privacy checks. Measured adapter fit: 1.9-3.4 ms for 128
+  pairs; a two-stage plan quotes at 30 sat and 100 ms. Settlement is an
+  authorization only; no coin moves in this crate. See
+  [`docs/cnnp.md`](cnnp.md).
 - **DiLoCo PoUW prototype (non-consensus, `srct-diloco`).** `cargo test -p
   srct-diloco` passes 19 tests: 9 unit and 10 acceptance. The acceptance suite
   trains a real 2-8-1 MLP for 24 rounds across three independently signed

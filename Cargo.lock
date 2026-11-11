@@ -1122,6 +1122,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "srct-cnnp"
+version = "0.1.0"
+dependencies = [
+ "chacha20poly1305",
+ "rand",
+ "srct-core",
+ "srct-diloco",
+]
+
+[[package]]
 name = "srct-core"
 version = "0.1.0"
 dependencies = [
