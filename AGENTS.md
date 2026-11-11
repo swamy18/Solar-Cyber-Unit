@@ -25,6 +25,8 @@ cargo test -p srct-miner
 cargo test -p srct-diloco
 # CNNP representation/adapter/discovery/metering core.
 cargo test -p srct-cnnp
+# Cross-network intent lifecycle, quotes, routes and disputes.
+cargo test -p srct-intent
 cargo test -p srct-core --test committee_rotation
 cargo test -p srct-node --test api external_miner
 # Escrow-specific subsets.

@@ -1154,6 +1154,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "srct-intent"
+version = "0.1.0"
+dependencies = [
+ "srct-core",
+]
+
+[[package]]
 name = "srct-l2"
 version = "0.1.0"
 dependencies = [

@@ -215,6 +215,11 @@ trusting any number in it:
   (`srct-l2/tests/unverified_result.rs` pins this rule). The dispute path
   re-executes and slashes fakes, but only if a challenger shows up. Running
   challengers is part of operating this network, not an optional extra.
+- **Intent settlement is an instruction, not a bridge.** `srct-intent` verifies
+  signatures, quotes, routes, delivery and disputes, then hands the payment or
+  refund to the existing escrow layer. It does not verify another chain, hold
+  custody or execute an atomic swap; the arbiter is a named address. See
+  [`docs/intents.md`](docs/intents.md).
 - **CNNP adapters are projections, not semantic alignment.** A signed adapter
   proves who fitted it and what space it maps, not that two models mean the
   same thing. A usage receipt authorizes a transfer; it does not move a coin.
@@ -1349,14 +1354,15 @@ not expose it directly, but the worker SDK does (`add_credit_collateral`).
 | `crates/srct-bench/` | Deterministic bench harness: `empty\|realistic\|adversarial` workloads, mini profile, scratch-dir stores. Measurement only. |
 | `crates/srct-diloco/` | Non-consensus DiLoCo proof-of-useful-work prototype: real MLP training, signed updates, Byzantine filtering, exact reward math. Hash mining remains the only consensus mechanism. |
 | `crates/srct-cnnp/` | Non-consensus Cross-Neural Network Protocol core: representation spaces, signed/sealed envelopes, ridge-fit cross-space adapters, capability discovery, metered settlement and plan quoting. |
+| `crates/srct-intent/` | Non-consensus cross-network intent settlement: signed intents, competitive quotes, cross-asset routes, delivery, escrow/refund instructions and dispute resolution. |
 | `fuzz/` | 17 cargo-fuzz targets over the attacker-controlled boundaries. |
 | `verification/sim/` | Independent Python reference, attack simulations, and feature demos (`x402_paid_api_demo.py`, `micropayment_benchmark.py`, `agent_economy_demo.py`). |
 | `verification/tests/vectors/` | Consensus vectors. Generated from source, never hand-edited. |
-| `docs/` | Design records, verification status and readiness reports — plus per-feature guides: `portable-policy.md`, `universal-security.md`, `x402.md`, `micropayments.md`, `wallet-safety.md`, `smart-gate-architecture.md`, `reputation.md`, `agent-jobs.md`, `usd-settlement.md`, `ramps.md`, `lending.md`, `treats.md`, `agent-credits.md`, `dual-mining.md`, `cnnp.md`. |
+| `docs/` | Design records, verification status and readiness reports — plus per-feature guides: `portable-policy.md`, `universal-security.md`, `x402.md`, `micropayments.md`, `wallet-safety.md`, `smart-gate-architecture.md`, `reputation.md`, `agent-jobs.md`, `usd-settlement.md`, `ramps.md`, `lending.md`, `treats.md`, `agent-credits.md`, `dual-mining.md`, `cnnp.md`, `intents.md`. |
 | `docs/performance/` | Bench baselines + Phase-C scalability report + raw JSON results. |
 | `paper/` | The Solar Cyber Unit protocol paper (LaTeX + PDF). |
 
-Twelve crates in one workspace. **All consensus logic lives in `srct-core`**, which
+Thirteen crates in one workspace. **All consensus logic lives in `srct-core`**, which
 has no I/O, no clock and no network. The service-layer feature modules
 live beside it without touching consensus: `x402.rs` (x402
 adapter, budget guard, Base rail options), `micro.rs` (batch/stream/sponsored), `safety.rs` (session budgets,

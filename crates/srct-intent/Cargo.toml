@@ -1,0 +1,12 @@
+[package]
+publish = false
+name = "srct-intent"
+description = "Universal cross-network intent settlement state machine: signed intents, quotes, cross-asset routes, delivery, escrow release/refund and dispute resolution (non-consensus)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+srct-core.workspace = true

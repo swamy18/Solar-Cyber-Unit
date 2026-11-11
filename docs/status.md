@@ -29,6 +29,15 @@ rules in code would have been the wrong order.
 
 ## Verified
 
+- **Cross-network intent settlement (non-consensus, `srct-intent`).** `cargo
+  test -p srct-intent` passes 10 acceptance tests: signed intent/tamper
+  refusal, exact cross-asset route conversion and inverse ranking, same-asset
+  and cross-asset quote caps, missing/expired/wrong-direction routes, one quote
+  per solver, best-quote ranking, full lifecycle with a single settlement,
+  wrong-solver/late/future delivery refusal, timeout refunds, creator-only
+  disputes, arbiter-only resolution with evidence binding, and duplicate
+  quote/refund/settlement guards. The book returns `SettlementInstruction` /
+  `RefundInstruction` only; no coin moves. See [`docs/intents.md`](intents.md).
 - **CNNP interoperability core (non-consensus, `srct-cnnp`).** `cargo test -p
   srct-cnnp` passes 11 acceptance tests: distinct spaces, signed plaintext
   envelopes with tamper refusal, sealed envelopes with wrong-key and
