@@ -1,0 +1,12 @@
+[package]
+publish = false
+name = "srct-compute"
+description = "Decentralized compute sharing across heterogeneous devices: signed device offers, capacity-aware sharding, requester-signed assignments, provider receipts and exact settlement (non-consensus)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+srct-core.workspace = true

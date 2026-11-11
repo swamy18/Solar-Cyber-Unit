@@ -1,0 +1,20 @@
+[package]
+publish = false
+name = "srct-agentnet"
+description = "Decentralized end-to-end encrypted messaging for SRCT agents: network/role-bound identities, ECDH+HKDF+AEAD envelopes, signed metadata and a replay-safe mailbox (non-consensus)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+srct-core.workspace = true
+chacha20poly1305.workspace = true
+k256.workspace = true
+hkdf.workspace = true
+sha2.workspace = true
+rand.workspace = true
+
+[dev-dependencies]
+hex.workspace = true

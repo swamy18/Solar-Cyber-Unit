@@ -65,7 +65,31 @@ rules in code would have been the wrong order.
   GPU/TPU/NPU/Apple-silicon/photonic backends are not implemented, and the
   required `TrainBackend` seam, determinism policy and conformance gates are
   specified in [`docs/dual-mining.md`](dual-mining.md) §8.
-- `cargo test --workspace` — **1,307 tests pass, 0 failures, 1 ignored** across the workspace.
+- **End-to-end agent messaging (non-consensus, `srct-agentnet`).** `cargo test
+  -p srct-agentnet` passes 14 acceptance tests: hybrid-wallet seal/open,
+  recipient-key/address binding at seal time, wrong-recipient refusal,
+  tampered ciphertext/thread/sequence/expiry/recipient refusal, sender spoof
+  refusal, strict wire decoding, zero-sequence and oversized-plaintext
+  refusal, mailbox storage without private keys, exact/re-signed/stale replay
+  refusal, wrong-network/wrong-recipient refusal, expiry pruning, total and
+  per-thread caps, drained-message replay refusal and duplicate wire delivery.
+  The mailbox is bounded and verifies without decrypting; content is hidden but
+  sender/recipient/thread/sequence metadata is visible, and no ratchet, sealed
+  sender or group messaging exists yet. See [`docs/agentnet.md`](agentnet.md).
+- **Decentralized compute sharing (non-consensus, `srct-compute`).** `cargo
+  test -p srct-compute` passes 15 tests (5 unit, 10 acceptance): profile and
+  requirement binding, offer/job wire round-trips and tamper refusal, a
+  30-unit job split deterministically across a GPU, a 2 GB phone and a laptop
+  (20 + 4 + 4 + 2 units, 244 sat), a small phone taking several shards up to
+  its per-job cap, ineligible-offer filtering (RAM, determinism,
+  kernel, class, service, price, privacy, verification, window), capacity and
+  budget caps, requester-only assignment signing, exact once-only settlement,
+  overclaim/price-mismatch/binding/impostor refusal, deadline and expiry
+  handling and attempt bounds. Payouts are instructions only; no coin moves.
+  Device capabilities are self-declared, only the receipt verification level is
+  enforced, and bonding/reputation/TEE challenge remain future work. See
+  [`docs/compute-sharing.md`](compute-sharing.md).
+- `cargo test --workspace` — **1,707 tests pass, 0 failures, 1 ignored** across the workspace.
   (this file quote counts as of their own dates — 242, then 263, then 293 —
   kept as history):
   - 227 unit tests in `srct-core` (M1–M5 suites, the 21-test validator-set suite, the 30-test real-BLS suite in
