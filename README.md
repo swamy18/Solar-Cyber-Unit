@@ -231,7 +231,10 @@ trusting any number in it:
   `crates/srct-diloco`, with signed updates, Byzantine filtering and exact
   reward math, but it is **not consensus-active**: hash mining remains the
   only block-security mechanism until a fork, migration and economic review
-  land. See [`docs/dual-mining.md`](docs/dual-mining.md).
+  land. Today the training path is a CPU `f32` reference: GPU, TPU, NPU, Apple
+  silicon and photonic backends are **not implemented**. The planned
+  `TrainBackend` seam and its determinism policy are in
+  [`docs/dual-mining.md`](docs/dual-mining.md) §8.
 - **Reputation, jobs, FX and ramps are per-node views.** They live in each
   node's `state.bin`, not in consensus — two honest nodes can disagree on a
   score, a quote or a job state. Consensus money (UTXOs, bonds, L2 accounts)
@@ -532,7 +535,8 @@ Hash mining is the only consensus mechanism today. The separate DiLoCo PoUW
 prototype in `crates/srct-diloco` trains a real model and validates, scores and
 pays contributions, but it is not consensus-active; see
 [`docs/dual-mining.md`](docs/dual-mining.md) for the measured results, threat
-model and the fork work still required.
+model, the heterogeneous-hardware backend plan and the fork work still
+required.
 
 **Where the reward goes.** Every block pays its coinbase to one address: the
 node's miner wallet for in-node mining, or the `--miner` address you pass to
@@ -1352,7 +1356,7 @@ not expose it directly, but the worker SDK does (`add_credit_collateral`).
 | `crates/srct-mcp/` | Keyless MCP surface over agent identity, payments — and the agent wallet guard. |
 | `crates/srct-policy/` | Chain-agnostic policy engine: portable grants, delegation proofs, bound grants, JSON decisions + TS/Python bindings. No consensus imports — but still compiles all of `srct-core` (see crate docs); outsiders use HTTP or the bindings. |
 | `crates/srct-bench/` | Deterministic bench harness: `empty\|realistic\|adversarial` workloads, mini profile, scratch-dir stores. Measurement only. |
-| `crates/srct-diloco/` | Non-consensus DiLoCo proof-of-useful-work prototype: real MLP training, signed updates, Byzantine filtering, exact reward math. Hash mining remains the only consensus mechanism. |
+| `crates/srct-diloco/` | Non-consensus DiLoCo proof-of-useful-work prototype: real MLP training, signed updates, Byzantine filtering, exact reward math. CPU `f32` reference only; the heterogeneous `TrainBackend` plan is a documented requirement. Hash mining remains the only consensus mechanism. |
 | `crates/srct-cnnp/` | Non-consensus Cross-Neural Network Protocol core: representation spaces, signed/sealed envelopes, ridge-fit cross-space adapters, capability discovery, metered settlement and plan quoting. |
 | `crates/srct-intent/` | Non-consensus cross-network intent settlement: signed intents, competitive quotes, cross-asset routes, delivery, escrow/refund instructions and dispute resolution. |
 | `fuzz/` | 17 cargo-fuzz targets over the attacker-controlled boundaries. |

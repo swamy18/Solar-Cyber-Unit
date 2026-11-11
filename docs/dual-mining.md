@@ -175,24 +175,98 @@ Nothing below has been done, and none of it should be improvised:
    continues unchanged and no PoUW reward is minted for that period. This is
    the default the prototype already enforces at the round level.
 
-## 8. Remaining programme
+## 8. Heterogeneous training hardware (requirement)
 
-The wider brief (CNNP representation exchange, FHE, TEE-backed SLAs, ZKML,
-cross-chain intents, AI work graph) is **not implemented by this change**. The
-audit above is the base those milestones build on. The ordered plan is:
+DiLoCo must be useful for training and running AI models, not only for PoUW.
+The same protocol must accept CPU, GPU, TPU, NPU, Apple silicon and future
+photonic accelerators without rewriting the round logic, validation or reward
+accounting every time hardware changes.
+
+The separation is mandatory:
+
+- **Hardware-independent:** model graph, optimizer, DiLoCo round state, update
+  envelopes, Byzantine filtering, contribution scoring and rewards.
+- **Hardware-specific:** kernel implementations, device memory, collectives,
+  device discovery and resource measurement.
+
+A planned `TrainBackend` seam (not implemented yet) carries:
+
+```text
+Capabilities {
+  device_class: Cpu | Gpu | Tpu | Npu | AppleSoc | Photonic | Other,
+  supported_dtypes, max_batch, memory_bytes,
+  deterministic: BitExact | Reproducible | Statistical,
+  fused_ops, collective_ops,
+}
+load(kernel_set) -> KernelHandle { kernel_hash, capabilities }
+upload/download(buffer)
+forward/backward/optimizer_step(device_buffer)
+all_reduce_sum(device_buffers)   // or coordinator-mediated exchange
+measure() -> ResourceEvidence
+```
+
+Determinism is a first-class property, not an assumption:
+
+| Class | Meaning | Consensus use |
+|---|---|---|
+| `BitExact` | Pinned integer/fixed-point kernel, identical bytes everywhere | Required for direct consensus verification |
+| `Reproducible` | Same backend + driver + shapes reproduce; other backends may differ | Re-execution challenge or TEE/ZK evidence |
+| `Statistical` | Numerically close, not reproducible | Non-consensus training only, or proof-backed |
+
+A backend that is not `BitExact` must never be the sole authority for a
+consensus finalization. Consensus would pin the kernel hash and the determinism
+class; adding a backend would not change the protocol, only the set of approved
+kernel hashes.
+
+Extension rule: adding a device means implementing the trait and passing the
+same conformance suite, never forking consensus:
+
+1. forward and backward parity against the CPU reference on fixed vectors;
+2. gradient and optimizer-step parity within the backend's determinism class;
+3. a full DiLoCo round producing the same checkpoint under `BitExact`, or a
+   documented divergence under the other classes;
+4. device-loss and out-of-memory recovery without corrupting the round;
+5. memory and resource-measurement bounds;
+6. unavailable backend fails closed and falls back to CPU, never silently
+   changing the math.
+
+The existing mining `ComputeBackend` in `crates/srct-miner/src/accel.rs` is the
+precedent for the conformance-test style, but training needs backward passes,
+optimizer state, device memory and collectives, so it is a separate seam.
+
+Milestones:
+
+1. Extract the CPU reference behind `TrainBackend`; add conformance vectors
+   with no behavioural change.
+2. GPU backend through a vendor-neutral shim (CUDA/ROCm), parity-tested.
+3. Apple Metal/ANE and NPU adapters.
+4. TPU and photonic experiments with an explicit determinism class and a
+   verification policy; useful for non-consensus training first.
+5. Capability-aware scheduler: discovery, price/latency/memory placement,
+   device failure and re-shard.
+
+## 9. Remaining programme
+
+The wider brief is only partially implemented. The CNNP core and the intent
+lifecycle exist as non-consensus prototypes; FHE, TEE-backed SLAs, ZKML,
+work-graph attribution and SDK adapters are **not implemented**. The audit
+above is the base those milestones build on. The ordered plan is:
 
 1. DiLoCo PoUW prototype — **done, non-consensus** (this crate).
-2. Deterministic training kernel + consensus round object — next.
-3. TEE execution attestation as an L2 evidence type, with an explicit
+2. Heterogeneous `TrainBackend` seam + CPU reference conformance — next.
+3. GPU, Apple/NPU, TPU and photonic backends under the determinism policy.
+4. Deterministic training kernel + consensus round object.
+5. TEE execution attestation as an L2 evidence type, with an explicit
    approved-execution vs correctness distinction.
-4. FHE encrypted-compute adapter with real TFHE-style operations and measured
+6. FHE encrypted-compute adapter with real TFHE-style operations and measured
    costs; start with narrow supported op sets, not neural inference claims.
-5. Unified verification policy (execution, correctness, resource metering).
-6. CNNP representation envelopes and cross-architecture adapters, priced and
-   settled through the existing payment/escrow surfaces.
-7. Cross-chain intent lifecycle (quote, execute, verify, settle, refund).
-8. Work-graph attribution and reuse compensation.
-9. SDK adapters (Rust/Python/TypeScript/MCP) and production hardening.
+7. Unified verification policy (execution, correctness, resource metering).
+8. CNNP nonlinear/tokenizer adapters and transport — the representation,
+   linear-adapter, discovery and metering core is done (non-consensus).
+9. Intent persistence, chain adapters and solver discovery — the lifecycle
+   state machine is done (non-consensus).
+10. Work-graph attribution and reuse compensation.
+11. SDK adapters (Rust/Python/TypeScript/MCP) and production hardening.
 
 Each milestone must ship with working code, adversarial tests, measured
 limitations, and a commit. Interfaces or simulations alone do not count.

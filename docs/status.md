@@ -57,7 +57,10 @@ rules in code would have been the wrong order.
   updates, a low-quality outlier excluded from aggregation and rewards, quorum
   failure, deterministic checkpoints and strict wire decoding. Measured release
   latency: 6.4-8.5 ms/round. Hash mining is untouched and remains the only
-  consensus mechanism; see [`docs/dual-mining.md`](dual-mining.md).
+  consensus mechanism. The training path is a CPU `f32` reference only;
+  GPU/TPU/NPU/Apple-silicon/photonic backends are not implemented, and the
+  required `TrainBackend` seam, determinism policy and conformance gates are
+  specified in [`docs/dual-mining.md`](dual-mining.md) §8.
 - `cargo test --workspace` — **1,307 tests pass, 0 failures, 1 ignored** across the workspace.
   (this file quote counts as of their own dates — 242, then 263, then 293 —
   kept as history):

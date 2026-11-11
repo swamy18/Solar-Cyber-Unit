@@ -29,8 +29,9 @@
 //!   fails closed otherwise, so a disconnected worker stalls neither the model
 //!   nor the reward accounting.
 //! - Contribution-weighted reward settlement in satoshis. Weights combine
-//!   accepted samples, measured cosine quality and a capped stake, and the
-//!   split is exact (largest-remainder), so the sum equals the pot.
+//!   accepted samples and measured cosine quality; stake is eligibility-only
+//!   until it is bonded and verifiable on chain. The split is exact
+//!   (largest-remainder), so the sum equals the pot.
 //! - Deterministic checkpoint encoding and hashing, so two coordinators that
 //!   accepted the same updates derive the same model bytes.
 //!
@@ -53,6 +54,12 @@
 //! - Sybil resistance here is stake-capped accounting, not a complete identity
 //!   system. A production design must bind worker keys to bonded stake and to
 //!   the L2 authority/escrow layer.
+//! - **Hardware:** the only implemented compute path is the CPU `f32`
+//!   reference in this crate. GPU, TPU, NPU, Apple-silicon and photonic
+//!   backends are not implemented. The required `TrainBackend` seam, its
+//!   determinism classes and the backend conformance gates are specified in
+//!   `docs/dual-mining.md` section 8; adding a device must not require forking
+//!   the round, validation or reward code.
 
 pub mod data;
 pub mod model;
