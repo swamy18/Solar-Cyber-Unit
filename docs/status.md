@@ -29,6 +29,15 @@ rules in code would have been the wrong order.
 
 ## Verified
 
+- **DiLoCo PoUW prototype (non-consensus, `srct-diloco`).** `cargo test -p
+  srct-diloco` passes 19 tests: 9 unit and 10 acceptance. The acceptance suite
+  trains a real 2-8-1 MLP for 24 rounds across three independently signed
+  workers (loss 1.0144 -> 0.2695, accuracy 17.2% -> 88.5%) and exercises forged
+  keys, tampered deltas, replay, wrong round/base/model, NaN/Inf and oversized
+  updates, a low-quality outlier excluded from aggregation and rewards, quorum
+  failure, deterministic checkpoints and strict wire decoding. Measured release
+  latency: 6.4-8.5 ms/round. Hash mining is untouched and remains the only
+  consensus mechanism; see [`docs/dual-mining.md`](dual-mining.md).
 - `cargo test --workspace` — **1,307 tests pass, 0 failures, 1 ignored** across the workspace.
   (this file quote counts as of their own dates — 242, then 263, then 293 —
   kept as history):

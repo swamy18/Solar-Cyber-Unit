@@ -1,0 +1,12 @@
+[package]
+publish = false
+name = "srct-diloco"
+description = "DiLoCo proof-of-useful-work prototype: real distributed training rounds, update validation, contribution scoring and reward settlement for SRCT (non-consensus)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+srct-core.workspace = true

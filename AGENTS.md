@@ -21,6 +21,8 @@ cargo test -p srct-core --lib
 cargo test -p srct-node --test api
 # Mining stack: solver/stratum/payouts/backends, template/submit roundtrips.
 cargo test -p srct-miner
+# DiLoCo proof-of-useful-work prototype (real training + adversarial rounds).
+cargo test -p srct-diloco
 cargo test -p srct-core --test committee_rotation
 cargo test -p srct-node --test api external_miner
 # Escrow-specific subsets.

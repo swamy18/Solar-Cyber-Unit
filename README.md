@@ -217,7 +217,12 @@ trusting any number in it:
   challengers is part of operating this network, not an optional extra.
 - **Mining does not train AI.** The neural stage is ML-shaped integer work
   with epoch-derived weights — it keeps AI hardware competitive, it does not
-  produce models or inference (see [What this is](#what-this-is)).
+  produce models or inference (see [What this is](#what-this-is)). A separate
+  DiLoCo proof-of-useful-work prototype now trains a real MLP in
+  `crates/srct-diloco`, with signed updates, Byzantine filtering and exact
+  reward math, but it is **not consensus-active**: hash mining remains the
+  only block-security mechanism until a fork, migration and economic review
+  land. See [`docs/dual-mining.md`](docs/dual-mining.md).
 - **Reputation, jobs, FX and ramps are per-node views.** They live in each
   node's `state.bin`, not in consensus — two honest nodes can disagree on a
   score, a quote or a job state. Consensus money (UTXOs, bonds, L2 accounts)
@@ -513,6 +518,12 @@ depends on them.
 
 Three ways to mine, from simplest to pooled. All three produce the same blocks
 and pay the same coinbase — the difference is only where the grinding happens.
+
+Hash mining is the only consensus mechanism today. The separate DiLoCo PoUW
+prototype in `crates/srct-diloco` trains a real model and validates, scores and
+pays contributions, but it is not consensus-active; see
+[`docs/dual-mining.md`](docs/dual-mining.md) for the measured results, threat
+model and the fork work still required.
 
 **Where the reward goes.** Every block pays its coinbase to one address: the
 node's miner wallet for in-node mining, or the `--miner` address you pass to
@@ -1332,14 +1343,15 @@ not expose it directly, but the worker SDK does (`add_credit_collateral`).
 | `crates/srct-mcp/` | Keyless MCP surface over agent identity, payments — and the agent wallet guard. |
 | `crates/srct-policy/` | Chain-agnostic policy engine: portable grants, delegation proofs, bound grants, JSON decisions + TS/Python bindings. No consensus imports — but still compiles all of `srct-core` (see crate docs); outsiders use HTTP or the bindings. |
 | `crates/srct-bench/` | Deterministic bench harness: `empty\|realistic\|adversarial` workloads, mini profile, scratch-dir stores. Measurement only. |
+| `crates/srct-diloco/` | Non-consensus DiLoCo proof-of-useful-work prototype: real MLP training, signed updates, Byzantine filtering, exact reward math. Hash mining remains the only consensus mechanism. |
 | `fuzz/` | 17 cargo-fuzz targets over the attacker-controlled boundaries. |
 | `verification/sim/` | Independent Python reference, attack simulations, and feature demos (`x402_paid_api_demo.py`, `micropayment_benchmark.py`, `agent_economy_demo.py`). |
 | `verification/tests/vectors/` | Consensus vectors. Generated from source, never hand-edited. |
-| `docs/` | Design records, verification status and readiness reports — plus per-feature guides: `portable-policy.md`, `universal-security.md`, `x402.md`, `micropayments.md`, `wallet-safety.md`, `smart-gate-architecture.md`, `reputation.md`, `agent-jobs.md`, `usd-settlement.md`, `ramps.md`, `lending.md`, `treats.md`, `agent-credits.md`. |
+| `docs/` | Design records, verification status and readiness reports — plus per-feature guides: `portable-policy.md`, `universal-security.md`, `x402.md`, `micropayments.md`, `wallet-safety.md`, `smart-gate-architecture.md`, `reputation.md`, `agent-jobs.md`, `usd-settlement.md`, `ramps.md`, `lending.md`, `treats.md`, `agent-credits.md`, `dual-mining.md`. |
 | `docs/performance/` | Bench baselines + Phase-C scalability report + raw JSON results. |
 | `paper/` | The Solar Cyber Unit protocol paper (LaTeX + PDF). |
 
-Ten crates in one workspace. **All consensus logic lives in `srct-core`**, which
+Eleven crates in one workspace. **All consensus logic lives in `srct-core`**, which
 has no I/O, no clock and no network. The service-layer feature modules
 live beside it without touching consensus: `x402.rs` (x402
 adapter, budget guard, Base rail options), `micro.rs` (batch/stream/sponsored), `safety.rs` (session budgets,
