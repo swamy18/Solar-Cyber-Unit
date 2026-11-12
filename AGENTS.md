@@ -27,8 +27,10 @@ cargo test -p srct-diloco
 cargo test -p srct-cnnp
 # Decentralized E2E agent messaging (envelopes, double ratchet, mailbox).
 cargo test -p srct-agentnet
-# Decentralized compute sharing (offers, sharding, receipts, settlement, bonds).
+# Decentralized compute sharing (offers, sharding, receipts, settlement, bonds, TEE).
 cargo test -p srct-compute
+# Encrypted-compute prototype (ElGamal tasks, receipts, verifier).
+cargo test -p srct-fhe
 # Cross-network intent lifecycle, quotes, routes and disputes.
 cargo test -p srct-intent
 cargo test -p srct-core --test committee_rotation

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/srct-core", "crates/srct-l2", "crates/srct-mcp", "crates/srct-miner", "crates/srct-net", "crates/srct-node", "crates/srct-store", "crates/srct-worker", "crates/srct-policy", "crates/srct-bench", "crates/srct-diloco", "crates/srct-cnnp", "crates/srct-intent", "crates/srct-agentnet", "crates/srct-compute"]
+members = ["crates/srct-core", "crates/srct-l2", "crates/srct-mcp", "crates/srct-miner", "crates/srct-net", "crates/srct-node", "crates/srct-store", "crates/srct-worker", "crates/srct-policy", "crates/srct-bench", "crates/srct-diloco", "crates/srct-cnnp", "crates/srct-intent", "crates/srct-agentnet", "crates/srct-compute", "crates/srct-fhe"]
 
 [workspace.package]
 version = "0.1.0"
@@ -21,6 +21,7 @@ srct-cnnp = { path = "crates/srct-cnnp" }
 srct-intent = { path = "crates/srct-intent" }
 srct-agentnet = { path = "crates/srct-agentnet" }
 srct-compute = { path = "crates/srct-compute" }
+srct-fhe = { path = "crates/srct-fhe" }
 sha2 = "0.10"
 k256 = { version = "0.13", features = ["ecdsa", "schnorr", "arithmetic", "ecdh"] }
 serde = { version = "1", features = ["derive"] }

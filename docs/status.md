@@ -111,7 +111,19 @@ rules in code would have been the wrong order.
   capabilities are self-declared, challenge re-execution remains future work,
   and a slash is only as real as the escrow rail that executes it. See
   [`docs/compute-sharing.md`](compute-sharing.md).
-- `cargo test --workspace` — **1,749 tests pass, 0 failures, 1 ignored** across the workspace.
+- **Encrypted compute prototype (non-consensus, `srct-fhe`).** `cargo test
+  -p srct-fhe` passes 11 acceptance tests: real exponential-ElGamal
+  encryption over secp256k1 with randomized ciphertexts, homomorphic
+  add/scale matching plaintext, a signed task → worker receipt → verifier
+  workflow decrypting to the exact expected value without the worker seeing
+  inputs, tampered outputs refused as fraud (exact homomorphic recomputation),
+  tampered inputs/weights breaking the task signature, impostor and
+  wrong-worker refusals, late/future receipts refused, double settlement
+  refused, and malformed tasks (identity/off-curve keys, over-cap weights,
+  empty inputs, zero nonce/deadline) refused. One operation only
+  (`bias + Σ w·x`); weights are public, values must stay inside the decode
+  bound. See [`docs/fhe.md`](fhe.md).
+- `cargo test --workspace` — **1,760 tests pass, 0 failures, 1 ignored** across the workspace.
   (this file quote counts as of their own dates — 242, then 263, then 293 —
   kept as history):
   - 227 unit tests in `srct-core` (M1–M5 suites, the 21-test validator-set suite, the 30-test real-BLS suite in

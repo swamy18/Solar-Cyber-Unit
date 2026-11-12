@@ -1,0 +1,14 @@
+[package]
+publish = false
+name = "srct-fhe"
+description = "Encrypted-compute prototype for SRCT: additive-homomorphic exponential ElGamal tasks, worker receipts and exact settlement checks (non-consensus)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+srct-core.workspace = true
+k256.workspace = true
+rand.workspace = true

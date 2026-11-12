@@ -255,10 +255,12 @@ Milestones:
 
 ## 9. Remaining programme
 
-The wider brief is only partially implemented. The CNNP core and the intent
-lifecycle exist as non-consensus prototypes; FHE, TEE-backed SLAs, ZKML,
-work-graph attribution and SDK adapters are **not implemented**. The audit
-above is the base those milestones build on. The ordered plan is:
+The wider brief is only partially implemented. The CNNP core, the intent
+lifecycle, TEE-backed execution evidence (`srct-compute::tee`) and an
+additive-homomorphic encrypted-compute prototype (`srct-fhe`) exist as
+non-consensus prototypes; ZKML, work-graph attribution and SDK adapters are
+**not implemented**. The audit above is the base those milestones build on.
+The ordered plan is:
 
 1. DiLoCo PoUW prototype — **done, non-consensus** (this crate).
 2. Heterogeneous `TrainBackend` seam + CPU reference conformance — **done**
@@ -266,10 +268,12 @@ above is the base those milestones build on. The ordered plan is:
 3. GPU, Apple/NPU, TPU and photonic backends under the determinism policy —
    next.
 4. Deterministic training kernel + consensus round object.
-5. TEE execution attestation as an L2 evidence type, with an explicit
-   approved-execution vs correctness distinction.
-6. FHE encrypted-compute adapter with real TFHE-style operations and measured
-   costs; start with narrow supported op sets, not neural inference claims.
+5. TEE execution attestation as an L2 evidence type — **done, non-consensus**
+   (`srct-compute::tee`: signed quotes, trusted roots, SLA verifier).
+   L2-evidence-type wiring is next.
+6. FHE encrypted-compute adapter — **prototype done, non-consensus**
+   (`srct-fhe`: exponential-ElGamal weighted sums, exact recomputation
+   checks). TFHE-style non-linear ops and measured-cost expansion are next.
 7. Unified verification policy (execution, correctness, resource metering).
 8. CNNP nonlinear/tokenizer adapters and transport — the representation,
    linear-adapter, discovery and metering core is done (non-consensus).
