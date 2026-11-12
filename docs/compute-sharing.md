@@ -284,7 +284,14 @@ correct or useful — that is challenge re-execution / ZKML, still future.
 - the same quote bytes cannot verify twice; simulator quotes accepted only
   by simulator SLAs;
 - quote wire codec round-trips, refuses unknown versions and truncation;
-  zero output hash and zero nonce never sign.
+  zero output hash and zero nonce never sign;
+- signed offers, assignments and receipts round-trip through wire codecs that
+  refuse truncation and version corruption;
+- the flow journal appends only verified objects, snapshots with bounded
+  encoding, and restarts by re-verifying every entry — tampering fails the
+  whole replay;
+- gossip keeps only signed live offers, dedups, merges order-independently,
+  prunes on expiry, and refuses forged/foreign/overflowed input.
 
 ## 10. Next milestones
 
@@ -295,5 +302,7 @@ correct or useful — that is challenge re-execution / ZKML, still future.
 3. Escrow integration: fund the job once, release per settled receipt, refund
    the remainder at the deadline; execute bond registrations, slashes and
    withdrawals on the same rail.
-4. Persistent offer/ledger/bond stores with the same caps and replay guards.
-5. Offer gossip and job transport over the agent messaging rail or HTTP/MCP.
+4. Persistent bond/reputation snapshots (offers, assignments and receipts
+   already journal — bonds are the escrow rail's job).
+5. Gossip transport binding: carry the gossip set over the agent messaging
+   rail or HTTP/MCP (message rules done here).

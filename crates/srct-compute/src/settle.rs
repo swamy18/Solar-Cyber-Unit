@@ -193,6 +193,22 @@ impl SignedReceipt {
     pub fn hash(&self) -> Hash {
         self.receipt.hash()
     }
+
+    pub fn encode(&self) -> Vec<u8> {
+        encode_signed(&self.receipt.encode(), &self.sigs, &self.keys)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, ComputeError> {
+        let (body, sigs, keys) = decode_signed(bytes, "receipt")?;
+        let receipt = ComputeReceipt::decode(&body)?;
+        let signed = SignedReceipt {
+            receipt,
+            sigs,
+            keys,
+        };
+        signed.verify()?;
+        Ok(signed)
+    }
 }
 
 /// The exact transfer the payment or escrow layer should execute.
@@ -317,4 +333,41 @@ impl ComputeLedger {
 
 fn malformed(e: srct_core::error::Error) -> ComputeError {
     ComputeError::Malformed(e.to_string())
+}
+
+fn encode_signed(body: &[u8], sigs: &Bundle, keys: &Bundle) -> Vec<u8> {
+    let sigs = sigs.to_bytes();
+    let keys = keys.to_bytes();
+    let mut w = Writer::with_capacity(body.len() + sigs.len() + keys.len() + 16);
+    w.u32le(body.len() as u32)
+        .raw(body)
+        .u32le(sigs.len() as u32)
+        .raw(&sigs)
+        .u32le(keys.len() as u32)
+        .raw(&keys);
+    w.into_vec()
+}
+
+fn decode_signed(bytes: &[u8], what: &str) -> Result<(Vec<u8>, Bundle, Bundle), ComputeError> {
+    let err = |detail: String| ComputeError::Malformed(format!("{what}: {detail}"));
+    let mut r = Reader::new(bytes);
+    let body_len = r.u32le().map_err(malformed)? as usize;
+    if body_len > 64 * 1024 {
+        return Err(err("body over cap".into()));
+    }
+    let body = r.fixed_slice(body_len).map_err(malformed)?.to_vec();
+    let sigs_len = r.u32le().map_err(malformed)? as usize;
+    if sigs_len > 8 * 1024 {
+        return Err(err("signature bundle over cap".into()));
+    }
+    let sigs = Bundle::deserialize(r.fixed_slice(sigs_len).map_err(malformed)?)
+        .map_err(|e| err(e.to_string()))?;
+    let keys_len = r.u32le().map_err(malformed)? as usize;
+    if keys_len > 8 * 1024 {
+        return Err(err("key bundle over cap".into()));
+    }
+    let keys = Bundle::deserialize(r.fixed_slice(keys_len).map_err(malformed)?)
+        .map_err(|e| err(e.to_string()))?;
+    r.expect_end().map_err(malformed)?;
+    Ok((body, sigs, keys))
 }

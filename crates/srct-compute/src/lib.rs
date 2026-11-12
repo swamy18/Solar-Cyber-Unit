@@ -16,6 +16,11 @@
 //! - [`settle`]: provider-signed receipts, overclaim/price/deadline checks and
 //!   an exact [`settle::PayoutInstruction`] the existing payment or escrow
 //!   layer should execute.
+//! - [`store`]: append-only journal of verified flow objects (offers,
+//!   assignments, receipts) with bounded snapshot encoding and
+//!   re-verifying replay for restarts.
+//! - [`gossip`]: transport-agnostic offer gossip — signed, live, deduplicated
+//!   offer sets with deterministic merge and expiry pruning.
 //! - [`tee`]: TEE-backed execution evidence — signed attestation quotes,
 //!   a trusted-roots registry with revocation, and a fail-closed SLA
 //!   verifier with freshness and replay protection.
@@ -42,8 +47,10 @@
 
 pub mod bond;
 pub mod device;
+pub mod gossip;
 pub mod market;
 pub mod settle;
+pub mod store;
 pub mod tee;
 
 pub use bond::{
@@ -52,12 +59,17 @@ pub use bond::{
     SLASH_NOSHOW_BPS, SLASH_PENALTY, TIMEOUT_PENALTY,
 };
 pub use device::{Determinism, DeviceClass, DeviceProfile, DeviceRequirement};
+pub use gossip::{GossipSet, MAX_GOSSIP_OFFERS};
 pub use market::{
     plan_assignments, Assignment, ComputeJob, ComputeOffer, Plan, SignedAssignment, SignedJob,
     SignedOffer, SignedPlan, MAX_ATTEMPTS, MAX_JOB_UNITS, MAX_SERVICE_LEN,
 };
 pub use settle::{
     ComputeLedger, ComputeReceipt, PayoutInstruction, SettlementStatus, SignedReceipt,
+};
+pub use store::{
+    EntryKind, FlowJournal, JournalEntry, Replayed, JOURNAL_VERSION, MAX_ENTRY_BYTES,
+    MAX_JOURNAL_ENTRIES,
 };
 pub use tee::{
     AttestationRoots, SignedTeeQuote, TeeError, TeeQuote, TeeSla, TeeType, TeeVerifier, TEE_VERSION,
