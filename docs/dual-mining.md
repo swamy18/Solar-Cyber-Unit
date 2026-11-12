@@ -266,10 +266,12 @@ The ordered plan is:
 2. Heterogeneous `TrainBackend` seam + CPU reference conformance — **done**
    (H1, 7 conformance tests).
 3. GPU, Apple/NPU, TPU and photonic backends under the determinism policy —
-   partially done: a second (`Statistical`, block-partitioned) backend passes
-   the same conformance suite, proving the seam takes heterogeneous execution.
-   Real silicon backends still next.
-4. Deterministic training kernel + consensus round object.
+   partially done: a block-partitioned executor passes the same `f32`
+   conformance, and a fixed-point Q16.16 integer backend proves the BitExact
+   tier with byte-identical training runs. Real silicon backends still next.
+4. Deterministic training kernel — **prototype done, non-consensus**
+   (`FixedMlp`: integer Padé-tanh/sigmoid, MSE objective, saturating
+   arithmetic). Consensus round object still next.
 5. TEE execution attestation as an L2 evidence type — **done, non-consensus**
    (`srct-l2::tee_evidence`: `TeeBackedAttestation` implementing the generic
    `Attestation` trait, verified through `srct-verify`, flowing through the

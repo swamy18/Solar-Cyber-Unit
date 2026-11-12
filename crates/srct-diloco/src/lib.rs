@@ -66,16 +66,18 @@
 
 pub mod backend;
 pub mod data;
+pub mod fixed;
 pub mod model;
 pub mod round;
 pub mod update;
 
 pub use backend::{
     check_backend, local_update_with, require_determinism, BackendCapabilities, BackendError,
-    BlockedBackend, ConformanceReport, CpuBackend, DeterminismClass, DeviceClass, LocalUpdate,
-    TrainBackend,
+    BlockedBackend, ConformanceReport, CpuBackend, DeterminismClass, DeviceClass,
+    FixedPointBackend, LocalUpdate, TrainBackend,
 };
 pub use data::{accuracy, mean_loss, shards, two_moons, Sample};
+pub use fixed::{quantize_samples, FixedMlp};
 pub use model::{Mlp, MODEL_VERSION};
 pub use round::{Contribution, FinalizedRound, Rejection, RoundConfig, RoundOutcome, RoundState};
 pub use update::{SignedUpdate, UpdateClaim};

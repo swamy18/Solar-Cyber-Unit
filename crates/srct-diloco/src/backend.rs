@@ -19,6 +19,7 @@ use srct_core::hash::{sha256_dom, Hash};
 use srct_core::ser::Writer;
 
 use crate::data::{two_moons, Sample};
+use crate::fixed::{from_f32, quantize_samples, to_f32, FixedMlp};
 use crate::model::Mlp;
 
 pub const BACKEND_VERSION: u8 = 1;
@@ -288,6 +289,72 @@ impl TrainBackend for BlockedBackend {
 
     fn sgd_step(&self, model: &Mlp, grad: &Mlp, lr: f32) -> Result<Mlp, BackendError> {
         CpuBackend.sgd_step(model, grad, lr)
+    }
+}
+
+/// Fixed-point Q16.16 integer kernels: the BitExact tier.
+///
+/// All arithmetic is integer, so identical inputs produce identical bytes on
+/// every host — the property the consensus gate requires. Activations are
+/// integer Padé-tanh/sigmoid approximations and the objective is MSE (see
+/// [`crate::fixed`]), so this trains a close cousin of the `f32` reference,
+/// not the identical function. Cross-dtype parity is Statistical by design;
+/// BitExact is claimed within this dtype only.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FixedPointBackend;
+
+impl TrainBackend for FixedPointBackend {
+    fn name(&self) -> &'static str {
+        "fixed-point-q16-16"
+    }
+
+    fn capabilities(&self) -> BackendCapabilities {
+        BackendCapabilities {
+            device: DeviceClass::Cpu,
+            determinism: DeterminismClass::BitExact,
+            dtype: "q16.16",
+            max_batch: 65_536,
+            memory_bytes: 0,
+        }
+    }
+
+    fn forward(&self, model: &Mlp, x: &[f32; 2]) -> Result<f32, BackendError> {
+        if !model.is_finite() || !x.iter().all(|v| v.is_finite()) {
+            return Err(BackendError::Malformed("non-finite model or input".into()));
+        }
+        let fixed = FixedMlp::from_mlp(model);
+        let (_, p) = fixed.forward(&[from_f32(x[0]), from_f32(x[1])]);
+        Ok(to_f32(p))
+    }
+
+    fn loss_and_grad(&self, model: &Mlp, samples: &[Sample]) -> Result<(f32, Mlp), BackendError> {
+        if samples.is_empty() {
+            return Err(BackendError::Malformed("empty sample batch".into()));
+        }
+        if !model.is_finite()
+            || !samples
+                .iter()
+                .all(|s| s.x.iter().all(|v| v.is_finite()) && s.y.is_finite())
+        {
+            return Err(BackendError::Malformed(
+                "non-finite model or samples".into(),
+            ));
+        }
+        let fixed = FixedMlp::from_mlp(model);
+        let (loss, grad) = fixed.loss_and_grad(&quantize_samples(samples));
+        Ok((to_f32(loss), grad.to_mlp()))
+    }
+
+    fn sgd_step(&self, model: &Mlp, grad: &Mlp, lr: f32) -> Result<Mlp, BackendError> {
+        if !lr.is_finite() || lr < 0.0 {
+            return Err(BackendError::Malformed("learning rate is invalid".into()));
+        }
+        if !model.is_finite() || !grad.is_finite() {
+            return Err(BackendError::NonFinite);
+        }
+        let mut fixed = FixedMlp::from_mlp(model);
+        fixed.sgd_step(&FixedMlp::from_mlp(grad), from_f32(lr));
+        Ok(fixed.to_mlp())
     }
 }
 

@@ -7,7 +7,7 @@
 
 use srct_diloco::backend::{
     check_backend, local_update_with, require_determinism, BackendCapabilities, BackendError,
-    BlockedBackend, CpuBackend, DeterminismClass, DeviceClass, TrainBackend,
+    BlockedBackend, CpuBackend, DeterminismClass, DeviceClass, FixedPointBackend, TrainBackend,
 };
 use srct_diloco::data::two_moons;
 use srct_diloco::model::Mlp;
@@ -256,4 +256,62 @@ fn a_zero_block_and_empty_batches_fail_closed() {
         CpuBackend.loss_and_grad(&model, &[]),
         Err(BackendError::Malformed(_))
     ));
+}
+
+#[test]
+fn the_fixed_point_backend_is_bit_exact_by_construction() {
+    let caps = FixedPointBackend.capabilities();
+    assert_eq!(caps.device, DeviceClass::Cpu);
+    assert_eq!(caps.determinism, DeterminismClass::BitExact);
+    assert_eq!(caps.dtype, "q16.16");
+    // The consensus gate accepts the declared class.
+    assert!(require_determinism(&caps, DeterminismClass::BitExact).is_ok());
+}
+
+#[test]
+fn fixed_point_training_is_byte_identical_across_runs() {
+    let global = Mlp::new(7);
+    let shard = two_moons(16, 7);
+    let first = local_update_with(&FixedPointBackend, &global, &shard, 6, 0.05).unwrap();
+    let second = local_update_with(&FixedPointBackend, &global, &shard, 6, 0.05).unwrap();
+    assert_eq!(first.model.hash(), second.model.hash());
+    assert_eq!(first.loss_before.to_bits(), second.loss_before.to_bits());
+    assert_eq!(first.loss_after.to_bits(), second.loss_after.to_bits());
+    // And it actually learns: loss goes down on separable data.
+    assert!(first.loss_after < first.loss_before);
+    assert!(first.loss_after.is_finite());
+}
+
+#[test]
+fn fixed_point_rejects_non_f32_kernels_and_bad_inputs() {
+    // The f32-parity conformance suite only speaks f32: a q16.16 backend is
+    // refused at the dtype gate, not silently compared.
+    assert!(matches!(
+        check_backend(&FixedPointBackend),
+        Err(BackendError::Unsupported(_))
+    ));
+    let model = Mlp::new(3);
+    assert!(matches!(
+        FixedPointBackend.loss_and_grad(&model, &[]),
+        Err(BackendError::Malformed(_))
+    ));
+    assert!(matches!(
+        FixedPointBackend.sgd_step(&model, &model, -0.1),
+        Err(BackendError::Malformed(_))
+    ));
+    let mut nan_model = Mlp::new(3);
+    nan_model.w1[0] = f32::NAN;
+    assert!(matches!(
+        FixedPointBackend.forward(&nan_model, &[0.0, 0.0]),
+        Err(BackendError::Malformed(_))
+    ));
+}
+
+#[test]
+fn fixed_point_forward_matches_sigmoid_shape() {
+    // Zero input through a zero-bias unit: sigmoid(0) = 0.5 exactly.
+    let model = Mlp::zeros();
+    let p = FixedPointBackend.forward(&model, &[0.0, 0.0]).unwrap();
+    assert!((p - 0.5).abs() < 1e-4, "sigmoid(0) should be 0.5, got {p}");
+    assert!(p.is_finite());
 }

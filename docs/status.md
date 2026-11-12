@@ -56,19 +56,22 @@ rules in code would have been the wrong order.
   authorization only; no coin moves in this crate. See
   [`docs/cnnp.md`](cnnp.md).
 - **DiLoCo PoUW prototype (non-consensus, `srct-diloco`).** `cargo test -p
-  srct-diloco` passes 33 tests: 12 unit and 21 acceptance. The acceptance suite
+  srct-diloco` passes 37 tests: 12 unit and 25 acceptance. The acceptance suite
   trains a real 2-8-1 MLP for 24 rounds across three independently signed
   workers (loss 1.0144 -> 0.2695, accuracy 17.2% -> 88.5%) and exercises forged
   keys, tampered deltas, replay, wrong round/base/model, NaN/Inf and oversized
   updates, a low-quality outlier excluded from aggregation and rewards, quorum
   failure, deterministic checkpoints and strict wire decoding. Measured release
   latency: 6.4-8.5 ms/round. A `TrainBackend` seam with fixed-vector
-  conformance wraps two implemented backends: the CPU `f32` reference and a
-  block-partitioned executor (`Statistical`) that proves heterogeneous
-  execution strategies — chunked batches, device memory caps — pass the same
-  suite. The suite proves both pass, a perturbed kernel fails, a `Statistical`
-  kernel can pass tolerance but is refused by the `BitExact` consensus gate,
-  and an unavailable device fails closed. Hash mining is untouched and remains the
+  conformance wraps three backends: the CPU `f32` reference, a
+  block-partitioned executor (`Statistical`), and a fixed-point Q16.16 integer
+  backend (`BitExact` by construction: byte-identical training runs, integer
+  Padé activations, MSE objective). The suite proves CPU and blocked pass the
+  same conformance, the fixed-point backend trains deterministically while
+  f32-parity conformance correctly refuses its dtype, a perturbed kernel fails,
+  a `Statistical` kernel can pass tolerance but is refused by the `BitExact`
+  consensus gate (which the fixed-point backend satisfies), and an unavailable
+  device fails closed. Hash mining is untouched and remains the
   only consensus mechanism. Real GPU/TPU/NPU/Apple-silicon/photonic silicon
   is not implemented, and the
   required `TrainBackend` seam, determinism policy and conformance gates are
@@ -155,7 +158,7 @@ rules in code would have been the wrong order.
   (execution/correctness per task kind, security level and value) is pinned,
   and one fail-closed verifier checks TEE, FHE and ZKML evidence with all
   replay books, preserving inner errors. See [`docs/verify.md`](verify.md).
-- `cargo test --workspace` — **1,814 tests pass, 0 failures, 1 ignored** across the workspace.
+- `cargo test --workspace` — **1,818 tests pass, 0 failures, 1 ignored** across the workspace.
   (this file quote counts as of their own dates — 242, then 263, then 293 —
   kept as history):
   - 227 unit tests in `srct-core` (M1–M5 suites, the 21-test validator-set suite, the 30-test real-BLS suite in
