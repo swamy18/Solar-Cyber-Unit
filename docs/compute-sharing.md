@@ -311,9 +311,11 @@ correct or useful — that is challenge re-execution / ZKML, still future.
   zero output hash and zero nonce never sign;
 - signed offers, assignments and receipts round-trip through wire codecs that
   refuse truncation and version corruption;
-- the flow journal appends only verified objects, snapshots with bounded
-  encoding, and restarts by re-verifying every entry — tampering fails the
-  whole replay;
+- the flow journal appends only verified offers, assignments, receipts, bonds
+  and escrow fundings, snapshots with bounded encoding, and restarts by
+  re-verifying every entry — tampering, truncation or a foreign-network entry
+  fails the whole replay, and a restarted node rebuilds the same bond and
+  escrow state;
 - gossip keeps only signed live offers, dedups, merges order-independently,
   prunes on expiry, and refuses forged/foreign/overflowed input;
 - challenge re-execution clears matching receipts and slashes fabricated ones:
@@ -337,7 +339,8 @@ correct or useful — that is challenge re-execution / ZKML, still future.
    settled receipt, refund the remainder at the deadline). Executing bond
    registrations, slashes and withdrawals on the same rail is still the
    payment layer's job.
-4. Persistent bond/reputation snapshots (offers, assignments and receipts
-   already journal — bonds are the escrow rail's job).
+4. Persistent bond/reputation snapshots — **partly done**: bonds and escrow
+   fundings now journal and replay. Timeout counts are not signed objects, so
+   a full reputation snapshot still needs an operator checkpoint.
 5. Gossip transport binding: carry the gossip set over the agent messaging
    rail or HTTP/MCP (message rules done here).

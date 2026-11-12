@@ -17,8 +17,8 @@
 //!   an exact [`settle::PayoutInstruction`] the existing payment or escrow
 //!   layer should execute.
 //! - [`store`]: append-only journal of verified flow objects (offers,
-//!   assignments, receipts) with bounded snapshot encoding and
-//!   re-verifying replay for restarts.
+//!   assignments, receipts, bonds, escrow fundings) with bounded snapshot
+//!   encoding and re-verifying replay for restarts.
 //! - [`gossip`]: transport-agnostic offer gossip — signed, live, deduplicated
 //!   offer sets with deterministic merge and expiry pruning.
 //! - [`tee`]: TEE-backed execution evidence — signed attestation quotes,

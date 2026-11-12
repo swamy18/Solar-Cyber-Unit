@@ -33,7 +33,7 @@ use srct_core::sig::{verify_bundle, Bundle};
 use srct_core::wallet::Wallet;
 
 use crate::market::SignedOffer;
-use crate::settle::SignedReceipt;
+use crate::settle::{decode_signed, encode_signed, SignedReceipt};
 use crate::{market::SignedAssignment, ComputeError};
 
 pub const BOND_VERSION: u8 = 1;
@@ -222,6 +222,18 @@ impl SignedBond {
 
     pub fn hash(&self) -> Hash {
         self.bond.hash()
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        encode_signed(&self.bond.encode(), &self.sigs, &self.keys)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, ComputeError> {
+        let (body, sigs, keys) = decode_signed(bytes, "bond")?;
+        let bond = ProviderBond::decode(&body)?;
+        let signed = SignedBond { bond, sigs, keys };
+        signed.verify()?;
+        Ok(signed)
     }
 }
 

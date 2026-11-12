@@ -253,13 +253,30 @@ impl EscrowBook {
     /// Returns the funded amount.
     pub fn fund(&mut self, funding: &SignedFunding, height: u64) -> Result<u64, ComputeError> {
         funding.verify()?;
-        let f = &funding.funding;
-        if f.network_id != self.network_id {
+        if funding.funding.network_id != self.network_id {
             return Err(ComputeError::WrongNetwork);
         }
-        if height > f.deadline {
+        if height > funding.funding.deadline {
             return Err(ComputeError::Expired);
         }
+        self.insert_funding(funding)
+    }
+
+    /// Restore a journaled funding on restart.
+    ///
+    /// The append-time height check already passed when the entry was first
+    /// verified, so replay does not re-apply it; signature, network and
+    /// single-use checks still run.
+    pub fn restore(&mut self, funding: &SignedFunding) -> Result<u64, ComputeError> {
+        funding.verify()?;
+        if funding.funding.network_id != self.network_id {
+            return Err(ComputeError::WrongNetwork);
+        }
+        self.insert_funding(funding)
+    }
+
+    fn insert_funding(&mut self, funding: &SignedFunding) -> Result<u64, ComputeError> {
+        let f = &funding.funding;
         if self.accounts.contains_key(&f.job) {
             return Err(ComputeError::Replay);
         }

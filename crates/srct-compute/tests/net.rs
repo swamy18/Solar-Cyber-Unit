@@ -6,8 +6,9 @@ use srct_compute::market::{
     plan_assignments, ComputeJob, ComputeOffer, Verification, JOB_VERSION, OFFER_VERSION,
 };
 use srct_compute::{
-    ComputeError, ComputeReceipt, Determinism, DeviceClass, DeviceProfile, FlowJournal, GossipSet,
-    SignedAssignment, SignedJob, SignedOffer, SignedReceipt,
+    BondBook, ComputeError, ComputeReceipt, Determinism, DeviceClass, DeviceProfile, EscrowBook,
+    EscrowFunding, FlowJournal, GossipSet, ProviderBond, SignedAssignment, SignedBond,
+    SignedFunding, SignedJob, SignedOffer, SignedReceipt, BOND_VERSION, ESCROW_VERSION,
 };
 use srct_core::hash::Hash;
 use srct_core::wallet::Wallet;
@@ -256,4 +257,79 @@ fn gossip_refuses_foreign_networks_and_overflow() {
     assert!(set
         .insert(mk_offer(&provider, 1_025, 1_000_000), 10)
         .is_err());
+}
+
+#[test]
+fn journal_persists_bonds_and_escrow_fundings() {
+    let provider = wallet(1);
+    let requester = wallet(2);
+    let bond = SignedBond::sign(
+        ProviderBond {
+            version: BOND_VERSION,
+            network_id: NET.into(),
+            provider: provider.address().unwrap(),
+            amount_sat: 50_000,
+            registered_height: 5,
+            nonce: 1,
+        },
+        &provider,
+    )
+    .unwrap();
+    let job = [9u8; 32];
+    let funding = SignedFunding::sign(
+        EscrowFunding {
+            version: ESCROW_VERSION,
+            network_id: NET.into(),
+            job,
+            requester: requester.address().unwrap(),
+            amount_sat: 100,
+            deadline: 100,
+            nonce: 1,
+        },
+        &requester,
+    )
+    .unwrap();
+
+    let mut journal = FlowJournal::new(NET);
+    assert_eq!(journal.append_bond(&bond).unwrap(), 0);
+    assert_eq!(journal.append_funding(&funding).unwrap(), 1);
+    let bytes = journal.encode();
+    let replayed = FlowJournal::decode(&bytes).unwrap().replay().unwrap();
+    assert_eq!(replayed.bonds, vec![bond.clone()]);
+    assert_eq!(replayed.fundings, vec![funding.clone()]);
+
+    // A restarted node rebuilds the same bond and escrow state.
+    let mut bonds = BondBook::new(NET);
+    for b in &replayed.bonds {
+        bonds.register(b, b.bond.registered_height).unwrap();
+    }
+    assert_eq!(
+        bonds.bond(&provider.address().unwrap()).unwrap().amount_sat,
+        50_000
+    );
+    let mut escrow = EscrowBook::new(NET);
+    for f in &replayed.fundings {
+        escrow.restore(f).unwrap();
+    }
+    assert_eq!(escrow.remaining_sat(&job), 100);
+
+    // A foreign-network bond is refused before it can enter history.
+    let mut foreign = bond.clone();
+    foreign.bond.network_id = "srct/other".into();
+    let foreign = SignedBond::sign(foreign.bond, &provider).unwrap();
+    assert_eq!(
+        journal.append_bond(&foreign),
+        Err(ComputeError::WrongNetwork)
+    );
+
+    // A snapshot whose network disagrees with its entries is a fork.
+    let mut forked = bytes.clone();
+    forked[3..3 + NET.len()].copy_from_slice(b"srct/otherxx");
+    assert!(FlowJournal::decode(&forked).is_err());
+
+    // Tampering with a bond entry fails the whole restart.
+    let mut bad = bytes.clone();
+    let last = bad.len() - 1;
+    bad[last] ^= 0x01;
+    assert!(FlowJournal::decode(&bad).is_err());
 }

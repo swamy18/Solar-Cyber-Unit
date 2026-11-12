@@ -96,7 +96,7 @@ rules in code would have been the wrong order.
   metadata is visible, and no ratchet for groups, sealed sender or persistent
   mailbox exists yet. See [`docs/agentnet.md`](agentnet.md).
 - **Decentralized compute sharing (non-consensus, `srct-compute`).** `cargo
-  test -p srct-compute` passes 63 tests (5 unit, 58 acceptance): profile and
+  test -p srct-compute` passes 64 tests (5 unit, 59 acceptance): profile and
   requirement binding, offer/job wire round-trips and tamper refusal, a
   30-unit job split deterministically across a GPU, a 2 GB phone and a laptop
   (20 + 4 + 4 + 2 units, 244 sat), a small phone taking several shards up to
@@ -119,8 +119,9 @@ rules in code would have been the wrong order.
   mismatches are refused, stale and future-height quotes are refused, the same
   quote bytes cannot verify twice, and simulator quotes are accepted only by
   simulator SLAs. Signed offers, assignments and receipts round-trip; the
-  flow journal snapshots and re-verified restarts; gossip dedups, merges and
-  prunes with forged/foreign/overflow refusals; challenge re-execution clears
+  flow journal snapshots and re-verified restarts, now including bonds and
+  escrow fundings; gossip dedups, merges and prunes with forged/foreign/overflow
+  refusals; challenge re-execution clears
   matching receipts and slashes fabricated ones through the `WrongResult`
   dispute path; and job escrow funds once, releases each settled receipt's
   exact total without ever exceeding the pot, and refunds the remainder
@@ -171,7 +172,7 @@ rules in code would have been the wrong order.
   transport errors, custom fetch injection); `tsc --strict --checkJs` passes
   on the JSDoc-typed source. Not a signer; live-node e2e is future. See
   [`docs/sdk-js.md`](sdk-js.md).
-- `cargo test --workspace` — **1,845 tests pass, 0 failures, 1 ignored** across the workspace; `npm test` in `sdk-js/` passes 7 suites. Proof-system latencies are measured in [`docs/benchmarks.md`](benchmarks.md).
+- `cargo test --workspace` — **1,846 tests pass, 0 failures, 1 ignored** across the workspace; `npm test` in `sdk-js/` passes 7 suites. Proof-system latencies are measured in [`docs/benchmarks.md`](benchmarks.md).
   (this file quote counts as of their own dates — 242, then 263, then 293 —
   kept as history):
   - 227 unit tests in `srct-core` (M1–M5 suites, the 21-test validator-set suite, the 30-test real-BLS suite in

@@ -1,18 +1,24 @@
 //! Append-only journal of signed flow objects for restart and audit.
 //!
 //! Operators crash. The journal records every network-visible signed object —
-//! offers, assignments, receipts — as it is first verified, so a restarted
-//! node replays the same bytes through the same checks and rebuilds
-//! market/ledger state instead of trusting a checkpoint. Unsigned, invalid
-//! or over-cap entries are refused at append time, and the whole journal
-//! round-trips through a bounded encoding.
+//! offers, assignments, receipts, bonds and escrow fundings — as it is first
+//! verified, so a restarted node replays the same bytes through the same
+//! checks and rebuilds market/ledger/bond/escrow state instead of trusting a
+//! checkpoint. Unsigned, invalid or over-cap entries are refused at append
+//! time, and the whole journal round-trips through a bounded encoding.
+//!
+//! Replay returns verified objects in original order. A restarted node feeds
+//! bonds to [`crate::bond::BondBook::register`] at their recorded
+//! `registered_height` and fundings to [`crate::escrow::EscrowBook::restore`],
+//! which skips the append-time height check that already passed.
 //!
 //! What this is not: a database. There is no index, no query language, no
-//! compaction and no pruning of settled history. Bonds and reputation live
-//! in [`crate::bond`]; persisting them is the escrow rail's job.
+//! compaction and no pruning of settled history.
 
 use srct_core::ser::{Reader, Writer};
 
+use crate::bond::SignedBond;
+use crate::escrow::SignedFunding;
 use crate::market::{SignedAssignment, SignedOffer};
 use crate::settle::SignedReceipt;
 use crate::ComputeError;
@@ -31,6 +37,8 @@ pub enum EntryKind {
     Offer = 0,
     Assignment = 1,
     Receipt = 2,
+    Bond = 3,
+    Funding = 4,
 }
 
 impl EntryKind {
@@ -39,6 +47,8 @@ impl EntryKind {
             0 => Some(EntryKind::Offer),
             1 => Some(EntryKind::Assignment),
             2 => Some(EntryKind::Receipt),
+            3 => Some(EntryKind::Bond),
+            4 => Some(EntryKind::Funding),
             _ => None,
         }
     }
@@ -119,6 +129,24 @@ impl FlowJournal {
         self.push(EntryKind::Receipt, receipt.encode())
     }
 
+    /// Append a bond registration after verifying it belongs to this network.
+    pub fn append_bond(&mut self, bond: &SignedBond) -> Result<u64, ComputeError> {
+        bond.verify()?;
+        if bond.bond.network_id != self.network_id {
+            return Err(ComputeError::WrongNetwork);
+        }
+        self.push(EntryKind::Bond, bond.encode())
+    }
+
+    /// Append an escrow funding after verifying it belongs to this network.
+    pub fn append_funding(&mut self, funding: &SignedFunding) -> Result<u64, ComputeError> {
+        funding.verify()?;
+        if funding.funding.network_id != self.network_id {
+            return Err(ComputeError::WrongNetwork);
+        }
+        self.push(EntryKind::Funding, funding.encode())
+    }
+
     /// Replay every entry through decode + signature verification, in order.
     /// A restarted node calls this before rebuilding market/ledger state; any
     /// tampered entry fails the whole replay rather than being skipped.
@@ -174,10 +202,14 @@ impl FlowJournal {
             // Offers must also agree with the snapshot's network: a journal
             // for one network replaying another's offers is a fork.
             verify_entry(kind, &entry_bytes)?;
-            if kind == EntryKind::Offer
-                && SignedOffer::decode(&entry_bytes)?.offer.network_id != journal.network_id
-            {
-                return Err(ComputeError::Malformed("journal offer network".into()));
+            let entry_network = match kind {
+                EntryKind::Offer => Some(SignedOffer::decode(&entry_bytes)?.offer.network_id),
+                EntryKind::Bond => Some(SignedBond::decode(&entry_bytes)?.bond.network_id),
+                EntryKind::Funding => Some(SignedFunding::decode(&entry_bytes)?.funding.network_id),
+                EntryKind::Assignment | EntryKind::Receipt => None,
+            };
+            if entry_network.is_some_and(|net| net != journal.network_id) {
+                return Err(ComputeError::Malformed("journal entry network".into()));
             }
             journal.entries.push(JournalEntry {
                 seq: seq as u64,
@@ -195,6 +227,8 @@ fn verify_entry(kind: EntryKind, bytes: &[u8]) -> Result<(), ComputeError> {
         EntryKind::Offer => SignedOffer::decode(bytes).map(|_| ()),
         EntryKind::Assignment => SignedAssignment::decode(bytes).map(|_| ()),
         EntryKind::Receipt => SignedReceipt::decode(bytes).map(|_| ()),
+        EntryKind::Bond => SignedBond::decode(bytes).map(|_| ()),
+        EntryKind::Funding => SignedFunding::decode(bytes).map(|_| ()),
     }
 }
 
@@ -202,6 +236,8 @@ fn replay_entries(entries: &[JournalEntry]) -> Result<Replayed, ComputeError> {
     let mut offers = Vec::new();
     let mut assignments = Vec::new();
     let mut receipts = Vec::new();
+    let mut bonds = Vec::new();
+    let mut fundings = Vec::new();
     for (i, entry) in entries.iter().enumerate() {
         if entry.seq != i as u64 {
             return Err(ComputeError::Malformed("journal sequence gap".into()));
@@ -210,12 +246,16 @@ fn replay_entries(entries: &[JournalEntry]) -> Result<Replayed, ComputeError> {
             EntryKind::Offer => offers.push(SignedOffer::decode(&entry.bytes)?),
             EntryKind::Assignment => assignments.push(SignedAssignment::decode(&entry.bytes)?),
             EntryKind::Receipt => receipts.push(SignedReceipt::decode(&entry.bytes)?),
+            EntryKind::Bond => bonds.push(SignedBond::decode(&entry.bytes)?),
+            EntryKind::Funding => fundings.push(SignedFunding::decode(&entry.bytes)?),
         }
     }
     Ok(Replayed {
         offers,
         assignments,
         receipts,
+        bonds,
+        fundings,
     })
 }
 
@@ -228,5 +268,7 @@ fn malformed(e: srct_core::error::Error) -> ComputeError {
 pub struct Replayed {
     pub offers: Vec<SignedOffer>,
     pub assignments: Vec<SignedAssignment>,
+    pub bonds: Vec<SignedBond>,
+    pub fundings: Vec<SignedFunding>,
     pub receipts: Vec<SignedReceipt>,
 }
