@@ -39,6 +39,8 @@ cargo test -p srct-workgraph
 cargo test -p srct-verify
 # L2 TEE evidence type (attestation, verification, contract path).
 cargo test -p srct-l2 --test tee_evidence
+# JS SDK (mock-transport REST client tests).
+npm --prefix sdk-js test
 # Cross-network intent lifecycle, quotes, routes and disputes.
 cargo test -p srct-intent
 cargo test -p srct-core --test committee_rotation

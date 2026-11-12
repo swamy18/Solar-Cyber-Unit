@@ -1,0 +1,13 @@
+{
+  "name": "@srct/sdk",
+  "version": "0.1.0",
+  "description": "Dependency-free JavaScript client for the SRCT node REST API (jobs, payments, escrow, VWC).",
+  "type": "module",
+  "exports": {
+    ".": "./src/srct.mjs"
+  },
+  "scripts": {
+    "test": "node --test test/client.test.mjs"
+  },
+  "license": "MIT"
+}
