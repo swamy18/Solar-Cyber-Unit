@@ -37,6 +37,8 @@ cargo test -p srct-zkml
 cargo test -p srct-workgraph
 # Unified verification policy (policy table, TEE/FHE/ZK verifier).
 cargo test -p srct-verify
+# L2 TEE evidence type (attestation, verification, contract path).
+cargo test -p srct-l2 --test tee_evidence
 # Cross-network intent lifecycle, quotes, routes and disputes.
 cargo test -p srct-intent
 cargo test -p srct-core --test committee_rotation

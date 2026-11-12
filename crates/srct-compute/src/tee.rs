@@ -331,6 +331,13 @@ impl SignedTeeQuote {
             .map_err(|e| TeeError::BadSignature(e.to_string()))
     }
 
+    /// Validate the body and verify the attestation signature, returning the
+    /// signer. Used by integrators (L2 evidence, escrow rails) that decode a
+    /// quote far from where it was created.
+    pub fn verify(&self) -> Result<Address, TeeError> {
+        self.verify_signature()
+    }
+
     fn verify_signature(&self) -> Result<Address, TeeError> {
         self.quote.validate()?;
         let signer = self

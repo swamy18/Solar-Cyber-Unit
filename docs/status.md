@@ -155,7 +155,7 @@ rules in code would have been the wrong order.
   (execution/correctness per task kind, security level and value) is pinned,
   and one fail-closed verifier checks TEE, FHE and ZKML evidence with all
   replay books, preserving inner errors. See [`docs/verify.md`](verify.md).
-- `cargo test --workspace` — **1,805 tests pass, 0 failures, 1 ignored** across the workspace.
+- `cargo test --workspace` — **1,814 tests pass, 0 failures, 1 ignored** across the workspace.
   (this file quote counts as of their own dates — 242, then 263, then 293 —
   kept as history):
   - 227 unit tests in `srct-core` (M1–M5 suites, the 21-test validator-set suite, the 30-test real-BLS suite in
@@ -1177,6 +1177,14 @@ validation tightening, not an economic change.
   (`BadAttestation`, regression-tested).
 - `crates/srct-core/src/l2.rs` — `DOM_L2_VWC` (`srct/l2/vwc/v1`), frozen like
   the other tags.
+- `crates/srct-l2/src/tee_evidence.rs` — `TeeBackedAttestation`, a TEE-backed
+  `Attestation` impl: `task_id` is the SLA workload, `result_hash` the quote
+  output, `worker` the SLA provider, with signature-checked fail-closed
+  decoding and SLA↔quote consistency enforced. Full verification runs
+  through `srct-verify` (roots, measurements, freshness, replay). The generic
+  `ServiceContract::submit` path accepts it with no consensus change;
+  activating it in `L2State` consensus state needs the formal
+  consensus-change process.
 
 **Reused, not reimplemented:** the M5 `ValidatorSet`/`BlsVerifier`/aggregate path
 (no new key ceremony, no custom crypto), the dispute engine (certificates are a

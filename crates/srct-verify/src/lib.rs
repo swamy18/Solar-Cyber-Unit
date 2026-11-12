@@ -14,5 +14,7 @@ pub use verify::{Evidence, EvidenceKind, UnifiedVerifier, VerifiedOutput, Verify
 
 // Evidence context types live in the proof crates; re-exported here so
 // integrators (escrow rails, intent books) depend on one facade.
-pub use srct_compute::tee::{AttestationRoots, SignedTeeQuote, TeeSla};
+pub use srct_compute::tee::{
+    AttestationRoots, SignedTeeQuote, TeeQuote, TeeSla, TeeType, TEE_VERSION,
+};
 pub use srct_zkml::task::{SignedZkReceipt, SignedZkTask};

@@ -10,7 +10,9 @@ repository.workspace = true
 
 [dependencies]
 srct-core.workspace = true
+srct-verify.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
 hex.workspace = true
+srct-compute.workspace = true

@@ -271,8 +271,10 @@ The ordered plan is:
    Real silicon backends still next.
 4. Deterministic training kernel + consensus round object.
 5. TEE execution attestation as an L2 evidence type — **done, non-consensus**
-   (`srct-compute::tee`: signed quotes, trusted roots, SLA verifier).
-   L2-evidence-type wiring is next.
+   (`srct-l2::tee_evidence`: `TeeBackedAttestation` implementing the generic
+   `Attestation` trait, verified through `srct-verify`, flowing through the
+   real `ServiceContract::submit` path). Consensus-state activation (`L2State`)
+   needs the formal consensus-change process and is explicitly next.
 6. FHE encrypted-compute adapter — **prototype done, non-consensus**
    (`srct-fhe`: exponential-ElGamal weighted sums, exact recomputation
    checks). TFHE-style non-linear ops and measured-cost expansion are next.

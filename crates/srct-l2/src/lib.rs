@@ -45,6 +45,7 @@ pub mod replay;
 pub mod reputation;
 pub mod state;
 pub mod task_contract;
+pub mod tee_evidence;
 pub mod vwc;
 
 pub use deposits::{
@@ -59,4 +60,5 @@ pub use task_contract::{
     ContractState, DisputeChallenge, ExpiryOutcome, L2Config, ServiceContract, SettlementOutcome,
     TaskContract,
 };
+pub use tee_evidence::{TeeBackedAttestation, TEE_EVIDENCE_VERSION};
 pub use vwc::{VerifiedWorkCertificate, VwcVerification, VWC_VERSION};
