@@ -136,7 +136,7 @@ pub trait TrainBackend {
     }
 }
 
-/// The CPU reference backend. This is the only implemented backend.
+/// The CPU reference backend: one-shot f32 kernels over the whole batch.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CpuBackend;
 
@@ -190,6 +190,104 @@ impl TrainBackend for CpuBackend {
             return Err(BackendError::NonFinite);
         }
         Ok(next)
+    }
+}
+
+/// A block-partitioned executor: the heterogeneity proof.
+///
+/// Real accelerators expose small fast memories and fixed transfer sizes;
+/// this backend models that constraint honestly on CPU hardware: it never
+/// holds more than `block` samples at once, chunking larger batches and
+/// combining per-block means. Blocked summation rounds differently than the
+/// one-shot CPU reference, so it is classified `Statistical` — close enough
+/// to interoperate (tolerance 1e-3), never bit-identical. Device class is
+/// `Other`: it proves the seam takes new execution strategies, not that this
+/// machine grew an NPU.
+///
+/// A zero block size fails closed in `check_backend` (`max_batch` must be
+/// positive), like a misconfigured device.
+#[derive(Clone, Copy, Debug)]
+pub struct BlockedBackend {
+    block: usize,
+}
+
+impl BlockedBackend {
+    pub fn new(block: usize) -> Self {
+        BlockedBackend { block }
+    }
+}
+
+impl TrainBackend for BlockedBackend {
+    fn name(&self) -> &'static str {
+        "blocked-executor-f32"
+    }
+
+    fn capabilities(&self) -> BackendCapabilities {
+        BackendCapabilities {
+            device: DeviceClass::Other,
+            determinism: DeterminismClass::Statistical,
+            dtype: "f32",
+            max_batch: self.block.min(u32::MAX as usize) as u32,
+            // Simulated scratchpad: 64 KiB of fast memory.
+            memory_bytes: 65_536,
+        }
+    }
+
+    fn forward(&self, model: &Mlp, x: &[f32; 2]) -> Result<f32, BackendError> {
+        let (_, p) = model.forward(x);
+        if p.is_finite() {
+            Ok(p)
+        } else {
+            Err(BackendError::NonFinite)
+        }
+    }
+
+    fn loss_and_grad(&self, model: &Mlp, samples: &[Sample]) -> Result<(f32, Mlp), BackendError> {
+        if samples.is_empty() {
+            return Err(BackendError::Malformed("empty sample batch".into()));
+        }
+        if self.block == 0 {
+            return Err(BackendError::Malformed("block size is zero".into()));
+        }
+        let mut loss_sum = 0.0f32;
+        let mut acc = Mlp::zeros();
+        for chunk in samples.chunks(self.block) {
+            let (loss, grad) = model.loss_and_grad(chunk);
+            if !loss.is_finite() || !grad.is_finite() {
+                return Err(BackendError::NonFinite);
+            }
+            let n = chunk.len() as f32;
+            loss_sum += loss * n;
+            for (dst, src) in acc
+                .w1
+                .iter_mut()
+                .zip(grad.w1.iter())
+                .chain(acc.b1.iter_mut().zip(grad.b1.iter()))
+                .chain(acc.w2.iter_mut().zip(grad.w2.iter()))
+                .chain(acc.b2.iter_mut().zip(grad.b2.iter()))
+            {
+                *dst += *src * n;
+            }
+        }
+        let inv = 1.0 / samples.len() as f32;
+        loss_sum *= inv;
+        for v in acc
+            .w1
+            .iter_mut()
+            .chain(acc.b1.iter_mut())
+            .chain(acc.w2.iter_mut())
+            .chain(acc.b2.iter_mut())
+        {
+            *v *= inv;
+        }
+        if !loss_sum.is_finite() || !acc.is_finite() {
+            return Err(BackendError::NonFinite);
+        }
+        Ok((loss_sum, acc))
+    }
+
+    fn sgd_step(&self, model: &Mlp, grad: &Mlp, lr: f32) -> Result<Mlp, BackendError> {
+        CpuBackend.sgd_step(model, grad, lr)
     }
 }
 

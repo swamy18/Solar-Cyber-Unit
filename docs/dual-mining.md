@@ -266,7 +266,9 @@ The ordered plan is:
 2. Heterogeneous `TrainBackend` seam + CPU reference conformance — **done**
    (H1, 7 conformance tests).
 3. GPU, Apple/NPU, TPU and photonic backends under the determinism policy —
-   next.
+   partially done: a second (`Statistical`, block-partitioned) backend passes
+   the same conformance suite, proving the seam takes heterogeneous execution.
+   Real silicon backends still next.
 4. Deterministic training kernel + consensus round object.
 5. TEE execution attestation as an L2 evidence type — **done, non-consensus**
    (`srct-compute::tee`: signed quotes, trusted roots, SLA verifier).

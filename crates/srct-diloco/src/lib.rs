@@ -54,13 +54,15 @@
 //! - Sybil resistance here is stake-capped accounting, not a complete identity
 //!   system. A production design must bind worker keys to bonded stake and to
 //!   the L2 authority/escrow layer.
-//! - **Hardware:** a `TrainBackend` seam now wraps the only implemented
-//!   compute path, the CPU `f32` reference. GPU, TPU, NPU, Apple-silicon and
-//!   photonic backends are not implemented. Adding one means implementing the
-//!   trait and passing `backend::check_backend`; the round, validation and
-//!   reward code does not change. `CpuBackend` is classified `Reproducible`,
-//!   so it is refused by the `BitExact` consensus gate; see
-//!   `docs/dual-mining.md` section 8.
+//! - **Hardware:** a `TrainBackend` seam wraps the compute path. Two backends
+//!   are implemented: the CPU `f32` reference (`Reproducible`) and a
+//!   block-partitioned executor (`Statistical`) that proves heterogeneous
+//!   execution strategies pass the same conformance suite. GPU, TPU, NPU,
+//!   Apple-silicon and photonic backends are not implemented. Adding one
+//!   means implementing the trait and passing `backend::check_backend`; the
+//!   round, validation and reward code does not change.
+//!   Neither implemented backend is `BitExact`, so both are refused by the
+//!   consensus gate; see `docs/dual-mining.md` section 8.
 
 pub mod backend;
 pub mod data;
@@ -70,7 +72,8 @@ pub mod update;
 
 pub use backend::{
     check_backend, local_update_with, require_determinism, BackendCapabilities, BackendError,
-    ConformanceReport, CpuBackend, DeterminismClass, DeviceClass, LocalUpdate, TrainBackend,
+    BlockedBackend, ConformanceReport, CpuBackend, DeterminismClass, DeviceClass, LocalUpdate,
+    TrainBackend,
 };
 pub use data::{accuracy, mean_loss, shards, two_moons, Sample};
 pub use model::{Mlp, MODEL_VERSION};

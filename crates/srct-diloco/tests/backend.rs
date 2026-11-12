@@ -7,7 +7,7 @@
 
 use srct_diloco::backend::{
     check_backend, local_update_with, require_determinism, BackendCapabilities, BackendError,
-    CpuBackend, DeterminismClass, DeviceClass, TrainBackend,
+    BlockedBackend, CpuBackend, DeterminismClass, DeviceClass, TrainBackend,
 };
 use srct_diloco::data::two_moons;
 use srct_diloco::model::Mlp;
@@ -173,4 +173,87 @@ fn local_update_through_the_backend_matches_direct_cpu_training() {
     assert!(update.loss_after <= update.loss_before);
     assert_eq!(update.samples, shard.len());
     assert_eq!(update.steps, 6);
+}
+
+#[test]
+fn the_blocked_executor_passes_conformance_as_statistical() {
+    let backend = BlockedBackend::new(3);
+    let caps = backend.capabilities();
+    assert_eq!(caps.device, DeviceClass::Other);
+    assert_eq!(caps.determinism, DeterminismClass::Statistical);
+    assert_eq!(caps.dtype, "f32");
+    assert_eq!(caps.max_batch, 3);
+    let report = check_backend(&backend).unwrap();
+    assert_eq!(report.determinism, DeterminismClass::Statistical);
+    assert!(report.max_forward_delta <= 1e-3);
+    assert!(report.max_loss_delta <= 1e-3);
+    assert!(report.max_gradient_delta <= 1e-3);
+    assert!(report.max_step_delta <= 1e-3);
+    // A different execution strategy hashes differently: consensus pins the
+    // hash, never the device name.
+    assert_ne!(report.kernel_hash, CpuBackend.kernel_hash());
+    assert_eq!(report.kernel_hash, backend.kernel_hash());
+    // Statistical can interoperate but never finalize consensus.
+    assert!(require_determinism(&caps, DeterminismClass::Statistical).is_ok());
+    assert!(require_determinism(&caps, DeterminismClass::BitExact).is_err());
+}
+
+#[test]
+fn blocked_chunking_matches_the_reference_within_rounding() {
+    let model = Mlp::new(21);
+    let samples = two_moons(8, 21);
+    let (reference_loss, reference_grad) = CpuBackend.loss_and_grad(&model, &samples).unwrap();
+    for block in [1, 2, 3, 5, 8, 64] {
+        let backend = BlockedBackend::new(block);
+        let (loss, grad) = backend.loss_and_grad(&model, &samples).unwrap();
+        assert!(
+            (loss - reference_loss).abs() < 1e-5,
+            "block {block}: loss delta too large"
+        );
+        let worst = grad
+            .w1
+            .iter()
+            .chain(grad.b1.iter())
+            .chain(grad.w2.iter())
+            .chain(grad.b2.iter())
+            .zip(
+                reference_grad
+                    .w1
+                    .iter()
+                    .chain(reference_grad.b1.iter())
+                    .chain(reference_grad.w2.iter())
+                    .chain(reference_grad.b2.iter()),
+            )
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(worst < 1e-5, "block {block}: gradient delta too large");
+    }
+}
+
+#[test]
+fn blocked_training_reduces_loss_like_the_reference() {
+    let global = Mlp::new(7);
+    let shard = two_moons(16, 7);
+    let update = local_update_with(&BlockedBackend::new(5), &global, &shard, 6, 0.05).unwrap();
+    assert!(update.loss_after <= update.loss_before);
+    assert_eq!(update.samples, shard.len());
+    let reference = local_update_with(&CpuBackend, &global, &shard, 6, 0.05).unwrap();
+    assert!((update.loss_after - reference.loss_after).abs() < 1e-3);
+}
+
+#[test]
+fn a_zero_block_and_empty_batches_fail_closed() {
+    assert!(matches!(
+        check_backend(&BlockedBackend::new(0)),
+        Err(BackendError::Malformed(_))
+    ));
+    let model = Mlp::new(3);
+    assert!(matches!(
+        BlockedBackend::new(4).loss_and_grad(&model, &[]),
+        Err(BackendError::Malformed(_))
+    ));
+    assert!(matches!(
+        CpuBackend.loss_and_grad(&model, &[]),
+        Err(BackendError::Malformed(_))
+    ));
 }
