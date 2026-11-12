@@ -315,3 +315,72 @@ fn wire_roundtrip() {
     let back = SignedFheReceipt::decode(&receipt.encode()).unwrap();
     assert_eq!(back.receipt, receipt.receipt);
 }
+
+/// Release-mode timing probe (ignored in normal runs). Prints keygen,
+/// encrypt, homomorphic eval and decrypt latency for the weighted-sum
+/// workload; numbers go to `docs/benchmarks.md`.
+#[test]
+#[ignore]
+fn bench_fhe_ops() {
+    use std::time::Instant;
+    let mut r = StdRng::seed_from_u64(7);
+    let t0 = Instant::now();
+    let keys = FheKeys::generate(&mut r);
+    let keygen_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    let op = WeightedSum {
+        weights: vec![3, -2, 5, 1],
+        bias: 7,
+    };
+    let t0 = Instant::now();
+    let inputs: Vec<Ciphertext> = [10u32, 4, 6, 9]
+        .iter()
+        .map(|m| keys.encrypt(*m, &mut r))
+        .collect();
+    let enc_ms = t0.elapsed().as_secs_f64() * 1000.0 / 4.0;
+    let t0 = Instant::now();
+    let out = eval(&op, &inputs).unwrap();
+    let eval_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    let t0 = Instant::now();
+    let plain = keys.decrypt(&out, 1 << 20);
+    let dec_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    assert_eq!(plain, Some(68));
+    println!("fhe keygen: {keygen_ms:.3} ms; encrypt: {enc_ms:.3} ms/ct; eval(4): {eval_ms:.3} ms; decrypt: {dec_ms:.3} ms");
+}
+
+#[test]
+fn wire_mutations_never_panic() {
+    use rand::{rngs::StdRng, Rng, SeedableRng};
+    let requester = wallet(1);
+    let provider = wallet(2);
+    let keys = keys();
+    let signed = task(&keys, &requester, &provider);
+    let receipt = receipt_for(&signed, &provider, HEIGHT, 1);
+    let corpora = vec![
+        signed.task.encode(),
+        signed.encode(),
+        receipt.receipt.encode(),
+        receipt.encode(),
+    ];
+    let mut rng = StdRng::seed_from_u64(0xbeef);
+    for base in &corpora {
+        for _ in 0..150 {
+            let mut b = base.clone();
+            match rng.gen_range(0..3) {
+                0 => b.truncate(rng.gen_range(0..=b.len())),
+                1 => {
+                    for _ in 0..rng.gen_range(1..=4) {
+                        if !b.is_empty() {
+                            let i = rng.gen_range(0..b.len());
+                            b[i] ^= 1 << rng.gen_range(0..8);
+                        }
+                    }
+                }
+                _ => b.extend((0..rng.gen_range(1..=8)).map(|_| rng.gen::<u8>())),
+            }
+            // Must return Ok or Err — never panic.
+            let _ = FheTask::decode(&b);
+            let _ = SignedFheTask::decode(&b);
+            let _ = FheReceipt::decode(&b);
+        }
+    }
+}

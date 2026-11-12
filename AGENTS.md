@@ -41,6 +41,8 @@ cargo test -p srct-verify
 cargo test -p srct-l2 --test tee_evidence
 # JS SDK (mock-transport REST client tests).
 npm --prefix sdk-js test
+# Proof-system benchmarks (release mode, ignored by default).
+cargo test --release -p srct-compute --test tee bench_ -- --ignored --nocapture
 # Cross-network intent lifecycle, quotes, routes and disputes.
 cargo test -p srct-intent
 cargo test -p srct-core --test committee_rotation

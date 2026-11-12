@@ -10,3 +10,6 @@ repository.workspace = true
 
 [dependencies]
 srct-core.workspace = true
+
+[dev-dependencies]
+rand.workspace = true

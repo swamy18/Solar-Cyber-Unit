@@ -407,6 +407,59 @@ fn a_second_quote_from_the_same_solver_is_refused() {
     assert_eq!(book.state(&id), Some(&IntentState::Open));
 }
 
+#[test]
+fn wire_mutations_never_panic() {
+    use rand::{rngs::StdRng, Rng, SeedableRng};
+    let creator = wallet(200);
+    let arbiter = wallet(201);
+    let solver = wallet(202);
+    let intent = intent(&creator, &arbiter, 1_000, vec![USDC, SRCT]);
+    let signed_intent = SignedIntent::sign(intent.clone(), &creator).unwrap();
+    let signed_quote = SignedQuote::sign(quote(&intent, &solver, 700, None), &solver).unwrap();
+    let delivery = SignedDelivery::sign(
+        Delivery {
+            version: DELIVERY_VERSION,
+            intent: intent.hash(),
+            quote: signed_quote.quote.hash(),
+            solver: solver.address().unwrap(),
+            result: [9u8; 32],
+            height: 20,
+            nonce: 1,
+        },
+        &solver,
+    )
+    .unwrap();
+    let corpora = vec![
+        signed_intent.encode(),
+        signed_quote.encode(),
+        delivery.encode(),
+        intent.encode(),
+    ];
+    let mut rng = StdRng::seed_from_u64(0xbeef);
+    for base in &corpora {
+        for _ in 0..150 {
+            let mut b = base.clone();
+            match rng.gen_range(0..3) {
+                0 => b.truncate(rng.gen_range(0..=b.len())),
+                1 => {
+                    for _ in 0..rng.gen_range(1..=4) {
+                        if !b.is_empty() {
+                            let i = rng.gen_range(0..b.len());
+                            b[i] ^= 1 << rng.gen_range(0..8);
+                        }
+                    }
+                }
+                _ => b.extend((0..rng.gen_range(1..=8)).map(|_| rng.gen::<u8>())),
+            }
+            // Must return Ok or Err — never panic.
+            let _ = SignedIntent::decode(&b);
+            let _ = SignedQuote::decode(&b);
+            let _ = SignedDelivery::decode(&b);
+            let _ = Intent::decode(&b);
+        }
+    }
+}
+
 // --- Execution-evidence enforcement (Verification::Tee/Zk) ---
 
 use rand::{rngs::StdRng, SeedableRng};

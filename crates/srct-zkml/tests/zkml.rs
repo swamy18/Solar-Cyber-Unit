@@ -349,3 +349,67 @@ fn wire_roundtrips() {
         SignedZkReceipt::decode(&receipt.encode(), package.input_commitments.len()).unwrap();
     assert_eq!(re_signed.receipt, receipt.receipt);
 }
+
+/// Release-mode timing probe (ignored in normal runs). Prints prove and
+/// verify latency for the 4-input linear statement; numbers go to
+/// `docs/benchmarks.md`.
+#[test]
+#[ignore]
+fn bench_zk_prove_verify() {
+    use std::time::Instant;
+    let (weights, bias, inputs) = dims();
+    let t0 = Instant::now();
+    let package = prove_linear(&weights, bias, &inputs, &mut rng()).unwrap();
+    let prove_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    let t0 = Instant::now();
+    verify_linear(&weights, bias, &package).unwrap();
+    let verify_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    println!("zk prove: {prove_ms:.1} ms; verify: {verify_ms:.1} ms");
+}
+
+#[test]
+fn wire_mutations_never_panic() {
+    use rand::{rngs::StdRng, Rng, SeedableRng};
+    let requester = wallet(1);
+    let provider = wallet(2);
+    let (weights, bias, inputs) = dims();
+    let package = prove_linear(&weights, bias, &inputs, &mut StdRng::seed_from_u64(99)).unwrap();
+    let signed = task_for(
+        &requester,
+        &provider,
+        &weights,
+        bias,
+        &package.input_commitments,
+        1,
+    );
+    let receipt = receipt_for(&signed, &provider, &package, HEIGHT, 1);
+    let corpora = vec![
+        signed.task.encode(),
+        signed.encode(),
+        receipt.receipt.encode(),
+        receipt.encode(),
+    ];
+    let mut rng = StdRng::seed_from_u64(0xbeef);
+    for base in &corpora {
+        for _ in 0..150 {
+            let mut b = base.clone();
+            match rng.gen_range(0..3) {
+                0 => b.truncate(rng.gen_range(0..=b.len())),
+                1 => {
+                    for _ in 0..rng.gen_range(1..=4) {
+                        if !b.is_empty() {
+                            let i = rng.gen_range(0..b.len());
+                            b[i] ^= 1 << rng.gen_range(0..8);
+                        }
+                    }
+                }
+                _ => b.extend((0..rng.gen_range(1..=8)).map(|_| rng.gen::<u8>())),
+            }
+            // Must return Ok or Err — never panic.
+            let _ = ZkTask::decode(&b);
+            let _ = SignedZkTask::decode(&b);
+            let _ = ZkReceipt::decode(&b);
+            let _ = SignedZkReceipt::decode(&b, package.input_commitments.len());
+        }
+    }
+}

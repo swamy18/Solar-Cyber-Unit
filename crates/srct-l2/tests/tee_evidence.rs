@@ -211,6 +211,31 @@ fn tee_attestation_flows_through_the_generic_submit_path() {
 }
 
 #[test]
+fn wire_mutations_never_panic() {
+    use rand::{rngs::StdRng, Rng, SeedableRng};
+    let (att, _, _) = attestation();
+    let encoded = att.encode();
+    let mut rng = StdRng::seed_from_u64(0xbeef);
+    for _ in 0..300 {
+        let mut b = encoded.clone();
+        match rng.gen_range(0..3) {
+            0 => b.truncate(rng.gen_range(0..=b.len())),
+            1 => {
+                for _ in 0..rng.gen_range(1..=4) {
+                    if !b.is_empty() {
+                        let i = rng.gen_range(0..b.len());
+                        b[i] ^= 1 << rng.gen_range(0..8);
+                    }
+                }
+            }
+            _ => b.extend((0..rng.gen_range(1..=8)).map(|_| rng.gen::<u8>())),
+        }
+        // Must return Ok or Err — never panic.
+        let _ = TeeBackedAttestation::decode(&mut srct_core::ser::Reader::new(&b));
+    }
+}
+
+#[test]
 fn quote_signed_by_unknown_key_is_not_a_worker_claim() {
     // The attestation carries a bundle, so it is "signed" structurally, but
     // full verification against the rail's roots refuses the stranger.

@@ -167,7 +167,7 @@ rules in code would have been the wrong order.
   transport errors, custom fetch injection); `tsc --strict --checkJs` passes
   on the JSDoc-typed source. Not a signer; live-node e2e is future. See
   [`docs/sdk-js.md`](sdk-js.md).
-- `cargo test --workspace` — **1,824 tests pass, 0 failures, 1 ignored** across the workspace; `npm test` in `sdk-js/` passes 7 suites.
+- `cargo test --workspace` — **1,831 tests pass, 0 failures, 1 ignored** across the workspace; `npm test` in `sdk-js/` passes 7 suites. Proof-system latencies are measured in [`docs/benchmarks.md`](benchmarks.md).
   (this file quote counts as of their own dates — 242, then 263, then 293 —
   kept as history):
   - 227 unit tests in `srct-core` (M1–M5 suites, the 21-test validator-set suite, the 30-test real-BLS suite in

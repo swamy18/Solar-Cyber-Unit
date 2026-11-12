@@ -394,3 +394,40 @@ fn malformed_artifacts_are_refused() {
     let signed = SignedArtifact::sign(net, &a).unwrap();
     assert_eq!(graph.register(&signed), Err(WorkError::WrongNetwork));
 }
+
+#[test]
+fn wire_mutations_never_panic() {
+    use rand::{rngs::StdRng, Rng, SeedableRng};
+    let a = wallet(1);
+    let base = artifact(
+        &a,
+        ArtifactKind::ZkProvenResult,
+        vec![],
+        license(true, 100),
+        10,
+        1,
+    );
+    let signed = SignedArtifact::sign(base.artifact.clone(), &a).unwrap();
+    let corpora = vec![signed.artifact.encode(), signed.encode()];
+    let mut rng = StdRng::seed_from_u64(0xbeef);
+    for based in &corpora {
+        for _ in 0..150 {
+            let mut b = based.clone();
+            match rng.gen_range(0..3) {
+                0 => b.truncate(rng.gen_range(0..=b.len())),
+                1 => {
+                    for _ in 0..rng.gen_range(1..=4) {
+                        if !b.is_empty() {
+                            let i = rng.gen_range(0..b.len());
+                            b[i] ^= 1 << rng.gen_range(0..8);
+                        }
+                    }
+                }
+                _ => b.extend((0..rng.gen_range(1..=8)).map(|_| rng.gen::<u8>())),
+            }
+            // Must return Ok or Err — never panic.
+            let _ = Artifact::decode(&b);
+            let _ = SignedArtifact::decode(&b);
+        }
+    }
+}

@@ -16,3 +16,4 @@ srct-verify.workspace = true
 serde_json.workspace = true
 hex.workspace = true
 srct-compute.workspace = true
+rand.workspace = true

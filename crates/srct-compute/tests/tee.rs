@@ -281,3 +281,25 @@ fn wire_roundtrip_and_malformed_refusals() {
         Err(TeeError::Malformed(_))
     ));
 }
+
+/// Release-mode timing probe (ignored in normal runs). Prints mean sign and
+/// verify latency; numbers go to `docs/benchmarks.md`.
+#[test]
+#[ignore]
+fn bench_tee_quote_verify() {
+    use std::time::Instant;
+    let (_provider, attester, _stranger, sla, roots) = setup();
+    let (_, _, _, _, _, output) = hashes();
+    let t0 = Instant::now();
+    let n = 200u32;
+    for i in 0..n {
+        let signed =
+            SignedTeeQuote::sign(quote_for(&sla, HEIGHT, (i + 1) as u64, output), &attester)
+                .unwrap();
+        TeeVerifier::new()
+            .verify(&sla, &signed, &roots, HEIGHT)
+            .unwrap();
+    }
+    let ms = t0.elapsed().as_secs_f64() * 1000.0 / f64::from(n);
+    println!("tee sign+verify: {ms:.3} ms/op over {n} ops");
+}

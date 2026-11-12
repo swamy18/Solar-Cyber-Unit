@@ -204,6 +204,43 @@ fn gossip_merge_is_order_independent_and_prunes() {
 }
 
 #[test]
+fn wire_mutations_never_panic() {
+    use rand::{rngs::StdRng, Rng, SeedableRng};
+    let (offer, assignment, receipt, _) = flow();
+    let mut journal = FlowJournal::new(NET);
+    journal.append_offer(&offer).unwrap();
+    let corpora: Vec<Vec<u8>> = vec![
+        offer.encode(),
+        assignment.encode(),
+        receipt.encode(),
+        journal.encode(),
+    ];
+    let mut rng = StdRng::seed_from_u64(0xbeef);
+    for base in &corpora {
+        for _ in 0..200 {
+            let mut b = base.clone();
+            match rng.gen_range(0..3) {
+                0 => b.truncate(rng.gen_range(0..=b.len())),
+                1 => {
+                    for _ in 0..rng.gen_range(1..=4) {
+                        if !b.is_empty() {
+                            let i = rng.gen_range(0..b.len());
+                            b[i] ^= 1 << rng.gen_range(0..8);
+                        }
+                    }
+                }
+                _ => b.extend((0..rng.gen_range(1..=8)).map(|_| rng.gen::<u8>())),
+            }
+            // Must return Ok or Err — never panic.
+            let _ = SignedOffer::decode(&b);
+            let _ = SignedAssignment::decode(&b);
+            let _ = SignedReceipt::decode(&b);
+            let _ = FlowJournal::decode(&b);
+        }
+    }
+}
+
+#[test]
 fn gossip_refuses_foreign_networks_and_overflow() {
     let provider = wallet(1);
     let mut set = GossipSet::new(NET);

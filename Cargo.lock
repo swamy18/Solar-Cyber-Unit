@@ -1162,6 +1162,7 @@ dependencies = [
 name = "srct-compute"
 version = "0.1.0"
 dependencies = [
+ "rand",
  "srct-core",
 ]
 
@@ -1212,6 +1213,7 @@ name = "srct-l2"
 version = "0.1.0"
 dependencies = [
  "hex",
+ "rand",
  "serde_json",
  "srct-compute",
  "srct-core",
@@ -1317,6 +1319,7 @@ dependencies = [
 name = "srct-workgraph"
 version = "0.1.0"
 dependencies = [
+ "rand",
  "srct-core",
 ]
 
