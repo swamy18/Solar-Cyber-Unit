@@ -1,7 +1,8 @@
 # Agent messaging
 
 Status: **working non-consensus prototype** in `crates/srct-agentnet`. It
-implements pairwise, end-to-end encrypted, signed agent messages and a bounded
+implements pairwise, end-to-end encrypted, signed agent messages, a double
+ratchet with forward secrecy and post-compromise security, and a bounded
 replay-safe mailbox. It changes no consensus rule and moves no coin.
 
 ```bash
@@ -109,7 +110,48 @@ transport. A message that arrives after a higher sequence was accepted is
 refused rather than buffered — the conservative choice, since buffering would
 need unbounded gap state.
 
-## 5. Hidden and visible
+## 5. Double ratchet
+
+`RatchetSession` wraps the same envelope format in a standard double ratchet,
+specialised for this crate's ordered transport:
+
+- The **initiator** generates a fresh DH ratchet key; the root key is
+  `KDF_RK(salt, ECDH(that key, the recipient's static key))`, where the salt
+  binds the session to the network, thread and pair of agents. The first
+  envelope header carries the ratchet key in the `ephemeral_pubkey` field.
+- The **responder** performs the same ECDH with its static key on the first
+  received message and immediately rotates its own ratchet key, so its first
+  reply already mixes a second DH into the root key. It also rotates on every
+  later direction change, even if it never sends.
+- Every message advances only its sending chain (`KDF_CK`); the old chain key
+  is overwritten and the message key is never stored. A compromised chain key
+  therefore cannot recover messages sent after it (forward secrecy).
+- Every direction change feeds a fresh ECDH into the root key (`KDF_RK`), so
+  an attacker who learns one endpoint's *current* state loses access to
+  future traffic after the next reply and cannot read past traffic
+  (post-compromise security).
+- Message keys are derived as `HKDF(ck, seq)`, where `seq` is the same global
+  per-sender sequence the mailbox enforces. A gap (`seq != expected`) is
+  refused rather than buffered, matching the mailbox's conservative rule, and
+  a refusal never advances the chains: the honest message that follows still
+  decrypts.
+
+Consequences:
+
+- a ratchet message **cannot** be opened with `MessageEnvelope::open` — the
+  static path derives a different key. Only the session can decrypt.
+- the envelope wire format, the sender's hybrid signature and the mailbox are
+  unchanged: a relay stores ratchet messages exactly like any other envelope.
+- the responder binds the expected peer at construction, so a third party
+  cannot hijack a session by delivering its own handshake first.
+- one session covers one `(network, thread)` pair. Multiple threads between
+  the same pair need separate sessions with separate thread nonces.
+- like Signal without one-time prekeys, the root key is a function of the
+  recipient's static key, so compromise of that key recovers the *initial*
+  chain; forward secrecy starts at the first DH ratchet step (the
+  responder's first reply) and post-compromise security from then on.
+
+## 6. Hidden and visible
 
 Hidden: plaintext, plaintext length (only ciphertext length is visible), and the
 per-message key.
@@ -117,21 +159,20 @@ per-message key.
 Visible by design: sender and recipient agents, addresses and roles, thread id,
 sequence, expiry and ciphertext size.
 
-## 6. Not provided yet
+## 7. Not provided yet
 
 - **Sealed sender** — the sender is in the envelope, so a relay sees the
   conversation graph.
-- **Forward secrecy / post-compromise security** — the recipient's static key
-  plus a captured ephemeral key decrypts that message. A double ratchet is not
-  implemented.
 - **Groups** — a thread is pairwise. Groups need a sender-key or MLS layer.
 - **Transport and push** — envelopes and mailboxes are bytes; moving them is the
   operator's P2P/HTTP/MCP rail. Multi-device fan-out and presence are absent.
+- **Out-of-order delivery** — the ratchet and the mailbox both assume an
+  ordered per-sender transport and refuse gaps instead of buffering them.
 - **Padding policy** — length hiding is the caller's job.
 
-## 7. Verified behavior
+## 8. Verified behavior
 
-`cargo test -p srct-agentnet` passes 14 acceptance tests:
+`cargo test -p srct-agentnet` passes 29 tests (2 unit, 27 acceptance):
 
 - hybrid-wallet seal/open round trip (including the address/ECDH binding);
 - only the named recipient can open;
@@ -146,13 +187,28 @@ sequence, expiry and ciphertext size.
 - expiry enforced and pruned;
 - total/per-thread caps fail closed, expired mail does not count;
 - draining keeps replay guards;
-- duplicate wire delivery refused.
+- duplicate wire delivery refused;
+- a ratchet conversation round-trips in both directions and sequences agree;
+- the responder cannot send before receiving;
+- a stale snapshot of session state cannot accept a later message, and an old
+  chain key cannot derive a later message key (unit-pinned);
+- every direction change rotates the DH ratchet key, including the
+  responder's key rotation when it has not replied;
+- a sequence gap is refused without advancing the chain, and the thread
+  recovers on the honest message;
+- replayed ratchet messages are refused;
+- tampered ciphertext fails before any key is touched and the chain is intact;
+- a third party cannot hijack a responder session;
+- envelopes from another thread are refused;
+- the static key path cannot open a ratchet message;
+- ratchet envelopes flow through the wire codec, a relay mailbox and the
+  session end to end;
+- a session refuses a wallet other than its owner's.
 
-## 8. Next milestones
+## 9. Next milestones
 
-1. Double ratchet for forward secrecy and post-compromise security.
-2. Sealed-sender routing (sender hidden from relays).
-3. Group threads (sender keys or MLS).
-4. Persistent mailbox storage with the same caps and guards.
-5. HTTP/MCP transport plus delivery acknowledgements and multi-device fan-out.
-6. Optional payload padding to a small set of sizes.
+1. Sealed-sender routing (sender hidden from relays).
+2. Group threads (sender keys or MLS).
+3. Persistent mailbox storage with the same caps and guards.
+4. HTTP/MCP transport plus delivery acknowledgements and multi-device fan-out.
+5. Optional payload padding to a small set of sizes.

@@ -66,18 +66,26 @@ rules in code would have been the wrong order.
   required `TrainBackend` seam, determinism policy and conformance gates are
   specified in [`docs/dual-mining.md`](dual-mining.md) §8.
 - **End-to-end agent messaging (non-consensus, `srct-agentnet`).** `cargo test
-  -p srct-agentnet` passes 14 acceptance tests: hybrid-wallet seal/open,
-  recipient-key/address binding at seal time, wrong-recipient refusal,
-  tampered ciphertext/thread/sequence/expiry/recipient refusal, sender spoof
-  refusal, strict wire decoding, zero-sequence and oversized-plaintext
-  refusal, mailbox storage without private keys, exact/re-signed/stale replay
-  refusal, wrong-network/wrong-recipient refusal, expiry pruning, total and
-  per-thread caps, drained-message replay refusal and duplicate wire delivery.
-  The mailbox is bounded and verifies without decrypting; content is hidden but
-  sender/recipient/thread/sequence metadata is visible, and no ratchet, sealed
-  sender or group messaging exists yet. See [`docs/agentnet.md`](agentnet.md).
+  -p srct-agentnet` passes 29 tests (2 unit, 27 acceptance): hybrid-wallet
+  seal/open, recipient-key/address binding at seal time, wrong-recipient
+  refusal, tampered ciphertext/thread/sequence/expiry/recipient refusal,
+  sender spoof refusal, strict wire decoding, zero-sequence and
+  oversized-plaintext refusal, mailbox storage without private keys,
+  exact/re-signed/stale replay refusal, wrong-network/wrong-recipient refusal,
+  expiry pruning, total and per-thread caps, drained-message replay refusal
+  and duplicate wire delivery — plus a double ratchet: both-direction
+  round-trips, responder-cannot-send-before-receiving, stale-session and
+  old-chain-key forward-secrecy refusals, DH ratchet-key rotation on every
+  direction change, sequence-gap refusal with recovery, replay refusal,
+  tampered-ciphertext refusal that does not advance the chain, third-party
+  session-hijack refusal, wrong-thread refusal, static-path inability to open
+  ratchet messages, wire→mailbox→session end to end, and wrong-wallet refusal.
+  The mailbox is bounded and verifies without decrypting; content is hidden
+  and conversation state is forward-secret, but sender/recipient/thread
+  metadata is visible, and no ratchet for groups, sealed sender or persistent
+  mailbox exists yet. See [`docs/agentnet.md`](agentnet.md).
 - **Decentralized compute sharing (non-consensus, `srct-compute`).** `cargo
-  test -p srct-compute` passes 15 tests (5 unit, 10 acceptance): profile and
+  test -p srct-compute` passes 31 tests (5 unit, 26 acceptance): profile and
   requirement binding, offer/job wire round-trips and tamper refusal, a
   30-unit job split deterministically across a GPU, a 2 GB phone and a laptop
   (20 + 4 + 4 + 2 units, 244 sat), a small phone taking several shards up to
@@ -85,11 +93,21 @@ rules in code would have been the wrong order.
   kernel, class, service, price, privacy, verification, window), capacity and
   budget caps, requester-only assignment signing, exact once-only settlement,
   overclaim/price-mismatch/binding/impostor refusal, deadline and expiry
-  handling and attempt bounds. Payouts are instructions only; no coin moves.
-  Device capabilities are self-declared, only the receipt verification level is
-  enforced, and bonding/reputation/TEE challenge remain future work. See
+  handling and attempt bounds — plus bonds and reputation: unbonded and
+  under-bonded offers refused, forged/tampered/replayed registrations refused
+  and top-ups accepted, a fraud dispute halving the bond and banning the
+  provider even after re-bonding, requester-only slashing with
+  exact-assignment binding, duplicate-dispute refusal, `NoShow` disputes
+  requiring the deadline, ten timeouts banning with settled units recovering,
+  timeouts cleared by re-bonding but not fraud slashes, lockup-enforced
+  withdrawals with replay and over-draw refusal, bond/withdrawal/dispute wire
+  round-trips, and settlement credit bound to the receipt's assignment.
+  Payouts and slashes are instructions only; no coin moves. Device
+  capabilities are self-declared, only the receipt verification level is
+  enforced, a slash is only as real as the escrow rail that executes it, and
+  TEE challenge verification remains future work. See
   [`docs/compute-sharing.md`](compute-sharing.md).
-- `cargo test --workspace` — **1,707 tests pass, 0 failures, 1 ignored** across the workspace.
+- `cargo test --workspace` — **1,738 tests pass, 0 failures, 1 ignored** across the workspace.
   (this file quote counts as of their own dates — 242, then 263, then 293 —
   kept as history):
   - 227 unit tests in `srct-core` (M1–M5 suites, the 21-test validator-set suite, the 30-test real-BLS suite in

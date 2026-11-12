@@ -6,6 +6,9 @@
 //! - [`message`]: network/role-bound agent identities, per-message ephemeral
 //!   ECDH, HKDF-SHA256 key derivation, XChaCha20-Poly1305 encryption, and a
 //!   hybrid signature over the whole envelope.
+//! - [`ratchet`]: double-ratchet sessions over the same envelope format,
+//!   giving forward secrecy and post-compromise security for ordered
+//!   conversation threads.
 //! - [`mailbox`]: bounded, replay-safe storage that verifies envelopes without
 //!   being able to decrypt them, so an untrusted relay can host it.
 //!
@@ -27,9 +30,6 @@
 //!
 //! - **sealed sender**: the sender identity is in the envelope, so a relay
 //!   learns the conversation graph;
-//! - **forward secrecy across messages / post-compromise security**: the
-//!   recipient's static key plus a captured ephemeral key decrypts that
-//!   message. A double ratchet is a later milestone;
 //! - **group messaging**: a thread is a pairwise conversation. Groups need a
 //!   sender-key or MLS layer;
 //! - **transport**: envelopes and mailboxes are byte formats. Moving them is
@@ -45,6 +45,7 @@
 
 pub mod mailbox;
 pub mod message;
+pub mod ratchet;
 
 pub use mailbox::{
     Mailbox, MailboxEntry, MailboxError, DEFAULT_MAX_MESSAGES, DEFAULT_MAX_PER_THREAD,
@@ -54,3 +55,4 @@ pub use message::{
     thread_id, MessageEnvelope, MessageError, Recipient, MAX_CIPHERTEXT, MAX_NETWORK_LEN,
     MAX_PLAINTEXT, MESSAGE_VERSION,
 };
+pub use ratchet::{RatchetSession, SessionSide};

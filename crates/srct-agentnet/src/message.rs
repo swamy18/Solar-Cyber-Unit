@@ -60,6 +60,12 @@ pub enum MessageError {
     Crypto(String),
     TooLarge,
     InvalidSequence,
+    /// The envelope's thread does not match the session's thread.
+    WrongThread,
+    /// The envelope's sender is not the peer this session is bound to.
+    WrongPeer,
+    /// The session cannot send or receive in its current state.
+    RatchetState(String),
 }
 
 impl std::fmt::Display for MessageError {
@@ -74,6 +80,9 @@ impl std::fmt::Display for MessageError {
             MessageError::Crypto(detail) => write!(f, "decryption failed: {detail}"),
             MessageError::TooLarge => write!(f, "message exceeds its size cap"),
             MessageError::InvalidSequence => write!(f, "sequence number must be positive"),
+            MessageError::WrongThread => write!(f, "message belongs to another thread"),
+            MessageError::WrongPeer => write!(f, "message is not from this session's peer"),
+            MessageError::RatchetState(detail) => write!(f, "ratchet state: {detail}"),
         }
     }
 }
@@ -587,7 +596,7 @@ fn derive_key(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn aad_bytes(
+pub(crate) fn aad_bytes(
     version: u8,
     network: &str,
     thread: &Hash,

@@ -1,9 +1,9 @@
 # Decentralized compute sharing
 
 Status: **working non-consensus prototype** in `crates/srct-compute`. It lets
-heterogeneous devices advertise compute, lets a requester shard work across
-them, and settles exactly the units each provider finished. It moves no coin and
-does not change consensus.
+heterogeneous devices advertise compute behind a signed bond, lets a requester
+shard work across them, and settles exactly the units each provider finished.
+It moves no coin and does not change consensus.
 
 ```bash
 cargo test -p srct-compute
@@ -142,7 +142,47 @@ assignments can never settle, so a late receipt cannot resurrect work that was
 already rescheduled. `attempt` is capped at `MAX_ATTEMPTS` (3), so a job cannot
 be retried forever against the same budget.
 
-## 6. What is not enforced
+## 6. Bonds and reputation
+
+Sybil resistance starts here: identity is still an ordinary SRCT address, but a
+capacity claim now costs stake and bad behaviour costs more.
+
+```
+ProviderBond    = version || network || provider || amount_sat || registered_height || nonce
+BondWithdrawal  = version || network || provider || amount_sat || nonce
+BondDispute     = version || network || requester || provider || assignment ||
+                  reason || evidence || nonce
+```
+
+- **Registration** (`BondBook::register`): the provider signs a bond. It is an
+  instruction for the escrow or payment layer; the book only records it. A
+  re-registration tops the bond up and clears accumulated timeouts — fresh
+  stake is skin in the game. The same signed bond cannot be registered twice.
+- **Lockup**: a bond cannot be withdrawn until `LOCKUP_HEIGHTS` (144) heights
+  after registration. A refused withdrawal is not consumed; the same signed
+  request may be retried after lockup. An applied one cannot be replayed.
+- **Disputes** (`BondBook::slash`): the assignment's requester signs a dispute
+  bound to one assignment. `NoShow` requires the deadline to have passed and
+  takes 10% of the bond; `Overclaim` and `Impostor` (fraud) take 50% at any
+  height. The same dispute cannot slash twice, the dispute must name the exact
+  assignment it slashes, and slashing an unbonded provider is refused.
+- **Reputation**: `score = settled_units - 10 * timeouts - 100 * slashes`,
+  saturating. `record_settlement` counts a verified receipt's units;
+  `record_timeout` counts an assignment that passed its deadline unclaimed.
+- **Admission** (`BondBook::admit_offer`): an offer is schedulable only if it
+  verifies, belongs to the book's network, stands behind a bond of at least
+  `MIN_BOND_SAT` (10,000 sat) registered before the current height, and its
+  provider's score is above `BAN_SCORE` (−100). A fraud slash therefore bans a
+  provider permanently — re-bonding restores the stake, not the score — and a
+  provider that times out ten assignments without settling any units is also
+  out until it settles work or re-bonds.
+
+Honest limits: the book verifies *who* signed a dispute, not the evidence
+behind it (arbitration belongs to the escrow layer); slashes and bonds are
+instructions, not coin movement; and a provider that can afford many bonds can
+still present many identities.
+
+## 7. What is not enforced
 
 - **Correctness.** A receipt proves who claims units, not that the output is
   correct. Only `Verification::Receipt` is implemented. `Challenge` and
@@ -150,17 +190,18 @@ be retried forever against the same budget.
   milestones, and are self-declared today.
 - **Hardware truth.** RAM, cores, bandwidth, kernel hash and device class are
   self-declared. They bound assignment, not reality.
-- **Sybil resistance.** Identity is an ordinary SRCT address; a provider can
-  create many. Bonding and reputation are prerequisites for production.
+- **Sybil resistance at the stake layer.** Bonds and reputation gate admission,
+  but a slash is only as real as the escrow or payment rail that executes it,
+  and dispute evidence is unverified here.
 - **Liveness and leasing.** Planning is a pure function of offers, job and
   height. Offer gossip, heartbeats, lease renewal and retry timers are the
   operator's responsibility.
 - **Confidential payloads.** `sealed_input` only requires a provider that accepts
   sealed input. Sealing itself is `srct-cnnp`'s envelope, keyed off-protocol.
 
-## 7. Verified behavior
+## 8. Verified behavior
 
-`cargo test -p srct-compute` passes 15 tests (5 unit, 10 acceptance):
+`cargo test -p srct-compute` passes 31 tests (5 unit, 26 acceptance):
 
 - profile hash binds class, RAM, caps and kernel; unknown encodings refused;
 - requirement matching refuses empty mask, low RAM, weak determinism and wrong
@@ -179,17 +220,34 @@ be retried forever against the same budget.
   forged receipts are refused;
 - late receipts and expired assignments cannot settle; expiry is idempotent;
 - attempt cap and deadline are enforced;
-- assignment arithmetic and wire decoding are checked.
+- assignment arithmetic and wire decoding are checked;
+- an unbonded or under-bonded provider's offer is refused; a bonded one is
+  admitted;
+- forged, tampered and replayed bond registrations are refused, and a
+  different registration tops the bond up;
+- a fraud dispute halves the bond, drops the score to the ban threshold, and
+  the provider stays banned even after re-bonding;
+- only the assignment's requester can slash: a stranger's dispute fails on the
+  requester binding, a rewritten one fails the signature;
+- a dispute must name the exact assignment it slashes; a duplicate dispute is
+  refused;
+- a `NoShow` dispute requires the deadline to pass and takes 10%;
+- ten timeouts ban a provider; settled units raise the score back over the
+  threshold; re-bonding clears timeouts but not fraud slashes;
+- withdrawals are refused during lockup, cannot exceed the stake, cannot be
+  replayed, and a drained bond no longer backs offers;
+- bond, withdrawal and dispute wire codecs round-trip and refuse truncation;
+- settlement credit binds the receipt to its assignment; overclaims never
+  reach the book.
 
-## 8. Next milestones
+## 9. Next milestones
 
 1. GPU / Apple / NPU / TPU / photonic backends behind the `srct-diloco`
    `TrainBackend` conformance suite; this crate only routes units.
 2. TEE attestation and benchmark challenges to turn `Attested` /
    `Challenge` into enforced levels.
-3. Bonded provider registration and reputation, so many cheap identities are not
-   a free capacity claim.
-4. Persistent offer/ledger stores with the same caps and replay guards.
+3. Escrow integration: fund the job once, release per settled receipt, refund
+   the remainder at the deadline; execute bond registrations, slashes and
+   withdrawals on the same rail.
+4. Persistent offer/ledger/bond stores with the same caps and replay guards.
 5. Offer gossip and job transport over the agent messaging rail or HTTP/MCP.
-6. Escrow integration: fund the job once, release per settled receipt, refund
-   the remainder at the deadline.

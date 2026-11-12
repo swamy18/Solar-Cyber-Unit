@@ -142,4 +142,64 @@ fn main() {
         ledger.settled_total_sat(),
         signed_plan.assignments.len()
     );
+
+    // Bonds and reputation: capacity claims now cost stake. A fraud dispute
+    // halves the bond and the reputation ban keeps the provider out even
+    // after it re-bonds.
+    println!("---");
+    let mut book = srct_compute::BondBook::new(NET);
+    let bond = srct_compute::ProviderBond {
+        version: srct_compute::bond::BOND_VERSION,
+        network_id: NET.into(),
+        provider: laptop.address().unwrap(),
+        amount_sat: srct_compute::MIN_BOND_SAT,
+        registered_height: 1,
+        nonce: 1,
+    };
+    let signed_bond = srct_compute::SignedBond::sign(bond, &laptop).unwrap();
+    println!(
+        "unbonded laptop admitted: {:?}",
+        book.admit_offer(&offers[1], 10)
+            .err()
+            .map(|e| e.to_string())
+    );
+    book.register(&signed_bond, 5).unwrap();
+    let laptop_offer = &offers[1];
+    let admit = book.admit_offer(laptop_offer, 10);
+    println!(
+        "laptop bonds {} sat -> admitted: {:?}",
+        srct_compute::MIN_BOND_SAT,
+        admit.is_ok()
+    );
+
+    let shard = &signed_plan
+        .assignments
+        .iter()
+        .find(|a| a.assignment.provider == laptop.address().unwrap())
+        .unwrap()
+        .clone();
+    let dispute = srct_compute::BondDispute {
+        version: srct_compute::bond::BOND_VERSION,
+        network_id: NET.into(),
+        requester: requester.address().unwrap(),
+        provider: laptop.address().unwrap(),
+        assignment: shard.hash(),
+        reason: srct_compute::DisputeReason::Overclaim,
+        evidence: [5u8; 32],
+        nonce: 1,
+    };
+    let signed_dispute = srct_compute::SignedDispute::sign(dispute, &requester).unwrap();
+    let remaining = book.slash(&signed_dispute, shard, 20).unwrap();
+    println!(
+        "fraud dispute: bond {} -> {} sat, score {}",
+        srct_compute::MIN_BOND_SAT,
+        remaining,
+        book.score(&laptop.address().unwrap())
+    );
+    println!(
+        "slashed laptop admission: {:?}",
+        book.admit_offer(laptop_offer, 10)
+            .err()
+            .map(|e| e.to_string())
+    );
 }

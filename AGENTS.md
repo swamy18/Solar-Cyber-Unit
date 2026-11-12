@@ -25,9 +25,9 @@ cargo test -p srct-miner
 cargo test -p srct-diloco
 # CNNP representation/adapter/discovery/metering core.
 cargo test -p srct-cnnp
-# Decentralized E2E agent messaging (envelopes + replay-safe mailbox).
+# Decentralized E2E agent messaging (envelopes, double ratchet, mailbox).
 cargo test -p srct-agentnet
-# Decentralized compute sharing (offers, sharding, receipts, settlement).
+# Decentralized compute sharing (offers, sharding, receipts, settlement, bonds).
 cargo test -p srct-compute
 # Cross-network intent lifecycle, quotes, routes and disputes.
 cargo test -p srct-intent

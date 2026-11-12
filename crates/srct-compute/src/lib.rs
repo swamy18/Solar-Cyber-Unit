@@ -16,6 +16,8 @@
 //! - [`settle`]: provider-signed receipts, overclaim/price/deadline checks and
 //!   an exact [`settle::PayoutInstruction`] the existing payment or escrow
 //!   layer should execute.
+//! - [`bond`]: bonded provider registration, requester-signed disputes with
+//!   bond slashing, and a reputation score that gates offer admission.
 //!
 //! # What this is not
 //!
@@ -28,16 +30,24 @@
 //! - **Not a scheduler daemon.** Planning is a pure function of offers, job and
 //!   height. Availability gossip, leases, retries on a timer and provider
 //!   liveness are the operator's job.
-//! - **Not Sybil-resistant.** Identity is a normal SRCT address; a provider can
-//!   create many. Bonding and reputation are prerequisites for production.
+//! - **Not fully Sybil-resistant.** [`bond::BondBook`] makes capacity claims
+//!   cost stake and reputation, but a slash is only as real as the escrow or
+//!   payment rail that executes it, and dispute evidence is unverified here.
+//!   A provider can still create many identities if it can post many bonds.
 //! - **Not a trusted benchmark.** RAM, cores, bandwidth and kernel hash are
 //!   self-declared. They bound what a job is assigned, not what the device
 //!   actually has.
 
+pub mod bond;
 pub mod device;
 pub mod market;
 pub mod settle;
 
+pub use bond::{
+    BondBook, BondDispute, BondWithdrawal, DisputeReason, ProviderBond, Reputation, SignedBond,
+    SignedDispute, SignedWithdrawal, BAN_SCORE, LOCKUP_HEIGHTS, MIN_BOND_SAT, SLASH_FRAUD_BPS,
+    SLASH_NOSHOW_BPS, SLASH_PENALTY, TIMEOUT_PENALTY,
+};
 pub use device::{Determinism, DeviceClass, DeviceProfile, DeviceRequirement};
 pub use market::{
     plan_assignments, Assignment, ComputeJob, ComputeOffer, Plan, SignedAssignment, SignedJob,
@@ -86,6 +96,18 @@ pub enum ComputeError {
     AlreadySettled,
     /// The assignment is expired and can no longer settle.
     AssignmentExpired,
+    /// No bond stands behind this provider's offers.
+    NotBonded,
+    /// The provider's bond is below the minimum.
+    InsufficientBond,
+    /// The bond cannot be released before its lockup ends.
+    LockupActive,
+    /// The provider's reputation is below the ban threshold.
+    Banned,
+    /// This dispute has already been applied to the bond.
+    AlreadySlashed,
+    /// This instruction was already applied once.
+    Replay,
 }
 
 impl std::fmt::Display for ComputeError {
@@ -109,6 +131,12 @@ impl std::fmt::Display for ComputeError {
             ComputeError::BindingMismatch => write!(f, "job, offer or assignment does not match"),
             ComputeError::AlreadySettled => write!(f, "assignment is already settled"),
             ComputeError::AssignmentExpired => write!(f, "assignment expired before settlement"),
+            ComputeError::NotBonded => write!(f, "provider has no active bond"),
+            ComputeError::InsufficientBond => write!(f, "bond is below the minimum"),
+            ComputeError::LockupActive => write!(f, "bond is still locked up"),
+            ComputeError::Banned => write!(f, "provider reputation is below the ban"),
+            ComputeError::AlreadySlashed => write!(f, "dispute was already applied"),
+            ComputeError::Replay => write!(f, "instruction was already applied"),
         }
     }
 }

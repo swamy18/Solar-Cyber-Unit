@@ -9,6 +9,7 @@
 
 use srct_agentnet::mailbox::Mailbox;
 use srct_agentnet::message::{thread_id, MessageEnvelope, Recipient};
+use srct_agentnet::RatchetSession;
 use srct_core::agent::{derive_agent_id, AgentRole};
 use srct_core::wallet::Wallet;
 
@@ -82,5 +83,44 @@ fn main() {
     println!(
         "tampered wire refused: {:?}",
         MessageEnvelope::decode(&tampered.encode())
+    );
+
+    // Double ratchet: forward secrecy on the same envelope format. A stale
+    // snapshot of the conversation state cannot read later messages.
+    println!("---");
+    let ratchet_thread = thread_id(&alice_agent, &bob_agent, 2);
+    let mut session =
+        RatchetSession::initiator(&alice, AgentRole::Machine, NET, ratchet_thread, &recipient)
+            .unwrap();
+    let mut peer = RatchetSession::responder(
+        &bob,
+        AgentRole::Machine,
+        NET,
+        ratchet_thread,
+        &Recipient::from_wallet(&alice, AgentRole::Machine).unwrap(),
+    )
+    .unwrap();
+
+    let r1 = session.send(&alice, b"ratchet: first", 1_000).unwrap();
+    let snapshot = peer.clone();
+    peer.receive(&r1, &bob).unwrap();
+    let r2 = peer.send(&bob, b"ratchet: reply", 1_000).unwrap();
+    session.receive(&r2, &alice).unwrap();
+    let r3 = session
+        .send(&alice, b"ratchet: after the DH ratchet step", 1_000)
+        .unwrap();
+    peer.receive(&r3, &bob).unwrap();
+
+    let mut stale = snapshot;
+    let stale_result = stale.receive(&r3, &bob);
+    println!(
+        "ratchet wire {} B (seq {}); stale state on later message: {:?}",
+        r1.encode().len(),
+        r1.seq,
+        stale_result.err().map(|e| e.to_string()),
+    );
+    println!(
+        "  static path on a ratchet message: {:?}",
+        r1.open(&bob).err().map(|e| e.to_string()),
     );
 }

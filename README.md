@@ -227,15 +227,21 @@ trusting any number in it:
 - **Agent messaging hides content, not metadata.** `srct-agentnet` encrypts and
   signs pairwise envelopes and stores them in a bounded replay-safe mailbox,
   but sender/recipient identities, thread, sequence and expiry stay visible.
-  There is no sealed sender, no double ratchet, no group messaging and no
-  transport. A static recipient key plus one captured ephemeral key decrypts
-  that one message. See [`docs/agentnet.md`](docs/agentnet.md).
+  A double ratchet now gives conversations forward secrecy and
+  post-compromise security: message keys come from a chain advanced after
+  every message and every reply mixes a fresh DH into the root key, so a
+  stale snapshot of session state cannot read later messages and the static
+  key path cannot open ratchet messages. Still absent: sealed sender, group
+  messaging and transport. See [`docs/agentnet.md`](docs/agentnet.md).
 - **Compute sharing settles receipts, not correctness.** `srct-compute` routes
-  capacity-aware shards and pays exactly for claimed units, but device RAM,
-  cores, bandwidth and kernel hash are self-declared, identity is an ordinary
-  address (no bonding or reputation yet), and only the `Receipt` verification
-  level is enforced. It can price a 2 GB phone or a GPU box; it cannot prove
-  either did honest work. See [`docs/compute-sharing.md`](docs/compute-sharing.md).
+  capacity-aware shards and pays exactly for claimed units. Offers must now
+  stand behind a signed bond: a requester-signed dispute can slash it (10%
+  for a timed-out assignment, 50% for fraud) and a reputation score gates
+  admission — but device RAM, cores, bandwidth and kernel hash are still
+  self-declared, a slash is only as real as the escrow rail that executes it,
+  and only the `Receipt` verification level is enforced. It can price a 2 GB
+  phone or a GPU box; it cannot prove either did honest work. See
+  [`docs/compute-sharing.md`](docs/compute-sharing.md).
 - **Mining does not train AI.** The neural stage is ML-shaped integer work
   with epoch-derived weights — it keeps AI hardware competitive, it does not
   produce models or inference (see [What this is](#what-this-is)). A separate
@@ -1371,8 +1377,8 @@ not expose it directly, but the worker SDK does (`add_credit_collateral`).
 | `crates/srct-diloco/` | Non-consensus DiLoCo proof-of-useful-work prototype: real MLP training, signed updates, Byzantine filtering, exact reward math. A `TrainBackend` seam with conformance gates now wraps the only implemented backend, the CPU `f32` reference; GPU/TPU/NPU/Apple/photonic backends remain future work. Hash mining remains the only consensus mechanism. |
 | `crates/srct-cnnp/` | Non-consensus Cross-Neural Network Protocol core: representation spaces, signed/sealed envelopes, ridge-fit cross-space adapters, capability discovery, metered settlement and plan quoting. |
 | `crates/srct-intent/` | Non-consensus cross-network intent settlement: signed intents, competitive quotes, cross-asset routes, delivery, escrow/refund instructions and dispute resolution. |
-| `crates/srct-agentnet/` | Non-consensus end-to-end encrypted agent messaging: network/role-bound identities, ECDH + HKDF + XChaCha20-Poly1305 envelopes, hybrid signatures and a bounded replay-safe mailbox. |
-| `crates/srct-compute/` | Non-consensus decentralized compute sharing: signed device offers for CPUs/GPUs/TPUs/NPUs/Apple silicon/photonic devices, deterministic capacity-aware sharding, requester-signed assignments, provider receipts and exact payout instructions. |
+| `crates/srct-agentnet/` | Non-consensus end-to-end encrypted agent messaging: network/role-bound identities, ECDH + HKDF + XChaCha20-Poly1305 envelopes, hybrid signatures, a bounded replay-safe mailbox and a double ratchet (forward secrecy + post-compromise security). |
+| `crates/srct-compute/` | Non-consensus decentralized compute sharing: signed device offers for CPUs/GPUs/TPUs/NPUs/Apple silicon/photonic devices, deterministic capacity-aware sharding, requester-signed assignments, provider receipts, exact payout instructions, and bonded provider registration with dispute slashing and reputation gating. |
 | `fuzz/` | 17 cargo-fuzz targets over the attacker-controlled boundaries. |
 | `verification/sim/` | Independent Python reference, attack simulations, and feature demos (`x402_paid_api_demo.py`, `micropayment_benchmark.py`, `agent_economy_demo.py`). |
 | `verification/tests/vectors/` | Consensus vectors. Generated from source, never hand-edited. |
@@ -1583,8 +1589,8 @@ cargo test -p srct-policy                     # chain-agnostic decide/verify JSO
 cargo test -p srct-mcp                        # keyless wallet guard, portable prove/verify, bound grants
 cargo test -p srct-node --test micro_safety   # batch quotes, streams, sponsor intents, session/risk/audit
 cargo test -p srct-node --test agent_economy  # passport, tiers, jobs, FX quotes, ramps, lending marketplace
-cargo test -p srct-agentnet                   # E2E agent messaging + replay-safe mailbox
-cargo test -p srct-compute                    # device offers, sharding, receipts, settlement
+cargo test -p srct-agentnet                   # E2E agent messaging, double ratchet + replay-safe mailbox
+cargo test -p srct-compute                    # device offers, sharding, receipts, settlement, bonds
 cargo test -p srct-core --lib arbitration::    # fraud-arbitration votes
 cargo test -p srct-core --test cp_signing_nodes # quorum, conflicts, restart
 cargo test -p srct-core --test bond_stake      # bonded-stake attacks
