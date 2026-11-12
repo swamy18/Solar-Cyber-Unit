@@ -1293,6 +1293,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "srct-workgraph"
+version = "0.1.0"
+dependencies = [
+ "srct-core",
+]
+
+[[package]]
 name = "srct-zkml"
 version = "0.1.0"
 dependencies = [
