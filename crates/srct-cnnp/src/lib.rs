@@ -19,6 +19,9 @@
 //!   service, space, price, latency, privacy and verification level.
 //! - [`metering`]: provider-signed usage receipts, exact settlement checks and
 //!   multi-stage plans with space continuity.
+//! - [`exec`]: execution-evidence gate — `Tee`/`Fhe`/`Zk` stages require
+//!   verified attestation/proof evidence (via `srct-verify`) before they
+//!   settle; plain stages need only the metering receipt.
 //!
 //! # What this is not
 //!
@@ -35,11 +38,13 @@
 //!   translation occurred or the space metadata.
 
 pub mod adapter;
+pub mod exec;
 pub mod metering;
 pub mod registry;
 pub mod space;
 
 pub use adapter::LinearAdapter;
+pub use exec::{required_evidence, StageError, StageGate};
 pub use metering::{
     quote_plan, settle_receipt, Plan, Quote, Settlement, SignedReceipt, UsageReceipt,
 };

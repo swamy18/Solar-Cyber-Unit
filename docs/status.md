@@ -42,13 +42,16 @@ rules in code would have been the wrong order.
   intents settling as before. The book returns `SettlementInstruction` /
   `RefundInstruction` only; no coin moves. See [`docs/intents.md`](intents.md).
 - **CNNP interoperability core (non-consensus, `srct-cnnp`).** `cargo test -p
-  srct-cnnp` passes 11 acceptance tests: distinct spaces, signed plaintext
+  srct-cnnp` passes 18 acceptance tests: distinct spaces, signed plaintext
   envelopes with tamper refusal, sealed envelopes with wrong-key and
   cross-space AAD refusal, a real 8 -> 16 ridge adapter (training MSE 0.000032
   vs 0.464712 mean baseline), adapter serialization and tamper refusal,
   deterministic capability discovery, exact receipt settlement with
   over-unit/future/mispriced refusals, a per-request replay book, and plan
-  chaining/budget/privacy checks. Measured adapter fit: 1.9-3.4 ms for 128
+  chaining/budget/privacy checks — plus the execution-evidence gate: pinned
+  proof mapping, plain stages settling without evidence, TEE/ZK/FHE stages
+  verifying through one gate with provider binding, and tampered, misbound,
+  replayed or badly-signed stages refused. Measured adapter fit: 1.9-3.4 ms for 128
   pairs; a two-stage plan quotes at 30 sat and 100 ms. Settlement is an
   authorization only; no coin moves in this crate. See
   [`docs/cnnp.md`](cnnp.md).
@@ -152,7 +155,7 @@ rules in code would have been the wrong order.
   (execution/correctness per task kind, security level and value) is pinned,
   and one fail-closed verifier checks TEE, FHE and ZKML evidence with all
   replay books, preserving inner errors. See [`docs/verify.md`](verify.md).
-- `cargo test --workspace` — **1,798 tests pass, 0 failures, 1 ignored** across the workspace.
+- `cargo test --workspace` — **1,805 tests pass, 0 failures, 1 ignored** across the workspace.
   (this file quote counts as of their own dates — 242, then 263, then 293 —
   kept as history):
   - 227 unit tests in `srct-core` (M1–M5 suites, the 21-test validator-set suite, the 30-test real-BLS suite in

@@ -171,13 +171,14 @@ models.
 - **Payments.** `Settlement` and the offer's `price_sat_per_unit` feed the
   existing `payment.rs` / x402 metered path. No new coin or mint is created.
 - **Verification levels.** `Verification::{None, ProviderSigned, Optimistic,
-  Tee, Zk}` is the routing seam for the later TEE/ZKML milestones. Today only
-  provider-signed receipts and discovery metadata are implemented.
+  Tee, Zk}` is enforced by `exec::StageGate`: `Tee`/`Zk` stages require
+  verified attestation/proof evidence before they settle; the rest settle on
+  provider-signed receipts and discovery metadata.
 - **Escrow.** A plan can be quoted first and settled per stage; the existing
   L2 escrow/dispute path remains the fallback for `Optimistic`.
 - **Privacy levels.** `Privacy::{Public, Sealed, Tee, Fhe}` distinguishes what
-  is actually protected. `Sealed` is implemented; `Tee` and `Fhe` are labels a
-  provider may not advertise until the corresponding verification exists.
+  is actually protected. `Sealed` is implemented; `Tee`/`Fhe` stages require
+  attestation/encrypted-compute evidence through the same gate.
 
 ## 6. Roadmap
 
@@ -186,7 +187,8 @@ models.
 3. Capability gossip and an HTTP/MCP transport binding.
 4. Semantic evaluation harness: held-out probes, not just paired MSE.
 5. Work-graph attribution: adapter reuse and downstream revenue sharing.
-6. TEE/FHE verification levels wired to real attestation and FHE runtimes.
+6. TEE/FHE verification levels — **done** (`exec::StageGate` with
+   `srct-verify` evidence for `Tee`/`Fhe`/`Zk` stages).
 7. Cross-chain intent lifecycle on top of plans and receipts (quote, execute,
    verify, refund, dispute).
 
