@@ -335,7 +335,7 @@ fn malformed(e: srct_core::error::Error) -> ComputeError {
     ComputeError::Malformed(e.to_string())
 }
 
-fn encode_signed(body: &[u8], sigs: &Bundle, keys: &Bundle) -> Vec<u8> {
+pub(crate) fn encode_signed(body: &[u8], sigs: &Bundle, keys: &Bundle) -> Vec<u8> {
     let sigs = sigs.to_bytes();
     let keys = keys.to_bytes();
     let mut w = Writer::with_capacity(body.len() + sigs.len() + keys.len() + 16);
@@ -348,7 +348,10 @@ fn encode_signed(body: &[u8], sigs: &Bundle, keys: &Bundle) -> Vec<u8> {
     w.into_vec()
 }
 
-fn decode_signed(bytes: &[u8], what: &str) -> Result<(Vec<u8>, Bundle, Bundle), ComputeError> {
+pub(crate) fn decode_signed(
+    bytes: &[u8],
+    what: &str,
+) -> Result<(Vec<u8>, Bundle, Bundle), ComputeError> {
     let err = |detail: String| ComputeError::Malformed(format!("{what}: {detail}"));
     let mut r = Reader::new(bytes);
     let body_len = r.u32le().map_err(malformed)? as usize;

@@ -142,6 +142,30 @@ assignments can never settle, so a late receipt cannot resurrect work that was
 already rescheduled. `attempt` is capped at `MAX_ATTEMPTS` (3), so a job cannot
 be retried forever against the same budget.
 
+### Job escrow
+
+`ComputeLedger` decides whether a receipt may be paid; `escrow::EscrowBook`
+decides whether the money is there. A requester signs one `EscrowFunding`
+(`job`, `requester`, `amount_sat`, `deadline`, `nonce`) and the book locks that
+budget for the job. Each settled receipt then releases exactly its own
+`total_sat` from the pot, and after the deadline the unspent remainder is
+refunded once.
+
+- a job is funded exactly once, before its deadline, by the requester that
+  signs its assignments; a second funding, a foreign network, a stranger's
+  signature or a post-deadline funding is refused;
+- `release` re-verifies the receipt and assignment, requires the funded job,
+  requester and deadline to match, and refuses overclaim, price mismatch, a
+  late receipt, a duplicate assignment and any release after a refund;
+- the sum of all releases can never exceed the funded amount
+  (`BudgetExceeded`), and a refused release consumes neither the assignment nor
+  the pot;
+- `refund` is only possible after the deadline, only once, and a fully released
+  pot refunds zero and still closes so a later release cannot reopen it.
+
+`PayoutInstruction` and `RefundInstruction` are instructions only; this crate
+never holds or moves coin.
+
 ## 6. Bonds and reputation
 
 Sybil resistance starts here: identity is still an ordinary SRCT address, but a
@@ -163,8 +187,8 @@ BondDispute     = version || network || requester || provider || assignment ||
   request may be retried after lockup. An applied one cannot be replayed.
 - **Disputes** (`BondBook::slash`): the assignment's requester signs a dispute
   bound to one assignment. `NoShow` requires the deadline to have passed and
-  takes 10% of the bond; `Overclaim` and `Impostor` (fraud) take 50% at any
-  height. The same dispute cannot slash twice, the dispute must name the exact
+  takes 10% of the bond; `Overclaim`, `Impostor` and `WrongResult` (fraud) take
+  50% at any height. The same dispute cannot slash twice, the dispute must name the exact
   assignment it slashes, and slashing an unbonded provider is refused.
 - **Reputation**: `score = settled_units - 10 * timeouts - 100 * slashes`,
   saturating. `record_settlement` counts a verified receipt's units;
@@ -222,8 +246,8 @@ correct or useful — that is challenge re-execution / ZKML, still future.
 
 - **Correctness.** A receipt proves who claims units, and a TEE quote proves
   approved execution — neither proves the output is correct. `Challenge`
-  re-execution and ZK proofs remain future milestones; `Challenge` is still a
-  self-declared advertised field.
+  re-execution catches a result that does not reproduce, by comparison, but it
+  cannot prove semantic correctness and ZK proofs remain future work.
 - **Hardware truth.** RAM, cores, bandwidth, kernel hash and device class are
   self-declared. They bound assignment, not reality.
 - **Sybil resistance at the stake layer.** Bonds and reputation gate admission,
@@ -237,7 +261,7 @@ correct or useful — that is challenge re-execution / ZKML, still future.
 
 ## 9. Verified behavior
 
-`cargo test -p srct-compute` passes 42 tests (5 unit, 37 acceptance):
+`cargo test -p srct-compute` passes 63 tests (5 unit, 58 acceptance):
 
 - profile hash binds class, RAM, caps and kernel; unknown encodings refused;
 - requirement matching refuses empty mask, low RAM, weak determinism and wrong
@@ -297,7 +321,11 @@ correct or useful — that is challenge re-execution / ZKML, still future.
   dispute that halves the bond and bans the provider through the existing
   slash path; self-challenges, stranger requesters, duplicate challenges and
   receipts, wrong-worker/late/misbound second receipts and tampered
-  challenges are all refused; challenge wire codecs round-trip.
+  challenges are all refused; challenge wire codecs round-trip;
+- escrow funds a job once, releases each settled receipt's exact total, refuses
+  over-release beyond the pot, duplicate assignments, late/misbound/overclaiming
+  receipts and any release after a refund, then refunds the remainder exactly
+  once after the deadline; funding wire codecs round-trip and refuse tampering.
 
 ## 10. Next milestones
 
@@ -305,9 +333,10 @@ correct or useful — that is challenge re-execution / ZKML, still future.
    `TrainBackend` conformance suite; this crate only routes units.
 2. Challenge re-execution — **done** (`challenge::ChallengeBook` with
    independent re-runs, result comparison and `WrongResult` fraud disputes).
-3. Escrow integration: fund the job once, release per settled receipt, refund
-   the remainder at the deadline; execute bond registrations, slashes and
-   withdrawals on the same rail.
+3. Escrow integration — **done** (`escrow::EscrowBook`: fund once, release per
+   settled receipt, refund the remainder at the deadline). Executing bond
+   registrations, slashes and withdrawals on the same rail is still the
+   payment layer's job.
 4. Persistent bond/reputation snapshots (offers, assignments and receipts
    already journal — bonds are the escrow rail's job).
 5. Gossip transport binding: carry the gossip set over the agent messaging

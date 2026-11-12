@@ -29,6 +29,9 @@
 //! - [`challenge`]: challenge re-execution — requester-signed demands for an
 //!   independent re-run, second-receipt comparison, and fraud verdicts that
 //!   feed `WrongResult` bond disputes.
+//! - [`escrow`]: job escrow — fund a job once, release each settled receipt's
+//!   exact total from the pot, and refund the unspent remainder after the
+//!   deadline, exactly once.
 //!
 //! # What this is not
 //!
@@ -52,6 +55,7 @@
 pub mod bond;
 pub mod challenge;
 pub mod device;
+pub mod escrow;
 pub mod gossip;
 pub mod market;
 pub mod settle;
@@ -67,6 +71,9 @@ pub use challenge::{
     Challenge, ChallengeBook, ChallengeVerdict, SignedChallenge, CHALLENGE_VERSION,
 };
 pub use device::{Determinism, DeviceClass, DeviceProfile, DeviceRequirement};
+pub use escrow::{
+    EscrowAccount, EscrowBook, EscrowFunding, RefundInstruction, SignedFunding, ESCROW_VERSION,
+};
 pub use gossip::{GossipSet, MAX_GOSSIP_OFFERS};
 pub use market::{
     plan_assignments, Assignment, ComputeJob, ComputeOffer, Plan, SignedAssignment, SignedJob,
@@ -134,6 +141,10 @@ pub enum ComputeError {
     AlreadySlashed,
     /// This instruction was already applied once.
     Replay,
+    /// The job has no escrow funding.
+    NotFunded,
+    /// The escrow remainder was already refunded.
+    AlreadyRefunded,
 }
 
 impl std::fmt::Display for ComputeError {
@@ -163,6 +174,8 @@ impl std::fmt::Display for ComputeError {
             ComputeError::Banned => write!(f, "provider reputation is below the ban"),
             ComputeError::AlreadySlashed => write!(f, "dispute was already applied"),
             ComputeError::Replay => write!(f, "instruction was already applied"),
+            ComputeError::NotFunded => write!(f, "job has no escrow funding"),
+            ComputeError::AlreadyRefunded => write!(f, "escrow remainder was already refunded"),
         }
     }
 }
