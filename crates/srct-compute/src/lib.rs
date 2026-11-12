@@ -26,6 +26,9 @@
 //!   verifier with freshness and replay protection.
 //! - [`bond`]: bonded provider registration, requester-signed disputes with
 //!   bond slashing, and a reputation score that gates offer admission.
+//! - [`challenge`]: challenge re-execution — requester-signed demands for an
+//!   independent re-run, second-receipt comparison, and fraud verdicts that
+//!   feed `WrongResult` bond disputes.
 //!
 //! # What this is not
 //!
@@ -33,7 +36,8 @@
 //!   A payout is an instruction; the caller decides which rail executes it.
 //! - **Not a correctness proof.** A [`tee`] quote proves the approved
 //!   environment *executed* the workload, not that the output is correct or
-//!   useful. Challenge re-execution and ZK proofs remain later milestones.
+//!   useful. [`challenge`] re-execution catches fabricated results by
+//!   comparison; ZK proofs remain a later milestone.
 //! - **Not a scheduler daemon.** Planning is a pure function of offers, job and
 //!   height. Availability gossip, leases, retries on a timer and provider
 //!   liveness are the operator's job.
@@ -46,6 +50,7 @@
 //!   actually has.
 
 pub mod bond;
+pub mod challenge;
 pub mod device;
 pub mod gossip;
 pub mod market;
@@ -55,8 +60,11 @@ pub mod tee;
 
 pub use bond::{
     BondBook, BondDispute, BondWithdrawal, DisputeReason, ProviderBond, Reputation, SignedBond,
-    SignedDispute, SignedWithdrawal, BAN_SCORE, LOCKUP_HEIGHTS, MIN_BOND_SAT, SLASH_FRAUD_BPS,
-    SLASH_NOSHOW_BPS, SLASH_PENALTY, TIMEOUT_PENALTY,
+    SignedDispute, SignedWithdrawal, BAN_SCORE, BOND_VERSION, LOCKUP_HEIGHTS, MIN_BOND_SAT,
+    SLASH_FRAUD_BPS, SLASH_NOSHOW_BPS, SLASH_PENALTY, TIMEOUT_PENALTY,
+};
+pub use challenge::{
+    Challenge, ChallengeBook, ChallengeVerdict, SignedChallenge, CHALLENGE_VERSION,
 };
 pub use device::{Determinism, DeviceClass, DeviceProfile, DeviceRequirement};
 pub use gossip::{GossipSet, MAX_GOSSIP_OFFERS};

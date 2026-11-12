@@ -65,6 +65,8 @@ pub enum DisputeReason {
     Overclaim = 1,
     /// The receipt's signer was not the assigned provider.
     Impostor = 2,
+    /// Re-execution produced a different result: the receipt is fabricated.
+    WrongResult = 3,
 }
 
 impl DisputeReason {
@@ -77,6 +79,7 @@ impl DisputeReason {
             0 => Some(DisputeReason::NoShow),
             1 => Some(DisputeReason::Overclaim),
             2 => Some(DisputeReason::Impostor),
+            3 => Some(DisputeReason::WrongResult),
             _ => None,
         }
     }
@@ -85,7 +88,9 @@ impl DisputeReason {
     pub fn penalty_bps(self) -> u64 {
         match self {
             DisputeReason::NoShow => SLASH_NOSHOW_BPS,
-            DisputeReason::Overclaim | DisputeReason::Impostor => SLASH_FRAUD_BPS,
+            DisputeReason::Overclaim | DisputeReason::Impostor | DisputeReason::WrongResult => {
+                SLASH_FRAUD_BPS
+            }
         }
     }
 }

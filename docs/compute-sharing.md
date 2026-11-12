@@ -291,14 +291,20 @@ correct or useful — that is challenge re-execution / ZKML, still future.
   encoding, and restarts by re-verifying every entry — tampering fails the
   whole replay;
 - gossip keeps only signed live offers, dedups, merges order-independently,
-  prunes on expiry, and refuses forged/foreign/overflowed input.
+  prunes on expiry, and refuses forged/foreign/overflowed input;
+- challenge re-execution clears matching receipts and slashes fabricated ones:
+  same result verifies clean, a different result produces a `WrongResult`
+  dispute that halves the bond and bans the provider through the existing
+  slash path; self-challenges, stranger requesters, duplicate challenges and
+  receipts, wrong-worker/late/misbound second receipts and tampered
+  challenges are all refused; challenge wire codecs round-trip.
 
 ## 10. Next milestones
 
 1. GPU / Apple / NPU / TPU / photonic backends behind the `srct-diloco`
    `TrainBackend` conformance suite; this crate only routes units.
-2. Challenge re-execution to turn `Challenge` into an enforced level
-   (attestation already enforces `Attested`).
+2. Challenge re-execution — **done** (`challenge::ChallengeBook` with
+   independent re-runs, result comparison and `WrongResult` fraud disputes).
 3. Escrow integration: fund the job once, release per settled receipt, refund
    the remainder at the deadline; execute bond registrations, slashes and
    withdrawals on the same rail.

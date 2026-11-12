@@ -52,9 +52,9 @@ const DOM_ASSIGNMENT: &[u8] = b"srct/compute/assignment/v1";
 ///
 /// [`Verification::Receipt`] is enforced by [`crate::settle`];
 /// [`Verification::Attested`] is enforced by [`crate::tee`] (signed
-/// attestation quotes against the requester's SLA). `Challenge` re-execution
-/// is still a discovery/requirements field only; an offer advertising it is
-/// self-declared.
+/// attestation quotes against the requester's SLA); [`Verification::Challenge`]
+/// is enforced by [`crate::challenge`] (independent re-execution with result
+/// comparison). `Receipt` remains the settlement level.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Verification {
     Receipt = 0,
