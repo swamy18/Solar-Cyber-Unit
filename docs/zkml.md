@@ -17,9 +17,15 @@ no new dependencies:
 - **Homomorphic checks:** the verifier recomputes `X == Σ 2^i·B_i` (range)
   and `Y == Σ w_i·X_i + bias·G` (evaluation) on commitments. A worker that
   skips the work or fabricates the output fails here.
+- **Threshold gate:** `prove_threshold`/`verify_threshold` prove `value >=
+  bound` for a committed value — the non-linear primitive clipped and step
+  activations build on. Bit blindings are constrained to the input blinding
+  so the recomposed difference matches `X - bound*G` exactly; the statement
+  carries its own domain tag, so threshold proofs never transplant to (or
+  from) linear evaluations.
 - **Fiat-Shamir:** every challenge hashes the statement (weights, bias,
-  commitments) plus the prover's first messages, so proofs cannot be
-  transplanted to another evaluation.
+  commitments — or threshold, commitment) plus the prover's first messages,
+  so proofs cannot be transplanted to another evaluation.
 
 ## Workflow
 
@@ -38,8 +44,10 @@ ZkReceipt = version || task_hash || worker || bit_proofs ||
 
 ## Honest limits
 
-- **One linear layer.** At most 8 inputs of 16 bits, no non-linearities, no
-  folding/recursion (Nova-style systems are future).
+- **One linear layer plus one gate.** At most 8 inputs of 16 bits, plus
+  threshold assertions. No folding/recursion (Nova-style systems are future),
+  and threshold assertions are not yet bound to task envelopes (that binding
+  is a wire-version decision).
 - **Public model.** Weights and bias are public; only inputs/outputs are
   private. Model privacy is future.
 - **Prototype generator.** `H` is derived from a fixed label, not a true
@@ -57,17 +65,21 @@ option, so this prototype uses only the workspace's existing `k256`.
 
 ## Verified behavior
 
-`cargo test -p srct-zkml` passes 9 acceptance tests in ~3 s: circuit
-prove/verify with a plaintext cross-check (68), a full task→receipt→verify
-workflow, tampered output commitments and wrong-statement proofs refused as
-`InvalidProof`, tampered commitments breaking the task signature, impostor
-and wrong-worker refusals, late/future/replay refusals, malformed tasks
-(over-cap weights, count mismatches, zero deadline/nonce) and receipts
-(wrong bit shape) refused, and wire round-trips.
+`cargo test -p srct-zkml` passes 10 acceptance tests in ~6 s: circuit
+prove/verify with a plaintext cross-check (68), a threshold gate proving
+`value >= bound` (including boundary and false-statement refusal), a full
+task→receipt→verify workflow, tampered output commitments and wrong-statement
+proofs refused as `InvalidProof`, tampered commitments breaking the task
+signature, impostor and wrong-worker refusals, late/future/replay refusals,
+malformed tasks (over-cap weights, count mismatches, zero deadline/nonce)
+and receipts (wrong bit shape) refused, and wire round-trips.
 
 ## Next milestones
 
-1. Non-linear gates (ReLU/argmax range arguments) for real neural layers.
+1. Non-linear gates — **threshold assertions done** (`prove_threshold` /
+   `verify_threshold` with bound blinding and domain separation). Step and
+   clipped activations compose on top; task-envelope binding is a wire-v2
+   decision.
 2. Folding/recursion (Nova-style) to aggregate many proofs cheaply.
 3. Model-commitment privacy: prove over committed weights too.
 4. Ceremonied NUMS generator to replace the prototype `H`.

@@ -10,24 +10,33 @@
 //!   owner signatures and wire codecs.
 //! - [`graph`]: provenance book (signature/network/parent/license/cycle/
 //!   replay checks) and exact recursive royalty settlement.
+//! - [`store`]: bounded content-addressed byte cache beside the graph.
 //!
 //! # What this is not
 //!
-//! - **Not a proof checker.** Evidence hashes point at the issuing crates'
-//!   proofs (VWC, TEE quote, FHE receipt, ZK proof). Those crates verify
-//!   their own proofs; this crate enforces lineage integrity.
 //! - **Not storage.** Content lives with its owner; the graph holds hashes.
 //! - **Not consensus.** Settlements are instructions; the payment or escrow
 //!   rail executes them.
+//!
+//! Evidence hashes can be checked, not just referenced: [`WorkGraph::register_with_evidence`]
+//! verifies the issuing crate's proof through `srct-verify` and binds the
+//! verified output to the artifact's evidence hash. Plain [`WorkGraph::register`]
+//! keeps the trusting path for proofs verified elsewhere.
 
 pub mod artifact;
+pub mod escrow;
 pub mod graph;
+pub mod store;
+pub mod usage;
 
 pub use artifact::{
     Artifact, ArtifactKind, License, SignedArtifact, ARTIFACT_VERSION, MAX_PARENTS,
     MAX_ROYALTY_BPS, MAX_ROYALTY_DEPTH,
 };
+pub use escrow::{RevenueEscrow, RevenuePayout, RevenueRefund};
 pub use graph::WorkGraph;
+pub use store::{ArtifactStore, MAX_BLOB_BYTES, MAX_STORED_BLOBS, STORE_VERSION};
+pub use usage::UsageLedger;
 
 /// Why a work-graph operation was refused. Fail-closed: any variant means no
 /// registration and no payout.
@@ -41,6 +50,8 @@ pub enum WorkError {
     UnknownArtifact,
     NotReusable,
     Replay,
+    EvidenceRefused(String),
+    EvidenceMismatch,
 }
 
 impl std::fmt::Display for WorkError {
@@ -54,6 +65,8 @@ impl std::fmt::Display for WorkError {
             WorkError::UnknownArtifact => write!(f, "artifact is not registered"),
             WorkError::NotReusable => write!(f, "parent license forbids reuse"),
             WorkError::Replay => write!(f, "artifact was already registered"),
+            WorkError::EvidenceRefused(detail) => write!(f, "evidence refused: {detail}"),
+            WorkError::EvidenceMismatch => write!(f, "evidence does not match the artifact"),
         }
     }
 }

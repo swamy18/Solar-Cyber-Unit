@@ -37,6 +37,7 @@
 //! iteration-order dependence. `L2State::advance_block` sorts task ids before it
 //! touches them, and a `HashMap` never decides an outcome.
 
+pub mod attested_log;
 pub mod deposits;
 pub mod dispute;
 pub mod error;
@@ -48,6 +49,7 @@ pub mod task_contract;
 pub mod tee_evidence;
 pub mod vwc;
 
+pub use attested_log::{AttestedExecutionLog, ATTESTED_LOG_VERSION, MAX_LOG_BLOB, MAX_LOG_TASKS};
 pub use deposits::{
     DepositIgnoreReason, DepositParams, DetectedDeposit, IgnoredDeposit, PendingDeposit,
 };

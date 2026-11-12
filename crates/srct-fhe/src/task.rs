@@ -206,7 +206,7 @@ impl FheTask {
     }
 }
 
-fn decode_pubkey(raw: &[u8; POINT_LEN]) -> Result<ProjectivePoint, FheError> {
+pub(crate) fn decode_pubkey(raw: &[u8; POINT_LEN]) -> Result<ProjectivePoint, FheError> {
     if *raw == [0u8; POINT_LEN] {
         return Err(FheError::Malformed(
             "fhe public key must not be the identity".into(),

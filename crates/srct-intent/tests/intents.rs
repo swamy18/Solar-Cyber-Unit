@@ -824,3 +824,403 @@ fn low_verification_intents_settle_without_evidence() {
     );
     assert!(book.settle(&id, 31).is_ok());
 }
+
+#[test]
+fn snapshot_restart_replays_identically() {
+    let creator = wallet(190);
+    let arbiter = wallet(191);
+    let solver_a = wallet(192);
+    let solver_b = wallet(193);
+    let mut book = IntentBook::new();
+    let (intent, id) = open(&mut book, &creator, &arbiter);
+    for (solver, price, nonce) in [(&solver_a, 900, 1), (&solver_b, 800, 2)] {
+        let mut q = quote(&intent, solver, price, None);
+        q.nonce = nonce;
+        book.quote(SignedQuote::sign(q, solver).unwrap(), 10)
+            .unwrap();
+    }
+    book.accept(&id, None, 10).unwrap();
+    // A second open intent rides in the same snapshot.
+    let creator2 = wallet(194);
+    let arbiter2 = wallet(195);
+    let (_, id2) = open(&mut book, &creator2, &arbiter2);
+    let bytes = book.encode();
+    let restored = IntentBook::decode(&bytes).unwrap();
+    assert_eq!(restored.len(), 2);
+    assert_eq!(restored.state(&id), book.state(&id));
+    assert_eq!(restored.state(&id2), book.state(&id2));
+    assert_eq!(
+        restored.quote_for(&id, &solver_a.address().unwrap()),
+        book.quote_for(&id, &solver_a.address().unwrap())
+    );
+    // Quotes stay signed by their solvers after the round trip.
+    restored
+        .quote_for(&id, &solver_b.address().unwrap())
+        .unwrap()
+        .verify()
+        .unwrap();
+    // Tampered bytes fail the whole replay; truncation fails too.
+    let mut bad = bytes.clone();
+    bad[10] ^= 0x01;
+    assert!(IntentBook::decode(&bad).is_err());
+    assert!(IntentBook::decode(&bytes[..bytes.len() - 4]).is_err());
+    assert!(IntentBook::decode(&[99u8; 8]).is_err());
+}
+
+#[test]
+fn fhe_privacy_intents_settle_only_on_verified_fhe() {
+    use srct_fhe::{
+        eval, FheKeys, FheReceipt, FheTask, SignedFheReceipt, SignedFheTask, WeightedSum,
+        FHE_VERSION,
+    };
+    use srct_intent::book::{ExpectedEvidence, IntentEvidence};
+    let creator = wallet(200);
+    let arbiter = wallet(201);
+    let solver = wallet(202);
+    let mut rng = StdRng::seed_from_u64(0xF00D);
+    let keys = FheKeys::generate(&mut rng);
+    let mut book = IntentBook::new();
+    let mut it = ev_intent(&creator, &arbiter, Verification::ProviderSigned, 11);
+    it.min_privacy = Privacy::Fhe;
+    let signed = SignedIntent::sign(it.clone(), &creator).unwrap();
+    let id = book.open(signed, 10).unwrap();
+    let mut q = ev_quote(&it, &solver, Verification::ProviderSigned);
+    q.privacy = Privacy::Fhe;
+    q.nonce = 2;
+    let quote_hash = book
+        .quote(SignedQuote::sign(q, &solver).unwrap(), 10)
+        .unwrap();
+    book.accept(&id, None, 10).unwrap();
+    let delivery = Delivery {
+        version: DELIVERY_VERSION,
+        intent: id,
+        quote: quote_hash,
+        solver: solver.address().unwrap(),
+        result: [9u8; 32],
+        height: 20,
+        nonce: 1,
+    };
+    book.fulfill(&id, SignedDelivery::sign(delivery, &solver).unwrap(), 21)
+        .unwrap();
+    // Sealed FHE execution settles only on verified FHE evidence.
+    assert_eq!(book.settle(&id, 31), Err(IntentError::EvidenceMissing));
+    let op = WeightedSum {
+        weights: vec![3, -2],
+        bias: 7,
+    };
+    let inputs = vec![keys.encrypt(10, &mut rng), keys.encrypt(4, &mut rng)];
+    let task = SignedFheTask::sign(
+        FheTask {
+            version: FHE_VERSION,
+            network_id: "srct/testnet".into(),
+            requester: creator.address().unwrap(),
+            provider: solver.address().unwrap(),
+            enc_pubkey: keys.public_bytes(),
+            op,
+            inputs,
+            deadline_height: 100,
+            nonce: 1,
+        },
+        &creator,
+    )
+    .unwrap();
+    book.expect_evidence(
+        &id,
+        ExpectedEvidence::Fhe(task.clone()),
+        &creator.address().unwrap(),
+    )
+    .unwrap();
+    // Wrong-kind evidence is refused even when the privacy floor is FHE.
+    let (ztask, zreceipt, _, _) = zk_package(&solver);
+    assert_eq!(
+        book.attach_evidence(&id, IntentEvidence::Zk(ztask, zreceipt), 30),
+        Err(IntentError::EvidenceMismatch)
+    );
+    let output = eval(&task.task.op, &task.task.inputs).unwrap();
+    let receipt = SignedFheReceipt::sign(
+        FheReceipt {
+            version: FHE_VERSION,
+            task: task.hash(),
+            worker: solver.address().unwrap(),
+            output,
+            height: 30,
+            nonce: 1,
+        },
+        &solver,
+    )
+    .unwrap();
+    book.attach_evidence(&id, IntentEvidence::Fhe(task, receipt), 30)
+        .unwrap();
+    assert!(book.settle(&id, 31).is_ok());
+}
+
+#[test]
+fn dispute_bonds_release_on_honest_and_slash_on_frivolous() {
+    let creator = wallet(210);
+    let arbiter = wallet(211);
+    let solver = wallet(212);
+    let stranger = wallet(213);
+    // Honest challenge: bond returns with the refund.
+    let mut book = IntentBook::new();
+    let (intent, id) = open(&mut book, &creator, &arbiter);
+    let q = SignedQuote::sign(quote(&intent, &solver, 700, None), &solver).unwrap();
+    let quote_hash = book.quote(q, 10).unwrap();
+    book.accept(&id, None, 10).unwrap();
+    let delivery = Delivery {
+        version: DELIVERY_VERSION,
+        intent: id,
+        quote: quote_hash,
+        solver: solver.address().unwrap(),
+        result: [9u8; 32],
+        height: 20,
+        nonce: 1,
+    };
+    book.fulfill(&id, SignedDelivery::sign(delivery, &solver).unwrap(), 21)
+        .unwrap();
+    // Only the creator bonds, only once, only positive.
+    assert!(book
+        .bond_dispute(&id, stranger.address().unwrap(), 100)
+        .is_err());
+    assert!(book
+        .bond_dispute(&id, creator.address().unwrap(), 0)
+        .is_err());
+    book.bond_dispute(&id, creator.address().unwrap(), 100)
+        .unwrap();
+    assert!(book
+        .bond_dispute(&id, creator.address().unwrap(), 100)
+        .is_err());
+    let dispute = SignedDispute::sign(
+        Dispute {
+            version: DISPUTE_VERSION,
+            intent: id,
+            creator: creator.address().unwrap(),
+            evidence: [5u8; 32],
+            nonce: 2,
+        },
+        &creator,
+    )
+    .unwrap();
+    book.dispute(dispute, 22).unwrap();
+    let resolution = SignedResolution::sign(
+        DisputeResolution {
+            version: RESOLUTION_VERSION,
+            intent: id,
+            arbiter: arbiter.address().unwrap(),
+            release_to_solver: false,
+            evidence: [5u8; 32],
+            nonce: 2,
+        },
+        &arbiter,
+    )
+    .unwrap();
+    let outcome = book.resolve(resolution, 23).unwrap();
+    assert!(outcome.refund.is_some());
+    let release = outcome.bond_release.unwrap();
+    assert_eq!(release.to, creator.address().unwrap());
+    assert_eq!(release.amount_sat, 100);
+    assert!(outcome.bond_slash.is_none());
+    // Frivolous challenge: bond goes to the wronged solver.
+    let mut book = IntentBook::new();
+    let (intent, id) = open(&mut book, &creator, &arbiter);
+    let q = SignedQuote::sign(quote(&intent, &solver, 700, None), &solver).unwrap();
+    let quote_hash = book.quote(q, 10).unwrap();
+    book.accept(&id, None, 10).unwrap();
+    let delivery = Delivery {
+        version: DELIVERY_VERSION,
+        intent: id,
+        quote: quote_hash,
+        solver: solver.address().unwrap(),
+        result: [9u8; 32],
+        height: 20,
+        nonce: 1,
+    };
+    book.fulfill(&id, SignedDelivery::sign(delivery, &solver).unwrap(), 21)
+        .unwrap();
+    book.bond_dispute(&id, creator.address().unwrap(), 100)
+        .unwrap();
+    let dispute = SignedDispute::sign(
+        Dispute {
+            version: DISPUTE_VERSION,
+            intent: id,
+            creator: creator.address().unwrap(),
+            evidence: [5u8; 32],
+            nonce: 3,
+        },
+        &creator,
+    )
+    .unwrap();
+    book.dispute(dispute, 22).unwrap();
+    let resolution = SignedResolution::sign(
+        DisputeResolution {
+            version: RESOLUTION_VERSION,
+            intent: id,
+            arbiter: arbiter.address().unwrap(),
+            release_to_solver: true,
+            evidence: [5u8; 32],
+            nonce: 3,
+        },
+        &arbiter,
+    )
+    .unwrap();
+    let outcome = book.resolve(resolution, 23).unwrap();
+    assert!(outcome.settlement.is_some());
+    let slash = outcome.bond_slash.unwrap();
+    assert_eq!(slash.from, creator.address().unwrap());
+    assert_eq!(slash.to, solver.address().unwrap());
+    assert!(outcome.bond_release.is_none());
+    // Unbonded disputes keep the legacy path: no bond instructions.
+    let mut book = IntentBook::new();
+    let (intent, id) = open(&mut book, &creator, &arbiter);
+    let q = SignedQuote::sign(quote(&intent, &solver, 700, None), &solver).unwrap();
+    let quote_hash = book.quote(q, 10).unwrap();
+    book.accept(&id, None, 10).unwrap();
+    let delivery = Delivery {
+        version: DELIVERY_VERSION,
+        intent: id,
+        quote: quote_hash,
+        solver: solver.address().unwrap(),
+        result: [9u8; 32],
+        height: 20,
+        nonce: 1,
+    };
+    book.fulfill(&id, SignedDelivery::sign(delivery, &solver).unwrap(), 21)
+        .unwrap();
+    let dispute = SignedDispute::sign(
+        Dispute {
+            version: DISPUTE_VERSION,
+            intent: id,
+            creator: creator.address().unwrap(),
+            evidence: [5u8; 32],
+            nonce: 4,
+        },
+        &creator,
+    )
+    .unwrap();
+    book.dispute(dispute, 22).unwrap();
+    let resolution = SignedResolution::sign(
+        DisputeResolution {
+            version: RESOLUTION_VERSION,
+            intent: id,
+            arbiter: arbiter.address().unwrap(),
+            release_to_solver: false,
+            evidence: [5u8; 32],
+            nonce: 4,
+        },
+        &arbiter,
+    )
+    .unwrap();
+    let outcome = book.resolve(resolution, 23).unwrap();
+    assert!(outcome.bond_release.is_none());
+    assert!(outcome.bond_slash.is_none());
+}
+
+#[test]
+fn open_split_opens_stages_atomically() {
+    let creator = wallet(220);
+    let arbiter = wallet(221);
+    let mut book = IntentBook::new();
+    let a = intent(&creator, &arbiter, 1_000, vec![USDC]);
+    let mut b = a.clone();
+    b.nonce = 2;
+    let batch = vec![
+        SignedIntent::sign(a, &creator).unwrap(),
+        SignedIntent::sign(b, &creator).unwrap(),
+    ];
+    let ids = book.open_split(batch, 10).unwrap();
+    assert_eq!(ids.len(), 2);
+    assert_ne!(ids[0], ids[1]);
+    // A batch with a duplicate share opens nothing, not half.
+    let c = intent(&creator, &arbiter, 500, vec![USDC, SRCT]);
+    let before = book.len();
+    let bad = vec![
+        SignedIntent::sign(c.clone(), &creator).unwrap(),
+        SignedIntent::sign(c, &creator).unwrap(),
+    ];
+    assert_eq!(book.open_split(bad, 10), Err(IntentError::DuplicateIntent));
+    assert_eq!(book.len(), before);
+    // Empty and over-cap batches are refused.
+    assert!(book.open_split(vec![], 10).is_err());
+}
+
+#[test]
+fn solver_directory_merges_gossip_and_feeds_the_book() {
+    use srct_intent::solver::{decode_quote_batch, encode_quote_batch, SolverDirectory};
+    let creator = wallet(230);
+    let arbiter = wallet(231);
+    let solver_a = wallet(232);
+    let solver_b = wallet(233);
+    let mut book = IntentBook::new();
+    let (it, id) = open(&mut book, &creator, &arbiter);
+    let qa = SignedQuote::sign(quote(&it, &solver_a, 900, None), &solver_a).unwrap();
+    let mut qb_raw = quote(&it, &solver_b, 800, None);
+    qb_raw.nonce = 2;
+    let qb = SignedQuote::sign(qb_raw, &solver_b).unwrap();
+    let batch = encode_quote_batch(&[&qa, &qb]).unwrap();
+    let mut dir = SolverDirectory::new("srct/testnet");
+    dir.advertise(solver_a.address().unwrap(), 9);
+    assert_eq!(dir.merge_batch(&batch, 10).unwrap(), 2);
+    assert!(dir.is_known(&solver_b.address().unwrap()));
+    assert_eq!(dir.quotes_for(&id).len(), 2);
+    // Re-merging adds nothing; tampered batches fail whole.
+    assert_eq!(dir.merge_batch(&batch, 10).unwrap(), 0);
+    let mut bad = batch.clone();
+    bad[10] ^= 0x01;
+    assert!(decode_quote_batch(&bad).is_err());
+    assert!(decode_quote_batch(&batch[..batch.len() - 3]).is_err());
+    // Gossiped quotes enter the book through the normal admission path,
+    // and the book still picks the best one.
+    for q in dir.quotes_for(&id) {
+        book.quote(q.clone(), 10).unwrap();
+    }
+    assert_eq!(book.accept(&id, None, 10).unwrap(), qb.quote.hash());
+    // Expired gossip prunes.
+    assert!(dir.prune(101) > 0);
+}
+
+#[test]
+fn adapter_rail_executes_settlement_end_to_end() {
+    use srct_intent::adapter::{MemRail, SettlementAdapter};
+    let creator = wallet(240);
+    let arbiter = wallet(241);
+    let solver = wallet(242);
+    let mut book = IntentBook::new();
+    let (intent, id, _) = open_accept_fulfill(
+        &mut book,
+        &creator,
+        &arbiter,
+        &solver,
+        Verification::ProviderSigned,
+    );
+    let instruction = book.settle(&id, 31).unwrap();
+    let mut rail = MemRail::new();
+    rail.fund(creator.address().unwrap(), 5_000);
+    rail.fund_escrow(id, creator.address().unwrap(), intent.max_price.amount)
+        .unwrap();
+    // Over-funding past the balance is refused (4000 left, 4001 asked).
+    assert!(rail
+        .fund_escrow([9u8; 32], creator.address().unwrap(), 4_001)
+        .is_err());
+    let receipt = rail.execute_settlement(&instruction).unwrap();
+    assert_eq!(receipt.to, solver.address().unwrap());
+    assert_eq!(receipt.amount.amount, 700);
+    assert_eq!(rail.balance(&solver.address().unwrap()), 700);
+    // A replayed instruction pays nothing twice.
+    assert!(rail.execute_settlement(&instruction).is_err());
+    // A second intent refunds through the same rail.
+    let (intent2, id2, _) = {
+        let it = ev_intent(&creator, &arbiter, Verification::ProviderSigned, 21);
+        let signed = SignedIntent::sign(it.clone(), &creator).unwrap();
+        let id = book.open(signed, 10).unwrap();
+        (it, id, [0u8; 32])
+    };
+    rail.fund_escrow(id2, creator.address().unwrap(), intent2.max_price.amount)
+        .unwrap();
+    let refund = book.refund(&id2, 101).unwrap();
+    let receipt = rail.execute_refund(&refund).unwrap();
+    assert_eq!(receipt.to, creator.address().unwrap());
+    assert_eq!(
+        rail.balance(&creator.address().unwrap()),
+        5_000 - 1_000 - 1_000 + 1_000
+    );
+    assert!(rail.execute_refund(&refund).is_err());
+}

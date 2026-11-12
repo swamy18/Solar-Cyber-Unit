@@ -154,25 +154,30 @@ Consequences:
 ## 6. Hidden and visible
 
 Hidden: plaintext, plaintext length (only ciphertext length is visible), and the
-per-message key.
+per-message key. Sealed envelopes additionally hide the sender (identity, address,
+role, key bundle, signature) from everyone except the recipient.
 
-Visible by design: sender and recipient agents, addresses and roles, thread id,
+Visible by design on the normal path: sender and recipient agents, addresses and roles, thread id,
 sequence, expiry and ciphertext size.
 
 ## 7. Not provided yet
 
-- **Sealed sender** — the sender is in the envelope, so a relay sees the
-  conversation graph.
-- **Groups** — a thread is pairwise. Groups need a sender-key or MLS layer.
-- **Transport and push** — envelopes and mailboxes are bytes; moving them is the
-  operator's P2P/HTTP/MCP rail. Multi-device fan-out and presence are absent.
+- **Sealed-sender relay hosting** — impossible by design (nothing to verify
+  without the recipient key): `sealed::SealedEnvelope` hides the sender from
+  every relay and verifies recipient-side with shared sequence guards.
+- **Groups** — sender-key groups are done (`groups::GroupSession`); MLS-style
+  key agreement remains a later milestone.
+- **Transport sockets and push daemons** — the bytes, seams, codecs, presence
+  book, fan-out addressing and ack sets are done (`transport`, `http`,
+  `presence`); moving bytes over P2P/HTTP/MCP plus multi-device push daemons
+  are the operator's.
 - **Out-of-order delivery** — the ratchet and the mailbox both assume an
   ordered per-sender transport and refuse gaps instead of buffering them.
-- **Padding policy** — length hiding is the caller's job.
+- **Padding policy** — done for callers who opt in (`padding::frame_padded`).
 
 ## 8. Verified behavior
 
-`cargo test -p srct-agentnet` passes 29 tests (2 unit, 27 acceptance):
+`cargo test -p srct-agentnet` passes 45 tests (2 unit, 43 acceptance):
 
 - hybrid-wallet seal/open round trip (including the address/ECDH binding);
 - only the named recipient can open;
@@ -203,12 +208,36 @@ sequence, expiry and ciphertext size.
 - the static key path cannot open a ratchet message;
 - ratchet envelopes flow through the wire codec, a relay mailbox and the
   session end to end;
-- a session refuses a wallet other than its owner's.
+- a session refuses a wallet other than its owner's;
+- sealed envelopes hide the sender on the wire and open only for the named
+  recipient; tampered sealed boxes fail at open; sealed and normal messages
+  share one sequence space (cross-kind replay refused); sealed snapshots
+  replay guards without the key;
+- sender-key groups round-trip in both directions with per-sender forward
+  secrecy; non-members can neither write nor read; removal bumps the epoch
+  and old-epoch messages fail closed; group wire codecs refuse tamper;
+- presence tracks liveness with TTL pruning, fan-out addresses every live
+  device once, acks confirm idempotently, and HTTP deliver/poll codecs
+  round-trip with tamper refusal.
 
 ## 9. Next milestones
 
-1. Sealed-sender routing (sender hidden from relays).
-2. Group threads (sender keys or MLS).
-3. Persistent mailbox storage with the same caps and guards.
-4. HTTP/MCP transport plus delivery acknowledgements and multi-device fan-out.
-5. Optional payload padding to a small set of sizes.
+1. Sealed-sender relay hosting — **sealed transport done** (`sealed::SealedEnvelope`:
+   sender hidden from every relay, recipient-side verify + shared sequence
+   guards, relay mailboxes refuse sealed bytes by construction). Hosting
+   sealed mailboxes on untrusted relays is impossible by design (nothing to
+   verify without the key), not a missing feature.
+2. Group threads — **sender-key groups done** (`groups::GroupSession`:
+   per-sender forward-secret chains, static-signature authorship, creator-
+   distributed sync snapshots, epoch-bump re-key on removal, past-epoch
+   refusal). MLS-style key agreement remains a later milestone.
+3. Persistent mailbox storage — **done** (`Mailbox::encode`/`decode`: bounded
+   snapshot, every envelope re-verified and replayed in stored order; sealed
+   entries replay structure + guards, authenticity re-checks on `open`).
+4. HTTP/MCP transport — **wire formats plus seams done** (`http::` deliver/
+   poll codecs, `transport::Transport` + `LoopbackTransport`,
+   `presence::PresenceBook` liveness with TTL pruning, `fanout_targets`,
+   `AckSet` confirmations). Socket daemons and multi-device push remain
+   operator-run.
+5. Payload padding — **done** (`padding::frame_padded`/`unframe_padded`: 2-byte
+   length frame, zero-pad to 64/256/1024/4096/65536, non-zero padding refused).

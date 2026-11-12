@@ -12,10 +12,12 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use srct_core::hash::{Address, Hash};
+use srct_core::hash::{sha256_dom, Address, Hash};
 
 use crate::artifact::{SignedArtifact, MAX_ROYALTY_DEPTH};
 use crate::WorkError;
+
+const DOM_EVIDENCE: &[u8] = b"srct/workgraph/evidence/v1";
 
 /// The provenance book for one network. Stores signed registrations only;
 ///
@@ -68,6 +70,32 @@ impl WorkGraph {
         }
         self.artifacts.insert(hash, artifact.clone());
         Ok(hash)
+    }
+
+    /// Register with cross-crate evidence verification. The evidence is
+    /// verified through `srct-verify` first; a refused proof registers
+    /// nothing. The verified output must then bind to the artifact:
+    /// either the 32-byte output itself (TEE output hash) or
+    /// `sha256_dom(evidence-tag, output)` must equal the artifact's
+    /// evidence hash. Lineage checks run last, unchanged.
+    pub fn register_with_evidence(
+        &mut self,
+        artifact: &SignedArtifact,
+        evidence: &srct_verify::Evidence,
+        verifier: &mut srct_verify::UnifiedVerifier,
+        roots: &srct_verify::AttestationRoots,
+        height: u64,
+    ) -> Result<Hash, WorkError> {
+        let output = verifier
+            .verify(evidence, roots, height)
+            .map_err(|e| WorkError::EvidenceRefused(e.to_string()))?;
+        let binds = (output.output.len() == 32
+            && output.output.as_slice() == artifact.artifact.evidence)
+            || sha256_dom(DOM_EVIDENCE, &[&output.output]) == artifact.artifact.evidence;
+        if !binds {
+            return Err(WorkError::EvidenceMismatch);
+        }
+        self.register(artifact)
     }
 
     /// Split `revenue_sat` earned by `child`: the child's owner keeps its

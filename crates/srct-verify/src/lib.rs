@@ -17,4 +17,6 @@ pub use verify::{Evidence, EvidenceKind, UnifiedVerifier, VerifiedOutput, Verify
 pub use srct_compute::tee::{
     AttestationRoots, SignedTeeQuote, TeeQuote, TeeSla, TeeType, TEE_VERSION,
 };
+pub use srct_compute::{ComputeError, SignedAssignment, SignedReceipt};
+pub use srct_fhe::{FheError, SignedFheReceipt, SignedFheTask};
 pub use srct_zkml::task::{SignedZkReceipt, SignedZkTask};

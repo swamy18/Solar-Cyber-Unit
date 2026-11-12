@@ -9,7 +9,10 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+srct-cnnp.workspace = true
 srct-core.workspace = true
+srct-verify.workspace = true
 
 [dev-dependencies]
 rand.workspace = true
+srct-compute.workspace = true

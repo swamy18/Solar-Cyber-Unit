@@ -3,7 +3,8 @@
 
 use srct_core::wallet::Wallet;
 use srct_workgraph::{
-    Artifact, ArtifactKind, License, SignedArtifact, WorkError, WorkGraph, ARTIFACT_VERSION,
+    Artifact, ArtifactKind, ArtifactStore, License, SignedArtifact, UsageLedger, WorkError,
+    WorkGraph, ARTIFACT_VERSION, MAX_BLOB_BYTES,
 };
 
 const NET: &str = "srct/testnet";
@@ -430,4 +431,250 @@ fn wire_mutations_never_panic() {
             let _ = SignedArtifact::decode(&b);
         }
     }
+}
+
+fn tee_setup() -> (
+    srct_verify::AttestationRoots,
+    srct_verify::TeeSla,
+    srct_verify::SignedTeeQuote,
+) {
+    use srct_verify::{AttestationRoots, SignedTeeQuote, TeeQuote, TeeSla, TeeType, TEE_VERSION};
+    let provider = wallet(21);
+    let attester = wallet(22);
+    let sla = TeeSla {
+        version: TEE_VERSION,
+        network_id: NET.into(),
+        provider: provider.address().unwrap(),
+        workload: [11u8; 32],
+        model_hash: [21u8; 32],
+        runtime_hash: [22u8; 32],
+        config_hash: [23u8; 32],
+        input_hash: [24u8; 32],
+        tee: TeeType::SevSnp,
+        max_age_heights: 10,
+    };
+    let quote = TeeQuote {
+        version: TEE_VERSION,
+        network_id: NET.into(),
+        provider: provider.address().unwrap(),
+        tee: TeeType::SevSnp,
+        workload: [11u8; 32],
+        model_hash: [21u8; 32],
+        runtime_hash: [22u8; 32],
+        config_hash: [23u8; 32],
+        input_hash: [24u8; 32],
+        output_hash: [25u8; 32],
+        height: 50,
+        nonce: 1,
+    };
+    let signed = SignedTeeQuote::sign(quote, &attester).unwrap();
+    let mut roots = AttestationRoots::new();
+    roots.add_root(attester.address().unwrap(), TeeType::SevSnp);
+    (roots, sla, signed)
+}
+
+#[test]
+fn register_with_evidence_checks_the_proof() {
+    use srct_verify::{Evidence, UnifiedVerifier};
+    let owner = wallet(31);
+    let (roots, sla, quote) = tee_setup();
+    // Evidence hash is the TEE output hash directly.
+    let body = Artifact {
+        version: ARTIFACT_VERSION,
+        network_id: NET.into(),
+        kind: ArtifactKind::AttestedExecution,
+        owner: owner.address().unwrap(),
+        model_hash: [21u8; 32],
+        input_hash: [24u8; 32],
+        runtime_hash: [22u8; 32],
+        result_hash: [25u8; 32],
+        evidence: [25u8; 32],
+        parents: vec![],
+        license: license(true, 0),
+        created_height: 50,
+        nonce: 1,
+    };
+    let signed = SignedArtifact::sign(body, &owner).unwrap();
+    let mut graph = WorkGraph::new(NET);
+    let mut verifier = UnifiedVerifier::new();
+    let evidence = Evidence::Tee {
+        sla: sla.clone(),
+        quote: quote.clone(),
+    };
+    graph
+        .register_with_evidence(&signed, &evidence, &mut verifier, &roots, 50)
+        .unwrap();
+    // Same bytes are now a replay (fresh verifier: the proof verifies again,
+    // then lineage refuses the duplicate).
+    let mut verifier = UnifiedVerifier::new();
+    assert_eq!(
+        graph.register_with_evidence(&signed, &evidence, &mut verifier, &roots, 50),
+        Err(WorkError::Replay)
+    );
+}
+
+#[test]
+fn register_with_evidence_refuses_mismatch_and_fraud() {
+    use srct_verify::{Evidence, UnifiedVerifier};
+    let owner = wallet(41);
+    let (roots, sla, quote) = tee_setup();
+    // Wrong evidence hash: proof verifies, binding fails.
+    let body = Artifact {
+        version: ARTIFACT_VERSION,
+        network_id: NET.into(),
+        kind: ArtifactKind::AttestedExecution,
+        owner: owner.address().unwrap(),
+        model_hash: [21u8; 32],
+        input_hash: [24u8; 32],
+        runtime_hash: [22u8; 32],
+        result_hash: [25u8; 32],
+        evidence: [99u8; 32],
+        parents: vec![],
+        license: license(true, 0),
+        created_height: 50,
+        nonce: 1,
+    };
+    let signed = SignedArtifact::sign(body, &owner).unwrap();
+    let mut graph = WorkGraph::new(NET);
+    let mut verifier = UnifiedVerifier::new();
+    let evidence = Evidence::Tee {
+        sla: sla.clone(),
+        quote: quote.clone(),
+    };
+    assert_eq!(
+        graph.register_with_evidence(&signed, &evidence, &mut verifier, &roots, 50),
+        Err(WorkError::EvidenceMismatch)
+    );
+    // Tampered quote: the proof itself is refused, nothing registers.
+    let mut bad_quote = quote.clone();
+    bad_quote.quote.output_hash = [77u8; 32];
+    let bad = Evidence::Tee {
+        sla,
+        quote: bad_quote,
+    };
+    let mut verifier = UnifiedVerifier::new();
+    assert!(matches!(
+        graph.register_with_evidence(&signed, &bad, &mut verifier, &roots, 50),
+        Err(WorkError::EvidenceRefused(_))
+    ));
+    assert!(graph.get(&signed.hash()).is_none());
+}
+
+#[test]
+fn artifact_store_is_content_addressed_and_bounded() {
+    let mut store = ArtifactStore::new();
+    let key = store.put(b"manifest-bytes".to_vec()).unwrap();
+    // Same bytes are idempotent, not a second entry.
+    assert_eq!(store.put(b"manifest-bytes".to_vec()).unwrap(), key);
+    assert_eq!(store.len(), 1);
+    assert_eq!(store.get(&key).unwrap(), b"manifest-bytes");
+    assert!(store.get(&[9u8; 32]).is_none());
+    // Empty and over-cap blobs are refused.
+    assert!(matches!(
+        store.put(Vec::new()),
+        Err(WorkError::Malformed(_))
+    ));
+    assert!(matches!(
+        store.put(vec![1u8; MAX_BLOB_BYTES + 1]),
+        Err(WorkError::Malformed(_))
+    ));
+    // Snapshot round-trips; framing tamper and truncation fail closed.
+    // (Flipping content bytes just addresses different content — the key
+    // is the hash of the bytes, so there is nothing to disagree about.)
+    let bytes = store.encode();
+    let restored = ArtifactStore::decode(&bytes).unwrap();
+    assert_eq!(restored.get(&key).unwrap(), b"manifest-bytes");
+    let mut bad = bytes.clone();
+    bad[5] ^= 0x01;
+    assert!(ArtifactStore::decode(&bad).is_err());
+    assert!(ArtifactStore::decode(&bytes[..bytes.len() - 2]).is_err());
+    assert!(ArtifactStore::decode(&[99u8; 4]).is_err());
+}
+
+#[test]
+fn usage_ledger_counts_verified_receipts_once() {
+    use srct_cnnp::metering::{SignedReceipt, UsageReceipt};
+    use srct_cnnp::registry::{Capability, Privacy, Verification, CAPABILITY_VERSION};
+    use srct_cnnp::space::{DType, ModelSpace};
+    let provider = wallet(51);
+    let payer = wallet(52);
+    let space = |id: u8, dim: u32| ModelSpace {
+        model_id: [id; 32],
+        tokenizer: [id.wrapping_add(1); 32],
+        architecture: "mlp".into(),
+        layer: "hidden".into(),
+        dim,
+        dtype: DType::F32,
+    };
+    let capability = Capability {
+        version: CAPABILITY_VERSION,
+        provider: provider.address().unwrap(),
+        source: space(51, 8),
+        target: space(52, 16),
+        service: "translate".into(),
+        price_sat_per_unit: 5,
+        max_units: 100,
+        latency_ms: 50,
+        privacy: Privacy::Public,
+        verification: Verification::ProviderSigned,
+        expires_height: 1_000,
+        nonce: 1,
+    };
+    let receipt = SignedReceipt::sign(
+        UsageReceipt::new(&capability, payer.address().unwrap(), [7u8; 32], 4, 10, 1).unwrap(),
+        &provider,
+    )
+    .unwrap();
+    let mut ledger = UsageLedger::new();
+    assert_eq!(ledger.record(&receipt).unwrap(), 4);
+    assert_eq!(ledger.units_for_capability(&capability.hash()), 4);
+    assert_eq!(ledger.revenue_for_capability(&capability.hash()), 20);
+    assert_eq!(ledger.units_for_provider(&provider.address().unwrap()), 4);
+    // The same receipt never counts twice.
+    assert_eq!(ledger.record(&receipt), Err(WorkError::Replay));
+    // A tampered receipt counts never.
+    let mut bad = receipt.clone();
+    bad.receipt.units = 9;
+    assert!(matches!(
+        ledger.record(&bad),
+        Err(WorkError::EvidenceRefused(_))
+    ));
+    assert_eq!(ledger.units_for_capability(&capability.hash()), 4);
+}
+
+#[test]
+fn revenue_escrow_locks_releases_and_refunds_once() {
+    use srct_workgraph::{RevenueEscrow, WorkError};
+    let payer = wallet(61).address().unwrap();
+    let alice = wallet(62).address().unwrap();
+    let bob = wallet(63).address().unwrap();
+    let artifact = [77u8; 32];
+    let mut escrow = RevenueEscrow::new(NET);
+    // Zero locks and duplicate locks are refused.
+    assert!(escrow.lock(&artifact, payer, 0, 1).is_err());
+    let id = escrow.lock(&artifact, payer, 1_000, 1).unwrap();
+    assert!(escrow.lock(&artifact, payer, 1_000, 1).is_err());
+    // A different nonce is a different earning event.
+    let id2 = escrow.lock(&artifact, payer, 500, 2).unwrap();
+    assert_ne!(id, id2);
+    // Releases split the locked total across owners, never above it.
+    let p1 = escrow.release(&id, alice, 700).unwrap();
+    assert_eq!(p1.from, payer);
+    assert_eq!(p1.to, alice);
+    assert_eq!(p1.amount_sat, 700);
+    assert_eq!(escrow.released_total(&id), 700);
+    let p2 = escrow.release(&id, bob, 200).unwrap();
+    assert_eq!(p2.amount_sat, 200);
+    assert!(escrow.release(&id, bob, 101).is_err());
+    assert!(escrow.release(&[9u8; 32], bob, 1).is_err());
+    // The remainder refunds to the payer exactly once.
+    let refund = escrow.refund(&id).unwrap();
+    assert_eq!(refund.to, payer);
+    assert_eq!(refund.amount_sat, 100);
+    assert_eq!(escrow.refund(&id), Err(WorkError::Replay));
+    assert!(escrow.release(&id, bob, 1).is_err());
+    // A fully released revenue has no remainder to refund.
+    let id3 = escrow.lock(&artifact, payer, 300, 3).unwrap();
+    escrow.release(&id3, alice, 300).unwrap();
+    assert!(matches!(escrow.refund(&id3), Err(WorkError::Malformed(_))));
 }

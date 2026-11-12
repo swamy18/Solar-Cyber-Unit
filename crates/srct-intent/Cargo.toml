@@ -14,5 +14,6 @@ srct-verify.workspace = true
 
 [dev-dependencies]
 srct-compute.workspace = true
+srct-fhe.workspace = true
 srct-zkml.workspace = true
 rand.workspace = true

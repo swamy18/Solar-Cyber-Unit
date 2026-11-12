@@ -1163,6 +1163,7 @@ name = "srct-compute"
 version = "0.1.0"
 dependencies = [
  "rand",
+ "srct-agentnet",
  "srct-core",
 ]
 
@@ -1204,6 +1205,7 @@ dependencies = [
  "rand",
  "srct-compute",
  "srct-core",
+ "srct-fhe",
  "srct-verify",
  "srct-zkml",
 ]
@@ -1320,7 +1322,10 @@ name = "srct-workgraph"
 version = "0.1.0"
 dependencies = [
  "rand",
+ "srct-cnnp",
+ "srct-compute",
  "srct-core",
+ "srct-verify",
 ]
 
 [[package]]

@@ -17,8 +17,9 @@
 //!   an exact [`settle::PayoutInstruction`] the existing payment or escrow
 //!   layer should execute.
 //! - [`store`]: append-only journal of verified flow objects (offers,
-//!   assignments, receipts, bonds, escrow fundings) with bounded snapshot
-//!   encoding and re-verifying replay for restarts.
+//!   assignments, receipts, bonds, escrow fundings, withdrawals, disputes)
+//!   with bounded snapshot encoding, re-verifying replay and an
+//!   order-preserving state rebuild for restarts.
 //! - [`gossip`]: transport-agnostic offer gossip — signed, live, deduplicated
 //!   offer sets with deterministic merge and expiry pruning.
 //! - [`tee`]: TEE-backed execution evidence — signed attestation quotes,
@@ -64,8 +65,8 @@ pub mod tee;
 
 pub use bond::{
     BondBook, BondDispute, BondWithdrawal, DisputeReason, ProviderBond, Reputation, SignedBond,
-    SignedDispute, SignedWithdrawal, BAN_SCORE, BOND_VERSION, LOCKUP_HEIGHTS, MIN_BOND_SAT,
-    SLASH_FRAUD_BPS, SLASH_NOSHOW_BPS, SLASH_PENALTY, TIMEOUT_PENALTY,
+    SignedDispute, SignedWithdrawal, TimeoutCheckpoint, BAN_SCORE, BOND_VERSION, LOCKUP_HEIGHTS,
+    MIN_BOND_SAT, SLASH_FRAUD_BPS, SLASH_NOSHOW_BPS, SLASH_PENALTY, TIMEOUT_PENALTY,
 };
 pub use challenge::{
     Challenge, ChallengeBook, ChallengeVerdict, SignedChallenge, CHALLENGE_VERSION,
@@ -74,7 +75,9 @@ pub use device::{Determinism, DeviceClass, DeviceProfile, DeviceRequirement};
 pub use escrow::{
     EscrowAccount, EscrowBook, EscrowFunding, RefundInstruction, SignedFunding, ESCROW_VERSION,
 };
-pub use gossip::{GossipSet, MAX_GOSSIP_OFFERS};
+pub use gossip::{
+    decode_batch, encode_batch, GossipSet, GOSSIP_BATCH_VERSION, MAX_BATCH_BYTES, MAX_GOSSIP_OFFERS,
+};
 pub use market::{
     plan_assignments, Assignment, ComputeJob, ComputeOffer, Plan, SignedAssignment, SignedJob,
     SignedOffer, SignedPlan, MAX_ATTEMPTS, MAX_JOB_UNITS, MAX_SERVICE_LEN,

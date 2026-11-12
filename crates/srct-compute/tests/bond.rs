@@ -556,3 +556,40 @@ fn receipts_must_bind_the_assignment_to_count() {
     assert!(matches!(too_big, Err(ComputeError::Overclaim)));
     assert_eq!(book.score(&provider.address().unwrap()), 10);
 }
+
+#[test]
+fn timeout_checkpoint_restores_without_rewinding() {
+    use srct_compute::TimeoutCheckpoint;
+    let provider = wallet(41).address().unwrap();
+    let other = wallet(42).address().unwrap();
+    let mut book = BondBook::new(NET);
+    // Fresh books start at zero; a checkpoint lifts the floor.
+    let checkpoint = TimeoutCheckpoint {
+        height: 200,
+        timeouts: vec![(provider, 3), (other, 1)],
+    };
+    let bytes = checkpoint.encode();
+    assert_eq!(TimeoutCheckpoint::decode(&bytes).unwrap(), checkpoint);
+    checkpoint.apply(&mut book).unwrap();
+    assert_eq!(book.reputation(&provider).timeouts, 3);
+    assert_eq!(book.reputation(&other).timeouts, 1);
+    // A newer checkpoint raises the floor; a stale one cannot rewind it.
+    let newer = TimeoutCheckpoint {
+        height: 300,
+        timeouts: vec![(provider, 5)],
+    };
+    newer.apply(&mut book).unwrap();
+    assert_eq!(book.reputation(&provider).timeouts, 5);
+    assert_eq!(book.score(&provider), -50);
+    let stale = TimeoutCheckpoint {
+        height: 100,
+        timeouts: vec![(provider, 2)],
+    };
+    assert!(stale.apply(&mut book).is_err());
+    assert_eq!(book.reputation(&provider).timeouts, 5);
+    // Tampered and truncated snapshots fail closed.
+    let mut bad = bytes.clone();
+    bad[0] = 99;
+    assert!(TimeoutCheckpoint::decode(&bad).is_err());
+    assert!(TimeoutCheckpoint::decode(&bytes[..bytes.len() - 2]).is_err());
+}

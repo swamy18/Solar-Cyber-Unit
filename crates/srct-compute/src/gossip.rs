@@ -100,3 +100,65 @@ impl GossipSet {
         before - self.offers.len()
     }
 }
+
+/// Wire version for [`encode_batch`].
+pub const GOSSIP_BATCH_VERSION: u8 = 1;
+/// Most bytes one batch may carry. Offers are small and signed; a bigger
+/// batch is two batches.
+pub const MAX_BATCH_BYTES: usize = 256 * 1024;
+
+/// Encode live offers for one transport packet. The batch carries only
+/// signed bytes; the receiver re-verifies every offer through
+/// [`GossipSet::merge`], so a relay can neither forge nor inflate.
+pub fn encode_batch(offers: &[&SignedOffer]) -> Result<Vec<u8>, ComputeError> {
+    use srct_core::ser::Writer;
+    if offers.len() > MAX_GOSSIP_OFFERS {
+        return Err(ComputeError::Malformed("gossip batch is over cap".into()));
+    }
+    let mut w = Writer::with_capacity(64 + offers.len() * 256);
+    w.u8(GOSSIP_BATCH_VERSION).u32le(offers.len() as u32);
+    for offer in offers {
+        let bytes = offer.encode();
+        if bytes.len() > MAX_BATCH_BYTES {
+            return Err(ComputeError::Malformed("gossip offer is over cap".into()));
+        }
+        w.u32le(bytes.len() as u32).raw(&bytes);
+    }
+    let out = w.into_vec();
+    if out.len() > MAX_BATCH_BYTES {
+        return Err(ComputeError::Malformed("gossip batch is over cap".into()));
+    }
+    Ok(out)
+}
+
+/// Decode a batch produced by [`encode_batch`]. Every offer decodes through
+/// its signature check, so tampered bytes fail the whole batch instead of
+/// merging half a peer's set.
+pub fn decode_batch(bytes: &[u8]) -> Result<Vec<SignedOffer>, ComputeError> {
+    use srct_core::ser::Reader;
+    if bytes.len() > MAX_BATCH_BYTES {
+        return Err(ComputeError::Malformed("gossip batch is over cap".into()));
+    }
+    let mut r = Reader::new(bytes);
+    let bad = |detail: &str| ComputeError::Malformed(format!("gossip batch {detail}"));
+    if r.u8().map_err(|_| bad("version is missing"))? != GOSSIP_BATCH_VERSION {
+        return Err(bad("version is unknown"));
+    }
+    let count = r.u32le().map_err(|_| bad("count is missing"))? as usize;
+    if count > MAX_GOSSIP_OFFERS {
+        return Err(bad("is over cap"));
+    }
+    let mut offers = Vec::with_capacity(count);
+    for _ in 0..count {
+        let len = r.u32le().map_err(|_| bad("offer length is missing"))? as usize;
+        if len == 0 || len > MAX_BATCH_BYTES {
+            return Err(bad("offer is over cap"));
+        }
+        let blob = r
+            .fixed_slice(len)
+            .map_err(|_| bad("offer bytes are missing"))?;
+        offers.push(SignedOffer::decode(blob)?);
+    }
+    r.expect_end().map_err(|_| bad("has trailing bytes"))?;
+    Ok(offers)
+}

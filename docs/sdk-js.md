@@ -24,10 +24,13 @@ payloads, `*_sat` amounts) and returns the decoded JSON body. Node failures
 
 ## Verified behavior
 
-`npm test` (7 tests): constructor validation, GET paths, exact job-lifecycle
+`npm test` (8 tests): constructor validation, GET paths, exact job-lifecycle
 bodies, payment/escrow/VWC round-trips, `SrctApiError` mapping (409
-`job_refused` case), unreachable-node transport errors, and custom
-`fetchImpl` injection. `tsc --noEmit --allowJs --checkJs --strict` passes on
+`job_refused` case), unreachable-node transport errors, custom
+`fetchImpl` injection, and client-side input hardening — path ids, sat
+amounts, hex payloads, release modes and resolve flags are shape-checked
+before any fetch happens, so caller bugs fail locally instead of as
+confusing node errors. `tsc --noEmit --allowJs --checkJs --strict` passes on
 the JSDoc-typed source.
 
 ## Next milestones

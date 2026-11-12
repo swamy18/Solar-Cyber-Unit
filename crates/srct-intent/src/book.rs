@@ -8,8 +8,9 @@ use std::collections::BTreeMap;
 
 use srct_core::hash::{Address, Hash};
 use srct_verify::{
-    AttestationRoots, Evidence as VerifyEvidence, EvidenceKind, SignedTeeQuote, SignedZkReceipt,
-    SignedZkTask, TeeSla, UnifiedVerifier, VerifiedOutput, VerifyError,
+    AttestationRoots, Evidence as VerifyEvidence, EvidenceKind, SignedFheReceipt, SignedFheTask,
+    SignedTeeQuote, SignedZkReceipt, SignedZkTask, TeeSla, UnifiedVerifier, VerifiedOutput,
+    VerifyError,
 };
 
 use crate::types::{
@@ -151,6 +152,27 @@ pub struct RefundInstruction {
 pub struct ResolutionOutcome {
     pub settlement: Option<SettlementInstruction>,
     pub refund: Option<RefundInstruction>,
+    /// Bond back to an honest challenger (arbiter ruled for the creator).
+    pub bond_release: Option<BondRelease>,
+    /// Bond slashed from a frivolous challenger to the wronged solver.
+    pub bond_slash: Option<BondSlash>,
+}
+
+/// A posted dispute bond returned to its challenger.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BondRelease {
+    pub to: Address,
+    pub amount_sat: u64,
+    pub intent: Hash,
+}
+
+/// A posted dispute bond slashed to the solver it wrongly accused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BondSlash {
+    pub from: Address,
+    pub to: Address,
+    pub amount_sat: u64,
+    pub intent: Hash,
 }
 
 struct Record {
@@ -159,6 +181,9 @@ struct Record {
     state: IntentState,
     expected: Option<ExpectedEvidence>,
     verified: Option<EvidenceKind>,
+    /// Optional challenger bond posted against a frivolous dispute. Set by
+    /// `bond_dispute`, consumed by `resolve`.
+    dispute_bond: Option<(Address, u64)>,
 }
 
 /// What the rail expects the solver to prove, pinned by the creator or the
@@ -168,6 +193,7 @@ struct Record {
 pub enum ExpectedEvidence {
     Tee(TeeSla),
     Zk(SignedZkTask),
+    Fhe(SignedFheTask),
 }
 
 impl ExpectedEvidence {
@@ -175,6 +201,7 @@ impl ExpectedEvidence {
         match self {
             ExpectedEvidence::Tee(_) => EvidenceKind::Tee,
             ExpectedEvidence::Zk(_) => EvidenceKind::Zk,
+            ExpectedEvidence::Fhe(_) => EvidenceKind::Fhe,
         }
     }
 }
@@ -185,6 +212,7 @@ impl ExpectedEvidence {
 pub enum IntentEvidence {
     Tee(SignedTeeQuote),
     Zk(SignedZkTask, SignedZkReceipt),
+    Fhe(SignedFheTask, SignedFheReceipt),
 }
 
 impl IntentEvidence {
@@ -192,6 +220,7 @@ impl IntentEvidence {
         match self {
             IntentEvidence::Tee(_) => EvidenceKind::Tee,
             IntentEvidence::Zk(_, _) => EvidenceKind::Zk,
+            IntentEvidence::Fhe(_, _) => EvidenceKind::Fhe,
         }
     }
 }
@@ -209,6 +238,9 @@ pub struct IntentBook {
     roots: AttestationRoots,
     verifier: UnifiedVerifier,
 }
+
+/// Most intents one atomic split may open. Past the cap the caller batches.
+pub const MAX_SPLIT_INTENTS: usize = 64;
 
 impl IntentBook {
     pub fn new() -> Self {
@@ -264,9 +296,54 @@ impl IntentBook {
                 state: IntentState::Open,
                 expected: None,
                 verified: None,
+                dispute_bond: None,
             },
         );
         Ok(id)
+    }
+
+    /// Open several intents atomically for multi-solver stages: either every
+    /// intent opens or none does. Each intent is validated exactly as in
+    /// [`IntentBook::open`] (signature, deadline, no duplicate) — including
+    /// against its siblings, so two identical shares in one batch are
+    /// refused rather than half-opened.
+    pub fn open_split(
+        &mut self,
+        batch: Vec<SignedIntent>,
+        height: u64,
+    ) -> Result<Vec<Hash>, IntentError> {
+        if batch.is_empty() {
+            return Err(IntentError::BadState("split holds no intents"));
+        }
+        if batch.len() > MAX_SPLIT_INTENTS {
+            return Err(IntentError::BadState("split is over cap"));
+        }
+        let mut ids = Vec::with_capacity(batch.len());
+        for signed in &batch {
+            signed.verify().map_err(IntentError::BadSignature)?;
+            if height > signed.intent.deadline_height {
+                return Err(IntentError::IntentExpired);
+            }
+            let id = signed.intent.hash();
+            if self.records.contains_key(&id) || ids.contains(&id) {
+                return Err(IntentError::DuplicateIntent);
+            }
+            ids.push(id);
+        }
+        for (signed, id) in batch.into_iter().zip(ids.iter()) {
+            self.records.insert(
+                *id,
+                Record {
+                    signed,
+                    quotes: BTreeMap::new(),
+                    state: IntentState::Open,
+                    expected: None,
+                    verified: None,
+                    dispute_bond: None,
+                },
+            );
+        }
+        Ok(ids)
     }
 
     /// Submit a solver quote. One quote per solver per intent; a second quote
@@ -505,6 +582,18 @@ impl IntentBook {
                     receipt: receipt.clone(),
                 }
             }
+            (ExpectedEvidence::Fhe(task), IntentEvidence::Fhe(submitted, receipt)) => {
+                if submitted.hash() != task.hash() {
+                    return Err(IntentError::EvidenceMismatch);
+                }
+                if task.task.provider != solver {
+                    return Err(IntentError::EvidenceMismatch);
+                }
+                VerifyEvidence::Fhe {
+                    task,
+                    receipt: receipt.clone(),
+                }
+            }
             _ => return Err(IntentError::EvidenceMismatch),
         };
         let output = self
@@ -548,6 +637,15 @@ impl IntentBook {
                 Some(kind) if evidence_level(kind) >= required => {}
                 _ => return Err(IntentError::EvidenceMissing),
             }
+        }
+        // Sealed execution settles only on verified encrypted compute: the
+        // privacy label is a gate now, not a comment. Tee-privacy delivery
+        // still rides the verification gate above; Fhe-privacy demands the
+        // homomorphic receipt itself.
+        if record.signed.intent.min_privacy == Privacy::Fhe
+            && record.verified != Some(EvidenceKind::Fhe)
+        {
+            return Err(IntentError::EvidenceMissing);
         }
         record.state = IntentState::Settled {
             solver,
@@ -626,6 +724,42 @@ impl IntentBook {
         Ok(())
     }
 
+    /// Post a bond against a frivolous dispute. Only the creator — the only
+    /// party that can dispute — may bond, only while fulfilled, only once,
+    /// and only a positive amount. The bond is an instruction the escrow rail
+    /// executes; this book records it. Unbonded disputes keep the legacy
+    /// path: `resolve` without bond instructions.
+    pub fn bond_dispute(
+        &mut self,
+        intent: &Hash,
+        challenger: Address,
+        amount_sat: u64,
+    ) -> Result<(), IntentError> {
+        let record = self
+            .records
+            .get_mut(intent)
+            .ok_or(IntentError::UnknownIntent)?;
+        if challenger != record.signed.intent.creator {
+            return Err(IntentError::BadSignature(
+                "dispute bond is not from the creator".into(),
+            ));
+        }
+        match &record.state {
+            IntentState::Fulfilled { .. } => {}
+            _ => return Err(IntentError::BadState("intent is not fulfilled")),
+        }
+        if amount_sat == 0 {
+            return Err(IntentError::BadSignature(
+                "dispute bond amount is zero".into(),
+            ));
+        }
+        if record.dispute_bond.is_some() {
+            return Err(IntentError::BadState("intent already bonded"));
+        }
+        record.dispute_bond = Some((challenger, amount_sat));
+        Ok(())
+    }
+
     /// Apply an arbiter-signed resolution to a disputed intent.
     pub fn resolve(
         &mut self,
@@ -659,6 +793,17 @@ impl IntentBook {
                 amount: price,
                 at_height: height,
             };
+            // The challenge was frivolous: a posted bond goes to the
+            // wronged solver. No bond, no instruction — the legacy path.
+            let bond_slash = record
+                .dispute_bond
+                .take()
+                .map(|(from, amount_sat)| BondSlash {
+                    from,
+                    to: solver,
+                    amount_sat,
+                    intent: id,
+                });
             Ok(ResolutionOutcome {
                 settlement: Some(SettlementInstruction {
                     from: record.signed.intent.creator,
@@ -668,9 +813,21 @@ impl IntentBook {
                     reference: evidence,
                 }),
                 refund: None,
+                bond_release: None,
+                bond_slash,
             })
         } else {
             record.state = IntentState::Refunded { at_height: height };
+            // The challenge was honest: a posted bond returns to the
+            // challenger alongside the creator's refund.
+            let bond_release = record
+                .dispute_bond
+                .take()
+                .map(|(to, amount_sat)| BondRelease {
+                    to,
+                    amount_sat,
+                    intent: id,
+                });
             Ok(ResolutionOutcome {
                 settlement: None,
                 refund: Some(RefundInstruction {
@@ -679,6 +836,8 @@ impl IntentBook {
                     intent: id,
                     reason: RefundReason::Resolved,
                 }),
+                bond_release,
+                bond_slash: None,
             })
         }
     }
@@ -762,17 +921,316 @@ pub fn meets_privacy(quote: &Quote, required: Privacy) -> bool {
 }
 
 /// Verification strength of verified evidence, for the settle gate.
-/// `Fhe` is unreachable here (intents take Tee/Zk evidence only) and maps
-/// below the gate on purpose: FHE correctness belongs to the privacy rail
-/// and its own settlement path, not to intent delivery evidence.
+/// `Fhe`/`Compute` are unreachable as intent delivery evidence (intents take
+/// Tee/Zk evidence only) and map below the gate on purpose.
 fn evidence_level(kind: EvidenceKind) -> Verification {
     match kind {
         EvidenceKind::Tee => Verification::Tee,
         EvidenceKind::Fhe => Verification::ProviderSigned,
         EvidenceKind::Zk => Verification::Zk,
+        EvidenceKind::Compute => Verification::ProviderSigned,
     }
 }
 
 fn map_verify_error(e: VerifyError) -> String {
     e.to_string()
+}
+
+/// Snapshot version for [`IntentBook`] restart persistence.
+pub const BOOK_VERSION: u8 = 1;
+/// Most intents one snapshot holds. Past the cap the operator archives.
+pub const MAX_BOOK_INTENTS: usize = 10_000;
+/// Most quotes one intent carries in a snapshot.
+pub const MAX_BOOK_QUOTES: usize = 64;
+/// Most bytes one signed blob may occupy in a snapshot.
+pub const MAX_BOOK_BLOB: usize = 65_536;
+
+fn book_fail(detail: String) -> IntentError {
+    IntentError::BadSignature(detail)
+}
+
+fn write_blob(w: &mut srct_core::ser::Writer, bytes: &[u8]) {
+    w.u32le(bytes.len() as u32).raw(bytes);
+}
+
+fn read_blob(r: &mut srct_core::ser::Reader) -> Result<Vec<u8>, IntentError> {
+    let len = r.u32le().map_err(|e| book_fail(e.to_string()))? as usize;
+    if len > MAX_BOOK_BLOB {
+        return Err(book_fail("intent snapshot blob is over cap".into()));
+    }
+    let bytes = r
+        .fixed_slice(len)
+        .map_err(|e| book_fail(e.to_string()))?
+        .to_vec();
+    Ok(bytes)
+}
+
+fn write_amount(w: &mut srct_core::ser::Writer, amount: &Amount) {
+    w.fixed(&amount.asset.0).u64le(amount.amount);
+}
+
+fn read_amount(r: &mut srct_core::ser::Reader) -> Result<Amount, IntentError> {
+    let asset: [u8; 32] = r.fixed().map_err(|e| book_fail(e.to_string()))?;
+    let amount = r.u64le().map_err(|e| book_fail(e.to_string()))?;
+    Ok(Amount {
+        asset: crate::types::AssetId(asset),
+        amount,
+    })
+}
+
+fn write_state(w: &mut srct_core::ser::Writer, state: &IntentState) {
+    match state {
+        IntentState::Open => {
+            w.u8(0);
+        }
+        IntentState::Accepted {
+            quote,
+            solver,
+            price,
+            delivery_by_height,
+        } => {
+            w.u8(1).fixed(quote).fixed(solver);
+            write_amount(w, price);
+            w.u64le(*delivery_by_height);
+        }
+        IntentState::Fulfilled {
+            quote,
+            solver,
+            price,
+            result,
+            delivery,
+            at_height,
+        } => {
+            w.u8(2).fixed(quote).fixed(solver);
+            write_amount(w, price);
+            w.fixed(result).fixed(delivery).u64le(*at_height);
+        }
+        IntentState::Disputed {
+            quote,
+            solver,
+            price,
+            evidence,
+            at_height,
+        } => {
+            w.u8(3).fixed(quote).fixed(solver);
+            write_amount(w, price);
+            w.fixed(evidence).u64le(*at_height);
+        }
+        IntentState::Settled {
+            solver,
+            amount,
+            at_height,
+        } => {
+            w.u8(4).fixed(solver);
+            write_amount(w, amount);
+            w.u64le(*at_height);
+        }
+        IntentState::Refunded { at_height } => {
+            w.u8(5).u64le(*at_height);
+        }
+    }
+}
+
+fn read_state(r: &mut srct_core::ser::Reader) -> Result<IntentState, IntentError> {
+    match r.u8().map_err(|e| book_fail(e.to_string()))? {
+        0 => Ok(IntentState::Open),
+        1 => {
+            let quote = r.fixed().map_err(|e| book_fail(e.to_string()))?;
+            let solver = r.fixed().map_err(|e| book_fail(e.to_string()))?;
+            let price = read_amount(r)?;
+            let delivery_by_height = r.u64le().map_err(|e| book_fail(e.to_string()))?;
+            Ok(IntentState::Accepted {
+                quote,
+                solver,
+                price,
+                delivery_by_height,
+            })
+        }
+        2 => {
+            let quote = r.fixed().map_err(|e| book_fail(e.to_string()))?;
+            let solver = r.fixed().map_err(|e| book_fail(e.to_string()))?;
+            let price = read_amount(r)?;
+            let result = r.fixed().map_err(|e| book_fail(e.to_string()))?;
+            let delivery = r.fixed().map_err(|e| book_fail(e.to_string()))?;
+            let at_height = r.u64le().map_err(|e| book_fail(e.to_string()))?;
+            Ok(IntentState::Fulfilled {
+                quote,
+                solver,
+                price,
+                result,
+                delivery,
+                at_height,
+            })
+        }
+        3 => {
+            let quote = r.fixed().map_err(|e| book_fail(e.to_string()))?;
+            let solver = r.fixed().map_err(|e| book_fail(e.to_string()))?;
+            let price = read_amount(r)?;
+            let evidence = r.fixed().map_err(|e| book_fail(e.to_string()))?;
+            let at_height = r.u64le().map_err(|e| book_fail(e.to_string()))?;
+            Ok(IntentState::Disputed {
+                quote,
+                solver,
+                price,
+                evidence,
+                at_height,
+            })
+        }
+        4 => {
+            let solver = r.fixed().map_err(|e| book_fail(e.to_string()))?;
+            let amount = read_amount(r)?;
+            let at_height = r.u64le().map_err(|e| book_fail(e.to_string()))?;
+            Ok(IntentState::Settled {
+                solver,
+                amount,
+                at_height,
+            })
+        }
+        5 => {
+            let at_height = r.u64le().map_err(|e| book_fail(e.to_string()))?;
+            Ok(IntentState::Refunded { at_height })
+        }
+        _ => Err(book_fail("intent snapshot state is unknown".into())),
+    }
+}
+
+impl IntentBook {
+    /// Bounded snapshot encoding for restarts. Every signed blob is stored
+    /// with its bytes; trust roots and verifier replay books are operator
+    /// state and are NOT persisted — the operator reconfigures roots after
+    /// restart, and evidence replays fail closed per attach rules.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = srct_core::ser::Writer::with_capacity(256 + self.records.len() * 512);
+        w.u8(BOOK_VERSION).u32le(self.records.len() as u32);
+        for record in self.records.values() {
+            write_blob(&mut w, &record.signed.encode());
+            w.u16le(record.quotes.len() as u16);
+            for quote in record.quotes.values() {
+                write_blob(&mut w, &quote.encode());
+            }
+            write_state(&mut w, &record.state);
+            match &record.expected {
+                None => {
+                    w.u8(0);
+                }
+                Some(ExpectedEvidence::Tee(sla)) => {
+                    w.u8(1);
+                    write_blob(&mut w, &sla.encode());
+                }
+                Some(ExpectedEvidence::Zk(task)) => {
+                    w.u8(2);
+                    write_blob(&mut w, &task.encode());
+                }
+                Some(ExpectedEvidence::Fhe(task)) => {
+                    w.u8(3);
+                    write_blob(&mut w, &task.encode());
+                }
+            }
+            match &record.verified {
+                None => w.u8(0),
+                Some(EvidenceKind::Tee) => w.u8(1),
+                Some(EvidenceKind::Fhe) => w.u8(2),
+                Some(EvidenceKind::Zk) => w.u8(3),
+                Some(EvidenceKind::Compute) => w.u8(4),
+            };
+            match &record.dispute_bond {
+                None => w.u8(0),
+                Some((challenger, amount)) => w.u8(1).fixed(challenger).u64le(*amount),
+            };
+        }
+        w.into_vec()
+    }
+
+    /// Rebuild from a snapshot. Every signed blob is decoded through its
+    /// signature check, so tampered bytes fail the whole replay instead of
+    /// loading half a book.
+    pub fn decode(bytes: &[u8]) -> Result<Self, IntentError> {
+        let mut r = srct_core::ser::Reader::new(bytes);
+        if r.u8().map_err(|e| book_fail(e.to_string()))? != BOOK_VERSION {
+            return Err(book_fail("intent snapshot version is unknown".into()));
+        }
+        let count = r.u32le().map_err(|e| book_fail(e.to_string()))? as usize;
+        if count > MAX_BOOK_INTENTS {
+            return Err(book_fail("intent snapshot is over cap".into()));
+        }
+        let mut book = IntentBook::new();
+        for _ in 0..count {
+            let intent_bytes = read_blob(&mut r)?;
+            let signed =
+                SignedIntent::decode(&intent_bytes).map_err(|e| book_fail(e.to_string()))?;
+            let quote_count = r.u16le().map_err(|e| book_fail(e.to_string()))? as usize;
+            if quote_count > MAX_BOOK_QUOTES {
+                return Err(book_fail("intent snapshot quotes are over cap".into()));
+            }
+            let mut quotes = BTreeMap::new();
+            for _ in 0..quote_count {
+                let quote_bytes = read_blob(&mut r)?;
+                let quote =
+                    SignedQuote::decode(&quote_bytes).map_err(|e| book_fail(e.to_string()))?;
+                if quote.quote.intent != signed.intent.hash() {
+                    return Err(book_fail(
+                        "intent snapshot quote names another intent".into(),
+                    ));
+                }
+                quotes.insert(quote.quote.solver, quote);
+            }
+            let state = read_state(&mut r)?;
+            let expected = match r.u8().map_err(|e| book_fail(e.to_string()))? {
+                0 => None,
+                1 => {
+                    let sla_bytes = read_blob(&mut r)?;
+                    let sla = srct_verify::TeeSla::decode(&sla_bytes)
+                        .map_err(|e| book_fail(e.to_string()))?;
+                    Some(ExpectedEvidence::Tee(sla))
+                }
+                2 => {
+                    let task_bytes = read_blob(&mut r)?;
+                    let task = srct_verify::SignedZkTask::decode(&task_bytes)
+                        .map_err(|e| book_fail(e.to_string()))?;
+                    Some(ExpectedEvidence::Zk(task))
+                }
+                3 => {
+                    let task_bytes = read_blob(&mut r)?;
+                    let task = srct_verify::SignedFheTask::decode(&task_bytes)
+                        .map_err(|e| book_fail(e.to_string()))?;
+                    Some(ExpectedEvidence::Fhe(task))
+                }
+                _ => return Err(book_fail("intent snapshot expectation is unknown".into())),
+            };
+            let verified = match r.u8().map_err(|e| book_fail(e.to_string()))? {
+                0 => None,
+                1 => Some(EvidenceKind::Tee),
+                2 => Some(EvidenceKind::Fhe),
+                3 => Some(EvidenceKind::Zk),
+                4 => Some(EvidenceKind::Compute),
+                _ => return Err(book_fail("intent snapshot evidence kind is unknown".into())),
+            };
+            let dispute_bond = match r.u8().map_err(|e| book_fail(e.to_string()))? {
+                0 => None,
+                1 => {
+                    let challenger: Address = r.fixed().map_err(|e| book_fail(e.to_string()))?;
+                    let amount = r.u64le().map_err(|e| book_fail(e.to_string()))?;
+                    Some((challenger, amount))
+                }
+                _ => return Err(book_fail("intent snapshot bond is unknown".into())),
+            };
+            let id = signed.intent.hash();
+            if book.records.contains_key(&id) {
+                return Err(book_fail("intent snapshot holds a duplicate".into()));
+            }
+            book.records.insert(
+                id,
+                Record {
+                    signed,
+                    quotes,
+                    state,
+                    expected,
+                    verified,
+                    dispute_bond,
+                },
+            );
+        }
+        r.expect_end().map_err(|e| book_fail(e.to_string()))?;
+        Ok(book)
+    }
 }

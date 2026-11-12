@@ -198,3 +198,29 @@ test("a custom fetch implementation is honored", async () => {
   assert.equal(calls[0][0], "http://node:1234/v1/health");
   assert.equal(calls[0][1].method, "GET");
 });
+
+test("client validates inputs before touching the network", () => {
+  let fetched = 0;
+  const c = new SrctClient("http://127.0.0.1:9", {
+    fetchImpl: () => {
+      fetched += 1;
+      throw new Error("must not fetch");
+    },
+  });
+  // Path ids.
+  assert.throws(() => c.jobGet(""), TypeError);
+  assert.throws(() => c.balance(""), TypeError);
+  assert.throws(() => c.escrowSettle(""), TypeError);
+  // Bad amounts and bad hex never leave the client.
+  assert.throws(() => c.jobOpen({ amount_sat: -1 }), TypeError);
+  assert.throws(() => c.jobOpen({ amount_sat: 1.5 }), TypeError);
+  assert.throws(() => c.jobOpen({ hirer_hex: "zz" }), TypeError);
+  assert.throws(() => c.jobOpen({ hirer_hex: "abc" }), TypeError);
+  assert.throws(() => c.jobDeliver("j", { result_hash_hex: "zz" }), TypeError);
+  assert.throws(() => c.paymentSubmit({ payment_hex: "zz" }), TypeError);
+  assert.throws(() => c.escrowOpen({ amount_sat: Number.MAX_SAFE_INTEGER + 1 }), TypeError);
+  assert.throws(() => c.escrowRelease("e", { mode: "sometimes" }), TypeError);
+  assert.throws(() => c.jobResolve("j", { pay_worker: 1 }), TypeError);
+  assert.throws(() => c.jobAccept("j", null), TypeError);
+  assert.equal(fetched, 0);
+});

@@ -30,7 +30,7 @@ rules in code would have been the wrong order.
 ## Verified
 
 - **Cross-network intent settlement (non-consensus, `srct-intent`).** `cargo
-  test -p srct-intent` passes 20 acceptance tests: signed intent/tamper
+  test -p srct-intent` passes 27 acceptance tests: signed intent/tamper
   refusal, exact cross-asset route conversion and inverse ranking, same-asset
   and cross-asset quote caps, missing/expired/wrong-direction routes, one quote
   per solver, best-quote ranking, full lifecycle with a single settlement,
@@ -39,13 +39,23 @@ rules in code would have been the wrong order.
   quote/refund/settlement guards — plus execution-evidence enforcement:
   `Tee`/`Zk` intents settle only with verified evidence pinned by the creator
   or arbiter, with kind/worker/signature checks, replay refusal and low-level
-  intents settling as before. The book returns `SettlementInstruction` /
+  intents settling as before — plus FHE-privacy enforcement (sealed
+  encrypted-compute intents settle only on verified FHE evidence), bonded
+  disputes (release on honest, slash-to-solver on frivolous), atomic
+  multi-intent opens for multi-solver stages, a solver directory with
+  verified quote gossip feeding normal admission, a settlement-adapter seam
+  with an executing in-memory rail, and a bounded snapshot: every signed blob
+  re-verified on replay, tamper and truncation failing the whole restore.
+  The book returns `SettlementInstruction` /
   `RefundInstruction` only; no coin moves. See [`docs/intents.md`](intents.md).
 - **CNNP interoperability core (non-consensus, `srct-cnnp`).** `cargo test -p
-  srct-cnnp` passes 18 acceptance tests: distinct spaces, signed plaintext
+  srct-cnnp` passes 22 acceptance tests: distinct spaces, signed plaintext
   envelopes with tamper refusal, sealed envelopes with wrong-key and
   cross-space AAD refusal, a real 8 -> 16 ridge adapter (training MSE 0.000032
-  vs 0.464712 mean baseline), adapter serialization and tamper refusal,
+  vs 0.464712 mean baseline), a quadratic adapter fitting a parabola
+  (MSE < 1e-5) a linear map cannot fit, a voted tokenizer map with coverage
+  reporting and unknown-token refusal, held-out evaluation against a mean
+  baseline, adapter serialization and tamper refusal,
   deterministic capability discovery, exact receipt settlement with
   over-unit/future/mispriced refusals, a per-request replay book, and plan
   chaining/budget/privacy checks — plus the execution-evidence gate: pinned
@@ -56,28 +66,37 @@ rules in code would have been the wrong order.
   authorization only; no coin moves in this crate. See
   [`docs/cnnp.md`](cnnp.md).
 - **DiLoCo PoUW prototype (non-consensus, `srct-diloco`).** `cargo test -p
-  srct-diloco` passes 37 tests: 12 unit and 25 acceptance. The acceptance suite
+  srct-diloco` passes 48 tests: 23 unit and 25 acceptance. The acceptance suite
   trains a real 2-8-1 MLP for 24 rounds across three independently signed
   workers (loss 1.0144 -> 0.2695, accuracy 17.2% -> 88.5%) and exercises forged
   keys, tampered deltas, replay, wrong round/base/model, NaN/Inf and oversized
   updates, a low-quality outlier excluded from aggregation and rewards, quorum
   failure, deterministic checkpoints and strict wire decoding. Measured release
   latency: 6.4-8.5 ms/round. A `TrainBackend` seam with fixed-vector
-  conformance wraps three backends: the CPU `f32` reference, a
-  block-partitioned executor (`Statistical`), and a fixed-point Q16.16 integer
-  backend (`BitExact` by construction: byte-identical training runs, integer
-  Padé activations, MSE objective). The suite proves CPU and blocked pass the
-  same conformance, the fixed-point backend trains deterministically while
+  conformance wraps the CPU `f32` reference, a block-partitioned executor
+  (`Statistical`), a fixed-point Q16.16 integer backend (`BitExact` by
+  construction: byte-identical training runs, integer Padé activations,
+  MSE objective) and six staged hardware backends (CUDA, ROCm, TPU, NPU,
+  Apple silicon, photonic): the suite proves CPU and blocked pass the same
+  conformance, the fixed-point backend trains deterministically while
   f32-parity conformance correctly refuses its dtype, a perturbed kernel fails,
   a `Statistical` kernel can pass tolerance but is refused by the `BitExact`
-  consensus gate (which the fixed-point backend satisfies), and an unavailable
-  device fails closed. Hash mining is untouched and remains the
-  only consensus mechanism. Real GPU/TPU/NPU/Apple-silicon/photonic silicon
-  is not implemented, and the
+  consensus gate (which the fixed-point backend satisfies), an unavailable
+  device fails closed, and every emulated hardware backend passes plumbing
+  conformance while no hardware backend passes the consensus gate. A staged
+  consensus package pins the rest of the fork surface without activating it:
+  round anchors with exact wire refusal, PoUW minting sharing the issuance
+  schedule through the real mint gate (a full coinbase plus any PoUW mint is
+  refused; a yielded satoshi admits a PoUW satoshi), bonded eligibility with
+  a positive floor, challenge re-execution that catches fabricated deltas,
+  and quorum-gated minting — all behind `pouw_activation_height`, `0` (off)
+  on every shipped profile. Hash mining is untouched and remains the
+  only consensus mechanism. Real silicon execution plugs in behind each
+  backend's probe; contributors test on their hardware. The
   required `TrainBackend` seam, determinism policy and conformance gates are
   specified in [`docs/dual-mining.md`](dual-mining.md) §8.
 - **End-to-end agent messaging (non-consensus, `srct-agentnet`).** `cargo test
-  -p srct-agentnet` passes 29 tests (2 unit, 27 acceptance): hybrid-wallet
+  -p srct-agentnet` passes 45 tests (2 unit, 43 acceptance): hybrid-wallet
   seal/open, recipient-key/address binding at seal time, wrong-recipient
   refusal, tampered ciphertext/thread/sequence/expiry/recipient refusal,
   sender spoof refusal, strict wire decoding, zero-sequence and
@@ -90,13 +109,20 @@ rules in code would have been the wrong order.
   direction change, sequence-gap refusal with recovery, replay refusal,
   tampered-ciphertext refusal that does not advance the chain, third-party
   session-hijack refusal, wrong-thread refusal, static-path inability to open
-  ratchet messages, wire→mailbox→session end to end, and wrong-wallet refusal.
-  The mailbox is bounded and verifies without decrypting; content is hidden
+  ratchet messages, wire→mailbox→session end to end, wrong-wallet refusal —
+  plus a bounded mailbox snapshot with re-verified replay, opt-in length
+  hiding to five buckets, a loopback transport seam, sealed-sender envelopes
+  that hide the sender from every relay (recipient-side verify, shared
+  sequence guards, snapshot guards without the key), sender-key group threads
+  with epoch-bump rekeying on removal and past-epoch refusal, presence
+  liveness with TTL pruning, fan-out addressing, idempotent acknowledgements,
+  and HTTP deliver/poll codecs. The mailbox is
+  bounded and verifies without decrypting; content is hidden
   and conversation state is forward-secret, but sender/recipient/thread
-  metadata is visible, and no ratchet for groups, sealed sender or persistent
-  mailbox exists yet. See [`docs/agentnet.md`](agentnet.md).
+  metadata stays visible on the normal path by design — the sealed path hides
+  the sender instead. See [`docs/agentnet.md`](agentnet.md).
 - **Decentralized compute sharing (non-consensus, `srct-compute`).** `cargo
-  test -p srct-compute` passes 65 tests (5 unit, 60 acceptance): profile and
+  test -p srct-compute` passes 68 tests (5 unit, 63 acceptance, plus 1 ignored bench): profile and
   requirement binding, offer/job wire round-trips and tamper refusal, a
   30-unit job split deterministically across a GPU, a 2 GB phone and a laptop
   (20 + 4 + 4 + 2 units, 244 sat), a small phone taking several shards up to
@@ -112,16 +138,20 @@ rules in code would have been the wrong order.
   requiring the deadline, ten timeouts banning with settled units recovering,
   timeouts cleared by re-bonding but not fraud slashes, lockup-enforced
   withdrawals with replay and over-draw refusal, bond/withdrawal/dispute wire
-  round-trips, and settlement credit bound to the receipt's assignment —
+  round-trips, and settlement credit bound to the receipt's assignment, plus
+  an operator timeout checkpoint that restores counts without ever rewinding
+  observed timeouts —
   plus TEE-backed execution evidence: valid attestation quotes verify and
   return the output hash, tampered quotes fail the signature, unknown and
   revoked attesters are refused, model/runtime/config/input/workload/provider
   mismatches are refused, stale and future-height quotes are refused, the same
   quote bytes cannot verify twice, and simulator quotes are accepted only by
   simulator SLAs. Signed offers, assignments and receipts round-trip; the
-  flow journal snapshots and re-verified restarts, now including bonds and
-  escrow fundings; gossip dedups, merges and prunes with forged/foreign/overflow
-  refusals; challenge re-execution clears
+  flow journal snapshots and re-verified restarts, now including bonds,
+  escrow fundings, withdrawals and disputes with an order-preserving rebuild;
+  gossip dedups, merges and prunes with forged/foreign/overflow
+  refusals, ships as signed batches re-verified on decode, and rides the
+  agent transport in a pinned end-to-end test; challenge re-execution clears
   matching receipts and slashes fabricated ones through the `WrongResult`
   dispute path; and job escrow funds once, releases each settled receipt's
   exact total without ever exceeding the pot, and refunds the remainder
@@ -132,49 +162,62 @@ rules in code would have been the wrong order.
   and a slash is only as real as the escrow rail that executes it. See
   [`docs/compute-sharing.md`](compute-sharing.md).
 - **Encrypted compute prototype (non-consensus, `srct-fhe`).** `cargo test
-  -p srct-fhe` passes 11 acceptance tests: real exponential-ElGamal
+  -p srct-fhe` passes 16 acceptance tests in ~30 s: real exponential-ElGamal
   encryption over secp256k1 with randomized ciphertexts, homomorphic
   add/scale matching plaintext, a signed task → worker receipt → verifier
   workflow decrypting to the exact expected value without the worker seeing
   inputs, tampered outputs refused as fraud (exact homomorphic recomputation),
   tampered inputs/weights breaking the task signature, impostor and
   wrong-worker refusals, late/future receipts refused, double settlement
-  refused, and malformed tasks (identity/off-curve keys, over-cap weights,
-  empty inputs, zero nonce/deadline) refused. One operation only
+  refused, malformed tasks (identity/off-curve keys, over-cap weights,
+  empty inputs, zero nonce/deadline) refused — plus exact operation-cost
+  pricing with overflow refusal, static worst-case bound analysis that refuses
+  over-bound evaluation before any ciphertext work, an operator-curated key
+  registry with rotation and revocation, and a one-shot task escrow with
+  release on verified receipt and refund after the deadline. One operation only
   (`bias + Σ w·x`); weights are public, values must stay inside the decode
   bound. See [`docs/fhe.md`](fhe.md).
 - **Zero-knowledge ML verification (non-consensus, `srct-zkml`).** `cargo
-  test -p srct-zkml` passes 9 acceptance tests in ~3 s: real Sigma-protocol
+  test -p srct-zkml` passes 11 acceptance tests (plus 1 ignored bench) in ~6 s: real Sigma-protocol
   proofs (Pedersen commitments, CDS OR bit-proofs, Fiat-Shamir) of correct
-  quantized linear evaluation with 16-bit range checks, a signed task →
-  receipt → verifier workflow, tampered outputs and wrong statements refused
-  as `InvalidProof`, tampered commitments breaking the task signature,
-  impostor and wrong-worker refusals, late/future/replay refusals, malformed
-  tasks and receipts refused, and wire round-trips. One linear layer only
-  (≤8 inputs); Bulletproofs R1CS was evaluated but its published crate does
-  not compile. See [`docs/zkml.md`](zkml.md).
+  quantized linear evaluation with 16-bit range checks, a threshold gate
+  proving `value >= bound` (including boundary and false-statement refusal),
+  a signed task → receipt → verifier workflow, tampered outputs and wrong
+  statements refused as `InvalidProof`, tampered commitments breaking the task
+  signature, impostor and wrong-worker refusals, late/future/replay refusals,
+  malformed tasks and receipts refused, and wire round-trips. One linear layer
+  plus one threshold gate (≤8 inputs); Bulletproofs R1CS was evaluated but its
+  published crate does not compile. See [`docs/zkml.md`](zkml.md).
 - **AI Work Graph (non-consensus, `srct-workgraph`).** `cargo test
-  -p srct-workgraph` passes 10 acceptance tests: lineage registration with
+  -p srct-workgraph` passes 16 acceptance tests: lineage registration with
   signature/network/parent/license checks, parent-newer-than-child and
   replay refusals, transitive descendants, an exact 3-level royalty chain
   (95,000 / 4,000 / 1,000 of 100,000), a 3-parent split with dust kept by
   the owner, depth-cap cutoff with exact sums, zero-royalty passthrough,
-  and wire round-trips. Cycles are impossible by construction; evidence
-  hashes reference (not recheck) the issuing crates' proofs. See
+  and wire round-trips — plus cross-crate evidence checks: a proof verified
+  through `srct-verify` must bind to the artifact's evidence hash, with
+  mismatch and fraud refused — plus a content-addressed store (key-is-hash,
+  caps, snapshot replay) and a metered-reuse oracle counting verified CNNP
+  receipts exactly once. Cycles are impossible by construction — plus a
+  revenue escrow with per-payout release and exactly-once refund. See
   [`docs/workgraph.md`](workgraph.md).
 - **Unified verification policy (non-consensus, `srct-verify`).** `cargo
-  test -p srct-verify` passes 5 acceptance tests: the Section 7 policy table
+  test -p srct-verify` passes 9 acceptance tests: the Section 7 policy table
   (execution/correctness per task kind, security level and value) is pinned,
-  and one fail-closed verifier checks TEE, FHE and ZKML evidence with all
-  replay books, preserving inner errors. See [`docs/verify.md`](verify.md).
+  one fail-closed verifier checks TEE, FHE, ZKML and compute-receipt evidence with all
+  replay books, preserving inner errors, a profile gate verifies every
+  evidence and refuses release unless the policy's proof set is covered,
+  and a gated-release seam runs the rail's closure only on pass. See
+  [`docs/verify.md`](verify.md).
 - **JavaScript SDK (`sdk-js/`, non-consensus tooling).** Dependency-free ESM
   REST client (health/status/balance/block, jobs lifecycle, payments, escrow,
-  VWC) with `SrctApiError` mapping. `npm test` passes 7 `node:test` suites
+  VWC) with `SrctApiError` mapping. `npm test` passes 8 `node:test` suites
   against a mock HTTP server (exact method/path/body pins, error mapping,
-  transport errors, custom fetch injection); `tsc --strict --checkJs` passes
-  on the JSDoc-typed source. Not a signer; live-node e2e is future. See
+  transport errors, custom fetch injection, client-side input hardening);
+  `tsc --strict --checkJs` passes on the JSDoc-typed source (TypeScript itself
+  is not vendored in this repo). Not a signer; live-node e2e is future. See
   [`docs/sdk-js.md`](sdk-js.md).
-- `cargo test --workspace` — **1,847 tests pass, 0 failures, 1 ignored** across the workspace; `npm test` in `sdk-js/` passes 7 suites. Proof-system latencies are measured in [`docs/benchmarks.md`](benchmarks.md).
+- `cargo test --workspace` — **1,905 tests pass, 0 failures, 3 ignored** across the workspace (the 3 ignored are opt-in bench probes, not skipped coverage); `npm test` in `sdk-js/` passes 8 suites. Proof-system latencies are measured in [`docs/benchmarks.md`](benchmarks.md).
   (this file quote counts as of their own dates — 242, then 263, then 293 —
   kept as history):
   - 227 unit tests in `srct-core` (M1–M5 suites, the 21-test validator-set suite, the 30-test real-BLS suite in

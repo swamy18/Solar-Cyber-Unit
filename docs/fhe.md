@@ -38,22 +38,25 @@ FheReceipt = version || task_hash || worker || output || height || nonce
 
 - **One operation only.** No encrypted non-linearities, no bootstrapping, no
   TFHE. Weights and bias are public; only inputs/outputs are private.
-- **Bounded values.** Decryption searches `[0, bound)`; overflow wraps
-  silently mod n. Keep evaluated sums inside the bound (weights are capped at
-  ±1,000,000, at most 64 inputs).
+- **Bounded values.** Decryption searches `[0, bound)`; arithmetic is modulo
+  the curve order. `cost::eval_bounded` refuses an evaluation whose static
+  worst case exceeds the decryption bound, so an over-bound sum never reaches
+  a receipt — but there is still no zero-knowledge range proof on inputs.
 - **No range proofs.** Ciphertexts are validated on-curve, not on-range.
 - A requester's keypair is self-managed; there is no on-chain key registry.
 
 ## Verified behavior
 
-`cargo test -p srct-fhe` passes 11 acceptance tests: encrypt/decrypt
+`cargo test -p srct-fhe` passes 12 acceptance tests: encrypt/decrypt
 round-trips (0 to 1,000,000), randomized encryption (same plaintext, different
 bytes), homomorphic add/scale matching plaintext, a full task→receipt→verify
 workflow decrypting to the exact expected value (59), tampered output refused
 as `FraudulentOutput`, tampered inputs/weights breaking the task signature,
 impostor and wrong-worker refusals, late/future receipts refused, double
 settlement refused, malformed tasks (identity/off-curve keys, over-cap
-weights, empty inputs, zero nonce/deadline) refused, and wire round-trips.
+weights, empty inputs, zero nonce/deadline) refused, wire round-trips —
+plus exact operation-cost pricing (`task_cost`/`price_task`) with overflow
+refusal.
 
 Measured on this machine (debug build): full 11-test suite in ~42 s, dominated
 by BSGS table builds at bound 2^32 (~65k entries). Production bounds should be
@@ -61,9 +64,16 @@ set per workload; smaller bounds decode proportionally faster.
 
 ## Next milestones
 
-1. TFHE-style runtime for non-linear ops (ReLU, argmax) and bootstrapping.
-2. Encrypted-weight inference (both model and input private).
-3. Range proofs on inputs so overflow fails closed instead of wrapping.
-4. On-chain encryption-key registry with rotation and revocation.
-5. Escrow-rail integration: fund on task, release on verified receipt, refund
-   on deadline, slash on proven fraud.
+1. TFHE-style runtime for non-linear ops (ReLU, argmax) and bootstrapping —
+   research work, explicitly out of scope for this prototype.
+2. Encrypted-weight inference (both model and input private) — research work.
+3. Range proofs on inputs so overflow fails closed instead of wrapping —
+   partially covered by static bound analysis (`cost::eval_bounded`
+   refuses over-bound evaluation before any ciphertext work); ZK range
+   proofs remain research work.
+4. On-chain encryption-key registry — **done** (`KeyRegistry`: operator-curated
+   keys with rotation that keeps old keys resolvable and revocation that
+   distrusts entirely).
+5. Escrow-rail integration — **done** (`FheEscrow`: fund once, release exactly
+   the funded task on a verified receipt, refund the remainder exactly once
+   after the deadline). Payment-rail execution of the instructions is next.

@@ -7,7 +7,8 @@
 //! - **Proof of correctness** — the result equals the specified computation
 //!   on the committed inputs (FHE homomorphic recomputation, ZK proof).
 //! - **Proof of resource consumption** — the agreed resources were provided
-//!   (metered receipts; enforced by `srct-compute::settle`, not here).
+//!   (metered receipts; enforced by `srct-compute::settle` and dispatched
+//!   through `UnifiedVerifier` as `Evidence::Compute`).
 //!
 //! [`select_proofs`] maps a task profile to the required proof set. It is
 //! advisory: the [`crate::verify::UnifiedVerifier`] enforces whatever evidence

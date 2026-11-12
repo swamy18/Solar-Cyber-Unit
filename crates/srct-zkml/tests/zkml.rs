@@ -413,3 +413,31 @@ fn wire_mutations_never_panic() {
         }
     }
 }
+
+#[test]
+fn threshold_gate_proves_a_lower_bound() {
+    use srct_zkml::{prove_threshold, verify_threshold, ThresholdProof};
+    // 1000 >= 500 proves and verifies, including the boundary.
+    let proof = prove_threshold(1000, 500, &mut rng()).unwrap();
+    verify_threshold(&proof).unwrap();
+    let edge = prove_threshold(500, 500, &mut StdRng::seed_from_u64(7)).unwrap();
+    verify_threshold(&edge).unwrap();
+    // Full-range bound proves too.
+    verify_threshold(&prove_threshold(65535, 0, &mut rng()).unwrap()).unwrap();
+    // A false statement is refused at prove time — there is no proof of a lie.
+    assert_eq!(
+        prove_threshold(499, 500, &mut rng()),
+        Err(ZkError::InvalidProof)
+    );
+    // Wire round-trip preserves the assertion.
+    assert_eq!(ThresholdProof::decode(&proof.encode()).unwrap(), proof);
+    // A retargeted threshold breaks the statement binding.
+    let mut bad = proof.clone();
+    bad.threshold = 501;
+    assert_eq!(verify_threshold(&bad), Err(ZkError::InvalidProof));
+    // Tampered and truncated bytes fail closed.
+    let mut bytes = proof.encode();
+    bytes[10] ^= 0x01;
+    assert!(ThresholdProof::decode(&bytes).is_err());
+    assert!(ThresholdProof::decode(&bytes[..bytes.len() - 4]).is_err());
+}

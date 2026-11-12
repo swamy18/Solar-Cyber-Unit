@@ -261,7 +261,7 @@ correct or useful — that is challenge re-execution / ZKML, still future.
 
 ## 9. Verified behavior
 
-`cargo test -p srct-compute` passes 65 tests (5 unit, 60 acceptance):
+`cargo test -p srct-compute` passes 68 tests (5 unit, 63 acceptance):
 
 - profile hash binds class, RAM, caps and kernel; unknown encodings refused;
 - requirement matching refuses empty mask, low RAM, weak determinism and wrong
@@ -311,14 +311,17 @@ correct or useful — that is challenge re-execution / ZKML, still future.
   zero output hash and zero nonce never sign;
 - signed offers, assignments and receipts round-trip through wire codecs that
   refuse truncation and version corruption;
-- the flow journal appends only verified offers, assignments, receipts, bonds
-  and escrow fundings, snapshots with bounded encoding, and restarts by
-  re-verifying every entry — tampering, truncation or a foreign-network entry
-  fails the whole replay, and a restarted node rebuilds the same bond
-  registrations and escrow fundings; slash/withdrawal outcomes and timeout
-  counts are not signed objects and still need an operator checkpoint;
+- the flow journal appends only verified offers, assignments, receipts, bonds,
+  escrow fundings, withdrawals and disputes, snapshots with bounded encoding,
+  and restarts by re-verifying every entry — tampering, truncation or a
+  foreign-network entry fails the whole replay; an order-preserving rebuild
+  replays registrations, releases, slashes and withdrawals to the same bond
+  balance, escrow remainder and ledger total, and applying credits before
+  disputes would visibly change the penalty; operator-observed timeout counts
+  persist through a checkpoint that restores as a floor, never a rewind;
 - gossip keeps only signed live offers, dedups, merges order-independently,
-  prunes on expiry, and refuses forged/foreign/overflowed input;
+  prunes on expiry, refuses forged/foreign/overflowed input, ships as signed
+  batches re-verified on decode, and rides the agent transport end to end;
 - challenge re-execution clears matching receipts and slashes fabricated ones:
   same result verifies clean, a different result produces a `WrongResult`
   dispute that halves the bond and bans the provider through the existing
@@ -342,9 +345,12 @@ correct or useful — that is challenge re-execution / ZKML, still future.
    settled receipt, refund the remainder at the deadline). Executing bond
    registrations, slashes and withdrawals on the same rail is still the
    payment layer's job.
-4. Persistent bond/reputation snapshots — **partly done**: bond registrations
-   and escrow fundings now journal and replay. Slash/withdrawal outcomes and
-   timeout counts are operator state, not signed flow objects, so exact bond
-   balances and reputation still need an operator checkpoint.
-5. Gossip transport binding: carry the gossip set over the agent messaging
-   rail or HTTP/MCP (message rules done here).
+4. Persistent bond/reputation snapshots — **done**: bond registrations,
+   escrow fundings, withdrawals and disputes journal and rebuild in order,
+   and operator-observed timeout counts persist through a
+   `TimeoutCheckpoint` that restores as a floor (never rewinds observed
+   timeouts).
+5. Gossip transport binding — **seam done** (`encode_batch`/`decode_batch`:
+   signed batch wire format, every offer re-verified on decode; the agent
+   `LoopbackTransport` round-trip is pinned by test). Live P2P/HTTP/MCP
+   rails and peer scoring stay the operator's job.

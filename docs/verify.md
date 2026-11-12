@@ -11,7 +11,7 @@ Three claims, three mechanisms:
 |---|---|---|
 | Proof of execution | TEE attestation | `srct-compute::tee` |
 | Proof of correctness | FHE recomputation / ZK proof | `srct-fhe`, `srct-zkml` |
-| Proof of resource use | Metered receipts | `srct-compute::settle` (enforced there) |
+| Proof of resource use | Metered receipts | `srct-compute::settle` via `Evidence::Compute` |
 
 `select_proofs` maps a task profile (kind, security level, value) to the
 required proof set. Execution first (cheap reject), correctness second.
@@ -25,23 +25,27 @@ and the escrow rail decides what to require.
 
 ## Unified verifier
 
-`UnifiedVerifier` holds the TEE, FHE and ZKML replay books and verifies any
-`Evidence` (quote+SLA, task+receipt, task+receipt) through the inner
+`UnifiedVerifier` holds the TEE, FHE, ZKML and compute-ledger replay books and verifies any
+`Evidence` (quote+SLA, task+receipt, task+receipt, assignment+receipt) through the inner
 verifiers, preserving their error types transparently. The same evidence can
 never verify twice, even across mixed workloads. Accepted evidence returns
-the output commitment for the escrow rail to settle against.
+the output commitment for the escrow rail to settle against (compute returns
+the 8-byte LE payout amount).
 
 ## Verified behavior
 
-`cargo test -p srct-verify` passes 5 acceptance tests: the full policy table
-is pinned, TEE/FHE/ZKML evidence each verify through the unified verifier
-with the right kind tags, fraud and wrong-statement evidence are refused
-with transparent inner errors, replays are refused, and one verifier handles
-mixed evidence independently.
+`cargo test -p srct-verify` passes 9 acceptance tests: the full policy table
+is pinned, TEE/FHE/ZKML/compute evidence each verify through the unified verifier
+with the right kind tags, fraud, wrong-statement, expired and replayed evidence are refused
+with transparent inner errors, one verifier handles mixed evidence independently,
+the profile gate refuses release without its proof set, and the gated-release
+seam runs the rail closure only on pass.
 
 ## Next milestones
 
-1. Resource-use proofs in the unified verifier (receipt settlement dispatch).
-2. Escrow-rail integration: require the policy's proof set before release.
-3. Intent lifecycle wiring: enforce `Verification::{Tee, Zk}` levels on
-   delivery (roadmap item 6).
+1. Escrow-rail integration — **gate plus seam done** (`verify_for_profile`:
+   verifies every evidence and refuses release unless the policy's proof set
+   is covered; `gated_release` runs the rail's closure only on pass, never
+   on failure). Node-side L1 escrow paths are intentionally unwired: the L1
+   coin escrow is signature-gated, not proof-gated, and mixing the two would
+   be a consensus-adjacent behaviour change.

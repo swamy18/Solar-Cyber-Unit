@@ -412,6 +412,14 @@ pub struct NetworkParams {
     /// `mainnet` carries 1_000_000 sat (0.01 SRCT), the same anti-dust scale
     /// as `l2_deposit_minimum_sat`.
     pub min_bond_sat: u64,
+    /// Height at which proof-of-useful-work minting and round anchoring
+    /// begin. `0` means never: the rule is inert and every profile is
+    /// byte-identical to the current consensus, so flipping it is the single
+    /// switch that activates the PoUW track. The same convention as
+    /// `pq_activation_height`. Hash mining is untouched either way — an
+    /// inactive PoUW track mints nothing and a low-participation round
+    /// settles nothing.
+    pub pouw_activation_height: u64,
 }
 
 impl NetworkParams {
@@ -554,6 +562,9 @@ impl NetworkParams {
             // PQ spend enforcement is off on mainnet until the post-quantum
             // launch decision sets a height.
             pq_activation_height: 0,
+            // PoUW minting and round anchoring are off on mainnet until the
+            // dual-mining fork sets a height. Hash mining alone secures blocks.
+            pouw_activation_height: 0,
             // Anti-dust bond floor on mainnet (see the field doc): 1-sat
             // bonds cost every node permanent ledger entries at no stake.
             min_bond_sat: 1_000_000,
@@ -646,6 +657,8 @@ impl NetworkParams {
             // PQ enforcement off on mini; the migration tests build their own
             // profile with a nonzero activation height.
             pq_activation_height: 0,
+            // PoUW off on mini; tests enabling it build their own profile.
+            pouw_activation_height: 0,
             // No bond floor on mini: tests exercise dust behavior deliberately.
             min_bond_sat: 0,
             // Exit throttle disabled on mini (all five zero): bare rules.
@@ -716,6 +729,8 @@ impl NetworkParams {
             exit_activation_height: 1,
             // PQ enforcement off on testnet too; activated by governance.
             pq_activation_height: 0,
+            // PoUW off on testnet too; activated by governance.
+            pouw_activation_height: 0,
             // No bond floor on testnet either: play money, dust is test data.
             min_bond_sat: 0,
             // Exit throttle disabled on testnet too.

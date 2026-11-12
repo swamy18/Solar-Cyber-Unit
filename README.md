@@ -252,10 +252,11 @@ trusting any number in it:
   `crates/srct-diloco`, with signed updates, Byzantine filtering and exact
   reward math, but it is **not consensus-active**: hash mining remains the
   only block-security mechanism until a fork, migration and economic review
-  land. Today the training path is a CPU `f32` reference: GPU, TPU, NPU, Apple
-  silicon and photonic backends are **not implemented**. The planned
-  `TrainBackend` seam and its determinism policy are in
-  [`docs/dual-mining.md`](docs/dual-mining.md) §8.
+  land. Training backends implement the `TrainBackend` seam for CPU, GPU
+  (CUDA/ROCm), TPU, NPU, Apple silicon and photonic targets: every backend
+  fails closed without its hardware and proves its plumbing in emulated mode
+  on any machine; silicon execution plugs in behind each backend's probe.
+  The determinism policy is in [`docs/dual-mining.md`](docs/dual-mining.md) §8.
 - **Reputation, jobs, FX and ramps are per-node views.** They live in each
   node's `state.bin`, not in consensus — two honest nodes can disagree on a
   score, a quote or a job state. Consensus money (UTXOs, bonds, L2 accounts)
@@ -296,7 +297,7 @@ trusting any number in it:
    `GuardGate::execute` is the implemented reference boundary).
 - **Slash vault is empty by construction (for now).** M2 (`slash.rs`, 50% burn + 50% vest) is defined and tested, but nothing creates a slash record yet — see `SPEC §14.6` / `mainnet-readiness.md`.
 - **Mainnet L2 settlement is fail-closed.** Its validator set starts empty, so settlements refuse until configured; testnet/mini use deterministic keys.
-- **HBM is staged, VWC is opt-in, PQ spend is off.** `hbm-v1` (`puzzle_id = 2`) is registered, never active; `vwc-v1` (`puzzle_id = 3`) mines only where a profile sets it, and consensus enforces the VWC commitment there; `pq_activation_height = 0` on every profile (age-gated when flipped, testnet rehearsal first).
+- **HBM is staged, VWC is opt-in, PQ spend is off, PoUW is off.** `hbm-v1` (`puzzle_id = 2`) is registered, never active; `vwc-v1` (`puzzle_id = 3`) mines only where a profile sets it, and consensus enforces the VWC commitment there; `pq_activation_height = 0` and `pouw_activation_height = 0` on every profile (age-gated when flipped, testnet rehearsal first).
 
 ---
 

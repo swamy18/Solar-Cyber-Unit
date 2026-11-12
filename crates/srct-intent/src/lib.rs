@@ -15,6 +15,11 @@
 //!   conversion and ranking.
 //! - A lifecycle state machine: open, accepted, fulfilled, settled, refunded,
 //!   disputed, with explicit failure and timeout paths.
+//! - Atomic multi-intent opens for multi-solver stages.
+//! - Solver discovery: liveness advertisement plus verified quote gossip.
+//! - Dispute bonds: an optional challenger bond, released on honest
+//!   challenges and slashed to the solver on frivolous ones.
+//! - A settlement adapter seam with an executing in-memory rail.
 //! - Replay guards: one quote per solver per intent, one delivery per accepted
 //!   quote, one settlement or refund per intent.
 //!
@@ -29,12 +34,20 @@
 //! - Not a complete dispute system. The arbiter is a named address; how that
 //!   address is selected or held accountable is outside this crate.
 
+pub mod adapter;
 pub mod book;
+pub mod solver;
 pub mod types;
 
+pub use adapter::{AdapterError, AdapterReceipt, MemRail, SettlementAdapter};
 pub use book::{
-    meets_privacy, meets_verification, IntentBook, IntentError, IntentState, RefundInstruction,
-    RefundReason, ResolutionOutcome, SettlementInstruction,
+    meets_privacy, meets_verification, BondRelease, BondSlash, IntentBook, IntentError,
+    IntentState, RefundInstruction, RefundReason, ResolutionOutcome, SettlementInstruction,
+    MAX_SPLIT_INTENTS,
+};
+pub use solver::{
+    decode_quote_batch, encode_quote_batch, SolverDirectory, MAX_BATCH_BYTES, MAX_GOSSIP_QUOTES,
+    QUOTE_BATCH_VERSION,
 };
 pub use types::{
     Amount, AssetId, AssetRoute, Delivery, Dispute, DisputeResolution, Intent, Privacy, Quote,

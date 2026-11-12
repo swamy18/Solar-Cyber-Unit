@@ -62,6 +62,10 @@ fn evidence_providers(evidence: &Evidence) -> Vec<srct_core::hash::Address> {
         Evidence::Tee { sla, quote } => vec![sla.provider, quote.quote.provider],
         Evidence::Fhe { task, receipt } => vec![task.task.provider, receipt.receipt.worker],
         Evidence::Zk { task, receipt } => vec![task.task.provider, receipt.receipt.worker],
+        Evidence::Compute {
+            assignment,
+            receipt,
+        } => vec![assignment.assignment.provider, receipt.receipt.provider],
     }
 }
 
@@ -70,6 +74,7 @@ fn evidence_kind(evidence: &Evidence) -> EvidenceKind {
         Evidence::Tee { .. } => EvidenceKind::Tee,
         Evidence::Fhe { .. } => EvidenceKind::Fhe,
         Evidence::Zk { .. } => EvidenceKind::Zk,
+        Evidence::Compute { .. } => EvidenceKind::Compute,
     }
 }
 

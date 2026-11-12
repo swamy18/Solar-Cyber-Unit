@@ -4,8 +4,8 @@
 use rand::{rngs::StdRng, SeedableRng};
 use srct_core::wallet::Wallet;
 use srct_fhe::{
-    eval, Ciphertext, FheError, FheKeys, FheReceipt, FheTask, FheVerifier, SignedFheReceipt,
-    SignedFheTask, WeightedSum, FHE_VERSION,
+    eval, price_task, task_cost, Ciphertext, FheError, FheKeys, FheReceipt, FheTask, FheVerifier,
+    SignedFheReceipt, SignedFheTask, WeightedSum, FHE_VERSION,
 };
 
 const NET: &str = "srct/testnet";
@@ -383,4 +383,125 @@ fn wire_mutations_never_panic() {
             let _ = FheReceipt::decode(&b);
         }
     }
+}
+
+#[test]
+fn task_cost_is_exact_and_priced() {
+    // 3 inputs: 50 + 3 * (20 + 10) = 140 units.
+    let op = WeightedSum {
+        weights: vec![3, -2, 5],
+        bias: 7,
+    };
+    assert_eq!(task_cost(&op).unwrap(), 140);
+    assert_eq!(price_task(&op, 7).unwrap(), 980);
+    assert_eq!(price_task(&op, 0).unwrap(), 0);
+    // Empty and over-cap ops are refused, like eval refuses them.
+    assert!(matches!(
+        task_cost(&WeightedSum {
+            weights: vec![],
+            bias: 0
+        }),
+        Err(FheError::Malformed(_))
+    ));
+    // Overflow refuses instead of wrapping.
+    assert!(matches!(
+        price_task(&op, u64::MAX),
+        Err(FheError::Malformed(_))
+    ));
+}
+
+#[test]
+fn bound_analysis_refuses_over_bound_sums() {
+    use srct_fhe::{eval_bounded, max_output};
+    let op = WeightedSum {
+        weights: vec![3, -2, 5],
+        bias: 7,
+    };
+    // Worst case at max_input 10: 7 + (3 + 2 + 5) * 10 = 107.
+    assert_eq!(max_output(&op, 10).unwrap(), 107);
+    let keys = keys();
+    let mut r = rng();
+    let inputs = vec![
+        keys.encrypt(10, &mut r),
+        keys.encrypt(4, &mut r),
+        keys.encrypt(6, &mut r),
+    ];
+    // 107 fits a 2^20 decode bound; it does not fit 100.
+    assert!(eval_bounded(&op, &inputs, 10, 1 << 20).is_ok());
+    assert!(matches!(
+        eval_bounded(&op, &inputs, 10, 100),
+        Err(FheError::Malformed(_))
+    ));
+    // Bound arithmetic overflows fail closed instead of wrapping.
+    assert!(matches!(
+        max_output(&op, u64::MAX),
+        Err(FheError::Malformed(_))
+    ));
+}
+
+#[test]
+fn key_registry_tracks_rotation_and_revocation() {
+    use srct_fhe::{KeyRegistry, KeyStatus};
+    let owner = wallet(51).address().unwrap();
+    let k1 = FheKeys::generate(&mut StdRng::seed_from_u64(0x51));
+    let k2 = FheKeys::generate(&mut StdRng::seed_from_u64(0x52));
+    let mut reg = KeyRegistry::new(NET);
+    reg.add_key(owner, k1.public_bytes(), 5).unwrap();
+    // A second current key needs rotate, not a second registration;
+    // garbage bytes are not a curve point.
+    assert!(reg.add_key(owner, k2.public_bytes(), 6).is_err());
+    assert!(reg
+        .add_key(wallet(52).address().unwrap(), [9u8; 33], 6)
+        .is_err());
+    assert_eq!(reg.status(&owner, &k1.public_bytes()), KeyStatus::Current);
+    // Rotating to the live key is refused; a real rotation retires the old.
+    assert!(reg.rotate(owner, k1.public_bytes(), 7).is_err());
+    reg.rotate(owner, k2.public_bytes(), 7).unwrap();
+    assert_eq!(reg.status(&owner, &k2.public_bytes()), KeyStatus::Current);
+    assert_eq!(reg.status(&owner, &k1.public_bytes()), KeyStatus::Retired);
+    assert_eq!(
+        reg.status(&wallet(53).address().unwrap(), &k1.public_bytes()),
+        KeyStatus::Unknown
+    );
+    // Revocation kills every resolution for the owner.
+    reg.revoke(owner);
+    assert_eq!(reg.status(&owner, &k2.public_bytes()), KeyStatus::Unknown);
+    assert!(reg.add_key(owner, k1.public_bytes(), 8).is_err());
+}
+
+#[test]
+fn escrow_funds_releases_and_refunds_once() {
+    use srct_fhe::{FheEscrow, FheVerifier};
+    let requester = wallet(61);
+    let provider = wallet(62);
+    let keys = keys();
+    let signed = task(&keys, &requester, &provider);
+    let mut escrow = FheEscrow::new(NET);
+    let mut verifier = FheVerifier::new();
+    // Zero funding and double funding are refused.
+    assert!(escrow.fund(&signed, 0, HEIGHT).is_err());
+    let id = escrow.fund(&signed, 1_000, HEIGHT).unwrap();
+    assert!(escrow.fund(&signed, 1_000, HEIGHT).is_err());
+    // A verified receipt releases exactly the funded amount, once.
+    let receipt = receipt_for(&signed, &provider, HEIGHT, 1);
+    let payout = escrow
+        .release(&signed, &receipt, &mut verifier, HEIGHT)
+        .unwrap();
+    assert_eq!(payout.amount_sat, 1_000);
+    assert_eq!(payout.from, requester.address().unwrap());
+    assert_eq!(payout.to, provider.address().unwrap());
+    assert!(escrow
+        .release(&signed, &receipt, &mut verifier, HEIGHT)
+        .is_err());
+    assert!(escrow.refund(&id, HEIGHT + 100).is_err());
+    // A second task refunds after its deadline, exactly once, never before.
+    let mut second = signed.task.clone();
+    second.nonce = 2;
+    let signed2 = SignedFheTask::sign(second, &requester).unwrap();
+    let id2 = escrow.fund(&signed2, 500, HEIGHT).unwrap();
+    assert!(escrow.refund(&id2, HEIGHT).is_err());
+    let refund = escrow.refund(&id2, HEIGHT + 100).unwrap();
+    assert_eq!(refund.to, requester.address().unwrap());
+    assert_eq!(refund.amount_sat, 500);
+    assert!(escrow.refund(&id2, HEIGHT + 100).is_err());
 }

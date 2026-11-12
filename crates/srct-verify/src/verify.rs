@@ -4,7 +4,9 @@
 //! verify twice even across mixed workloads. Error types are preserved
 //! transparently — no information is lost by unifying.
 
+use crate::policy::{select_proofs, ProofKind, TaskProfile};
 use srct_compute::tee::{AttestationRoots, SignedTeeQuote, TeeError, TeeSla, TeeVerifier};
+use srct_compute::{ComputeError, ComputeLedger, SignedAssignment, SignedReceipt};
 use srct_fhe::{FheError, SignedFheReceipt, SignedFheTask};
 use srct_zkml::{SignedZkReceipt, SignedZkTask, ZkError};
 
@@ -14,6 +16,8 @@ pub enum VerifyError {
     Tee(TeeError),
     Fhe(FheError),
     Zk(ZkError),
+    Compute(ComputeError),
+    Policy(String),
 }
 
 impl std::fmt::Display for VerifyError {
@@ -22,6 +26,8 @@ impl std::fmt::Display for VerifyError {
             VerifyError::Tee(e) => write!(f, "tee evidence refused: {e}"),
             VerifyError::Fhe(e) => write!(f, "fhe evidence refused: {e}"),
             VerifyError::Zk(e) => write!(f, "zk evidence refused: {e}"),
+            VerifyError::Compute(e) => write!(f, "compute receipt refused: {e}"),
+            VerifyError::Policy(detail) => write!(f, "policy not satisfied: {detail}"),
         }
     }
 }
@@ -44,6 +50,12 @@ pub enum Evidence {
         task: SignedZkTask,
         receipt: SignedZkReceipt,
     },
+    /// Resource-use proof: the requester-signed assignment plus the
+    /// provider-signed receipt. Verifies exact metered settlement.
+    Compute {
+        assignment: SignedAssignment,
+        receipt: SignedReceipt,
+    },
 }
 
 /// What an accepted evidence proves: the output commitment for the
@@ -61,6 +73,7 @@ pub enum EvidenceKind {
     Tee,
     Fhe,
     Zk,
+    Compute,
 }
 
 /// One verifier for all proof types, holding every replay book.
@@ -69,6 +82,7 @@ pub struct UnifiedVerifier {
     tee: TeeVerifier,
     fhe: srct_fhe::task::FheVerifier,
     zk: srct_zkml::task::ZkVerifier,
+    compute: ComputeLedger,
 }
 
 impl UnifiedVerifier {
@@ -77,6 +91,7 @@ impl UnifiedVerifier {
             tee: TeeVerifier::new(),
             fhe: srct_fhe::task::FheVerifier::new(),
             zk: srct_zkml::task::ZkVerifier::new(),
+            compute: ComputeLedger::new(),
         }
     }
 
@@ -119,6 +134,67 @@ impl UnifiedVerifier {
                     output: output.to_vec(),
                 })
             }
+            Evidence::Compute {
+                assignment,
+                receipt,
+            } => {
+                let payout = self
+                    .compute
+                    .settle(receipt, assignment, current_height)
+                    .map_err(VerifyError::Compute)?;
+                Ok(VerifiedOutput {
+                    kind: EvidenceKind::Compute,
+                    output: payout.amount_sat.to_le_bytes().to_vec(),
+                })
+            }
         }
+    }
+
+    /// Verify every evidence and refuse unless the task profile's proof set
+    /// is covered. This is the escrow-rail gate: the rail calls this before
+    /// release instead of trusting any single proof.
+    pub fn verify_for_profile(
+        &mut self,
+        profile: &TaskProfile,
+        evidences: &[Evidence],
+        roots: &AttestationRoots,
+        current_height: u64,
+    ) -> Result<Vec<VerifiedOutput>, VerifyError> {
+        let mut outputs = Vec::with_capacity(evidences.len());
+        let mut kinds = Vec::with_capacity(evidences.len());
+        for evidence in evidences {
+            let out = self.verify(evidence, roots, current_height)?;
+            kinds.push(out.kind);
+            outputs.push(out);
+        }
+        let missing: Vec<ProofKind> = select_proofs(profile)
+            .into_iter()
+            .filter(|p| match p {
+                ProofKind::Execution => !kinds.contains(&EvidenceKind::Tee),
+                ProofKind::Correctness => {
+                    !kinds.contains(&EvidenceKind::Fhe) && !kinds.contains(&EvidenceKind::Zk)
+                }
+            })
+            .collect();
+        if !missing.is_empty() {
+            return Err(VerifyError::Policy(format!("missing proofs: {missing:?}")));
+        }
+        Ok(outputs)
+    }
+
+    /// Verify the policy gate and, only on success, run the rail's release.
+    /// One call instead of two, so a rail cannot release first and check
+    /// proofs after. The closure runs exactly when the gate passes and never
+    /// when it fails — the test pins both directions.
+    pub fn gated_release<T>(
+        &mut self,
+        profile: &TaskProfile,
+        evidences: &[Evidence],
+        roots: &AttestationRoots,
+        current_height: u64,
+        release: impl FnOnce(Vec<VerifiedOutput>) -> T,
+    ) -> Result<T, VerifyError> {
+        let outputs = self.verify_for_profile(profile, evidences, roots, current_height)?;
+        Ok(release(outputs))
     }
 }

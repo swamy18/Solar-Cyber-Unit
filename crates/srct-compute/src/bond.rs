@@ -352,6 +352,22 @@ impl SignedWithdrawal {
         verify_bundle(&self.sigs, &self.keys, &self.withdrawal.hash())
             .map_err(|e| ComputeError::BadSignature(e.to_string()))
     }
+
+    pub fn encode(&self) -> Vec<u8> {
+        encode_signed(&self.withdrawal.encode(), &self.sigs, &self.keys)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, ComputeError> {
+        let (body, sigs, keys) = decode_signed(bytes, "withdrawal")?;
+        let withdrawal = BondWithdrawal::decode(&body)?;
+        let signed = SignedWithdrawal {
+            withdrawal,
+            sigs,
+            keys,
+        };
+        signed.verify()?;
+        Ok(signed)
+    }
 }
 
 /// A requester's signed accusation, bound to one assignment.
@@ -480,6 +496,22 @@ impl SignedDispute {
         }
         verify_bundle(&self.sigs, &self.keys, &self.dispute.hash())
             .map_err(|e| ComputeError::BadSignature(e.to_string()))
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        encode_signed(&self.dispute.encode(), &self.sigs, &self.keys)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, ComputeError> {
+        let (body, sigs, keys) = decode_signed(bytes, "dispute")?;
+        let dispute = BondDispute::decode(&body)?;
+        let signed = SignedDispute {
+            dispute,
+            sigs,
+            keys,
+        };
+        signed.verify()?;
+        Ok(signed)
     }
 }
 
@@ -716,6 +748,91 @@ impl BondBook {
         }
         if self.score(&provider) <= BAN_SCORE {
             return Err(ComputeError::Banned);
+        }
+        Ok(())
+    }
+
+    /// Restore timeout counts from an operator checkpoint. Timeouts are
+    /// observed, not signed: the journal cannot replay them, so the operator
+    /// snapshots `{provider: timeouts}` beside it. Restore is a floor —
+    /// counts only move up, never rewind what this book already observed —
+    /// so a stale checkpoint cannot erase a ban the book already earned.
+    pub fn restore_timeouts(
+        &mut self,
+        provider: Address,
+        timeouts: u64,
+    ) -> Result<(), ComputeError> {
+        let rep = self.reputation.entry(provider).or_default();
+        if timeouts < rep.timeouts {
+            return Err(ComputeError::Malformed(
+                "timeout checkpoint is older than observed timeouts".into(),
+            ));
+        }
+        rep.timeouts = timeouts;
+        Ok(())
+    }
+}
+
+/// Operator timeout checkpoint: `{provider: timeout_count}` at a height.
+///
+/// Unsigned by design — timeouts are observations, not signed flow objects.
+/// The journal replays bonds and escrow; this file replays what the operator
+/// saw expire. `decode` checks shape only; `BondBook::restore_timeouts`
+/// enforces monotonicity per provider.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TimeoutCheckpoint {
+    pub height: u64,
+    pub timeouts: Vec<(Address, u64)>,
+}
+
+impl TimeoutCheckpoint {
+    pub const VERSION: u8 = 1;
+    pub const MAX_PROVIDERS: usize = 4096;
+
+    pub fn encode(&self) -> Vec<u8> {
+        use srct_core::ser::Writer;
+        let mut w = Writer::with_capacity(16 + self.timeouts.len() * 28);
+        w.u8(Self::VERSION)
+            .u64le(self.height)
+            .u32le(self.timeouts.len() as u32);
+        for (provider, count) in &self.timeouts {
+            w.fixed(provider).u64le(*count);
+        }
+        w.into_vec()
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, ComputeError> {
+        use srct_core::ser::Reader;
+        let bad = |detail: &str| ComputeError::Malformed(format!("timeout checkpoint {detail}"));
+        let mut r = Reader::new(bytes);
+        if r.u8().map_err(|_| bad("version is missing"))? != Self::VERSION {
+            return Err(bad("version is unknown"));
+        }
+        let height = r.u64le().map_err(|_| bad("height is missing"))?;
+        let count = r.u32le().map_err(|_| bad("count is missing"))? as usize;
+        if count > Self::MAX_PROVIDERS {
+            return Err(bad("is over cap"));
+        }
+        let mut timeouts = Vec::with_capacity(count);
+        let mut last: Option<Address> = None;
+        for _ in 0..count {
+            let provider: Address = r.fixed().map_err(|_| bad("provider is missing"))?;
+            if last.is_some_and(|p| provider <= p) {
+                return Err(bad("providers are not sorted and unique"));
+            }
+            last = Some(provider);
+            let n = r.u64le().map_err(|_| bad("count is missing"))?;
+            timeouts.push((provider, n));
+        }
+        r.expect_end().map_err(|_| bad("has trailing bytes"))?;
+        Ok(TimeoutCheckpoint { height, timeouts })
+    }
+
+    /// Apply every entry through [`BondBook::restore_timeouts`]. Fails on
+    /// the first entry that would rewind observed timeouts.
+    pub fn apply(&self, book: &mut BondBook) -> Result<(), ComputeError> {
+        for (provider, count) in &self.timeouts {
+            book.restore_timeouts(*provider, *count)?;
         }
         Ok(())
     }

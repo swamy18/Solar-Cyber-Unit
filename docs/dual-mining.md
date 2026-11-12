@@ -246,12 +246,18 @@ Milestones:
 
 1. Extract the CPU reference behind `TrainBackend` — **done** (7 conformance
    tests; no behavioural change to rounds).
-2. GPU backend through a vendor-neutral shim (CUDA/ROCm), parity-tested.
-3. Apple Metal/ANE and NPU adapters.
+2. GPU backends (CUDA, ROCm shims) — **done as staged seams**: trait impls
+   with declared capabilities, kernel hashes and fail-closed probes, plus
+   emulated-mode conformance on CPU. Silicon execution plugs in behind
+   `probe()`; contributors test on their hardware.
+3. Apple Metal/ANE and NPU adapters — **done as staged seams** (same
+   pattern: declare, fail closed, emulate for plumbing tests).
 4. TPU and photonic experiments with an explicit determinism class and a
-   verification policy; useful for non-consensus training first.
+   verification policy — **done as staged seams** (TPU `Reproducible`,
+   photonic `Statistical`, both gated from consensus finalization).
 5. Capability-aware scheduler: discovery, price/latency/memory placement,
-   device failure and re-shard.
+   device failure and re-shard — still next (the compute scheduler routes
+   units today; training-aware placement is not wired).
 
 ## 9. Remaining programme
 
@@ -259,42 +265,78 @@ The wider brief is only partially implemented. The CNNP core, the intent
 lifecycle exist, TEE-backed execution evidence (`srct-compute::tee`), an
 additive-homomorphic encrypted-compute prototype (`srct-fhe`) and a
 zero-knowledge linear-evaluation prototype (`srct-zkml`) as non-consensus
-prototypes; SDK adapters are **not implemented**. The audit above is the base those milestones build on.
+prototypes; SDK coverage is the dependency-free JS client plus Python
+template flows, with live-node end-to-end and production hardening still
+next. The audit above is the base those milestones build on.
 The ordered plan is:
 
 1. DiLoCo PoUW prototype — **done, non-consensus** (this crate).
 2. Heterogeneous `TrainBackend` seam + CPU reference conformance — **done**
    (H1, 7 conformance tests).
 3. GPU, Apple/NPU, TPU and photonic backends under the determinism policy —
-   partially done: a block-partitioned executor passes the same `f32`
-   conformance, and a fixed-point Q16.16 integer backend proves the BitExact
-   tier with byte-identical training runs. Real silicon backends still next.
-4. Deterministic training kernel — **prototype done, non-consensus**
-   (`FixedMlp`: integer Padé-tanh/sigmoid, MSE objective, saturating
-   arithmetic). Consensus round object still next.
+   **done as staged seams** (`srct-diloco::devices`: CUDA, ROCm, TPU, NPU,
+   Apple-silicon and photonic backends implement `TrainBackend`, declare
+   capabilities, fail closed without hardware, and pass plumbing conformance
+   in emulated mode; no backend passes the `BitExact` consensus gate).
+   Silicon execution plugs in behind each `probe()`; contributors test on
+   their hardware.
+4. Deterministic training kernel + consensus round object — **mechanism done,
+   activation staged** (`FixedMlp` integer training; `consensus::RoundAnchor`
+   with bounded encoding; `pouw_active` switch defaulting off on every
+   profile; hash mining unchanged while off).
+   PoUW reward schedule — **done as bounded math** (`pouw_mint_sat` shares
+   the existing schedule through the real `check_mint_at_height` gate, so
+   PoUW mint can never exceed the issuance integral or the rate anchor).
+   Eligibility/Sybil rule (`worker_eligible`: positive bonded floor, fraud
+   slash) and bonded challenge path (`reexecute_check` with per-class
+   tolerance) are implemented and tested; the fork schedule and migration
+   remain governance steps.
 5. TEE execution attestation as an L2 evidence type — **done, non-consensus**
    (`srct-l2::tee_evidence`: `TeeBackedAttestation` implementing the generic
    `Attestation` trait, verified through `srct-verify`, flowing through the
-   real `ServiceContract::submit` path). Consensus-state activation (`L2State`)
-   needs the formal consensus-change process and is explicitly next.
+   real `ServiceContract::submit` path) plus a staged, replay-safe
+   `AttestedExecutionLog` (explicit on/off switch, default off). Wiring the
+   log into `L2State` needs the formal consensus-change process and is
+   explicitly next.
 6. FHE encrypted-compute adapter — **prototype done, non-consensus**
    (`srct-fhe`: exponential-ElGamal weighted sums, exact recomputation
-   checks). TFHE-style non-linear ops and measured-cost expansion are next.
+   checks, exact operation-cost pricing, static worst-case bound analysis
+   that refuses over-bound evaluation, an operator-curated key registry with
+   rotation/revocation, and a one-shot task escrow with release-on-verified-
+   receipt and refund-after-deadline).
+   TFHE-style non-linear ops and encrypted weights remain research work.
 7. Unified verification policy (execution, correctness, resource metering)
    — **done, non-consensus** (`srct-verify`: policy table + one verifier
-   for TEE/FHE/ZKML). Escrow/intent wiring is next.
+   for TEE/FHE/ZKML/compute receipts, a profile gate the escrow rail calls
+   before release, and a `gated_release` seam so rails verify-then-release
+   in one call instead of two).
 8. Native ZKML — **prototype done, non-consensus** (`srct-zkml`:
    Sigma-protocol proofs for one quantized linear layer with range checks;
-   Bulletproofs R1CS evaluated but its published crate does not compile).
-   Non-linear gates and folding are next.
+   Bulletproofs R1CS evaluated but its published crate does not compile),
+   plus a threshold-assertion gate (`value >= bound`) as the non-linear
+   primitive, wired through the same CDS machinery with its own domain tag.
+   Task-envelope binding for threshold assertions (wire v2) and folding
+   remain next.
 8. CNNP nonlinear/tokenizer adapters and transport — the representation,
-   linear-adapter, discovery and metering core is done (non-consensus).
+   linear-adapter, quadratic-adapter, tokenizer-map, held-out evaluation
+   harness, discovery and metering core is done (non-consensus). The
+   network transport remains operator-run.
 9. Intent persistence, chain adapters and solver discovery — the lifecycle
-   state machine is done (non-consensus).
+   state machine plus snapshot/replay, FHE-privacy enforcement on delivery,
+   a solver directory with verified quote gossip, atomic multi-intent opens
+   for multi-solver stages, bonded disputes (release-on-honest,
+   slash-to-solver-on-frivolous), a settlement-adapter seam with an
+   executing in-memory rail, and end-to-end settle-via-rail tests are done
+   (non-consensus). External-chain adapters remain per-rail work.
 10. Work-graph attribution and reuse compensation — **done, non-consensus**
-    (`srct-workgraph`: lineage, licenses, exact royalty settlement).
-    Cross-crate evidence checks are next.
-11. SDK adapters (Rust/Python/TypeScript/MCP) and production hardening.
+    (`srct-workgraph`: lineage, licenses, exact royalty settlement, plus
+    cross-crate evidence checks at registration, a bounded content store, a
+    metered-reuse oracle fed by verified CNNP receipts, and a revenue escrow
+    with per-payout release and exactly-once refund). Rail execution of the
+    payout/refund instructions is next.
+11. SDK adapters — the JS client covers the agent surface with mock-transport
+    tests and client-side input hardening; live-node end-to-end and Python/
+    Rust/MCP SDK production hardening remain next.
 
 Each milestone must ship with working code, adversarial tests, measured
 limitations, and a commit. Interfaces or simulations alone do not count.

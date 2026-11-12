@@ -6,9 +6,11 @@ use srct_compute::market::{
     plan_assignments, ComputeJob, ComputeOffer, Verification, JOB_VERSION, OFFER_VERSION,
 };
 use srct_compute::{
-    BondBook, ComputeError, ComputeReceipt, Determinism, DeviceClass, DeviceProfile, EscrowBook,
+    decode_batch, encode_batch, BondBook, BondDispute, BondWithdrawal, ComputeError, ComputeLedger,
+    ComputeReceipt, Determinism, DeviceClass, DeviceProfile, DisputeReason, EscrowBook,
     EscrowFunding, FlowJournal, GossipSet, ProviderBond, SignedAssignment, SignedBond,
-    SignedFunding, SignedJob, SignedOffer, SignedReceipt, BOND_VERSION, ESCROW_VERSION,
+    SignedDispute, SignedFunding, SignedJob, SignedOffer, SignedReceipt, SignedWithdrawal,
+    BOND_VERSION, ESCROW_VERSION,
 };
 use srct_core::hash::Hash;
 use srct_core::wallet::Wallet;
@@ -332,4 +334,139 @@ fn journal_persists_bonds_and_escrow_fundings() {
     let last = bad.len() - 1;
     bad[last] ^= 0x01;
     assert!(FlowJournal::decode(&bad).is_err());
+}
+
+#[test]
+fn journal_rebuild_replays_releases_slashes_and_withdrawals_in_order() {
+    let provider = wallet(1);
+    let requester = wallet(2);
+    let (offer, assignment, receipt, _) = flow();
+    let job = assignment.assignment.job;
+    let provider_address = provider.address().unwrap();
+    let requester_address = requester.address().unwrap();
+
+    let bond1 = SignedBond::sign(
+        ProviderBond {
+            version: BOND_VERSION,
+            network_id: NET.into(),
+            provider: provider_address,
+            amount_sat: 100_000,
+            registered_height: 5,
+            nonce: 1,
+        },
+        &provider,
+    )
+    .unwrap();
+    let funding = SignedFunding::sign(
+        EscrowFunding {
+            version: ESCROW_VERSION,
+            network_id: NET.into(),
+            job,
+            requester: requester_address,
+            amount_sat: 100,
+            deadline: assignment.assignment.deadline,
+            nonce: 1,
+        },
+        &requester,
+    )
+    .unwrap();
+    let dispute = SignedDispute::sign(
+        BondDispute {
+            version: BOND_VERSION,
+            network_id: NET.into(),
+            requester: requester_address,
+            provider: provider_address,
+            assignment: assignment.hash(),
+            reason: DisputeReason::WrongResult,
+            evidence: [5u8; 32],
+            nonce: 1,
+        },
+        &requester,
+    )
+    .unwrap();
+    let bond2 = SignedBond::sign(
+        ProviderBond {
+            version: BOND_VERSION,
+            network_id: NET.into(),
+            provider: provider_address,
+            amount_sat: 100_000,
+            registered_height: 10,
+            nonce: 2,
+        },
+        &provider,
+    )
+    .unwrap();
+    let withdrawal = SignedWithdrawal::sign(
+        BondWithdrawal {
+            version: BOND_VERSION,
+            network_id: NET.into(),
+            provider: provider_address,
+            amount_sat: 10_000,
+            nonce: 1,
+        },
+        &provider,
+    )
+    .unwrap();
+
+    let mut journal = FlowJournal::new(NET);
+    journal.append_bond(&bond1).unwrap(); // 100,000
+    journal.append_funding(&funding).unwrap();
+    journal.append_offer(&offer).unwrap();
+    journal.append_assignment(&assignment).unwrap();
+    journal.append_receipt(&receipt).unwrap(); // release 35
+    journal.append_dispute(&dispute).unwrap(); // slash 50% -> 50,000
+    journal.append_bond(&bond2).unwrap(); // top-up -> 150,000
+    journal.append_withdrawal(&withdrawal).unwrap(); // -> 140,000
+
+    let mut bonds = BondBook::new(NET);
+    let mut escrow = EscrowBook::new(NET);
+    let mut ledger = ComputeLedger::new();
+    journal
+        .rebuild(&mut bonds, &mut escrow, &mut ledger)
+        .unwrap();
+
+    assert_eq!(bonds.bond(&provider_address).unwrap().amount_sat, 140_000);
+    assert_eq!(bonds.score(&provider_address), -95);
+    assert_eq!(escrow.remaining_sat(&job), 65);
+    assert_eq!(ledger.settled_total_sat(), 35);
+
+    // Applying both credits before the dispute would have slashed 50% of the
+    // topped-up bond instead; the journal's original order is what keeps the
+    // penalty exact.
+    let mut wrong_order = BondBook::new(NET);
+    wrong_order.register(&bond1, 5).unwrap();
+    wrong_order.register(&bond2, 10).unwrap();
+    assert_eq!(wrong_order.slash(&dispute, &assignment, 0), Ok(100_000));
+}
+
+#[test]
+fn gossip_batch_rides_the_agent_transport() {
+    use srct_agentnet::transport::{LoopbackTransport, Transport};
+    let peer_b: srct_core::agent::AgentId = [12u8; 20];
+    let p1 = wallet(21);
+    let p2 = wallet(22);
+    let mut set_a = GossipSet::new(NET);
+    set_a.insert(mk_offer(&p1, 1, 1_000), 10).unwrap();
+    set_a.insert(mk_offer(&p2, 1, 1_000), 10).unwrap();
+    // A ships its live set as one signed batch over the agent transport.
+    let mut transport = LoopbackTransport::new();
+    let batch = encode_batch(&set_a.offers()).unwrap();
+    transport.send(&peer_b, batch);
+    assert_eq!(transport.pending(), 1);
+    // B decodes through signature checks and merges; order does not matter.
+    let mut set_b = GossipSet::new(NET);
+    let mut packets = transport.receive(&peer_b);
+    assert_eq!(packets.len(), 1);
+    let offers = decode_batch(&packets.remove(0)).unwrap();
+    assert_eq!(offers.len(), 2);
+    assert_eq!(set_b.merge(offers, 10), 2);
+    assert_eq!(set_b.len(), 2);
+    // Re-sending the same batch adds nothing.
+    let batch = encode_batch(&set_a.offers()).unwrap();
+    assert_eq!(set_b.merge(decode_batch(&batch).unwrap(), 10), 0);
+    // Tampered bytes fail the whole batch, never half a set.
+    let mut bad = batch.clone();
+    bad[12] ^= 0x01;
+    assert!(decode_batch(&bad).is_err());
+    assert!(decode_batch(&batch[..batch.len() - 3]).is_err());
 }

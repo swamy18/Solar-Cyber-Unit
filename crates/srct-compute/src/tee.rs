@@ -197,6 +197,58 @@ impl TeeSla {
         }
         Ok(())
     }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = Writer::with_capacity(256 + self.network_id.len());
+        w.u8(self.version)
+            .u16le(self.network_id.len() as u16)
+            .raw(self.network_id.as_bytes())
+            .fixed(&self.provider)
+            .fixed(&self.workload)
+            .fixed(&self.model_hash)
+            .fixed(&self.runtime_hash)
+            .fixed(&self.config_hash)
+            .fixed(&self.input_hash)
+            .u8(self.tee.as_u8())
+            .u64le(self.max_age_heights);
+        w.into_vec()
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, TeeError> {
+        let mut r = Reader::new(bytes);
+        let version = r.u8().map_err(malformed)?;
+        let net_len = r.u16le().map_err(malformed)? as usize;
+        if net_len == 0 || net_len > MAX_NETWORK_ID_LEN {
+            return Err(TeeError::Malformed("tee sla network id length".into()));
+        }
+        let network_id = std::str::from_utf8(r.fixed_slice(net_len).map_err(malformed)?)
+            .map_err(|_| TeeError::Malformed("tee sla network is not utf-8".into()))?
+            .to_string();
+        let provider = r.fixed().map_err(malformed)?;
+        let workload = r.fixed().map_err(malformed)?;
+        let model_hash = r.fixed().map_err(malformed)?;
+        let runtime_hash = r.fixed().map_err(malformed)?;
+        let config_hash = r.fixed().map_err(malformed)?;
+        let input_hash = r.fixed().map_err(malformed)?;
+        let tee = TeeType::from_u8(r.u8().map_err(malformed)?)
+            .ok_or_else(|| TeeError::Malformed("tee sla tee type is unknown".into()))?;
+        let max_age_heights = r.u64le().map_err(malformed)?;
+        r.expect_end().map_err(malformed)?;
+        let sla = TeeSla {
+            version,
+            network_id,
+            provider,
+            workload,
+            model_hash,
+            runtime_hash,
+            config_hash,
+            input_hash,
+            tee,
+            max_age_heights,
+        };
+        sla.validate()?;
+        Ok(sla)
+    }
 }
 
 /// A signed statement by a quoting key that the workload executed inside the
@@ -336,6 +388,25 @@ impl SignedTeeQuote {
     /// quote far from where it was created.
     pub fn verify(&self) -> Result<Address, TeeError> {
         self.verify_signature()
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        crate::settle::encode_signed(&self.quote.encode(), &self.sigs, &self.keys)
+    }
+
+    /// Strict inverse of [`SignedTeeQuote::encode`]. Verifies the signature,
+    /// so tampered bytes fail here instead of merging half a log.
+    pub fn decode(bytes: &[u8]) -> Result<Self, TeeError> {
+        let (body, sigs, keys) =
+            crate::settle::decode_signed(bytes, "tee quote").map_err(|e| match e {
+                crate::ComputeError::Malformed(detail) => TeeError::Malformed(detail),
+                crate::ComputeError::BadSignature(detail) => TeeError::BadSignature(detail),
+                _ => TeeError::Malformed("tee quote bundle is invalid".into()),
+            })?;
+        let quote = TeeQuote::decode(&body)?;
+        let signed = SignedTeeQuote { quote, sigs, keys };
+        signed.verify_signature()?;
+        Ok(signed)
     }
 
     fn verify_signature(&self) -> Result<Address, TeeError> {

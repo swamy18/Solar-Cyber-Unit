@@ -10,7 +10,10 @@
 //!   giving forward secrecy and post-compromise security for ordered
 //!   conversation threads.
 //! - [`mailbox`]: bounded, replay-safe storage that verifies envelopes without
-//!   being able to decrypt them, so an untrusted relay can host it.
+//!   being able to decrypt them, so an untrusted relay can host it, with a
+//!   bounded snapshot encoding for restarts.
+//! - [`padding`]: opt-in length hiding to five fixed buckets.
+//! - [`transport`]: the delivery seam plus an in-memory loopback reference.
 //!
 //! # Threat model
 //!
@@ -28,14 +31,14 @@
 //!
 //! Not provided yet:
 //!
-//! - **sealed sender**: the sender identity is in the envelope, so a relay
-//!   learns the conversation graph;
-//! - **group messaging**: a thread is a pairwise conversation. Groups need a
-//!   sender-key or MLS layer;
-//! - **transport**: envelopes and mailboxes are byte formats. Moving them is
-//!   the operator's P2P/HTTP/MCP rail;
-//! - **online delivery**: a mailbox is passive storage. Push, presence and
-//!   multi-device fan-out are not implemented.
+//! - **sealed-sender relay hosting**: sealed envelopes verify recipient-side
+//!   only ([`sealed`]), so an untrusted relay can route but never host them.
+//! - **group key agreement**: groups use creator-distributed sender keys
+//!   ([`groups`]); MLS-style agreement is a later milestone.
+//! - **network sockets**: [`transport`] is the delivery seam with an
+//!   in-memory reference, [`http`] the wire codecs and [`presence`] the
+//!   liveness book. P2P/HTTP/MCP sockets, push and multi-device fan-out
+//!   daemons are the operator's.
 //!
 //! # Consensus
 //!
@@ -43,16 +46,32 @@
 //! `srct-core` only for keys, signatures and hashing, and it changes no
 //! consensus rule.
 
+pub mod groups;
+pub mod http;
 pub mod mailbox;
 pub mod message;
+pub mod padding;
+pub mod presence;
 pub mod ratchet;
+pub mod sealed;
+pub mod transport;
 
+pub use groups::{
+    GroupError, GroupMessage, GroupSession, GroupSync, GROUP_VERSION, MAX_GROUP_BODY,
+    MAX_GROUP_MEMBERS,
+};
+pub use http::{
+    DeliverRequest, DeliverResponse, PollRequest, PollResponse, HTTP_CODEC_VERSION,
+    MAX_POLL_MESSAGES, MAX_TRANSPORT_BODY,
+};
 pub use mailbox::{
-    Mailbox, MailboxEntry, MailboxError, DEFAULT_MAX_MESSAGES, DEFAULT_MAX_PER_THREAD,
-    MAX_GUARD_ENTRIES,
+    Mailbox, MailboxEntry, MailboxError, SealedMailboxEntry, DEFAULT_MAX_MESSAGES,
+    DEFAULT_MAX_PER_THREAD, MAILBOX_VERSION, MAX_GUARD_ENTRIES, MAX_MAILBOX_ENTRIES,
 };
 pub use message::{
     thread_id, MessageEnvelope, MessageError, Recipient, MAX_CIPHERTEXT, MAX_NETWORK_LEN,
     MAX_PLAINTEXT, MESSAGE_VERSION,
 };
+pub use presence::{fanout_targets, AckSet, PresenceBook, MAX_DEVICES_PER_AGENT, MAX_DEVICE_LABEL};
 pub use ratchet::{RatchetSession, SessionSide};
+pub use sealed::{SealedEnvelope, MAX_SEALED_BLOB, SEALED_VERSION};

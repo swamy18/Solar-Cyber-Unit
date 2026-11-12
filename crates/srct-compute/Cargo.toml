@@ -13,3 +13,4 @@ srct-core.workspace = true
 
 [dev-dependencies]
 rand.workspace = true
+srct-agentnet.workspace = true

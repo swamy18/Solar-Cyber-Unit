@@ -12,6 +12,12 @@
 //!   giant-step decryption. Additive homomorphism + scalar multiplication.
 //! - [`task`]: signed tasks, worker receipts and a fail-closed verifier whose
 //!   `Ok` is the escrow rail's release signal.
+//! - [`cost`]: operation-count pricing and worst-case bound analysis, so the
+//!   rail refuses evaluation that cannot decrypt correctly.
+//! - [`registry`]: operator-curated encryption keys with rotation and
+//!   revocation, so workers encrypt under the right key.
+//! - [`escrow`]: one-shot per-task funding with release on verified receipt
+//!   and refund after the deadline, as settlement instructions.
 //!
 //! # What this is not
 //!
@@ -19,13 +25,23 @@
 //!   non-linearities, no bootstrapping, no TFHE. Weights and bias are public.
 //! - **Not consensus.** Nothing here moves coin. The verifier returns the
 //!   accepted output ciphertext; the escrow or payment layer settles it.
-//! - **Not a range proof.** Arithmetic is modulo the curve order. Values must
-//!   stay inside the caller's decode bound; overflow wraps silently.
+//! - **Not a zero-knowledge range proof.** Arithmetic is modulo the curve
+//!   order. Static bound analysis ([`cost::eval_bounded`]) refuses an
+//!   evaluation whose worst case exceeds the decryption bound, but ciphertext
+//!   inputs carry no proof of their own range.
 
+pub mod cost;
 pub mod elgamal;
+pub mod escrow;
+pub mod registry;
 pub mod task;
 
+pub use cost::{
+    eval_bounded, max_output, price_task, task_cost, COST_ADD, COST_BASE, COST_SCALAR_MUL,
+};
 pub use elgamal::{Ciphertext, FheKeys, CIPHERTEXT_LEN, POINT_LEN};
+pub use escrow::{FheEscrow, Payout, Refund};
+pub use registry::{KeyRecord, KeyRegistry, KeyStatus, MAX_RETIRED_KEYS, REGISTRY_VERSION};
 pub use task::{
     eval, FheReceipt, FheTask, FheVerifier, SignedFheReceipt, SignedFheTask, WeightedSum,
     FHE_VERSION, MAX_INPUTS, MAX_WEIGHT_ABS,

@@ -165,13 +165,33 @@ hold custody and cannot release funds by itself.
 
 ## 8. Roadmap
 
-1. Persist and replicate the book (state encoding + restart tests).
-2. Chain adapters: SRCT escrow binding, external settlement adapters, asset
-   route registry.
-3. Solver discovery and quote gossip (HTTP/MCP transport).
-4. Partial fills, streaming settlement and multi-solver stages.
-5. Bonded arbitration and slashing for proven misbehaviour.
+1. Persist and replicate the book — **done** (`IntentBook::encode`/`decode`:
+   bounded snapshot, every signed blob re-verified on replay, tamper and
+   truncation fail the whole restore, dispute bonds and FHE expectations
+   included; trust roots and verifier replay books stay operator state and
+   rebuild through the attach rules).
+2. Chain adapters — **seam plus executing rail done** (`adapter::SettlementAdapter`
+   with `MemRail`: escrow funding, exactly-once settlement/refund execution
+   with balance movement and replay refusal, pinned by end-to-end tests).
+   External-chain adapters remain per-rail work.
+3. Solver discovery and quote gossip — **done** (`solver::SolverDirectory`:
+   liveness advertisement plus verified quote-batch gossip that feeds the
+   book's normal admission path; merging is deterministic, tampered batches
+   fail whole).
+4. Partial fills, streaming settlement and multi-solver stages — **staged
+   multi-solver done** (`open_split`: atomic multi-intent opens, each share
+   quoted/accepted/settled independently; no wire change needed). Single-quote
+   partial fills would need a quote wire v2 with unit pricing and are
+   explicitly not smuggled into v1.
+5. Bonded arbitration and slashing — **done** (`bond_dispute` + resolve-time
+   `BondRelease`/`BondSlash` instructions: honest challenges get the bond
+   back with the refund; frivolous ones pay it to the wronged solver;
+   unbonded disputes keep the legacy path).
 6. Verification-level enforcement — **done** (`expect_evidence` /
    `attach_evidence` / settle gate for `Tee`/`Zk` via `srct-verify`).
-   FHE-privacy enforcement on delivery is next.
-7. End-to-end test with two independent node processes and a real escrow lock.
+   FHE-privacy enforcement on delivery — **done** (`Privacy::Fhe` intents
+   settle only on verified FHE evidence).
+7. End-to-end test with two independent node processes and a real escrow lock —
+   covered at state-machine level (fund → accept → fulfill → settle → rail
+   execution with balance movement); live multi-node runs remain operator
+   verification.

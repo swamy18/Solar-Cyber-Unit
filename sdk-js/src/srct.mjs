@@ -35,6 +35,82 @@ function joinUrl(base, path) {
 }
 
 /**
+ * Fail fast on a path id before any fetch happens.
+ * @param {string} name
+ * @param {unknown} value
+ */
+function assertId(name, value) {
+  if (typeof value !== "string" || value.length === 0) {
+    throw new TypeError(`${name} must be a non-empty string`);
+  }
+}
+
+/**
+ * Fail fast on a sat/height/count field: non-negative safe integer.
+ * @param {string} name
+ * @param {unknown} value
+ */
+function assertAmount(name, value) {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new TypeError(`${name} must be a non-negative safe integer`);
+  }
+}
+
+/**
+ * Fail fast on a hex payload: even-length hex string, or a non-empty array
+ * of them. Shape only.
+ * @param {string} name
+ * @param {unknown} value
+ */
+function assertHex(name, value) {
+  const bad = `${name} must be an even-length hex string`;
+  const check = (v) => {
+    if (
+      typeof v !== "string" ||
+      v.length === 0 ||
+      v.length % 2 !== 0 ||
+      !/^[0-9a-fA-F]*$/.test(v)
+    ) {
+      throw new TypeError(bad);
+    }
+  };
+  if (Array.isArray(value)) {
+    if (value.length === 0) {
+      throw new TypeError(bad);
+    }
+    for (const v of value) {
+      check(v);
+    }
+    return;
+  }
+  check(value);
+}
+
+/**
+ * Shape-check a body before it leaves the client: numeric fields must be
+ * non-negative safe integers, `*_hex` fields even-length hex. Only fields
+ * that are present are checked — requiredness is the node's job, so a
+ * missing field still surfaces as the node's own error.
+ * @param {unknown} params
+ * @param {{amounts?: string[], hexes?: string[]}} kinds
+ */
+function assertBody(params, { amounts = [], hexes = [] } = {}) {
+  if (!params || typeof params !== "object" || Array.isArray(params)) {
+    throw new TypeError("params must be an object");
+  }
+  for (const name of amounts) {
+    if (params[name] !== undefined) {
+      assertAmount(`params.${name}`, params[name]);
+    }
+  }
+  for (const name of hexes) {
+    if (params[name] !== undefined) {
+      assertHex(`params.${name}`, params[name]);
+    }
+  }
+}
+
+/**
  * @typedef {object} ClientOptions
  * @property {number} [timeoutMs] per-request deadline (default 10000).
  * @property {typeof fetch} [fetchImpl] fetch-compatible function (for tests).
@@ -104,6 +180,7 @@ export class SrctClient {
    * @param {string} address bech32 address.
    */
   balance(address) {
+    assertId("address", address);
     return this.request("GET", `/v1/balance/${encodeURIComponent(address)}`);
   }
 
@@ -121,6 +198,10 @@ export class SrctClient {
    * nonce, hirer_sig_hex.
    */
   jobOpen(params) {
+    assertBody(params, {
+      amounts: ["amount_sat", "deadline_height", "nonce"],
+      hexes: ["hirer_hex", "worker_hex", "service_hex", "hirer_sig_hex"],
+    });
     return this.request("POST", "/v1/jobs/open", params);
   }
 
@@ -129,6 +210,7 @@ export class SrctClient {
    * @param {string} jobId
    */
   jobGet(jobId) {
+    assertId("jobId", jobId);
     return this.request("GET", `/v1/jobs/${encodeURIComponent(jobId)}`);
   }
 
@@ -138,6 +220,8 @@ export class SrctClient {
    * @param {object} params worker_sigs_hex, worker_keys_hex.
    */
   jobAccept(jobId, params) {
+    assertId("jobId", jobId);
+    assertBody(params, { hexes: ["worker_sigs_hex", "worker_keys_hex"] });
     return this.request("POST", `/v1/jobs/${encodeURIComponent(jobId)}/accept`, params);
   }
 
@@ -147,6 +231,10 @@ export class SrctClient {
    * @param {object} params result_hash_hex, receipt_hex?, worker_sigs_hex, worker_keys_hex.
    */
   jobDeliver(jobId, params) {
+    assertId("jobId", jobId);
+    assertBody(params, {
+      hexes: ["result_hash_hex", "receipt_hex", "worker_sigs_hex", "worker_keys_hex"],
+    });
     return this.request("POST", `/v1/jobs/${encodeURIComponent(jobId)}/deliver`, params);
   }
 
@@ -156,6 +244,8 @@ export class SrctClient {
    * @param {object} params by, reason, sig_hex.
    */
   jobDispute(jobId, params) {
+    assertId("jobId", jobId);
+    assertBody(params, { hexes: ["sig_hex"] });
     return this.request("POST", `/v1/jobs/${encodeURIComponent(jobId)}/dispute`, params);
   }
 
@@ -165,6 +255,11 @@ export class SrctClient {
    * @param {object} params pay_worker, result_hash_hex?, arbitrator_sig_hex.
    */
   jobResolve(jobId, params) {
+    assertId("jobId", jobId);
+    assertBody(params, { hexes: ["result_hash_hex", "arbitrator_sig_hex"] });
+    if (params.pay_worker !== undefined && typeof params.pay_worker !== "boolean") {
+      throw new TypeError("params.pay_worker must be a boolean");
+    }
     return this.request("POST", `/v1/jobs/${encodeURIComponent(jobId)}/resolve`, params);
   }
 
@@ -175,6 +270,9 @@ export class SrctClient {
    * @param {object} params payment_hex, authorization_hex, auth_sigs_hex, auth_keys_hex, ...
    */
   paymentSubmit(params) {
+    assertBody(params, {
+      hexes: ["payment_hex", "authorization_hex", "auth_sigs_hex", "auth_keys_hex"],
+    });
     return this.request("POST", "/v1/payment/submit", params);
   }
 
@@ -183,6 +281,7 @@ export class SrctClient {
    * @param {string} paymentId
    */
   paymentGet(paymentId) {
+    assertId("paymentId", paymentId);
     return this.request("GET", `/v1/payment/${encodeURIComponent(paymentId)}`);
   }
 
@@ -194,6 +293,9 @@ export class SrctClient {
    * arbitrator, amount_sat, nonce.
    */
   escrowOpen(params) {
+    // Payer/payee/bls identities travel as-is (address formats vary);
+    // only the numeric shape is pinned client-side.
+    assertBody(params, { amounts: ["amount_sat", "nonce"] });
     return this.request("POST", "/v1/escrow/open", params);
   }
 
@@ -202,6 +304,7 @@ export class SrctClient {
    * @param {string} id
    */
   escrowGet(id) {
+    assertId("id", id);
     return this.request("GET", `/v1/escrow/${encodeURIComponent(id)}`);
   }
 
@@ -211,6 +314,11 @@ export class SrctClient {
    * @param {object} params mode ("arbiter"|"mutual"), arbiter_sig_hex?, mutual_sigs_hex?.
    */
   escrowRelease(id, params) {
+    assertId("id", id);
+    assertBody(params, { hexes: ["arbiter_sig_hex", "mutual_sigs_hex"] });
+    if (params.mode !== undefined && params.mode !== "arbiter" && params.mode !== "mutual") {
+      throw new TypeError('params.mode must be "arbiter" or "mutual"');
+    }
     return this.request("POST", `/v1/escrow/${encodeURIComponent(id)}/release`, params);
   }
 
@@ -220,6 +328,7 @@ export class SrctClient {
    * @param {object} [params] route-dependent body (pass-through).
    */
   escrowSettle(id, params = {}) {
+    assertId("id", id);
     return this.request("POST", `/v1/escrow/${encodeURIComponent(id)}/settle`, params);
   }
 
@@ -230,6 +339,7 @@ export class SrctClient {
    * @param {string} taskId hex task id.
    */
   vwc(taskId) {
+    assertId("taskId", taskId);
     return this.request("GET", `/v1/vwc/${encodeURIComponent(taskId)}`);
   }
 }

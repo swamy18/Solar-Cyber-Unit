@@ -628,3 +628,99 @@ fn address_helpers_do_not_confuse_providers() {
     assert_ne!(a, b);
     assert_eq!(a.len(), 20);
 }
+
+#[test]
+fn quadratic_adapter_fits_curves_linear_cannot() {
+    use srct_cnnp::quad::QuadraticAdapter;
+    let source = space(80, "mlp", "hidden", 1);
+    let target = space(81, "mlp", "out", 1);
+    // y = 2x^2 - x + 0.5 over x in [-1, 1]: no straight line fits this.
+    let pairs: Vec<(Vec<f32>, Vec<f32>)> = (-10..=10)
+        .map(|i| {
+            let x = i as f32 / 10.0;
+            (vec![x], vec![2.0 * x * x - x + 0.5])
+        })
+        .collect();
+    let quad =
+        QuadraticAdapter::fit(source.clone(), target.clone(), &pairs, 1e-6, &wallet(80)).unwrap();
+    assert!(quad.train_mse < 1e-5, "quad mse = {}", quad.train_mse);
+    let lin = LinearAdapter::fit(source, target, &pairs, 1e-6, &wallet(81)).unwrap();
+    assert!(lin.train_mse > 0.1, "linear mse = {}", lin.train_mse);
+    // Wire round-trip and tamper refusal.
+    assert_eq!(QuadraticAdapter::decode(&quad.encode()).unwrap(), quad);
+    let mut bad = quad.encode();
+    bad[20] ^= 0x01;
+    assert!(QuadraticAdapter::decode(&bad).is_err());
+    assert!(QuadraticAdapter::decode(&quad.encode()[..20]).is_err());
+    // Wrong input dimension refused; over-cap source dimension refused.
+    assert!(quad.apply(&[1.0, 2.0]).is_err());
+    let big = space(82, "mlp", "hidden", 17);
+    assert!(
+        QuadraticAdapter::fit(big, space(83, "mlp", "out", 1), &pairs, 1e-6, &wallet(82)).is_err()
+    );
+}
+
+#[test]
+fn tokenizer_map_votes_deterministically() {
+    use srct_cnnp::token::TokenizerMap;
+    // Consistent 1:1 mapping plus one contested token (7 -> 70 twice, 71 once).
+    let pairs = vec![
+        (vec![1, 2, 3], vec![10, 20, 30]),
+        (vec![1, 2, 7], vec![10, 20, 70]),
+        (vec![1, 7, 3], vec![10, 71, 30]),
+        (vec![1, 2, 7], vec![10, 20, 70]),
+    ];
+    let map = TokenizerMap::fit([1u8; 32], [2u8; 32], &pairs, &wallet(90)).unwrap();
+    assert_eq!(map.translate(&[1, 2, 3]).unwrap(), vec![10, 20, 30]);
+    assert_eq!(map.translate_token(7).unwrap(), 70);
+    // 11 of 12 aligned positions reproduce: contested 71 loses the vote.
+    assert!(
+        (map.coverage - 11.0 / 12.0).abs() < 1e-6,
+        "coverage = {}",
+        map.coverage
+    );
+    // Unknown tokens refuse instead of guessing.
+    assert!(map.translate(&[1, 99]).is_err());
+    // Held-out exact match on the same distribution is high.
+    let held = vec![(vec![1, 2, 3], vec![10, 20, 30])];
+    assert!(map.heldout_exact_match(&held).unwrap() > 0.99);
+    // Wire round-trip and tamper refusal.
+    assert_eq!(TokenizerMap::decode(&map.encode()).unwrap(), map);
+    let mut bad = map.encode();
+    bad[40] ^= 0x01;
+    assert!(TokenizerMap::decode(&bad).is_err());
+    assert!(TokenizerMap::decode(&map.encode()[..20]).is_err());
+    // Empty and position-less fits are refused.
+    assert!(TokenizerMap::fit([1u8; 32], [2u8; 32], &[], &wallet(91)).is_err());
+    assert!(TokenizerMap::fit([1u8; 32], [2u8; 32], &[(vec![], vec![])], &wallet(91)).is_err());
+}
+
+#[test]
+fn held_out_evaluation_states_both_mses() {
+    use srct_cnnp::eval::evaluate;
+    use srct_cnnp::quad::QuadraticAdapter;
+    let source = space(84, "mlp", "hidden", 1);
+    let target = space(85, "mlp", "out", 1);
+    let train: Vec<(Vec<f32>, Vec<f32>)> = (-10..=10)
+        .step_by(2)
+        .map(|i| {
+            let x = i as f32 / 10.0;
+            (vec![x], vec![2.0 * x * x - x + 0.5])
+        })
+        .collect();
+    let held: Vec<(Vec<f32>, Vec<f32>)> = (-9..=9)
+        .step_by(2)
+        .map(|i| {
+            let x = i as f32 / 10.0;
+            (vec![x], vec![2.0 * x * x - x + 0.5])
+        })
+        .collect();
+    let quad = QuadraticAdapter::fit(source, target, &train, 1e-6, &wallet(86)).unwrap();
+    let report = evaluate(|x| quad.apply(x), 1, &held).unwrap();
+    assert_eq!(report.pairs, held.len());
+    assert!(report.beats_baseline(), "report = {report:?}");
+    assert!(report.model_mse < 1e-4, "model mse = {}", report.model_mse);
+    // Empty pairs and wrong dimensions fail closed.
+    assert!(evaluate(|x| quad.apply(x), 1, &[]).is_err());
+    assert!(evaluate(|x| quad.apply(x), 2, &held).is_err());
+}

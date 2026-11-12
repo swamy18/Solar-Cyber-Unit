@@ -390,3 +390,89 @@ fn mailbox_accepts_wire_and_rejects_a_duplicate_wire() {
     tampered[last] ^= 0x01;
     assert!(mailbox.accept_wire(&tampered, 5).is_err());
 }
+
+#[test]
+fn mailbox_snapshot_restart_replays_identically() {
+    let alice = wallet(33);
+    let bob = wallet(34);
+    let thread = conversation(&alice, &bob);
+    let mut mailbox = Mailbox::new(NET, agent(&bob, ROLE));
+    mailbox
+        .accept(seal(&alice, &bob, thread, 1, b"one", 100), 5)
+        .unwrap();
+    mailbox
+        .accept(seal(&alice, &bob, thread, 2, b"two", 100), 6)
+        .unwrap();
+
+    let bytes = mailbox.encode();
+    let restored = Mailbox::decode(&bytes).unwrap();
+    assert_eq!(restored.len(), 2);
+    assert_eq!(restored.last_seq(&thread, &agent(&alice, ROLE)), Some(2));
+    // Guards survive the round trip: the replay is still refused.
+    let mut restored = restored;
+    assert_eq!(
+        restored.accept(seal(&alice, &bob, thread, 2, b"two-again", 100), 6),
+        Err(MailboxError::Replay)
+    );
+    restored
+        .accept(seal(&alice, &bob, thread, 3, b"three", 100), 7)
+        .unwrap();
+    assert_eq!(restored.len(), 3);
+    // Tampered and truncated snapshots fail closed.
+    let mut bad = bytes.clone();
+    bad[20] ^= 0x01;
+    assert!(Mailbox::decode(&bad).is_err());
+    assert!(Mailbox::decode(&bytes[..bytes.len() - 4]).is_err());
+    assert!(Mailbox::decode(&[99u8; 8]).is_err());
+}
+
+#[test]
+fn padding_hides_plaintext_length() {
+    use srct_agentnet::padding::{frame_padded, unframe_padded, PAD_BUCKETS};
+    let short = frame_padded(b"hi").unwrap();
+    let medium = frame_padded(&[7u8; 200]).unwrap();
+    assert_eq!(short.len(), 64);
+    assert_eq!(medium.len(), 256);
+    assert!(PAD_BUCKETS.contains(&short.len()));
+    assert_eq!(unframe_padded(&short).unwrap(), b"hi");
+    assert!(unframe_padded(&medium).unwrap() == [7u8; 200]);
+    // Non-zero padding and bad sizes are refused.
+    let mut bad = short.clone();
+    bad[10] = 1;
+    assert!(unframe_padded(&bad).is_err());
+    assert!(unframe_padded(&short[..10]).is_err());
+}
+
+#[test]
+fn loopback_transport_delivers_to_mailboxes() {
+    use srct_agentnet::transport::{LoopbackTransport, Transport};
+    let alice = wallet(35);
+    let bob = wallet(36);
+    let carol = wallet(37);
+    let thread = conversation(&alice, &bob);
+    let mut transport = LoopbackTransport::new();
+    transport.send(
+        &agent(&bob, ROLE),
+        seal(&alice, &bob, thread, 1, b"via relay", 100).encode(),
+    );
+    transport.send(
+        &agent(&carol, ROLE),
+        seal(
+            &alice,
+            &carol,
+            conversation(&alice, &carol),
+            1,
+            b"not for bob",
+            100,
+        )
+        .encode(),
+    );
+    assert_eq!(transport.pending(), 2);
+    let mut mailbox = Mailbox::new(NET, agent(&bob, ROLE));
+    let (accepted, refused) = transport.deliver(&mut mailbox, 5);
+    assert_eq!(accepted.len(), 1);
+    assert_eq!(refused, 0);
+    assert_eq!(mailbox.len(), 1);
+    // Carol's packet stays queued for her mailbox.
+    assert_eq!(transport.pending(), 1);
+}

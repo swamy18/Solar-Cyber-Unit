@@ -80,6 +80,32 @@ that hash. Applying it verifies the envelope's source space first.
 This transfers a *representation*, not model weights: a provider can offer a
 target-space capability without publishing its model.
 
+### Quadratic adapters (`quad::QuadraticAdapter`)
+
+A signed second-order map `target = W * expand(source) + b`, where
+`expand(x) = [x, x_i * x_j (i <= j)]`. It reuses the linear ridge solver on
+the expanded features, so the bytes stay deterministic and the trainer
+signature covers the same fields. It fits parabolas and bends a linear map
+cannot; the honest limit is unchanged — a fixed polynomial basis, not a
+learned representation. Source dimensions are capped at 16 (152 expanded
+features).
+
+### Tokenizer maps (`token::TokenizerMap`)
+
+A signed vote table from a source tokenizer to a target tokenizer, fitted
+from paired token-id sequences: every aligned position casts one vote, the
+most-voted target wins per source token (ties break toward the smallest id),
+and `coverage` reports the fraction of training positions the winners
+reproduce. Unknown source tokens refuse instead of guessing. Alignment is
+positional — pairs must tokenize the same text with position `i`
+corresponding — and a low coverage tells the caller the pairs did not.
+
+### Held-out evaluation (`eval`)
+
+`evaluate` scores any fitted map on held-out pairs against the
+mean-predictor baseline over the same targets, and states both MSEs. A map
+that cannot beat predicting the mean is overfitted or fitted on noise.
+
 ### Capability discovery (`registry`)
 
 A capability names the provider, source and target spaces, service, price per
@@ -182,8 +208,14 @@ models.
 
 ## 6. Roadmap
 
-1. Nonlinear adapters (small MLP/attention) with a versioned format.
-2. Tokenizer-level input adapters, not just layer activations.
+1. Nonlinear adapters — **quadratic done** (`quad::QuadraticAdapter`:
+   second-order expansion with the same ridge solver, versioned format and
+   signed bytes; fits parabolas a linear map cannot). Small MLP/attention
+   remain later work.
+2. Tokenizer-level input adapters — **vote-table maps done**
+   (`token::TokenizerMap`: positional co-occurrence voting, deterministic
+   tie-breaks, coverage reporting, unknown-token refusal). True alignment
+   (non-positional) remains later work.
 3. Capability gossip and an HTTP/MCP transport binding.
 4. Semantic evaluation harness: held-out probes, not just paired MSE.
 5. Work-graph attribution: adapter reuse and downstream revenue sharing.

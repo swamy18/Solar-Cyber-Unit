@@ -2,8 +2,15 @@
 //! single-verifier dispatch across TEE, FHE and ZKML evidence.
 
 use rand::{rngs::StdRng, SeedableRng};
+use srct_compute::market::{
+    plan_assignments, ComputeJob, ComputeOffer, Verification, JOB_VERSION, OFFER_VERSION,
+};
 use srct_compute::tee::{
     AttestationRoots, SignedTeeQuote, TeeError, TeeQuote, TeeSla, TeeType, TEE_VERSION,
+};
+use srct_compute::{
+    ComputeError, ComputeReceipt, Determinism, DeviceClass, DeviceProfile, SignedAssignment,
+    SignedReceipt,
 };
 use srct_core::wallet::Wallet;
 use srct_fhe::{
@@ -342,4 +349,219 @@ fn one_verifier_handles_mixed_evidence() {
             HEIGHT
         )
         .is_ok());
+}
+
+fn compute_evidence() -> (SignedAssignment, SignedReceipt) {
+    let provider = wallet(11);
+    let requester = wallet(12);
+    let profile = DeviceProfile::new(
+        DeviceClass::Gpu,
+        Determinism::Reproducible,
+        24_576,
+        8,
+        20,
+        50_000,
+        [7u8; 32],
+    );
+    let offer = srct_compute::market::SignedOffer::sign(
+        ComputeOffer {
+            version: OFFER_VERSION,
+            network_id: NET.into(),
+            provider: provider.address().unwrap(),
+            service: "train.mlp".into(),
+            profile,
+            unit_price_sat: 7,
+            min_units: 1,
+            max_units_per_job: 20,
+            privacy: false,
+            verification: Verification::Receipt,
+            available_from: 0,
+            available_until: 1_000,
+            nonce: 1,
+        },
+        &provider,
+    )
+    .unwrap();
+    let job = srct_compute::market::SignedJob::sign(
+        ComputeJob {
+            version: JOB_VERSION,
+            network_id: NET.into(),
+            requester: requester.address().unwrap(),
+            service: "train.mlp".into(),
+            units: 5,
+            max_unit_price_sat: 20,
+            max_total_sat: 100,
+            class_mask: DeviceClass::Gpu.mask(),
+            min_ram_mib: 512,
+            determinism: Determinism::Reproducible,
+            required_kernel: [7u8; 32],
+            min_verification: Verification::Receipt,
+            sealed_input: false,
+            input: [3u8; 32],
+            deadline: 100,
+            nonce: 1,
+        },
+        &requester,
+    )
+    .unwrap();
+    let plan = plan_assignments(&job, std::slice::from_ref(&offer), 10, 1).unwrap();
+    let assignment = plan.sign(&requester).unwrap().assignments.remove(0);
+    let receipt = SignedReceipt::sign(
+        ComputeReceipt::new(&assignment, 5, [4u8; 32], 1_000, 20, 1).unwrap(),
+        &provider,
+    )
+    .unwrap();
+    (assignment, receipt)
+}
+
+#[test]
+fn unified_compute_verifies_and_refuses_replay() {
+    let roots = AttestationRoots::new();
+    let mut verifier = UnifiedVerifier::new();
+    let (assignment, receipt) = compute_evidence();
+    let out = verifier
+        .verify(
+            &Evidence::Compute {
+                assignment: assignment.clone(),
+                receipt: receipt.clone(),
+            },
+            &roots,
+            HEIGHT,
+        )
+        .unwrap();
+    assert_eq!(out.kind, EvidenceKind::Compute);
+    assert_eq!(out.output, 35u64.to_le_bytes().to_vec());
+    // Same receipt again is already settled.
+    assert_eq!(
+        verifier.verify(
+            &Evidence::Compute {
+                assignment,
+                receipt
+            },
+            &roots,
+            HEIGHT
+        ),
+        Err(VerifyError::Compute(ComputeError::AlreadySettled))
+    );
+}
+
+#[test]
+fn unified_compute_refuses_expired_receipt() {
+    let roots = AttestationRoots::new();
+    let mut verifier = UnifiedVerifier::new();
+    let (assignment, receipt) = compute_evidence();
+    assert_eq!(
+        verifier.verify(
+            &Evidence::Compute {
+                assignment,
+                receipt
+            },
+            &roots,
+            101
+        ),
+        Err(VerifyError::Compute(ComputeError::Expired))
+    );
+}
+
+#[test]
+fn verify_for_profile_gates_release_on_policy() {
+    // Attested execution (standard) needs Tee; compute receipt alone is not enough.
+    let profile = TaskProfile {
+        kind: TaskKind::AttestedExecution,
+        security: SecurityLevel::Standard,
+        value_sat: 0,
+    };
+    let (roots, sla, quote) = tee_evidence();
+    let mut verifier = UnifiedVerifier::new();
+    let tee_only = vec![Evidence::Tee {
+        sla: sla.clone(),
+        quote: quote.clone(),
+    }];
+    assert!(verifier
+        .verify_for_profile(&profile, &tee_only, &roots, HEIGHT)
+        .is_ok());
+    let (assignment, receipt) = compute_evidence();
+    let mut verifier = UnifiedVerifier::new();
+    let compute_only = vec![Evidence::Compute {
+        assignment,
+        receipt,
+    }];
+    assert!(matches!(
+        verifier.verify_for_profile(&profile, &compute_only, &roots, HEIGHT),
+        Err(VerifyError::Policy(_))
+    ));
+    // Proven compute needs correctness; Tee alone is not enough, Zk passes.
+    let proven = TaskProfile {
+        kind: TaskKind::ProvenCompute,
+        security: SecurityLevel::Standard,
+        value_sat: 0,
+    };
+    let mut verifier = UnifiedVerifier::new();
+    assert!(verifier
+        .verify_for_profile(&profile, &tee_only, &roots, HEIGHT)
+        .is_ok());
+    let mut verifier = UnifiedVerifier::new();
+    assert!(matches!(
+        verifier.verify_for_profile(&proven, &tee_only, &roots, HEIGHT),
+        Err(VerifyError::Policy(_))
+    ));
+    let (ztask, zreceipt) = zk_evidence();
+    let mut verifier = UnifiedVerifier::new();
+    let zk_only = vec![Evidence::Zk {
+        task: ztask,
+        receipt: zreceipt,
+    }];
+    assert!(verifier
+        .verify_for_profile(&proven, &zk_only, &roots, HEIGHT)
+        .is_ok());
+}
+
+#[test]
+fn gated_release_runs_rail_only_on_policy_pass() {
+    use srct_verify::{TaskKind, TaskProfile};
+    let profile = TaskProfile {
+        kind: TaskKind::ProvenCompute,
+        security: SecurityLevel::Standard,
+        value_sat: 0,
+    };
+    let roots = AttestationRoots::new();
+    // Policy fails: the rail closure never runs.
+    let mut verifier = UnifiedVerifier::new();
+    let mut ran = false;
+    let (assignment, receipt) = compute_evidence();
+    let err = verifier.gated_release(
+        &profile,
+        &[Evidence::Compute {
+            assignment,
+            receipt,
+        }],
+        &roots,
+        HEIGHT,
+        |_| {
+            ran = true;
+        },
+    );
+    assert!(matches!(err, Err(VerifyError::Policy(_))));
+    assert!(!ran);
+    // Policy passes: the rail closure runs exactly once with the outputs.
+    let mut verifier = UnifiedVerifier::new();
+    let (ztask, zreceipt) = zk_evidence();
+    let mut ran = false;
+    let out = verifier
+        .gated_release(
+            &profile,
+            &[Evidence::Zk {
+                task: ztask,
+                receipt: zreceipt,
+            }],
+            &roots,
+            HEIGHT,
+            |outputs| {
+                ran = true;
+                outputs.len()
+            },
+        )
+        .unwrap();
+    assert!(ran);
+    assert_eq!(out, 1);
 }

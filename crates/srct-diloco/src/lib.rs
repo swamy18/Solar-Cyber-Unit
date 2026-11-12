@@ -54,18 +54,20 @@
 //! - Sybil resistance here is stake-capped accounting, not a complete identity
 //!   system. A production design must bind worker keys to bonded stake and to
 //!   the L2 authority/escrow layer.
-//! - **Hardware:** a `TrainBackend` seam wraps the compute path. Two backends
-//!   are implemented: the CPU `f32` reference (`Reproducible`) and a
-//!   block-partitioned executor (`Statistical`) that proves heterogeneous
-//!   execution strategies pass the same conformance suite. GPU, TPU, NPU,
-//!   Apple-silicon and photonic backends are not implemented. Adding one
-//!   means implementing the trait and passing `backend::check_backend`; the
-//!   round, validation and reward code does not change.
-//!   Neither implemented backend is `BitExact`, so both are refused by the
-//!   consensus gate; see `docs/dual-mining.md` section 8.
+//! - **Hardware:** a `TrainBackend` seam wraps the compute path. The CPU
+//!   `f32` reference (`Reproducible`), a block-partitioned executor
+//!   (`Statistical`), a fixed-point Q16.16 backend (`BitExact`) and six
+//!   hardware backends (CUDA, ROCm, TPU, NPU, Apple silicon, photonic) are
+//!   implemented. The hardware backends fail closed without their device and
+//!   run CPU kernels in `emulated()` mode so plumbing passes conformance on
+//!   any machine; silicon execution plugs in behind the probe without moving
+//!   the seam. Only `BitExact` backends pass the consensus gate; see
+//!   `docs/dual-mining.md` section 8.
 
 pub mod backend;
+pub mod consensus;
 pub mod data;
+pub mod devices;
 pub mod fixed;
 pub mod model;
 pub mod round;
@@ -76,7 +78,14 @@ pub use backend::{
     BlockedBackend, ConformanceReport, CpuBackend, DeterminismClass, DeviceClass,
     FixedPointBackend, LocalUpdate, TrainBackend,
 };
+pub use consensus::{
+    pouw_active, pouw_mint_for_round, pouw_mint_sat, reexecute_check, tolerance_for,
+    worker_eligible, PouwError, RoundAnchor, MAX_ANCHOR_WORKERS, ROUND_ANCHOR_VERSION,
+};
 pub use data::{accuracy, mean_loss, shards, two_moons, Sample};
+pub use devices::{
+    AppleSocBackend, CudaBackend, NpuBackend, PhotonicBackend, RocmBackend, TpuBackend,
+};
 pub use fixed::{quantize_samples, FixedMlp};
 pub use model::{Mlp, MODEL_VERSION};
 pub use round::{Contribution, FinalizedRound, Rejection, RoundConfig, RoundOutcome, RoundState};

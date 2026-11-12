@@ -84,79 +84,15 @@ impl LinearAdapter {
         }
 
         // Normal equations: (X^T X + lambda I) W = X^T Y, with a bias column.
-        let n = d + 1;
-        let mut a = vec![vec![0.0f64; n]; n];
-        let mut b = vec![vec![0.0f64; t]; n];
-        for (x, y) in pairs {
-            let mut row = Vec::with_capacity(n);
-            row.extend(x.iter().map(|v| *v as f64));
-            row.push(1.0);
-            for i in 0..n {
-                for j in 0..n {
-                    a[i][j] += row[i] * row[j];
-                }
-                for k in 0..t {
-                    b[i][k] += row[i] * y[k] as f64;
-                }
-            }
-        }
-        for i in 0..d {
-            a[i][i] += ridge as f64;
-        }
-
-        // Gauss-Jordan with partial pivoting on [A | B].
-        for col in 0..n {
-            let mut pivot = col;
-            for row in col + 1..n {
-                if a[row][col].abs() > a[pivot][col].abs() {
-                    pivot = row;
-                }
-            }
-            if a[pivot][col].abs() < 1e-12 {
-                return Err("adapter fit is singular; add ridge or more data".into());
-            }
-            a.swap(col, pivot);
-            b.swap(col, pivot);
-            let inv = 1.0 / a[col][col];
-            for j in col..n {
-                a[col][j] *= inv;
-            }
-            for k in 0..t {
-                b[col][k] *= inv;
-            }
-            for row in 0..n {
-                if row == col {
-                    continue;
-                }
-                let factor = a[row][col];
-                if factor == 0.0 {
-                    continue;
-                }
-                for j in col..n {
-                    a[row][j] -= factor * a[col][j];
-                }
-                for k in 0..t {
-                    b[row][k] -= factor * b[col][k];
-                }
-            }
-        }
-
-        let mut weight = vec![0.0f32; t * d];
-        let mut bias = vec![0.0f32; t];
-        for k in 0..t {
-            for i in 0..d {
-                let v = b[i][k];
-                if !v.is_finite() || v.abs() > f32::MAX as f64 {
-                    return Err("adapter weights are not representable as f32".into());
-                }
-                weight[k * d + i] = v as f32;
-            }
-            let v = b[d][k];
-            if !v.is_finite() || v.abs() > f32::MAX as f64 {
-                return Err("adapter bias is not representable as f32".into());
-            }
-            bias[k] = v as f32;
-        }
+        let features: Vec<Vec<f64>> = pairs
+            .iter()
+            .map(|(x, _)| x.iter().map(|v| *v as f64).collect())
+            .collect();
+        let targets: Vec<Vec<f64>> = pairs
+            .iter()
+            .map(|(_, y)| y.iter().map(|v| *v as f64).collect())
+            .collect();
+        let (weight, bias) = ridge_affine_solve(&features, &targets, ridge as f64)?;
 
         let address = trainer.address().map_err(|e| e.to_string())?;
         let mut adapter = LinearAdapter {
@@ -413,4 +349,95 @@ impl LinearAdapter {
         adapter.verify()?;
         Ok(adapter)
     }
+}
+
+/// Ridge-regularized affine fit shared by the linear and quadratic adapters.
+///
+/// Solves `(X^T X + lambda I) W = X^T Y` over the given feature rows with an
+/// unregularized bias column, by Gauss-Jordan elimination with partial
+/// pivoting. The math is byte-identical to the original linear-adapter fit;
+/// only the feature construction differs per adapter kind.
+#[allow(clippy::needless_range_loop)]
+pub(crate) fn ridge_affine_solve(
+    features: &[Vec<f64>],
+    targets: &[Vec<f64>],
+    ridge: f64,
+) -> Result<(Vec<f32>, Vec<f32>), String> {
+    let d = features.first().map(Vec::len).unwrap_or(0);
+    let t = targets.first().map(Vec::len).unwrap_or(0);
+    // Normal equations with a bias column.
+    let n = d + 1;
+    let mut a = vec![vec![0.0f64; n]; n];
+    let mut b = vec![vec![0.0f64; t]; n];
+    for (x, y) in features.iter().zip(targets.iter()) {
+        let mut row = Vec::with_capacity(n);
+        row.extend(x.iter().copied());
+        row.push(1.0);
+        for i in 0..n {
+            for j in 0..n {
+                a[i][j] += row[i] * row[j];
+            }
+            for k in 0..t {
+                b[i][k] += row[i] * y[k];
+            }
+        }
+    }
+    for i in 0..d {
+        a[i][i] += ridge;
+    }
+
+    // Gauss-Jordan with partial pivoting on [A | B].
+    for col in 0..n {
+        let mut pivot = col;
+        for row in col + 1..n {
+            if a[row][col].abs() > a[pivot][col].abs() {
+                pivot = row;
+            }
+        }
+        if a[pivot][col].abs() < 1e-12 {
+            return Err("adapter fit is singular; add ridge or more data".into());
+        }
+        a.swap(col, pivot);
+        b.swap(col, pivot);
+        let inv = 1.0 / a[col][col];
+        for j in col..n {
+            a[col][j] *= inv;
+        }
+        for k in 0..t {
+            b[col][k] *= inv;
+        }
+        for row in 0..n {
+            if row == col {
+                continue;
+            }
+            let factor = a[row][col];
+            if factor == 0.0 {
+                continue;
+            }
+            for j in col..n {
+                a[row][j] -= factor * a[col][j];
+            }
+            for k in 0..t {
+                b[row][k] -= factor * b[col][k];
+            }
+        }
+    }
+
+    let mut weight = vec![0.0f32; t * d];
+    let mut bias = vec![0.0f32; t];
+    for k in 0..t {
+        for i in 0..d {
+            let v = b[i][k];
+            if !v.is_finite() || v.abs() > f32::MAX as f64 {
+                return Err("adapter weights are not representable as f32".into());
+            }
+            weight[k * d + i] = v as f32;
+        }
+        let v = b[d][k];
+        if !v.is_finite() || v.abs() > f32::MAX as f64 {
+            return Err("adapter bias is not representable as f32".into());
+        }
+        bias[k] = v as f32;
+    }
+    Ok((weight, bias))
 }

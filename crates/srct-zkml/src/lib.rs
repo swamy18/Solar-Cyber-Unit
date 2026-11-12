@@ -8,14 +8,17 @@
 //!
 //! - [`circuit`]: Sigma-protocol proofs (Pedersen commitments, CDS OR
 //!   bit-proofs, Fiat-Shamir) for one quantized linear layer with 16-bit
-//!   range checks.
+//!   range checks, plus threshold assertions (`value >= bound`) as the
+//!   non-linear gate primitive.
 //! - [`task`]: signed tasks, worker receipts carrying the proofs, and a
 //!   fail-closed verifier whose `Ok` is the escrow rail's release signal.
 //!
 //! # What this is not
 //!
-//! - **Not general ZKML.** One linear layer, at most 8 inputs of 16 bits, no
-//!   non-linearities, no folding/recursion (Nova-style systems are future).
+//! - **Not general ZKML.** One linear layer, at most 8 inputs of 16 bits, plus
+//!   a threshold-assertion gate. No folding/recursion (Nova-style systems are
+//!   future), and threshold assertions are not yet bound to task envelopes
+//!   (that binding is a wire-version decision).
 //! - **Not a usefulness proof.** The proof shows the specified computation
 //!   ran, not that the output is factually correct or useful.
 //! - **Not consensus.** Nothing here moves coin. Verification returns the
@@ -25,8 +28,8 @@ pub mod circuit;
 pub mod task;
 
 pub use circuit::{
-    eval_plaintext, prove_linear, verify_linear, BitProof, LinearProof, BIT_WIDTH, MAX_INPUTS,
-    MAX_WEIGHT_ABS, POINT_LEN,
+    eval_plaintext, prove_linear, prove_threshold, verify_linear, verify_threshold, BitProof,
+    LinearProof, ThresholdProof, BIT_WIDTH, MAX_INPUTS, MAX_WEIGHT_ABS, POINT_LEN,
 };
 pub use task::{
     SignedZkReceipt, SignedZkTask, ZkReceipt, ZkTask, ZkVerifier, BIT_PROOF_LEN, ZK_VERSION,

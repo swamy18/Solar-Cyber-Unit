@@ -267,6 +267,7 @@ pub fn prove_linear(
         openings.push(opening);
     }
     // Phase 2: OR-prove every bit against the complete statement.
+    let statement = statement_bytes(weights, bias, &input_coms);
     let mut bit_proofs_all = Vec::with_capacity(inputs.len());
     for opening in &openings {
         let mut bit_proofs = Vec::with_capacity(BIT_WIDTH);
@@ -277,15 +278,7 @@ pub fn prove_linear(
             .zip(opening.bit_values.iter())
             .map(|((c, r), v)| (c, r, v))
         {
-            bit_proofs.push(prove_bit_known(
-                *bit,
-                *b_com,
-                *r,
-                weights,
-                bias,
-                &input_coms,
-                rng,
-            )?);
+            bit_proofs.push(prove_bit_known(*bit, *b_com, *r, &statement, rng)?);
         }
         bit_proofs_all.push(bit_proofs);
     }
@@ -315,16 +308,14 @@ fn statement_bytes(weights: &[i64], bias: u64, input_coms: &[[u8; POINT_LEN]]) -
     bytes
 }
 
-/// CDS OR-proof for one bit commitment already made in phase 1. The challenge
-/// binds the statement so the proof cannot be transplanted to another
-/// evaluation.
+/// CDS OR-proof for one bit commitment already made in phase 1. The
+/// precomputed `statement` binds the proof to its exact evaluation, so a
+/// bit-proof cannot be transplanted to another statement.
 fn prove_bit_known(
     bit: u64,
     b_com: ProjectivePoint,
     r: Scalar,
-    weights: &[i64],
-    bias: u64,
-    input_coms: &[[u8; POINT_LEN]],
+    statement: &[u8],
     rng: &mut StdRng,
 ) -> Result<BitProof, ZkError> {
     debug_assert!(bit <= 1);
@@ -334,7 +325,6 @@ fn prove_bit_known(
     // P0 = B (bit 0: B = rH), P1 = B - G (bit 1: B - G = rH).
     let p0 = b_com;
     let p1 = b_com - g;
-    let statement = statement_bytes(weights, bias, input_coms);
     // Real branch is `bit`; fake the other with random challenge/response.
     let fake = 1 - bit as usize;
     let mut first = [ProjectivePoint::IDENTITY; 2];
@@ -348,7 +338,7 @@ fn prove_bit_known(
     first[fake] = h * responses[fake] - p_fake * challenges[fake];
     let a0_bytes = encode_point(&first[0])?;
     let a1_bytes = encode_point(&first[1])?;
-    let c = challenge(&[&statement, &b_com_bytes, &a0_bytes, &a1_bytes]);
+    let c = challenge(&[statement, &b_com_bytes, &a0_bytes, &a1_bytes]);
     challenges[bit as usize] = c - challenges[fake];
     responses[bit as usize] = a_real + challenges[bit as usize] * r;
     Ok(BitProof {
@@ -377,6 +367,7 @@ pub fn verify_linear(weights: &[i64], bias: u64, package: &LinearProof) -> Resul
     let h = h_generator();
     let g = ProjectivePoint::GENERATOR;
     let mut input_pts = Vec::with_capacity(package.input_commitments.len());
+    let statement = statement_bytes(weights, bias, &package.input_commitments);
     for (input_raw, bits) in package
         .input_commitments
         .iter()
@@ -387,7 +378,7 @@ pub fn verify_linear(weights: &[i64], bias: u64, package: &LinearProof) -> Resul
         let mut recomposed = ProjectivePoint::IDENTITY;
         let mut power = Scalar::from(1u64);
         for proof in bits {
-            verify_bit(weights, bias, &package.input_commitments, proof, &h)?;
+            verify_bit(&statement, proof, &h)?;
             let b_com = decode_point(&proof.commitment)?;
             recomposed += b_com * power;
             power += power;
@@ -409,13 +400,7 @@ pub fn verify_linear(weights: &[i64], bias: u64, package: &LinearProof) -> Resul
     Ok(())
 }
 
-fn verify_bit(
-    weights: &[i64],
-    bias: u64,
-    input_coms: &[[u8; POINT_LEN]],
-    proof: &BitProof,
-    h: &ProjectivePoint,
-) -> Result<(), ZkError> {
+fn verify_bit(statement: &[u8], proof: &BitProof, h: &ProjectivePoint) -> Result<(), ZkError> {
     let g = ProjectivePoint::GENERATOR;
     let b_com = decode_point(&proof.commitment)?;
     let a0 = decode_point(&proof.a0)?;
@@ -428,8 +413,7 @@ fn verify_bit(
         .ok_or_else(|| ZkError::Malformed("zk bit-proof z0 is not canonical".into()))?;
     let z1 = Option::<Scalar>::from(Scalar::from_repr(proof.z1.into()))
         .ok_or_else(|| ZkError::Malformed("zk bit-proof z1 is not canonical".into()))?;
-    let statement = statement_bytes(weights, bias, input_coms);
-    let c = challenge(&[&statement, &proof.commitment, &proof.a0, &proof.a1]);
+    let c = challenge(&[statement, &proof.commitment, &proof.a0, &proof.a1]);
     if c0 + c1 != c {
         return Err(ZkError::InvalidProof);
     }
@@ -440,6 +424,139 @@ fn verify_bit(
         return Err(ZkError::InvalidProof);
     }
     Ok(())
+}
+
+/// A proven lower bound: the committed value opens to at least `threshold`.
+///
+/// The prover commits the value, bit-decomposes the difference `d = value -
+/// threshold` with one CDS OR-proof per bit (same machinery as the linear
+/// gate, under a distinct statement tag), and the verifier recomposes the
+/// difference homomorphically and checks `X - threshold*G == D`. This is the
+/// non-linear gate primitive thresholded activations are built from: a
+/// clipped `max(x, c)` is a linear gate plus this assertion, and a step
+/// gate is this assertion alone.
+///
+/// Task-envelope binding (which task commitment this assertion covers) is a
+/// wire-version decision and is deliberately not smuggled in here: this
+/// proof stands alone with its own domain separation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ThresholdProof {
+    pub input_commitment: [u8; POINT_LEN],
+    pub threshold: u16,
+    pub bit_proofs: Vec<BitProof>,
+}
+
+fn threshold_statement_bytes(threshold: u16, input_com: &[u8; POINT_LEN]) -> Vec<u8> {
+    let mut bytes = Vec::from(b"srct/zkml/threshold/v1");
+    bytes.extend_from_slice(&threshold.to_be_bytes());
+    bytes.extend_from_slice(input_com);
+    bytes
+}
+
+/// Prove `value >= threshold` for a freshly committed value. A false
+/// statement is refused at prove time — there is no proof of a lie to verify.
+///
+/// The bit commitments reuse the input's blinding by construction: blindings
+/// `r_1..r_15` are fresh and `r_0` absorbs the slack so that
+/// `Σ 2^i r_i` equals the input blinding. The verifier's homomorphic
+/// recomposition then matches `X - threshold*G` exactly. This is the same
+/// blinding discipline Bulletproof-style range proofs use.
+pub fn prove_threshold(
+    value: u16,
+    threshold: u16,
+    rng: &mut StdRng,
+) -> Result<ThresholdProof, ZkError> {
+    if value < threshold {
+        return Err(ZkError::InvalidProof);
+    }
+    let h = h_generator();
+    let g = ProjectivePoint::GENERATOR;
+    let r_x = scalar_from_key(&SecretKey::random(rng));
+    let x_com = g * Scalar::from(value as u64) + h * r_x;
+    let input_commitment = encode_point(&x_com)?;
+    let d = (value - threshold) as u64;
+    let statement = threshold_statement_bytes(threshold, &input_commitment);
+    let mut tail = Vec::with_capacity(BIT_WIDTH - 1);
+    let mut acc = r_x;
+    let mut pow = Scalar::from(2u64);
+    for _ in 1..BIT_WIDTH {
+        let r = scalar_from_key(&SecretKey::random(rng));
+        tail.push(r);
+        acc -= pow * r;
+        pow = pow + pow;
+    }
+    let mut r_bits = Vec::with_capacity(BIT_WIDTH);
+    r_bits.push(acc);
+    r_bits.extend(tail);
+    let mut bit_proofs = Vec::with_capacity(BIT_WIDTH);
+    for (i, r) in r_bits.iter().enumerate().take(BIT_WIDTH) {
+        let bit = (d >> i) & 1;
+        let b_com = g * Scalar::from(bit) + h * *r;
+        encode_point(&b_com)?;
+        bit_proofs.push(prove_bit_known(bit, b_com, *r, &statement, rng)?);
+    }
+    Ok(ThresholdProof {
+        input_commitment,
+        threshold,
+        bit_proofs,
+    })
+}
+
+/// Verify a threshold assertion. Learns nothing about the value beyond the
+/// bound and the 16-bit length.
+pub fn verify_threshold(proof: &ThresholdProof) -> Result<(), ZkError> {
+    if proof.bit_proofs.len() != BIT_WIDTH {
+        return Err(ZkError::Malformed(
+            "zk threshold bit proof shape is wrong".into(),
+        ));
+    }
+    let x_com = decode_point(&proof.input_commitment)?;
+    let statement = threshold_statement_bytes(proof.threshold, &proof.input_commitment);
+    let h = h_generator();
+    let g = ProjectivePoint::GENERATOR;
+    let mut recomposed = ProjectivePoint::IDENTITY;
+    let mut power = Scalar::from(1u64);
+    for bp in &proof.bit_proofs {
+        verify_bit(&statement, bp, &h)?;
+        recomposed += decode_point(&bp.commitment)? * power;
+        power += power;
+    }
+    if recomposed != x_com - g * Scalar::from(proof.threshold as u64) {
+        return Err(ZkError::InvalidProof);
+    }
+    Ok(())
+}
+
+impl ThresholdProof {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = srct_core::ser::Writer::with_capacity(POINT_LEN + 2 + BIT_WIDTH * 256);
+        w.raw(&self.input_commitment).u16le(self.threshold);
+        for bp in &self.bit_proofs {
+            bp.encode(&mut w);
+        }
+        w.into_vec()
+    }
+
+    /// Strict inverse of [`ThresholdProof::encode`]. Verifies the assertion,
+    /// so tampered bytes fail here instead of loading a bad proof.
+    pub fn decode(bytes: &[u8]) -> Result<Self, ZkError> {
+        let mut r = srct_core::ser::Reader::new(bytes);
+        let mut input_commitment = [0u8; POINT_LEN];
+        input_commitment.copy_from_slice(r.fixed_slice(POINT_LEN).map_err(malformed)?);
+        let threshold = r.u16le().map_err(malformed)?;
+        let mut bit_proofs = Vec::with_capacity(BIT_WIDTH);
+        for _ in 0..BIT_WIDTH {
+            bit_proofs.push(BitProof::decode(&mut r)?);
+        }
+        r.expect_end().map_err(malformed)?;
+        let proof = ThresholdProof {
+            input_commitment,
+            threshold,
+            bit_proofs,
+        };
+        verify_threshold(&proof)?;
+        Ok(proof)
+    }
 }
 
 fn malformed(e: srct_core::error::Error) -> ZkError {
