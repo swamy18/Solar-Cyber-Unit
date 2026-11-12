@@ -1,0 +1,12 @@
+[package]
+publish = false
+name = "srct-workgraph"
+description = "AI Work Graph: reusable verifiable compute artifacts with lineage, reuse permissions and exact royalty settlement (non-consensus)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+srct-core.workspace = true

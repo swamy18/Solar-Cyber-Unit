@@ -133,7 +133,16 @@ rules in code would have been the wrong order.
   tasks and receipts refused, and wire round-trips. One linear layer only
   (≤8 inputs); Bulletproofs R1CS was evaluated but its published crate does
   not compile. See [`docs/zkml.md`](zkml.md).
-- `cargo test --workspace` — **1,769 tests pass, 0 failures, 1 ignored** across the workspace.
+- **AI Work Graph (non-consensus, `srct-workgraph`).** `cargo test
+  -p srct-workgraph` passes 10 acceptance tests: lineage registration with
+  signature/network/parent/license checks, parent-newer-than-child and
+  replay refusals, transitive descendants, an exact 3-level royalty chain
+  (95,000 / 4,000 / 1,000 of 100,000), a 3-parent split with dust kept by
+  the owner, depth-cap cutoff with exact sums, zero-royalty passthrough,
+  and wire round-trips. Cycles are impossible by construction; evidence
+  hashes reference (not recheck) the issuing crates' proofs. See
+  [`docs/workgraph.md`](workgraph.md).
+- `cargo test --workspace` — **1,779 tests pass, 0 failures, 1 ignored** across the workspace.
   (this file quote counts as of their own dates — 242, then 263, then 293 —
   kept as history):
   - 227 unit tests in `srct-core` (M1–M5 suites, the 21-test validator-set suite, the 30-test real-BLS suite in

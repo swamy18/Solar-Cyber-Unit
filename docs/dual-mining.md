@@ -259,8 +259,7 @@ The wider brief is only partially implemented. The CNNP core, the intent
 lifecycle exist, TEE-backed execution evidence (`srct-compute::tee`), an
 additive-homomorphic encrypted-compute prototype (`srct-fhe`) and a
 zero-knowledge linear-evaluation prototype (`srct-zkml`) as non-consensus
-prototypes; work-graph attribution and SDK adapters are **not
-implemented**. The audit above is the base those milestones build on.
+prototypes; SDK adapters are **not implemented**. The audit above is the base those milestones build on.
 The ordered plan is:
 
 1. DiLoCo PoUW prototype — **done, non-consensus** (this crate).
@@ -284,7 +283,9 @@ The ordered plan is:
    linear-adapter, discovery and metering core is done (non-consensus).
 9. Intent persistence, chain adapters and solver discovery — the lifecycle
    state machine is done (non-consensus).
-10. Work-graph attribution and reuse compensation.
+10. Work-graph attribution and reuse compensation — **done, non-consensus**
+    (`srct-workgraph`: lineage, licenses, exact royalty settlement).
+    Cross-crate evidence checks are next.
 11. SDK adapters (Rust/Python/TypeScript/MCP) and production hardening.
 
 Each milestone must ship with working code, adversarial tests, measured

@@ -33,6 +33,8 @@ cargo test -p srct-compute
 cargo test -p srct-fhe
 # ZKML verification prototype (Sigma proofs, tasks, receipts, verifier).
 cargo test -p srct-zkml
+# AI Work Graph (artifacts, lineage, royalty settlement).
+cargo test -p srct-workgraph
 # Cross-network intent lifecycle, quotes, routes and disputes.
 cargo test -p srct-intent
 cargo test -p srct-core --test committee_rotation
