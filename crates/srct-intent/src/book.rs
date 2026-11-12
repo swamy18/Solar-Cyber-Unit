@@ -7,6 +7,10 @@
 use std::collections::BTreeMap;
 
 use srct_core::hash::{Address, Hash};
+use srct_verify::{
+    AttestationRoots, Evidence as VerifyEvidence, EvidenceKind, SignedTeeQuote, SignedZkReceipt,
+    SignedZkTask, TeeSla, UnifiedVerifier, VerifiedOutput, VerifyError,
+};
 
 use crate::types::{
     Amount, Delivery, Intent, Privacy, Quote, SignedDelivery, SignedDispute, SignedIntent,
@@ -38,6 +42,9 @@ pub enum IntentError {
     EmptyResult,
     EmptyEvidence,
     EvidenceMismatch,
+    EvidenceMissing,
+    BadEvidence(String),
+    NotAuthorized,
     WrongArbiter,
     Overflow,
 }
@@ -66,7 +73,10 @@ impl std::fmt::Display for IntentError {
             IntentError::LateDelivery => write!(f, "delivery arrived after its deadline"),
             IntentError::EmptyResult => write!(f, "delivery result hash is zero"),
             IntentError::EmptyEvidence => write!(f, "dispute evidence hash is zero"),
-            IntentError::EvidenceMismatch => write!(f, "resolution evidence does not match"),
+            IntentError::EvidenceMismatch => write!(f, "evidence does not match"),
+            IntentError::EvidenceMissing => write!(f, "required execution evidence is missing"),
+            IntentError::BadEvidence(detail) => write!(f, "evidence refused: {detail}"),
+            IntentError::NotAuthorized => write!(f, "caller is not the creator or arbiter"),
             IntentError::WrongArbiter => write!(f, "resolution is not signed by the arbiter"),
             IntentError::Overflow => write!(f, "arithmetic overflow"),
         }
@@ -147,18 +157,68 @@ struct Record {
     signed: SignedIntent,
     quotes: BTreeMap<Address, SignedQuote>,
     state: IntentState,
+    expected: Option<ExpectedEvidence>,
+    verified: Option<EvidenceKind>,
+}
+
+/// What the rail expects the solver to prove, pinned by the creator or the
+/// arbiter. The SLA/task pins the exact measurements; the rail checks the
+/// worker against them at `attach_evidence` time.
+#[derive(Clone, Debug)]
+pub enum ExpectedEvidence {
+    Tee(TeeSla),
+    Zk(SignedZkTask),
+}
+
+impl ExpectedEvidence {
+    fn kind(&self) -> EvidenceKind {
+        match self {
+            ExpectedEvidence::Tee(_) => EvidenceKind::Tee,
+            ExpectedEvidence::Zk(_) => EvidenceKind::Zk,
+        }
+    }
+}
+
+/// Solver-submitted evidence. The request is checked against the pinned
+/// expectation (kind, worker binding) and then verified cryptographically.
+#[derive(Clone, Debug)]
+pub enum IntentEvidence {
+    Tee(SignedTeeQuote),
+    Zk(SignedZkTask, SignedZkReceipt),
+}
+
+impl IntentEvidence {
+    fn kind(&self) -> EvidenceKind {
+        match self {
+            IntentEvidence::Tee(_) => EvidenceKind::Tee,
+            IntentEvidence::Zk(_, _) => EvidenceKind::Zk,
+        }
+    }
 }
 
 /// In-memory intent book. Persistence is the caller's responsibility; the
 /// state machine itself is deterministic.
+///
+/// The book is also the evidence rail: it holds the attestation trust roots
+/// and a unified verifier, pins creator/arbiter expectations, and refuses to
+/// settle high-verification intents without matching verified evidence.
+/// Arbitration (`dispute`/`resolve`) stays available as the fallback.
 #[derive(Default)]
 pub struct IntentBook {
     records: BTreeMap<Hash, Record>,
+    roots: AttestationRoots,
+    verifier: UnifiedVerifier,
 }
 
 impl IntentBook {
     pub fn new() -> Self {
         IntentBook::default()
+    }
+
+    /// Trust roots for TEE attestation quotes. The rail operator configures
+    /// hardware trust out of band; unknown attesters are refused.
+    pub fn attestation_roots_mut(&mut self) -> &mut AttestationRoots {
+        &mut self.roots
     }
 
     pub fn len(&self) -> usize {
@@ -202,6 +262,8 @@ impl IntentBook {
                 signed,
                 quotes: BTreeMap::new(),
                 state: IntentState::Open,
+                expected: None,
+                verified: None,
             },
         );
         Ok(id)
@@ -362,7 +424,106 @@ impl IntentBook {
         Ok(())
     }
 
+    /// Pin what evidence the solver must present, signed off by the creator
+    /// or the arbiter. Allowed while the intent is open, accepted or
+    /// fulfilled; the rail authenticates the caller and passes its address.
+    pub fn expect_evidence(
+        &mut self,
+        intent: &Hash,
+        expected: ExpectedEvidence,
+        authority: &Address,
+    ) -> Result<(), IntentError> {
+        let record = self
+            .records
+            .get_mut(intent)
+            .ok_or(IntentError::UnknownIntent)?;
+        if *authority != record.signed.intent.creator && *authority != record.signed.intent.arbiter
+        {
+            return Err(IntentError::NotAuthorized);
+        }
+        match &record.state {
+            IntentState::Open | IntentState::Accepted { .. } | IntentState::Fulfilled { .. } => {}
+            _ => {
+                return Err(IntentError::BadState(
+                    "intent can no longer take expectations",
+                ))
+            }
+        }
+        if let ExpectedEvidence::Zk(task) = &expected {
+            task.verify()
+                .map_err(|e| IntentError::BadEvidence(e.to_string()))?;
+        }
+        record.expected = Some(expected);
+        Ok(())
+    }
+
+    /// Verify solver-submitted evidence against the pinned expectation and
+    /// the accepted solver. Only on fulfilled intents: evidence arrives with
+    /// or after the delivery, and settlement consumes the verdict.
+    pub fn attach_evidence(
+        &mut self,
+        intent: &Hash,
+        evidence: IntentEvidence,
+        height: u64,
+    ) -> Result<VerifiedOutput, IntentError> {
+        // Read the expectation and the accepted solver first; the borrow ends
+        // before verification takes `&mut self`.
+        let (solver, expected) = {
+            let record = self.records.get(intent).ok_or(IntentError::UnknownIntent)?;
+            let solver = match &record.state {
+                IntentState::Fulfilled { solver, .. } => *solver,
+                _ => return Err(IntentError::BadState("intent is not fulfilled")),
+            };
+            let expected = record
+                .expected
+                .clone()
+                .ok_or(IntentError::EvidenceMissing)?;
+            (solver, expected)
+        };
+        if evidence.kind() != expected.kind() {
+            return Err(IntentError::EvidenceMismatch);
+        }
+        let bundle = match (expected, &evidence) {
+            (ExpectedEvidence::Tee(sla), IntentEvidence::Tee(quote)) => {
+                if sla.provider != solver || quote.quote.provider != sla.provider {
+                    return Err(IntentError::EvidenceMismatch);
+                }
+                VerifyEvidence::Tee {
+                    sla,
+                    quote: quote.clone(),
+                }
+            }
+            (ExpectedEvidence::Zk(task), IntentEvidence::Zk(submitted, receipt)) => {
+                if submitted.hash() != task.hash() {
+                    return Err(IntentError::EvidenceMismatch);
+                }
+                if task.task.provider != solver {
+                    return Err(IntentError::EvidenceMismatch);
+                }
+                VerifyEvidence::Zk {
+                    task,
+                    receipt: receipt.clone(),
+                }
+            }
+            _ => return Err(IntentError::EvidenceMismatch),
+        };
+        let output = self
+            .verifier
+            .verify(&bundle, &self.roots, height)
+            .map_err(|e| IntentError::BadEvidence(map_verify_error(e)))?;
+        let record = self
+            .records
+            .get_mut(intent)
+            .ok_or(IntentError::UnknownIntent)?;
+        record.verified = Some(evidence.kind());
+        Ok(output)
+    }
+
     /// Release the escrow to the solver after a delivery.
+    ///
+    /// High-verification intents (`Tee` and above) additionally require
+    /// verified evidence of a satisfying kind: a stronger proof satisfies a
+    /// weaker requirement, never the reverse.
     pub fn settle(
         &mut self,
         intent: &Hash,
@@ -381,6 +542,13 @@ impl IntentBook {
             } => (*solver, *price, *delivery),
             _ => return Err(IntentError::BadState("intent is not fulfilled")),
         };
+        let required = record.signed.intent.min_verification;
+        if required >= Verification::Tee {
+            match record.verified {
+                Some(kind) if evidence_level(kind) >= required => {}
+                _ => return Err(IntentError::EvidenceMissing),
+            }
+        }
         record.state = IntentState::Settled {
             solver,
             amount: price,
@@ -591,4 +759,20 @@ pub fn meets_verification(quote: &Quote, required: Verification) -> bool {
 /// Convenience for privacy floors.
 pub fn meets_privacy(quote: &Quote, required: Privacy) -> bool {
     quote.privacy >= required
+}
+
+/// Verification strength of verified evidence, for the settle gate.
+/// `Fhe` is unreachable here (intents take Tee/Zk evidence only) and maps
+/// below the gate on purpose: FHE correctness belongs to the privacy rail
+/// and its own settlement path, not to intent delivery evidence.
+fn evidence_level(kind: EvidenceKind) -> Verification {
+    match kind {
+        EvidenceKind::Tee => Verification::Tee,
+        EvidenceKind::Fhe => Verification::ProviderSigned,
+        EvidenceKind::Zk => Verification::Zk,
+    }
+}
+
+fn map_verify_error(e: VerifyError) -> String {
+    e.to_string()
 }

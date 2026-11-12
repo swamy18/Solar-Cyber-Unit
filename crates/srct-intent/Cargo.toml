@@ -10,3 +10,9 @@ repository.workspace = true
 
 [dependencies]
 srct-core.workspace = true
+srct-verify.workspace = true
+
+[dev-dependencies]
+srct-compute.workspace = true
+srct-zkml.workspace = true
+rand.workspace = true

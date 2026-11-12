@@ -153,9 +153,13 @@ hold custody and cannot release funds by itself.
 - The returned `SettlementInstruction` is the authorization the existing
   payment/escrow layer consumes; the settlement adapter maps `AssetId` to its
   rail.
-- `Verification::{None, ProviderSigned, Optimistic, Tee, Zk}` is the seam for
-  TEE/ZKML evidence. Today the lifecycle requires only signatures; the
-  verification level is a routing constraint.
+- `Verification::{None, ProviderSigned, Optimistic, Tee, Zk}` is enforced at
+  settlement: `Tee`/`Zk` intents require verified evidence. The creator or
+  arbiter pins expectations (`expect_evidence`: the TEE SLA or the ZK task);
+  the solver attaches its proof (`attach_evidence`); the book checks kind,
+  worker binding and cryptographic validity through `srct-verify`, then
+  `settle` releases. Dispute/resolve stays available as the arbitration
+  fallback.
 - `Privacy::{Public, Sealed, Tee, Fhe}` is the same seam as CNNP. Only the
   label is enforced here; actual privacy must come from the execution layer.
 
@@ -167,5 +171,7 @@ hold custody and cannot release funds by itself.
 3. Solver discovery and quote gossip (HTTP/MCP transport).
 4. Partial fills, streaming settlement and multi-solver stages.
 5. Bonded arbitration and slashing for proven misbehaviour.
-6. Verification-level enforcement once TEE/ZKML evidence exists.
+6. Verification-level enforcement — **done** (`expect_evidence` /
+   `attach_evidence` / settle gate for `Tee`/`Zk` via `srct-verify`).
+   FHE-privacy enforcement on delivery is next.
 7. End-to-end test with two independent node processes and a real escrow lock.

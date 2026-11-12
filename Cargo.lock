@@ -1196,7 +1196,11 @@ dependencies = [
 name = "srct-intent"
 version = "0.1.0"
 dependencies = [
+ "rand",
+ "srct-compute",
  "srct-core",
+ "srct-verify",
+ "srct-zkml",
 ]
 
 [[package]]

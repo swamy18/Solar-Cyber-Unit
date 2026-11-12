@@ -11,3 +11,8 @@ pub mod verify;
 
 pub use policy::{select_proofs, ProofKind, SecurityLevel, TaskKind, TaskProfile, HIGH_VALUE_SAT};
 pub use verify::{Evidence, EvidenceKind, UnifiedVerifier, VerifiedOutput, VerifyError};
+
+// Evidence context types live in the proof crates; re-exported here so
+// integrators (escrow rails, intent books) depend on one facade.
+pub use srct_compute::tee::{AttestationRoots, SignedTeeQuote, TeeSla};
+pub use srct_zkml::task::{SignedZkReceipt, SignedZkTask};

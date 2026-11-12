@@ -1,7 +1,9 @@
 //! Acceptance tests for the cross-network intent lifecycle.
 
 use srct_core::wallet::Wallet;
-use srct_intent::book::{IntentBook, IntentError, IntentState, RefundReason};
+use srct_intent::book::{
+    ExpectedEvidence, IntentBook, IntentError, IntentEvidence, IntentState, RefundReason,
+};
 use srct_intent::types::{
     Amount, AssetId, AssetRoute, Delivery, Dispute, DisputeResolution, Intent, Privacy, Quote,
     SignedDelivery, SignedDispute, SignedIntent, SignedQuote, SignedResolution, SignedRoute,
@@ -403,4 +405,369 @@ fn a_second_quote_from_the_same_solver_is_refused() {
         Err(IntentError::DuplicateQuote)
     );
     assert_eq!(book.state(&id), Some(&IntentState::Open));
+}
+
+// --- Execution-evidence enforcement (Verification::Tee/Zk) ---
+
+use rand::{rngs::StdRng, SeedableRng};
+use srct_compute::tee::{SignedTeeQuote, TeeQuote, TeeSla, TeeType, TEE_VERSION};
+use srct_zkml::{prove_linear, SignedZkReceipt, SignedZkTask, ZkReceipt, ZkTask, ZK_VERSION};
+
+fn ev_intent(creator: &Wallet, arbiter: &Wallet, level: Verification, nonce: u64) -> Intent {
+    Intent {
+        version: INTENT_VERSION,
+        creator: creator.address().unwrap(),
+        service: [3u8; 32],
+        input: [4u8; 32],
+        arbiter: arbiter.address().unwrap(),
+        max_price: Amount {
+            asset: USDC,
+            amount: 1_000,
+        },
+        max_latency_ms: 100,
+        min_verification: level,
+        min_privacy: Privacy::Sealed,
+        accepted_assets: vec![USDC, SRCT],
+        deadline_height: 100,
+        nonce,
+    }
+}
+
+fn ev_quote(intent: &Intent, solver: &Wallet, level: Verification) -> Quote {
+    Quote {
+        version: QUOTE_VERSION,
+        intent: intent.hash(),
+        solver: solver.address().unwrap(),
+        price: Amount {
+            asset: USDC,
+            amount: 700,
+        },
+        route: None,
+        latency_ms: 40,
+        verification: level,
+        privacy: Privacy::Sealed,
+        valid_until_height: 100,
+        nonce: 1,
+    }
+}
+
+fn open_accept_fulfill(
+    book: &mut IntentBook,
+    creator: &Wallet,
+    arbiter: &Wallet,
+    solver: &Wallet,
+    level: Verification,
+) -> (Intent, srct_core::hash::Hash, srct_core::hash::Hash) {
+    let intent = ev_intent(creator, arbiter, level, 1);
+    let signed = SignedIntent::sign(intent.clone(), creator).unwrap();
+    let id = book.open(signed, 10).unwrap();
+    let signed = SignedQuote::sign(ev_quote(&intent, solver, level), solver).unwrap();
+    let quote_hash = book.quote(signed, 10).unwrap();
+    book.accept(&id, None, 10).unwrap();
+    let delivery = Delivery {
+        version: DELIVERY_VERSION,
+        intent: id,
+        quote: quote_hash,
+        solver: solver.address().unwrap(),
+        result: [9u8; 32],
+        height: 20,
+        nonce: 1,
+    };
+    book.fulfill(&id, SignedDelivery::sign(delivery, solver).unwrap(), 21)
+        .unwrap();
+    (intent, id, quote_hash)
+}
+
+fn tee_sla(provider: &Wallet) -> TeeSla {
+    TeeSla {
+        version: TEE_VERSION,
+        network_id: "srct/testnet".into(),
+        provider: provider.address().unwrap(),
+        workload: [11u8; 32],
+        model_hash: [21u8; 32],
+        runtime_hash: [22u8; 32],
+        config_hash: [23u8; 32],
+        input_hash: [24u8; 32],
+        tee: TeeType::SevSnp,
+        max_age_heights: 10,
+    }
+}
+
+fn tee_quote_for(sla: &TeeSla, attester: &Wallet, output: [u8; 32]) -> SignedTeeQuote {
+    SignedTeeQuote::sign(
+        TeeQuote {
+            version: TEE_VERSION,
+            network_id: sla.network_id.clone(),
+            provider: sla.provider,
+            tee: sla.tee,
+            workload: sla.workload,
+            model_hash: sla.model_hash,
+            runtime_hash: sla.runtime_hash,
+            config_hash: sla.config_hash,
+            input_hash: sla.input_hash,
+            output_hash: output,
+            height: 30,
+            nonce: 1,
+        },
+        attester,
+    )
+    .unwrap()
+}
+
+fn zk_package(provider: &Wallet) -> (SignedZkTask, SignedZkReceipt, Vec<i64>, u64) {
+    let weights = vec![3, -2, 5, 1];
+    let bias = 7u64;
+    let inputs = vec![10u16, 4, 6, 9];
+    let package = prove_linear(&weights, bias, &inputs, &mut StdRng::seed_from_u64(11)).unwrap();
+    let requester = wallet(71);
+    let task = SignedZkTask::sign(
+        ZkTask {
+            version: ZK_VERSION,
+            network_id: "srct/testnet".into(),
+            requester: requester.address().unwrap(),
+            provider: provider.address().unwrap(),
+            weights: weights.clone(),
+            bias,
+            input_commitments: package.input_commitments.clone(),
+            deadline_height: 100,
+            nonce: 1,
+        },
+        &requester,
+    )
+    .unwrap();
+    let receipt = SignedZkReceipt::sign(
+        ZkReceipt {
+            version: ZK_VERSION,
+            task: task.hash(),
+            worker: provider.address().unwrap(),
+            bit_proofs: package.bit_proofs.clone(),
+            output_commitment: package.output_commitment,
+            height: 30,
+            nonce: 1,
+        },
+        package.input_commitments.len(),
+        provider,
+    )
+    .unwrap();
+    (task, receipt, weights, bias)
+}
+
+#[test]
+fn tee_evidence_settles_a_tee_intent() {
+    let creator = wallet(90);
+    let arbiter = wallet(91);
+    let solver = wallet(92);
+    let attester = wallet(93);
+    let mut book = IntentBook::new();
+    book.attestation_roots_mut()
+        .add_root(attester.address().unwrap(), TeeType::SevSnp);
+    let (_intent, id, _quote) =
+        open_accept_fulfill(&mut book, &creator, &arbiter, &solver, Verification::Tee);
+    let sla = tee_sla(&solver);
+    book.expect_evidence(
+        &id,
+        ExpectedEvidence::Tee(sla.clone()),
+        &creator.address().unwrap(),
+    )
+    .unwrap();
+    let quote = tee_quote_for(&sla, &attester, [25u8; 32]);
+    let output = book
+        .attach_evidence(&id, IntentEvidence::Tee(quote), 30)
+        .unwrap();
+    assert_eq!(output.output, [25u8; 32].to_vec());
+    let instruction = book.settle(&id, 31).unwrap();
+    assert_eq!(instruction.to, solver.address().unwrap());
+    assert_eq!(instruction.amount.amount, 700);
+}
+
+#[test]
+fn tee_intent_refuses_settlement_without_evidence() {
+    let creator = wallet(100);
+    let arbiter = wallet(101);
+    let solver = wallet(102);
+    let mut book = IntentBook::new();
+    let (_intent, id, _quote) =
+        open_accept_fulfill(&mut book, &creator, &arbiter, &solver, Verification::Tee);
+    // No expectation and no evidence at all.
+    assert_eq!(book.settle(&id, 31), Err(IntentError::EvidenceMissing));
+    // Expectation alone is not evidence.
+    let sla = tee_sla(&solver);
+    book.expect_evidence(&id, ExpectedEvidence::Tee(sla), &creator.address().unwrap())
+        .unwrap();
+    assert_eq!(book.settle(&id, 31), Err(IntentError::EvidenceMissing));
+}
+
+#[test]
+fn tee_attach_without_expectation_is_refused() {
+    let creator = wallet(110);
+    let arbiter = wallet(111);
+    let solver = wallet(112);
+    let attester = wallet(113);
+    let mut book = IntentBook::new();
+    book.attestation_roots_mut()
+        .add_root(attester.address().unwrap(), TeeType::SevSnp);
+    let (_intent, id, _quote) =
+        open_accept_fulfill(&mut book, &creator, &arbiter, &solver, Verification::Tee);
+    let quote = tee_quote_for(&tee_sla(&solver), &attester, [25u8; 32]);
+    assert_eq!(
+        book.attach_evidence(&id, IntentEvidence::Tee(quote), 30),
+        Err(IntentError::EvidenceMissing)
+    );
+}
+
+#[test]
+fn only_creator_or_arbiter_pins_expectations() {
+    let creator = wallet(120);
+    let arbiter = wallet(121);
+    let solver = wallet(122);
+    let stranger = wallet(123);
+    let mut book = IntentBook::new();
+    let (_intent, id, _quote) =
+        open_accept_fulfill(&mut book, &creator, &arbiter, &solver, Verification::Tee);
+    let sla = tee_sla(&solver);
+    assert_eq!(
+        book.expect_evidence(
+            &id,
+            ExpectedEvidence::Tee(sla.clone()),
+            &stranger.address().unwrap()
+        ),
+        Err(IntentError::NotAuthorized)
+    );
+    // The arbiter may pin instead of the creator.
+    book.expect_evidence(&id, ExpectedEvidence::Tee(sla), &arbiter.address().unwrap())
+        .unwrap();
+}
+
+#[test]
+fn tee_tampered_and_wrong_solver_evidence_is_refused() {
+    let creator = wallet(130);
+    let arbiter = wallet(131);
+    let solver = wallet(132);
+    let stranger = wallet(133);
+    let attester = wallet(134);
+    let mut book = IntentBook::new();
+    book.attestation_roots_mut()
+        .add_root(attester.address().unwrap(), TeeType::SevSnp);
+    let (_intent, id, _quote) =
+        open_accept_fulfill(&mut book, &creator, &arbiter, &solver, Verification::Tee);
+    let sla = tee_sla(&solver);
+    book.expect_evidence(
+        &id,
+        ExpectedEvidence::Tee(sla.clone()),
+        &creator.address().unwrap(),
+    )
+    .unwrap();
+    // Tampered output breaks the attestation signature.
+    let mut bad = tee_quote_for(&sla, &attester, [25u8; 32]);
+    bad.quote.output_hash = [99u8; 32];
+    assert!(matches!(
+        book.attach_evidence(&id, IntentEvidence::Tee(bad), 30),
+        Err(IntentError::BadEvidence(_))
+    ));
+    // A quote for another provider does not bind this solver.
+    let stranger_sla = tee_sla(&stranger);
+    let stranger_quote = tee_quote_for(&stranger_sla, &attester, [25u8; 32]);
+    assert_eq!(
+        book.attach_evidence(&id, IntentEvidence::Tee(stranger_quote), 30),
+        Err(IntentError::EvidenceMismatch)
+    );
+}
+
+#[test]
+fn wrong_kind_evidence_is_refused() {
+    let creator = wallet(140);
+    let arbiter = wallet(141);
+    let solver = wallet(142);
+    let mut book = IntentBook::new();
+    let (_intent, id, _quote) =
+        open_accept_fulfill(&mut book, &creator, &arbiter, &solver, Verification::Tee);
+    let sla = tee_sla(&solver);
+    book.expect_evidence(&id, ExpectedEvidence::Tee(sla), &creator.address().unwrap())
+        .unwrap();
+    // A ZK receipt is valid evidence, but not the expected kind.
+    let (task, receipt, _weights, _bias) = zk_package(&solver);
+    assert_eq!(
+        book.attach_evidence(&id, IntentEvidence::Zk(task, receipt), 30),
+        Err(IntentError::EvidenceMismatch)
+    );
+}
+
+#[test]
+fn tee_evidence_cannot_attach_twice_but_settles_once() {
+    let creator = wallet(150);
+    let arbiter = wallet(151);
+    let solver = wallet(152);
+    let attester = wallet(153);
+    let mut book = IntentBook::new();
+    book.attestation_roots_mut()
+        .add_root(attester.address().unwrap(), TeeType::SevSnp);
+    let (_intent, id, _quote) =
+        open_accept_fulfill(&mut book, &creator, &arbiter, &solver, Verification::Tee);
+    let sla = tee_sla(&solver);
+    book.expect_evidence(
+        &id,
+        ExpectedEvidence::Tee(sla.clone()),
+        &creator.address().unwrap(),
+    )
+    .unwrap();
+    let quote = tee_quote_for(&sla, &attester, [25u8; 32]);
+    book.attach_evidence(&id, IntentEvidence::Tee(quote.clone()), 30)
+        .unwrap();
+    // The replay book refuses the same bytes; settlement still works.
+    assert!(matches!(
+        book.attach_evidence(&id, IntentEvidence::Tee(quote), 30),
+        Err(IntentError::BadEvidence(_))
+    ));
+    assert!(book.settle(&id, 31).is_ok());
+}
+
+#[test]
+fn zk_evidence_settles_a_zk_intent() {
+    let creator = wallet(160);
+    let arbiter = wallet(161);
+    let solver = wallet(162);
+    let mut book = IntentBook::new();
+    let (_intent, id, _quote) =
+        open_accept_fulfill(&mut book, &creator, &arbiter, &solver, Verification::Zk);
+    let (task, receipt, _weights, _bias) = zk_package(&solver);
+    book.expect_evidence(
+        &id,
+        ExpectedEvidence::Zk(task.clone()),
+        &creator.address().unwrap(),
+    )
+    .unwrap();
+    let output = book
+        .attach_evidence(&id, IntentEvidence::Zk(task, receipt), 30)
+        .unwrap();
+    assert!(!output.output.is_empty());
+    let instruction = book.settle(&id, 31).unwrap();
+    assert_eq!(instruction.to, solver.address().unwrap());
+}
+
+#[test]
+fn zk_intent_refuses_settlement_without_evidence() {
+    let creator = wallet(170);
+    let arbiter = wallet(171);
+    let solver = wallet(172);
+    let mut book = IntentBook::new();
+    let (_intent, id, _quote) =
+        open_accept_fulfill(&mut book, &creator, &arbiter, &solver, Verification::Zk);
+    assert_eq!(book.settle(&id, 31), Err(IntentError::EvidenceMissing));
+}
+
+#[test]
+fn low_verification_intents_settle_without_evidence() {
+    let creator = wallet(180);
+    let arbiter = wallet(181);
+    let solver = wallet(182);
+    let mut book = IntentBook::new();
+    // ProviderSigned (like the other lifecycle tests): no evidence needed.
+    let (_intent, id, _quote) = open_accept_fulfill(
+        &mut book,
+        &creator,
+        &arbiter,
+        &solver,
+        Verification::ProviderSigned,
+    );
+    assert!(book.settle(&id, 31).is_ok());
 }
