@@ -1,0 +1,18 @@
+[package]
+publish = false
+name = "srct-verify"
+description = "Unified execution-verification policy: selects proof-of-execution/correctness evidence per task and verifies TEE, FHE and ZKML evidence through one fail-closed verifier (non-consensus)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+srct-core.workspace = true
+srct-compute.workspace = true
+srct-fhe.workspace = true
+srct-zkml.workspace = true
+
+[dev-dependencies]
+rand.workspace = true

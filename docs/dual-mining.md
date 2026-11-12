@@ -274,7 +274,9 @@ The ordered plan is:
 6. FHE encrypted-compute adapter — **prototype done, non-consensus**
    (`srct-fhe`: exponential-ElGamal weighted sums, exact recomputation
    checks). TFHE-style non-linear ops and measured-cost expansion are next.
-7. Unified verification policy (execution, correctness, resource metering).
+7. Unified verification policy (execution, correctness, resource metering)
+   — **done, non-consensus** (`srct-verify`: policy table + one verifier
+   for TEE/FHE/ZKML). Escrow/intent wiring is next.
 8. Native ZKML — **prototype done, non-consensus** (`srct-zkml`:
    Sigma-protocol proofs for one quantized linear layer with range checks;
    Bulletproofs R1CS evaluated but its published crate does not compile).

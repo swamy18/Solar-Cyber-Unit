@@ -1282,6 +1282,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "srct-verify"
+version = "0.1.0"
+dependencies = [
+ "rand",
+ "srct-compute",
+ "srct-core",
+ "srct-fhe",
+ "srct-zkml",
+]
+
+[[package]]
 name = "srct-worker"
 version = "0.1.0"
 dependencies = [

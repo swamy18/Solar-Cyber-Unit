@@ -35,6 +35,8 @@ cargo test -p srct-fhe
 cargo test -p srct-zkml
 # AI Work Graph (artifacts, lineage, royalty settlement).
 cargo test -p srct-workgraph
+# Unified verification policy (policy table, TEE/FHE/ZK verifier).
+cargo test -p srct-verify
 # Cross-network intent lifecycle, quotes, routes and disputes.
 cargo test -p srct-intent
 cargo test -p srct-core --test committee_rotation

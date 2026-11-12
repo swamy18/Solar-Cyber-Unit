@@ -142,7 +142,12 @@ rules in code would have been the wrong order.
   and wire round-trips. Cycles are impossible by construction; evidence
   hashes reference (not recheck) the issuing crates' proofs. See
   [`docs/workgraph.md`](workgraph.md).
-- `cargo test --workspace` — **1,779 tests pass, 0 failures, 1 ignored** across the workspace.
+- **Unified verification policy (non-consensus, `srct-verify`).** `cargo
+  test -p srct-verify` passes 5 acceptance tests: the Section 7 policy table
+  (execution/correctness per task kind, security level and value) is pinned,
+  and one fail-closed verifier checks TEE, FHE and ZKML evidence with all
+  replay books, preserving inner errors. See [`docs/verify.md`](verify.md).
+- `cargo test --workspace` — **1,784 tests pass, 0 failures, 1 ignored** across the workspace.
   (this file quote counts as of their own dates — 242, then 263, then 293 —
   kept as history):
   - 227 unit tests in `srct-core` (M1–M5 suites, the 21-test validator-set suite, the 30-test real-BLS suite in
