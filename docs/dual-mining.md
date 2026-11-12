@@ -256,10 +256,11 @@ Milestones:
 ## 9. Remaining programme
 
 The wider brief is only partially implemented. The CNNP core, the intent
-lifecycle, TEE-backed execution evidence (`srct-compute::tee`) and an
-additive-homomorphic encrypted-compute prototype (`srct-fhe`) exist as
-non-consensus prototypes; ZKML, work-graph attribution and SDK adapters are
-**not implemented**. The audit above is the base those milestones build on.
+lifecycle exist, TEE-backed execution evidence (`srct-compute::tee`), an
+additive-homomorphic encrypted-compute prototype (`srct-fhe`) and a
+zero-knowledge linear-evaluation prototype (`srct-zkml`) as non-consensus
+prototypes; work-graph attribution and SDK adapters are **not
+implemented**. The audit above is the base those milestones build on.
 The ordered plan is:
 
 1. DiLoCo PoUW prototype — **done, non-consensus** (this crate).
@@ -275,6 +276,10 @@ The ordered plan is:
    (`srct-fhe`: exponential-ElGamal weighted sums, exact recomputation
    checks). TFHE-style non-linear ops and measured-cost expansion are next.
 7. Unified verification policy (execution, correctness, resource metering).
+8. Native ZKML — **prototype done, non-consensus** (`srct-zkml`:
+   Sigma-protocol proofs for one quantized linear layer with range checks;
+   Bulletproofs R1CS evaluated but its published crate does not compile).
+   Non-linear gates and folding are next.
 8. CNNP nonlinear/tokenizer adapters and transport — the representation,
    linear-adapter, discovery and metering core is done (non-consensus).
 9. Intent persistence, chain adapters and solver discovery — the lifecycle

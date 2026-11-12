@@ -1,0 +1,14 @@
+[package]
+publish = false
+name = "srct-zkml"
+description = "Zero-knowledge ML verification prototype: Bulletproofs R1CS proofs of correct quantized linear evaluation with committed inputs (non-consensus)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+srct-core.workspace = true
+k256.workspace = true
+rand.workspace = true

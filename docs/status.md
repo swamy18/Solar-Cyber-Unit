@@ -123,7 +123,17 @@ rules in code would have been the wrong order.
   empty inputs, zero nonce/deadline) refused. One operation only
   (`bias + Σ w·x`); weights are public, values must stay inside the decode
   bound. See [`docs/fhe.md`](fhe.md).
-- `cargo test --workspace` — **1,760 tests pass, 0 failures, 1 ignored** across the workspace.
+- **Zero-knowledge ML verification (non-consensus, `srct-zkml`).** `cargo
+  test -p srct-zkml` passes 9 acceptance tests in ~3 s: real Sigma-protocol
+  proofs (Pedersen commitments, CDS OR bit-proofs, Fiat-Shamir) of correct
+  quantized linear evaluation with 16-bit range checks, a signed task →
+  receipt → verifier workflow, tampered outputs and wrong statements refused
+  as `InvalidProof`, tampered commitments breaking the task signature,
+  impostor and wrong-worker refusals, late/future/replay refusals, malformed
+  tasks and receipts refused, and wire round-trips. One linear layer only
+  (≤8 inputs); Bulletproofs R1CS was evaluated but its published crate does
+  not compile. See [`docs/zkml.md`](zkml.md).
+- `cargo test --workspace` — **1,769 tests pass, 0 failures, 1 ignored** across the workspace.
   (this file quote counts as of their own dates — 242, then 263, then 293 —
   kept as history):
   - 227 unit tests in `srct-core` (M1–M5 suites, the 21-test validator-set suite, the 30-test real-BLS suite in

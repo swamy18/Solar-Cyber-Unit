@@ -31,6 +31,8 @@ cargo test -p srct-agentnet
 cargo test -p srct-compute
 # Encrypted-compute prototype (ElGamal tasks, receipts, verifier).
 cargo test -p srct-fhe
+# ZKML verification prototype (Sigma proofs, tasks, receipts, verifier).
+cargo test -p srct-zkml
 # Cross-network intent lifecycle, quotes, routes and disputes.
 cargo test -p srct-intent
 cargo test -p srct-core --test committee_rotation

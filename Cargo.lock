@@ -1184,6 +1184,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "srct-fhe"
+version = "0.1.0"
+dependencies = [
+ "k256",
+ "rand",
+ "srct-core",
+]
+
+[[package]]
 name = "srct-intent"
 version = "0.1.0"
 dependencies = [
@@ -1281,6 +1290,15 @@ dependencies = [
  "serde_json",
  "srct-core",
  "srct-l2",
+]
+
+[[package]]
+name = "srct-zkml"
+version = "0.1.0"
+dependencies = [
+ "k256",
+ "rand",
+ "srct-core",
 ]
 
 [[package]]
