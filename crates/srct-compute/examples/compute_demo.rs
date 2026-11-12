@@ -1,7 +1,8 @@
 //! End-to-end compute-sharing demo:
 //! one requester -> one job -> signed offers from a phone, laptop and GPU
-//! -> capacity-aware shards -> requester-authorized assignments -> provider
-//! receipts -> exact payout instructions -> replay refused.
+//! -> capacity-aware shards -> requester-authorized assignments -> job escrow
+//! -> provider receipts -> exact payouts and releases -> challenge re-run ->
+//! `WrongResult` slash -> refund of the remainder -> replay refused.
 //!
 //! Run with:
 //! ```text
@@ -12,8 +13,10 @@ use srct_compute::market::{
     plan_assignments, ComputeJob, ComputeOffer, Verification, JOB_VERSION, OFFER_VERSION,
 };
 use srct_compute::{
-    ComputeLedger, ComputeReceipt, Determinism, DeviceClass, DeviceProfile, SignedJob, SignedOffer,
-    SignedReceipt,
+    BondBook, BondDispute, Challenge, ChallengeBook, ComputeLedger, ComputeReceipt, Determinism,
+    DeviceClass, DeviceProfile, DisputeReason, EscrowBook, EscrowFunding, ProviderBond, SignedBond,
+    SignedChallenge, SignedDispute, SignedFunding, SignedJob, SignedOffer, SignedReceipt,
+    BOND_VERSION, CHALLENGE_VERSION, ESCROW_VERSION,
 };
 use srct_core::hash::Hash;
 use srct_core::wallet::Wallet;
@@ -65,6 +68,7 @@ fn main() {
     let phone = wallet(1);
     let laptop = wallet(2);
     let desktop = wallet(3);
+    let challenger = wallet(4);
 
     let offers = vec![
         offer(&phone, DeviceClass::Cpu, 2_048, 4, 8, 10),
@@ -108,7 +112,31 @@ fn main() {
     let signed_plan = plan.sign(&requester).unwrap();
     signed_plan.verify().unwrap();
 
+    // Job escrow: lock the plan budget once, then release each settled
+    // receipt's exact total and refund whatever is left after the deadline.
+    let mut escrow = EscrowBook::new(NET);
+    let funding = SignedFunding::sign(
+        EscrowFunding {
+            version: ESCROW_VERSION,
+            network_id: NET.into(),
+            job: job.hash(),
+            requester: requester.address().unwrap(),
+            amount_sat: signed_plan.total_sat,
+            deadline: job.job.deadline,
+            nonce: 1,
+        },
+        &requester,
+    )
+    .unwrap();
+    escrow.fund(&funding, 10).unwrap();
+    println!("---");
+    println!(
+        "escrow funds {} sat for the job",
+        escrow.remaining_sat(&job.hash())
+    );
+
     let mut ledger = ComputeLedger::new();
+    let mut laptop_shard = None;
     for assignment in &signed_plan.assignments {
         let provider = if assignment.assignment.provider == phone.address().unwrap() {
             &phone
@@ -128,9 +156,17 @@ fn main() {
         .unwrap();
         let receipt = SignedReceipt::sign(receipt, provider).unwrap();
         let payout = ledger.settle(&receipt, assignment, 21).unwrap();
+        let released = escrow.release(&receipt, assignment, 21).unwrap();
+        assert_eq!(released.amount_sat, payout.amount_sat);
+        if assignment.assignment.provider == laptop.address().unwrap() {
+            laptop_shard = Some((receipt.clone(), (*assignment).clone()));
+        }
         println!(
-            "  settled shard {}: {} sat (ref {})",
-            assignment.assignment.shard, payout.amount_sat, payout.receipt[0]
+            "  settled shard {}: {} sat (ref {}), escrow left {}",
+            assignment.assignment.shard,
+            payout.amount_sat,
+            payout.receipt[0],
+            escrow.remaining_sat(&job.hash())
         );
         println!(
             "  replay refused: {:?}",
@@ -143,20 +179,20 @@ fn main() {
         signed_plan.assignments.len()
     );
 
-    // Bonds and reputation: capacity claims now cost stake. A fraud dispute
-    // halves the bond and the reputation ban keeps the provider out even
-    // after it re-bonds.
+    // Bonds and reputation: capacity claims cost stake. A challenge re-runs
+    // the laptop's shard independently; a different result becomes a
+    // `WrongResult` dispute, halves the bond and bans the provider.
     println!("---");
-    let mut book = srct_compute::BondBook::new(NET);
-    let bond = srct_compute::ProviderBond {
-        version: srct_compute::bond::BOND_VERSION,
+    let mut book = BondBook::new(NET);
+    let bond = ProviderBond {
+        version: BOND_VERSION,
         network_id: NET.into(),
         provider: laptop.address().unwrap(),
         amount_sat: srct_compute::MIN_BOND_SAT,
         registered_height: 1,
         nonce: 1,
     };
-    let signed_bond = srct_compute::SignedBond::sign(bond, &laptop).unwrap();
+    let signed_bond = SignedBond::sign(bond, &laptop).unwrap();
     println!(
         "unbonded laptop admitted: {:?}",
         book.admit_offer(&offers[1], 10)
@@ -172,26 +208,38 @@ fn main() {
         admit.is_ok()
     );
 
-    let shard = &signed_plan
-        .assignments
-        .iter()
-        .find(|a| a.assignment.provider == laptop.address().unwrap())
+    let (first, shard) = laptop_shard.expect("laptop shard was settled");
+    let mut challenges = ChallengeBook::new(NET);
+    let demand = SignedChallenge::sign(
+        Challenge {
+            version: CHALLENGE_VERSION,
+            network_id: NET.into(),
+            requester: requester.address().unwrap(),
+            provider: laptop.address().unwrap(),
+            challenger: challenger.address().unwrap(),
+            assignment: shard.hash(),
+            deadline_height: 90,
+            nonce: 1,
+        },
+        &requester,
+    )
+    .unwrap();
+    challenges.open(&demand, &shard, 30).unwrap();
+    let mut second =
+        ComputeReceipt::new(&shard, shard.assignment.units, [9u8; 32], 700, 40, 1).unwrap();
+    second.provider = challenger.address().unwrap();
+    let second = SignedReceipt::sign(second, &challenger).unwrap();
+    challenges.submit_second(&second, 40).unwrap();
+    let dispute: BondDispute = challenges
+        .verdict(&shard.hash(), &first)
         .unwrap()
-        .clone();
-    let dispute = srct_compute::BondDispute {
-        version: srct_compute::bond::BOND_VERSION,
-        network_id: NET.into(),
-        requester: requester.address().unwrap(),
-        provider: laptop.address().unwrap(),
-        assignment: shard.hash(),
-        reason: srct_compute::DisputeReason::Overclaim,
-        evidence: [5u8; 32],
-        nonce: 1,
-    };
-    let signed_dispute = srct_compute::SignedDispute::sign(dispute, &requester).unwrap();
-    let remaining = book.slash(&signed_dispute, shard, 20).unwrap();
+        .fraud_dispute(NET, 1)
+        .expect("the re-run differs");
+    assert_eq!(dispute.reason, DisputeReason::WrongResult);
+    let signed_dispute = SignedDispute::sign(dispute, &requester).unwrap();
+    let remaining = book.slash(&signed_dispute, &shard, 50).unwrap();
     println!(
-        "fraud dispute: bond {} -> {} sat, score {}",
+        "challenge mismatch -> WrongResult: bond {} -> {} sat, score {}",
         srct_compute::MIN_BOND_SAT,
         remaining,
         book.score(&laptop.address().unwrap())
@@ -201,5 +249,12 @@ fn main() {
         book.admit_offer(laptop_offer, 10)
             .err()
             .map(|e| e.to_string())
+    );
+
+    // The pot is fully released, so the refund is zero and closes it.
+    let refund = escrow.refund(&job.hash(), job.job.deadline + 1).unwrap();
+    println!(
+        "escrow refund after deadline: {} sat to requester",
+        refund.amount_sat
     );
 }

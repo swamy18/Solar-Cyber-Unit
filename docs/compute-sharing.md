@@ -261,7 +261,7 @@ correct or useful — that is challenge re-execution / ZKML, still future.
 
 ## 9. Verified behavior
 
-`cargo test -p srct-compute` passes 63 tests (5 unit, 58 acceptance):
+`cargo test -p srct-compute` passes 65 tests (5 unit, 60 acceptance):
 
 - profile hash binds class, RAM, caps and kernel; unknown encodings refused;
 - requirement matching refuses empty mask, low RAM, weak determinism and wrong
@@ -314,8 +314,9 @@ correct or useful — that is challenge re-execution / ZKML, still future.
 - the flow journal appends only verified offers, assignments, receipts, bonds
   and escrow fundings, snapshots with bounded encoding, and restarts by
   re-verifying every entry — tampering, truncation or a foreign-network entry
-  fails the whole replay, and a restarted node rebuilds the same bond and
-  escrow state;
+  fails the whole replay, and a restarted node rebuilds the same bond
+  registrations and escrow fundings; slash/withdrawal outcomes and timeout
+  counts are not signed objects and still need an operator checkpoint;
 - gossip keeps only signed live offers, dedups, merges order-independently,
   prunes on expiry, and refuses forged/foreign/overflowed input;
 - challenge re-execution clears matching receipts and slashes fabricated ones:
@@ -327,7 +328,9 @@ correct or useful — that is challenge re-execution / ZKML, still future.
 - escrow funds a job once, releases each settled receipt's exact total, refuses
   over-release beyond the pot, duplicate assignments, late/misbound/overclaiming
   receipts and any release after a refund, then refunds the remainder exactly
-  once after the deadline; funding wire codecs round-trip and refuse tampering.
+  once after the deadline; funding wire codecs round-trip and refuse tampering;
+- one end-to-end test runs a bonded two-shard job from bond admission and
+  funding through settlement, challenge/slash, refund and journal replay.
 
 ## 10. Next milestones
 
@@ -339,8 +342,9 @@ correct or useful — that is challenge re-execution / ZKML, still future.
    settled receipt, refund the remainder at the deadline). Executing bond
    registrations, slashes and withdrawals on the same rail is still the
    payment layer's job.
-4. Persistent bond/reputation snapshots — **partly done**: bonds and escrow
-   fundings now journal and replay. Timeout counts are not signed objects, so
-   a full reputation snapshot still needs an operator checkpoint.
+4. Persistent bond/reputation snapshots — **partly done**: bond registrations
+   and escrow fundings now journal and replay. Slash/withdrawal outcomes and
+   timeout counts are operator state, not signed flow objects, so exact bond
+   balances and reputation still need an operator checkpoint.
 5. Gossip transport binding: carry the gossip set over the agent messaging
    rail or HTTP/MCP (message rules done here).

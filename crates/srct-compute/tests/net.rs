@@ -298,7 +298,7 @@ fn journal_persists_bonds_and_escrow_fundings() {
     assert_eq!(replayed.bonds, vec![bond.clone()]);
     assert_eq!(replayed.fundings, vec![funding.clone()]);
 
-    // A restarted node rebuilds the same bond and escrow state.
+    // A restarted node rebuilds the same bond registration and escrow funding.
     let mut bonds = BondBook::new(NET);
     for b in &replayed.bonds {
         bonds.register(b, b.bond.registered_height).unwrap();

@@ -7,10 +7,12 @@
 //! checkpoint. Unsigned, invalid or over-cap entries are refused at append
 //! time, and the whole journal round-trips through a bounded encoding.
 //!
-//! Replay returns verified objects in original order. A restarted node feeds
-//! bonds to [`crate::bond::BondBook::register`] at their recorded
-//! `registered_height` and fundings to [`crate::escrow::EscrowBook::restore`],
-//! which skips the append-time height check that already passed.
+//! Replay returns verified objects. A restarted node feeds bonds to
+//! [`crate::bond::BondBook::register`] at their recorded `registered_height`
+//! and fundings to [`crate::escrow::EscrowBook::restore`], which skips the
+//! append-time height check that already passed. Slash and withdrawal
+//! outcomes are not signed objects and are not journaled here; an operator
+//! that needs exact bond balances must checkpoint those separately.
 //!
 //! What this is not: a database. There is no index, no query language, no
 //! compaction and no pruning of settled history.
