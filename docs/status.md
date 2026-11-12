@@ -85,7 +85,7 @@ rules in code would have been the wrong order.
   metadata is visible, and no ratchet for groups, sealed sender or persistent
   mailbox exists yet. See [`docs/agentnet.md`](agentnet.md).
 - **Decentralized compute sharing (non-consensus, `srct-compute`).** `cargo
-  test -p srct-compute` passes 31 tests (5 unit, 26 acceptance): profile and
+  test -p srct-compute` passes 42 tests (5 unit, 37 acceptance): profile and
   requirement binding, offer/job wire round-trips and tamper refusal, a
   30-unit job split deterministically across a GPU, a 2 GB phone and a laptop
   (20 + 4 + 4 + 2 units, 244 sat), a small phone taking several shards up to
@@ -101,13 +101,17 @@ rules in code would have been the wrong order.
   requiring the deadline, ten timeouts banning with settled units recovering,
   timeouts cleared by re-bonding but not fraud slashes, lockup-enforced
   withdrawals with replay and over-draw refusal, bond/withdrawal/dispute wire
-  round-trips, and settlement credit bound to the receipt's assignment.
-  Payouts and slashes are instructions only; no coin moves. Device
-  capabilities are self-declared, only the receipt verification level is
-  enforced, a slash is only as real as the escrow rail that executes it, and
-  TEE challenge verification remains future work. See
+  round-trips, and settlement credit bound to the receipt's assignment —
+  plus TEE-backed execution evidence: valid attestation quotes verify and
+  return the output hash, tampered quotes fail the signature, unknown and
+  revoked attesters are refused, model/runtime/config/input/workload/provider
+  mismatches are refused, stale and future-height quotes are refused, the same
+  quote bytes cannot verify twice, and simulator quotes are accepted only by
+  simulator SLAs. Payouts and slashes are instructions only; no coin moves. Device
+  capabilities are self-declared, challenge re-execution remains future work,
+  and a slash is only as real as the escrow rail that executes it. See
   [`docs/compute-sharing.md`](compute-sharing.md).
-- `cargo test --workspace` — **1,738 tests pass, 0 failures, 1 ignored** across the workspace.
+- `cargo test --workspace` — **1,749 tests pass, 0 failures, 1 ignored** across the workspace.
   (this file quote counts as of their own dates — 242, then 263, then 293 —
   kept as history):
   - 227 unit tests in `srct-core` (M1–M5 suites, the 21-test validator-set suite, the 30-test real-BLS suite in

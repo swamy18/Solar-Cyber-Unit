@@ -50,9 +50,11 @@ const DOM_ASSIGNMENT: &[u8] = b"srct/compute/assignment/v1";
 
 /// How much independent evidence a job accepts.
 ///
-/// Only [`Verification::Receipt`] is enforced by this crate today. `Challenge`
-/// and `Attested` are discovery/requirements fields for future re-execution and
-/// TEE milestones; an offer advertising them is self-declared.
+/// [`Verification::Receipt`] is enforced by [`crate::settle`];
+/// [`Verification::Attested`] is enforced by [`crate::tee`] (signed
+/// attestation quotes against the requester's SLA). `Challenge` re-execution
+/// is still a discovery/requirements field only; an offer advertising it is
+/// self-declared.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Verification {
     Receipt = 0,

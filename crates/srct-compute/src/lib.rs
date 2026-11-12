@@ -16,6 +16,9 @@
 //! - [`settle`]: provider-signed receipts, overclaim/price/deadline checks and
 //!   an exact [`settle::PayoutInstruction`] the existing payment or escrow
 //!   layer should execute.
+//! - [`tee`]: TEE-backed execution evidence — signed attestation quotes,
+//!   a trusted-roots registry with revocation, and a fail-closed SLA
+//!   verifier with freshness and replay protection.
 //! - [`bond`]: bonded provider registration, requester-signed disputes with
 //!   bond slashing, and a reputation score that gates offer admission.
 //!
@@ -23,10 +26,9 @@
 //!
 //! - **Not consensus.** Nothing here can mint, move, slash or finalize a coin.
 //!   A payout is an instruction; the caller decides which rail executes it.
-//! - **Not a verifier.** A receipt proves *who claims* units were done, not that
-//!   the computation was correct. `Verification::Receipt` is the only level this
-//!   crate enforces; challenge re-execution, ZK proofs and TEE attestation are
-//!   later milestones.
+//! - **Not a correctness proof.** A [`tee`] quote proves the approved
+//!   environment *executed* the workload, not that the output is correct or
+//!   useful. Challenge re-execution and ZK proofs remain later milestones.
 //! - **Not a scheduler daemon.** Planning is a pure function of offers, job and
 //!   height. Availability gossip, leases, retries on a timer and provider
 //!   liveness are the operator's job.
@@ -42,6 +44,7 @@ pub mod bond;
 pub mod device;
 pub mod market;
 pub mod settle;
+pub mod tee;
 
 pub use bond::{
     BondBook, BondDispute, BondWithdrawal, DisputeReason, ProviderBond, Reputation, SignedBond,
@@ -55,6 +58,9 @@ pub use market::{
 };
 pub use settle::{
     ComputeLedger, ComputeReceipt, PayoutInstruction, SettlementStatus, SignedReceipt,
+};
+pub use tee::{
+    AttestationRoots, SignedTeeQuote, TeeError, TeeQuote, TeeSla, TeeType, TeeVerifier, TEE_VERSION,
 };
 
 /// Why a compute-sharing operation was refused.

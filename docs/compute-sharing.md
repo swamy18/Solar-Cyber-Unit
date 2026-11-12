@@ -182,12 +182,48 @@ behind it (arbitration belongs to the escrow layer); slashes and bonds are
 instructions, not coin movement; and a provider that can afford many bonds can
 still present many identities.
 
-## 7. What is not enforced
+## 7. TEE-backed execution evidence
 
-- **Correctness.** A receipt proves who claims units, not that the output is
-  correct. Only `Verification::Receipt` is implemented. `Challenge` and
-  `Attested` are advertised/required fields for future re-execution and TEE
-  milestones, and are self-declared today.
+`Verification::Attested` is now enforced by `crate::tee`, not self-declared.
+A worker that runs the workload inside an approved environment presents a
+signed attestation quote; the verifier decides whether the escrow rail may
+release payment.
+
+```
+TeeQuote = version || network || provider || tee || workload || model ||
+           runtime || config || input || output || height || nonce
+```
+
+- **Quote** (`SignedTeeQuote::sign`): the attestation (quoting) key signs the
+  body. The signer is the *attester*, not the provider — the provider address
+  is bound inside the signed body, so a worker cannot forge evidence for
+  another provider's SLA.
+- **Roots** (`AttestationRoots`): the registry of trusted quoting keys, one
+  entry per `(attester, tee family)`. `revoke` marks a compromised root;
+  unknown and revoked attesters are refused.
+- **SLA** (`TeeSla`): the requester's conditions — network, provider, workload
+  binding, approved model/runtime/config measurements, input commitment,
+  required TEE family, and `max_age_heights` freshness window.
+- **Verify** (`TeeVerifier::verify`, fail-closed, cheap checks first):
+  SLA/quote well-formed → signature valid → attester trusted and live →
+  TEE family matches → provider/workload/network bind → measurements match →
+  input matches → height not future and within the age window → quote hash
+  unseen (replay book) → accept and return the output hash.
+
+Any refusal means no payment. `TeeType::Software` is a test/simulator label,
+accepted only when the SLA explicitly asks for it; production SLAs pin `Tdx`
+or `SevSnp`.
+
+Honest limit, stated in code: a quote proves the approved environment
+*executed* the workload (proof of execution). It does not prove the output is
+correct or useful — that is challenge re-execution / ZKML, still future.
+
+## 8. What is not enforced
+
+- **Correctness.** A receipt proves who claims units, and a TEE quote proves
+  approved execution — neither proves the output is correct. `Challenge`
+  re-execution and ZK proofs remain future milestones; `Challenge` is still a
+  self-declared advertised field.
 - **Hardware truth.** RAM, cores, bandwidth, kernel hash and device class are
   self-declared. They bound assignment, not reality.
 - **Sybil resistance at the stake layer.** Bonds and reputation gate admission,
@@ -199,9 +235,9 @@ still present many identities.
 - **Confidential payloads.** `sealed_input` only requires a provider that accepts
   sealed input. Sealing itself is `srct-cnnp`'s envelope, keyed off-protocol.
 
-## 8. Verified behavior
+## 9. Verified behavior
 
-`cargo test -p srct-compute` passes 31 tests (5 unit, 26 acceptance):
+`cargo test -p srct-compute` passes 42 tests (5 unit, 37 acceptance):
 
 - profile hash binds class, RAM, caps and kernel; unknown encodings refused;
 - requirement matching refuses empty mask, low RAM, weak determinism and wrong
@@ -238,14 +274,24 @@ still present many identities.
   replayed, and a drained bond no longer backs offers;
 - bond, withdrawal and dispute wire codecs round-trip and refuse truncation;
 - settlement credit binds the receipt to its assignment; overclaims never
-  reach the book.
+  reach the book;
+- a valid attestation quote verifies and returns the output hash;
+- tampered quotes fail the signature; unknown and revoked attesters refused;
+- model, runtime and config mismatches refused; wrong provider, workload,
+  input or TEE family refused;
+- stale (past the age window) and future-height quotes refused; the exact
+  age limit is still fresh;
+- the same quote bytes cannot verify twice; simulator quotes accepted only
+  by simulator SLAs;
+- quote wire codec round-trips, refuses unknown versions and truncation;
+  zero output hash and zero nonce never sign.
 
-## 9. Next milestones
+## 10. Next milestones
 
 1. GPU / Apple / NPU / TPU / photonic backends behind the `srct-diloco`
    `TrainBackend` conformance suite; this crate only routes units.
-2. TEE attestation and benchmark challenges to turn `Attested` /
-   `Challenge` into enforced levels.
+2. Challenge re-execution to turn `Challenge` into an enforced level
+   (attestation already enforces `Attested`).
 3. Escrow integration: fund the job once, release per settled receipt, refund
    the remainder at the deadline; execute bond registrations, slashes and
    withdrawals on the same rail.
