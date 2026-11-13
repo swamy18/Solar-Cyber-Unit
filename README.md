@@ -201,6 +201,23 @@ Every piece of jargon, in one line each:
 
 ---
 
+## Development snapshot (November 13, 2026)
+
+The November 10–13 implementation series expanded the AI and agent service
+layers. Major additions include DiLoCo fixed-point training and a staged PoUW
+consensus seam; bonded, challenged and escrowed decentralized compute;
+TEE/FHE/ZKML evidence verification; encrypted agent group messaging; CNNP
+representation adapters; cross-network intent workflows; and an AI work-artifact
+graph with royalty accounting. Most of these are **non-consensus prototypes or
+integration seams**. They do not activate useful-work mining or make the new
+service crates independently transfer L1 funds.
+
+The workspace declares **19 Rust crates**. The repository's `docs/status.md`
+reports **1,905 workspace tests passing, 0 failing and 3 ignored benchmark
+probes**, plus 8 JavaScript SDK test suites. These are repository-recorded
+results, not tests independently rerun for this README update. Refresh counts
+using `scripts/test_count.sh`.
+
 ## Honest limits
 
 What this project is not, and where trust actually lives. Read this before
@@ -224,39 +241,39 @@ trusting any number in it:
   proves who fitted it and what space it maps, not that two models mean the
   same thing. A usage receipt authorizes a transfer; it does not move a coin.
   See [`docs/cnnp.md`](docs/cnnp.md).
-- **Agent messaging hides content, not metadata.** `srct-agentnet` encrypts and
-  signs pairwise envelopes and stores them in a bounded replay-safe mailbox,
-  but sender/recipient identities, thread, sequence and expiry stay visible.
-  A double ratchet now gives conversations forward secrecy and
-  post-compromise security: message keys come from a chain advanced after
-  every message and every reply mixes a fresh DH into the root key, so a
-  stale snapshot of session state cannot read later messages and the static
-  key path cannot open ratchet messages. Still absent: sealed sender, group
-  messaging and transport. See [`docs/agentnet.md`](docs/agentnet.md).
-- **Compute sharing settles receipts, not correctness.** `srct-compute` routes
-  capacity-aware shards and pays exactly for claimed units. Offers must now
-  stand behind a signed bond: a requester-signed dispute can slash it (10%
-  for a timed-out assignment, 50% for fraud) and a reputation score gates
-  admission. Challenge re-execution compares an independent re-run and turns a
-  mismatch into a `WrongResult` slash, and job escrow funds a job once,
-  releases each settled receipt's exact total and refunds the remainder after
-  the deadline. Still absent: ZK proofs, and device RAM, cores, bandwidth and
-  kernel hash are self-declared; a slash is only as real as the escrow rail
-  that executes it. It can price a 2 GB phone or a GPU box; it cannot prove
-  either did honest work. See
-  [`docs/compute-sharing.md`](docs/compute-sharing.md).
-- **Mining does not train AI.** The neural stage is ML-shaped integer work
-  with epoch-derived weights — it keeps AI hardware competitive, it does not
-  produce models or inference (see [What this is](#what-this-is)). A separate
-  DiLoCo proof-of-useful-work prototype now trains a real MLP in
-  `crates/srct-diloco`, with signed updates, Byzantine filtering and exact
-  reward math, but it is **not consensus-active**: hash mining remains the
-  only block-security mechanism until a fork, migration and economic review
-  land. Training backends implement the `TrainBackend` seam for CPU, GPU
-  (CUDA/ROCm), TPU, NPU, Apple silicon and photonic targets: every backend
-  fails closed without its hardware and proves its plumbing in emulated mode
-  on any machine; silicon execution plugs in behind each backend's probe.
-  The determinism policy is in [`docs/dual-mining.md`](docs/dual-mining.md) §8.
+- **Agent messaging has several privacy modes, with visible metadata on the normal path.**
+  `srct-agentnet` now includes pairwise E2E envelopes, double-ratchet sessions,
+  a bounded replay-safe mailbox, sealed-sender envelopes, sender-key groups,
+  MLS-style epoch-ratcheted groups, presence/fan-out/ack codecs and HTTP
+  deliver/poll codecs. Normal pairwise sender/recipient/thread/sequence/expiry
+  metadata remains visible; sealed sender hides the sender from relays, not
+  every metadata field. Membership changes require authenticated group sync
+  and epoch updates. These are protocol/library components, not proof of a
+  deployed public messaging service. See [`docs/agentnet.md`](docs/agentnet.md).
+- **Compute sharing combines metering, bonds, challenges and evidence gates, but is not a coin-moving service by itself.**
+  `srct-compute` plans capacity-aware shards, binds signed offers and
+  requester-signed assignments, checks provider receipts and records exact
+  settlement instructions. Bonded provider registration, timeout/fraud
+  disputes, challenge re-execution with `WrongResult` slashing, replay-verified
+  journals/gossip, TEE quote/SLA evidence and funded job escrow (per-receipt
+  release plus deadline refund instructions) are implemented and tested.
+  Hardware profiles and kernel hashes are declarations, not remote proof of
+  physical resources; TEE trust depends on configured roots and attesters.
+  The crate and its in-memory rails produce instructions/state, not L1 coin
+  transfers. See [`docs/compute-sharing.md`](docs/compute-sharing.md).
+- **Useful-work mining is a prototype, not consensus-active.** The neural-shaped
+  `hybrid-v1` puzzle remains hash PoW, not model training. Separately,
+  `srct-diloco` trains a real MLP with signed worker updates, Byzantine
+  filtering, deterministic reward apportionment, backend conformance and a
+  fixed-point Q16.16 path classified BitExact. CUDA, ROCm, TPU, NPU,
+  Apple-silicon and photonic backend types expose fail-closed hardware probes;
+  their `emulated()` mode runs CPU kernels and proves plumbing only. No real
+  vendor kernels/drivers are included. A staged PoUW consensus package adds
+  round anchors, issuance-bounded minting, bonded eligibility and challenge
+  re-execution, but `pouw_activation_height = 0` on every shipped profile.
+  Hash PoW remains the only active block-security and mining-reward path.
+  Fork activation, migration, cross-platform vectors and economic/security
+  review remain required. See [`docs/dual-mining.md`](docs/dual-mining.md).
 - **Reputation, jobs, FX and ramps are per-node views.** They live in each
   node's `state.bin`, not in consensus — two honest nodes can disagree on a
   score, a quote or a job state. Consensus money (UTXOs, bonds, L2 accounts)
@@ -1383,19 +1400,23 @@ not expose it directly, but the worker SDK does (`add_credit_collateral`).
 | `crates/srct-mcp/` | Keyless MCP surface over agent identity, payments — and the agent wallet guard. |
 | `crates/srct-policy/` | Chain-agnostic policy engine: portable grants, delegation proofs, bound grants, JSON decisions + TS/Python bindings. No consensus imports — but still compiles all of `srct-core` (see crate docs); outsiders use HTTP or the bindings. |
 | `crates/srct-bench/` | Deterministic bench harness: `empty\|realistic\|adversarial` workloads, mini profile, scratch-dir stores. Measurement only. |
-| `crates/srct-diloco/` | Non-consensus DiLoCo proof-of-useful-work prototype: real MLP training, signed updates, Byzantine filtering, exact reward math. A `TrainBackend` seam with conformance gates now wraps the only implemented backend, the CPU `f32` reference; GPU/TPU/NPU/Apple/photonic backends remain future work. Hash mining remains the only consensus mechanism. |
+| `crates/srct-diloco/` | Non-consensus DiLoCo PoUW prototype: real MLP training, signed updates, Byzantine filtering, exact rewards; CPU `f32`, block-partitioned statistical, fixed-point Q16.16 BitExact backend, plus CUDA/ROCm/TPU/NPU/Apple/photonic probe-and-emulation adapters. Hardware adapters have no vendor kernels here; PoUW consensus package is staged and disabled on all profiles. |
 | `crates/srct-cnnp/` | Non-consensus Cross-Neural Network Protocol core: representation spaces, signed/sealed envelopes, ridge-fit cross-space adapters, capability discovery, metered settlement and plan quoting. |
 | `crates/srct-intent/` | Non-consensus cross-network intent settlement: signed intents, competitive quotes, cross-asset routes, delivery, escrow/refund instructions and dispute resolution. |
 | `crates/srct-agentnet/` | Non-consensus end-to-end encrypted agent messaging: network/role-bound identities, ECDH + HKDF + XChaCha20-Poly1305 envelopes, hybrid signatures, a bounded replay-safe mailbox and a double ratchet (forward secrecy + post-compromise security). |
-| `crates/srct-compute/` | Non-consensus decentralized compute sharing: signed device offers for CPUs/GPUs/TPUs/NPUs/Apple silicon/photonic devices, deterministic capacity-aware sharding, requester-signed assignments, provider receipts, exact payout instructions, job escrow (fund once, release per settled receipt, refund the remainder), challenge re-execution, and bonded provider registration with dispute slashing and reputation gating. |
+| `crates/srct-compute/` | Non-consensus decentralized compute sharing: signed offers, deterministic sharding, receipts, TEE evidence, bonded providers, challenge/re-execution, replay-verified journal and funded job escrow instructions. Does not itself transfer L1 coins. |
+| `crates/srct-fhe/` | Non-consensus encrypted-compute prototype: exponential ElGamal weighted sums, signed tasks/receipts, bounded decryption-cost analysis, key registry and escrow instructions; toy TFHE gates are correctness-tested but not production crypto or task-wired. |
+| `crates/srct-zkml/` | Non-consensus Sigma-protocol proofs for a quantized linear layer (up to 8 inputs, 16-bit range proofs), threshold assertions and same-statement linear batch folding; not general or recursive ZKML. |
+| `crates/srct-verify/` | Unified non-consensus evidence policy/verifier for TEE, FHE, ZKML and metered-compute evidence, with replay books and a verify-then-release closure seam. |
+| `crates/srct-workgraph/` | Non-consensus AI artifact lineage, ownership/licensing, evidence binding, content-addressed cache, metered reuse and exact recursive royalty instructions; depth capped at eight, with no coin movement. |
 | `fuzz/` | 17 cargo-fuzz targets over the attacker-controlled boundaries. |
 | `verification/sim/` | Independent Python reference, attack simulations, and feature demos (`x402_paid_api_demo.py`, `micropayment_benchmark.py`, `agent_economy_demo.py`). |
 | `verification/tests/vectors/` | Consensus vectors. Generated from source, never hand-edited. |
-| `docs/` | Design records, verification status and readiness reports — plus per-feature guides: `portable-policy.md`, `universal-security.md`, `x402.md`, `micropayments.md`, `wallet-safety.md`, `smart-gate-architecture.md`, `reputation.md`, `agent-jobs.md`, `usd-settlement.md`, `ramps.md`, `lending.md`, `treats.md`, `agent-credits.md`, `dual-mining.md`, `cnnp.md`, `intents.md`. |
+| `docs/` | Design records, verification status and readiness reports — plus per-feature guides: `portable-policy.md`, `universal-security.md`, `x402.md`, `micropayments.md`, `wallet-safety.md`, `smart-gate-architecture.md`, `reputation.md`, `agent-jobs.md`, `usd-settlement.md`, `ramps.md`, `lending.md`, `treats.md`, `agent-credits.md`, `dual-mining.md`, `cnnp.md`, `intents.md`, `agentnet.md`, `compute-sharing.md`, `fhe.md`, `zkml.md`, `verify.md`, `workgraph.md`. |
 | `docs/performance/` | Bench baselines + Phase-C scalability report + raw JSON results. |
 | `paper/` | The Solar Cyber Unit protocol paper (LaTeX + PDF). |
 
-Fifteen crates in one workspace. **All consensus logic lives in `srct-core`**, which
+Nineteen crates in one workspace. **All consensus logic lives in `srct-core`**, which
 has no I/O, no clock and no network. The service-layer feature modules
 live beside it without touching consensus: `x402.rs` (x402
 adapter, budget guard, Base rail options), `micro.rs` (batch/stream/sponsored), `safety.rs` (session budgets,
@@ -1580,7 +1601,7 @@ digest-checked file with a fail-closed load (a corrupt file refuses to start)
 ## Testing
 
 ```sh
-cargo test --workspace                                   # 1707 passed, 0 failed, 1 ignored
+cargo test --workspace                                   # 1905 passed, 0 failed, 3 ignored (repository-reported; refresh with scripts/test_count.sh)
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 python verification/sim/verify_vectors.py --check                     # consensus vectors
@@ -1598,8 +1619,15 @@ cargo test -p srct-policy                     # chain-agnostic decide/verify JSO
 cargo test -p srct-mcp                        # keyless wallet guard, portable prove/verify, bound grants
 cargo test -p srct-node --test micro_safety   # batch quotes, streams, sponsor intents, session/risk/audit
 cargo test -p srct-node --test agent_economy  # passport, tiers, jobs, FX quotes, ramps, lending marketplace
-cargo test -p srct-agentnet                   # E2E agent messaging, double ratchet + replay-safe mailbox
-cargo test -p srct-compute                    # device offers, sharding, receipts, settlement, bonds, challenge, escrow
+cargo test -p srct-agentnet                   # pairwise, double ratchet, sealed sender, groups, MLS-style epochs
+cargo test -p srct-compute                    # offers, sharding, TEE evidence, bonds, challenges, journal, escrow
+cargo test -p srct-diloco                     # DiLoCo rounds, fixed-point backend and hardware conformance
+cargo test -p srct-cnnp                       # representation adapters, metering and evidence gates
+cargo test -p srct-intent                     # intent lifecycle, evidence, bonds and solver directory
+cargo test -p srct-fhe                        # encrypted sums and toy TFHE gates
+cargo test -p srct-zkml                       # Sigma proofs, threshold gate and batch folding
+cargo test -p srct-workgraph                  # lineage, evidence, usage ledger and revenue escrow
+cargo test -p srct-verify                     # unified TEE/FHE/ZKML/compute evidence policy
 cargo test -p srct-core --lib arbitration::    # fraud-arbitration votes
 cargo test -p srct-core --test cp_signing_nodes # quorum, conflicts, restart
 cargo test -p srct-core --test bond_stake      # bonded-stake attacks
