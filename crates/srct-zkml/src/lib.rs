@@ -25,12 +25,14 @@
 //!   accepted output commitment; the escrow or payment layer settles it.
 
 pub mod circuit;
+pub mod fold;
 pub mod task;
 
 pub use circuit::{
     eval_plaintext, prove_linear, prove_threshold, verify_linear, verify_threshold, BitProof,
     LinearProof, ThresholdProof, BIT_WIDTH, MAX_INPUTS, MAX_WEIGHT_ABS, POINT_LEN,
 };
+pub use fold::{fold_summary, verify_fold, FoldSummary};
 pub use task::{
     SignedZkReceipt, SignedZkTask, ZkReceipt, ZkTask, ZkVerifier, BIT_PROOF_LEN, ZK_VERSION,
 };

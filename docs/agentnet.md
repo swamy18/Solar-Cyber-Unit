@@ -165,8 +165,12 @@ sequence, expiry and ciphertext size.
 - **Sealed-sender relay hosting** — impossible by design (nothing to verify
   without the recipient key): `sealed::SealedEnvelope` hides the sender from
   every relay and verifies recipient-side with shared sequence guards.
-- **Groups** — sender-key groups are done (`groups::GroupSession`); MLS-style
-  key agreement remains a later milestone.
+- **Groups** — sender-key groups are done (`groups::GroupSession`).
+  MLS-style epoch-ratcheted group messaging is done too (`mls::MlsGroup`,
+  key packages, add/remove proposals, commits with wrapped epoch keys,
+  per-epoch shared keys, replay refusal), in the MLS *structure* only:
+  the RFC 9420 ratchet tree, path secrets and ciphersuite negotiation are
+  explicitly not implemented.
 - **Transport sockets and push daemons** — the bytes, seams, codecs, presence
   book, fan-out addressing and ack sets are done (`transport`, `http`,
   `presence`); moving bytes over P2P/HTTP/MCP plus multi-device push daemons
@@ -177,7 +181,7 @@ sequence, expiry and ciphertext size.
 
 ## 8. Verified behavior
 
-`cargo test -p srct-agentnet` passes 45 tests (2 unit, 43 acceptance):
+`cargo test -p srct-agentnet` passes 50 tests (2 unit, 48 acceptance):
 
 - hybrid-wallet seal/open round trip (including the address/ECDH binding);
 - only the named recipient can open;
@@ -218,7 +222,11 @@ sequence, expiry and ciphertext size.
   and old-epoch messages fail closed; group wire codecs refuse tamper;
 - presence tracks liveness with TTL pruning, fan-out addresses every live
   device once, acks confirm idempotently, and HTTP deliver/poll codecs
-  round-trip with tamper refusal.
+  round-trip with tamper refusal;
+- MLS-style group threads (`mls::MlsGroup`): a commit adds a member and both
+  sides read each other's messages; a removed member cannot read the next
+  epoch; replays and tampering are refused; commits from non-members are
+  refused; signed commits and messages verify on decode.
 
 ## 9. Next milestones
 
@@ -230,7 +238,10 @@ sequence, expiry and ciphertext size.
 2. Group threads — **sender-key groups done** (`groups::GroupSession`:
    per-sender forward-secret chains, static-signature authorship, creator-
    distributed sync snapshots, epoch-bump re-key on removal, past-epoch
-   refusal). MLS-style key agreement remains a later milestone.
+   refusal) — and **MLS-style epoch-ratcheted groups done**
+   (`mls::MlsGroup`: key packages, proposals, wrapped-epoch commits, shared
+   epoch keys, per-sender sequence guards). The RFC 9420 ratchet tree
+   remains unimplemented — explicitly out of scope, not a gap queued next.
 3. Persistent mailbox storage — **done** (`Mailbox::encode`/`decode`: bounded
    snapshot, every envelope re-verified and replayed in stored order; sealed
    entries replay structure + guards, authenticity re-checks on `open`).

@@ -441,3 +441,83 @@ fn threshold_gate_proves_a_lower_bound() {
     assert!(ThresholdProof::decode(&bytes).is_err());
     assert!(ThresholdProof::decode(&bytes[..bytes.len() - 4]).is_err());
 }
+
+#[test]
+fn folding_verifies_a_batch_of_identical_statements() {
+    use srct_zkml::{fold_summary, verify_fold};
+    let (weights, bias, inputs) = dims();
+    // Three independent proofs of the SAME statement.
+    let packages: Vec<_> = (0..3)
+        .map(|i| {
+            prove_linear(
+                &weights,
+                bias,
+                &inputs,
+                &mut StdRng::seed_from_u64(0x100 + i),
+            )
+            .unwrap()
+        })
+        .collect();
+    let mut rng = StdRng::seed_from_u64(0xabcd);
+    verify_fold(&weights, bias, &packages, &mut rng).unwrap();
+    // The summary pins the batch.
+    let summary = fold_summary(&weights, bias, &packages, &mut rng).unwrap();
+    assert_eq!(summary.proofs, 3);
+    assert!(summary.transcript != [0u8; 32]);
+    // A different batch gives a different summary.
+    let other: Vec<_> = (0..2)
+        .map(|i| {
+            prove_linear(
+                &weights,
+                bias,
+                &inputs,
+                &mut StdRng::seed_from_u64(0x200 + i),
+            )
+            .unwrap()
+        })
+        .collect();
+    let other_summary = fold_summary(&weights, bias, &other, &mut rng).unwrap();
+    assert_ne!(summary.transcript, other_summary.transcript);
+}
+
+#[test]
+fn folding_catches_a_cheating_proof() {
+    use srct_zkml::verify_fold;
+    let (weights, bias, inputs) = dims();
+    let mut packages: Vec<_> = (0..3)
+        .map(|i| {
+            prove_linear(
+                &weights,
+                bias,
+                &inputs,
+                &mut StdRng::seed_from_u64(0x300 + i),
+            )
+            .unwrap()
+        })
+        .collect();
+    // Break one output commitment: the folded check must fail.
+    packages[1].output_commitment[0] ^= 0x01;
+    let mut rng = StdRng::seed_from_u64(0x1111);
+    assert!(verify_fold(&weights, bias, &packages, &mut rng).is_err());
+}
+
+#[test]
+fn folding_refuses_mismatched_statements() {
+    use srct_zkml::verify_fold;
+    let (weights, bias, inputs) = dims();
+    let a = prove_linear(&weights, bias, &inputs, &mut StdRng::seed_from_u64(0x400)).unwrap();
+    let mut other_weights = weights.clone();
+    other_weights[0] = 4;
+    let b = prove_linear(
+        &other_weights,
+        bias,
+        &inputs,
+        &mut StdRng::seed_from_u64(0x401),
+    )
+    .unwrap();
+    let mut rng = StdRng::seed_from_u64(0x2222);
+    // Different statements must not fold together.
+    assert!(verify_fold(&weights, bias, &[a.clone(), b], &mut rng).is_err());
+    // An empty batch is refused.
+    assert!(verify_fold(&weights, bias, &[], &mut rng).is_err());
+}

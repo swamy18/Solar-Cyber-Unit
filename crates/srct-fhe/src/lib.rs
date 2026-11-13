@@ -18,11 +18,15 @@
 //!   revocation, so workers encrypt under the right key.
 //! - [`escrow`]: one-shot per-task funding with release on verified receipt
 //!   and refund after the deadline, as settlement instructions.
+//! - [`tfhe`]: toy gate-bootstrapping engine (LWE, blind rotation, NAND and
+//!   derived gates, one-bootstrap lookup tables). Correctness-tested;
+//!   explicitly not production parameters.
 //!
 //! # What this is not
 //!
-//! - **Not general FHE.** One operation only: `bias + Σ w·x`. No encrypted
-//!   non-linearities, no bootstrapping, no TFHE. Weights and bias are public.
+//! - **Not general FHE.** The ElGamal core does one operation only:
+//!   `bias + Σ w·x`. Non-linear work goes through the [`tfhe`] bootstrapped
+//!   gates instead. Weights and bias are public in both paths.
 //! - **Not consensus.** Nothing here moves coin. The verifier returns the
 //!   accepted output ciphertext; the escrow or payment layer settles it.
 //! - **Not a zero-knowledge range proof.** Arithmetic is modulo the curve
@@ -35,6 +39,7 @@ pub mod elgamal;
 pub mod escrow;
 pub mod registry;
 pub mod task;
+pub mod tfhe;
 
 pub use cost::{
     eval_bounded, max_output, price_task, task_cost, COST_ADD, COST_BASE, COST_SCALAR_MUL,
@@ -45,6 +50,11 @@ pub use registry::{KeyRecord, KeyRegistry, KeyStatus, MAX_RETIRED_KEYS, REGISTRY
 pub use task::{
     eval, FheReceipt, FheTask, FheVerifier, SignedFheReceipt, SignedFheTask, WeightedSum,
     FHE_VERSION, MAX_INPUTS, MAX_WEIGHT_ABS,
+};
+pub use tfhe::{
+    and_gate, bootstrap, lwe_decrypt, lwe_decrypt_answer, lwe_encrypt, mux_gate, nand_gate,
+    not_gate, or_gate, phase, relu2_gate, tfhe_keygen, xor_gate, LweCipher, LweSecret, TfheKeys,
+    AND_TABLE, NAND_TABLE, OR_TABLE, TFHE_LWE_N, TFHE_N, XOR_TABLE,
 };
 
 /// Why an encrypted-compute operation was refused. Fail-closed: any variant

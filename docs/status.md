@@ -96,7 +96,7 @@ rules in code would have been the wrong order.
   required `TrainBackend` seam, determinism policy and conformance gates are
   specified in [`docs/dual-mining.md`](dual-mining.md) §8.
 - **End-to-end agent messaging (non-consensus, `srct-agentnet`).** `cargo test
-  -p srct-agentnet` passes 45 tests (2 unit, 43 acceptance): hybrid-wallet
+  -p srct-agentnet` passes 50 tests (2 unit, 48 acceptance): hybrid-wallet
   seal/open, recipient-key/address binding at seal time, wrong-recipient
   refusal, tampered ciphertext/thread/sequence/expiry/recipient refusal,
   sender spoof refusal, strict wire decoding, zero-sequence and
@@ -116,7 +116,12 @@ rules in code would have been the wrong order.
   sequence guards, snapshot guards without the key), sender-key group threads
   with epoch-bump rekeying on removal and past-epoch refusal, presence
   liveness with TTL pruning, fan-out addressing, idempotent acknowledgements,
-  and HTTP deliver/poll codecs. The mailbox is
+  and HTTP deliver/poll codecs — plus MLS-style epoch-ratcheted group
+  threads (5 acceptance tests): key packages with member signatures,
+  add/remove proposals, commits carrying epoch keys wrapped per member's
+  leaf key (ECDH + XChaCha20-Poly1305), a shared epoch key with per-sender
+  key derivation, replay refusal, and a removed member who cannot read the
+  next epoch. The mailbox is
   bounded and verifies without decrypting; content is hidden
   and conversation state is forward-secret, but sender/recipient/thread
   metadata stays visible on the normal path by design — the sealed path hides
@@ -162,7 +167,7 @@ rules in code would have been the wrong order.
   and a slash is only as real as the escrow rail that executes it. See
   [`docs/compute-sharing.md`](compute-sharing.md).
 - **Encrypted compute prototype (non-consensus, `srct-fhe`).** `cargo test
-  -p srct-fhe` passes 16 acceptance tests in ~30 s: real exponential-ElGamal
+  -p srct-fhe` passes 27 tests (11 TFHE unit plus 16 acceptance, 1 ignored bench) in ~45 s: real exponential-ElGamal
   encryption over secp256k1 with randomized ciphertexts, homomorphic
   add/scale matching plaintext, a signed task → worker receipt → verifier
   workflow decrypting to the exact expected value without the worker seeing
@@ -174,18 +179,27 @@ rules in code would have been the wrong order.
   pricing with overflow refusal, static worst-case bound analysis that refuses
   over-bound evaluation before any ciphertext work, an operator-curated key
   registry with rotation and revocation, and a one-shot task escrow with
-  release on verified receipt and refund after the deadline. One operation only
-  (`bias + Σ w·x`); weights are public, values must stay inside the decode
+  release on verified receipt and refund after the deadline — plus a toy
+  TFHE gate-bootstrapping engine (11 unit tests): LWE over a coarse mask
+  grid, TGGSW external product, blind rotation, sample extract, and
+  NAND/AND/OR/XOR/NOT/MUX/ReLU gates whose outputs rebind into further
+  gates. Non-linear support beyond the linear core is exactly that engine;
+  evaluations stay `bias + Σ w·x`, weights public, values inside the decode
   bound. See [`docs/fhe.md`](fhe.md).
 - **Zero-knowledge ML verification (non-consensus, `srct-zkml`).** `cargo
-  test -p srct-zkml` passes 11 acceptance tests (plus 1 ignored bench) in ~6 s: real Sigma-protocol
+  test -p srct-zkml` passes 14 acceptance tests (plus 1 ignored bench) in ~10 s: real Sigma-protocol
   proofs (Pedersen commitments, CDS OR bit-proofs, Fiat-Shamir) of correct
   quantized linear evaluation with 16-bit range checks, a threshold gate
   proving `value >= bound` (including boundary and false-statement refusal),
   a signed task → receipt → verifier workflow, tampered outputs and wrong
   statements refused as `InvalidProof`, tampered commitments breaking the task
   signature, impostor and wrong-worker refusals, late/future/replay refusals,
-  malformed tasks and receipts refused, and wire round-trips. One linear layer
+  malformed tasks and receipts refused, and wire round-trips — plus batch
+  folding of several proofs of the same statement: Fiat-Shamir challenges
+  fold the linear constraints into one check, a cheating proof is caught,
+  and mismatched statements refuse to fold (the per-bit CDS OR-proofs are
+  still verified individually — this is linear batch verification, not
+  Nova-style recursive folding). One linear layer
   plus one threshold gate (≤8 inputs); Bulletproofs R1CS was evaluated but its
   published crate does not compile. See [`docs/zkml.md`](zkml.md).
 - **AI Work Graph (non-consensus, `srct-workgraph`).** `cargo test
@@ -2462,3 +2476,48 @@ could never execute key-bound grants. Fixed without extending any lifetime:
   node api 52, core guard 22, policy 10, MCP 24, state_persist 3;
   `cargo clippy --workspace --all-targets -- -D warnings` clean,
   `cargo fmt --all --check` clean; churn test repeated 3x, stable.
+
+### 2026-11-13 TFHE gates, ZKML batch folding, MLS group messaging, live 3-node E2E (no consensus change)
+
+Four milestones close the remaining feature gaps in the verification stack
+and the node harness; all toy/prototype systems, no consensus rule touched.
+
+- **Toy TFHE gate bootstrapping** (`crates/srct-fhe/src/tfhe.rs`, 11 unit
+  tests): LWE over a coarse mask grid (`TFHE_MASK_STEP = 1<<24`, so the blind
+  rotation's phase arithmetic is exact), gadget decomposition (bit-exact
+  round trip), TGGSW external product, blind rotation, sample extract, and
+  the gates NAND/AND/OR/XOR/NOT/MUX/ReLU2 — each gate output is re-encrypted
+  (`rebind`), so gates compose into circuits. Every layer is tested against
+  independently computed expectations. Toy parameters only: not production
+  crypto, and not wired into task envelopes (wire v2 is a protocol step).
+- **ZKML batch folding** (`crates/srct-zkml/src/fold.rs`, 3 acceptance
+  tests): several proofs of the *same* statement fold with Fiat-Shamir
+  challenges; the linear constraints (bit recombination, weighted
+  evaluation) verify once on the folded commitments instead of once per
+  proof. The per-bit CDS OR-proofs are verified individually (they are not
+  linear equations). This is linear batch verification — **not** Nova-style
+  recursive folding, which is research work.
+- **MLS-style group messaging** (`crates/srct-agentnet/src/mls.rs`, 5
+  acceptance tests): key packages with member signatures, add/remove
+  proposals, commits carrying epoch keys wrapped per member's leaf key
+  (ECDH + XChaCha20-Poly1305), one shared epoch key with per-sender key
+  derivation, per-(epoch, sender) sequence guards with replay refusal, and
+  group-message/commit decoding that verifies signatures on decode. A
+  removed member cannot read the next epoch. This has the commitment-and-
+  epoch structure of MLS, **not** RFC 9420 (no ratchet tree).
+- **Live 3-node E2E** (`crates/srct-node/tests/e2e_multi_node.rs`): three real
+  `srct-node serve` processes P2P-linked (one mining seed, two `--no-mine`
+  relays). The relays sync against the mining seed (tolerantly: a mining
+  seed serves `GETDATA` on its next mine tick, so exact-tip equality during
+  mining is unobservable by design); the seed is then stopped, a payment is
+  mined offline by one-shot `send`, and the seed restarts as a relay. All
+  three nodes agree on the frozen tip, every node's API reports the exact
+  recipient/sender balances (sender fee exact via the tip block's coinbase),
+  `verify` replays cleanly on every data directory, and a restarted relay
+  catches up and agrees again. Node stdout/stderr is drained into log files
+  so a miner printing every block can never block on a full pipe.
+
+- Verification (working tree): `cargo test --workspace` — 155 suites, 1924
+  passed, 0 failed, 4 ignored; `npm --prefix sdk-js test` 8/8;
+  `cargo clippy --workspace --all-targets -- -D warnings` clean;
+  `cargo fmt --all --check` clean.

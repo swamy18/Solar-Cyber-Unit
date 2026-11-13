@@ -50,6 +50,7 @@ pub mod groups;
 pub mod http;
 pub mod mailbox;
 pub mod message;
+pub mod mls;
 pub mod padding;
 pub mod presence;
 pub mod ratchet;
@@ -71,6 +72,10 @@ pub use mailbox::{
 pub use message::{
     thread_id, MessageEnvelope, MessageError, Recipient, MAX_CIPHERTEXT, MAX_NETWORK_LEN,
     MAX_PLAINTEXT, MESSAGE_VERSION,
+};
+pub use mls::{
+    Commit, KeyPackage, LeafKey, Member, MlsError, MlsGroup, MlsMessage, Proposal, MAX_MLS_BODY,
+    MAX_MLS_MEMBERS, MLS_VERSION,
 };
 pub use presence::{fanout_targets, AckSet, PresenceBook, MAX_DEVICES_PER_AGENT, MAX_DEVICE_LABEL};
 pub use ratchet::{RatchetSession, SessionSide};

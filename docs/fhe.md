@@ -17,6 +17,26 @@ Exponential ElGamal over secp256k1: `Enc(m) = (rG, mG + rP)`.
 The one supported operation is `output = bias + Σ weights[i] * inputs[i]`
 over ciphertexts — the linear core of private-input neural inference.
 
+## Toy TFHE gates (`src/tfhe.rs`)
+
+A weighted sum stays linear no matter how it is evaluated, so the ElGamal
+core above cannot do non-linear work. `tfhe.rs` adds the missing piece the
+other way — bootstrapped binary gates over LWE ciphertexts, from which any
+boolean circuit (and, by lookup table, small quantized non-linearities like
+ReLU) is built:
+
+- **LWE** encrypts one bit as `b = <a, s> + e + m/8` on a coarse mask grid
+  (`TFHE_MASK_STEP = 2^24`), so the blind rotation's phases are exact;
+- **TGGSW external product**, **blind rotation** and **sample extract**
+  compose into a **functional bootstrap** evaluating a lookup table;
+- gates: **NAND, AND, OR, XOR, NOT, MUX, ReLU2** — every gate output is
+  re-encrypted through `rebind`, so gates compose into circuits.
+
+Toy parameters (`N = 128`), non-constant-time, naive `O(N^2)` arithmetic:
+correctness is measured (every gate against its full truth table, plus
+randomized trials), never claimed. Not production crypto; the TFHE envelope
+is not wired into tasks (that binding is a protocol step).
+
 ## Workflow
 
 ```
@@ -36,8 +56,10 @@ FheReceipt = version || task_hash || worker || output || height || nonce
 
 ## Honest limits
 
-- **One operation only.** No encrypted non-linearities, no bootstrapping, no
-  TFHE. Weights and bias are public; only inputs/outputs are private.
+- **One task operation only.** The task envelope carries the linear
+  `bias + Σ w·x` evaluation; non-linearities exist only as the standalone
+  toy TFHE engine above, not wired to tasks. Weights and bias are public;
+  only inputs/outputs are private.
 - **Bounded values.** Decryption searches `[0, bound)`; arithmetic is modulo
   the curve order. `cost::eval_bounded` refuses an evaluation whose static
   worst case exceeds the decryption bound, so an over-bound sum never reaches
@@ -47,7 +69,7 @@ FheReceipt = version || task_hash || worker || output || height || nonce
 
 ## Verified behavior
 
-`cargo test -p srct-fhe` passes 12 acceptance tests: encrypt/decrypt
+`cargo test -p srct-fhe` passes 27 tests — 16 acceptance tests: encrypt/decrypt
 round-trips (0 to 1,000,000), randomized encryption (same plaintext, different
 bytes), homomorphic add/scale matching plaintext, a full task→receipt→verify
 workflow decrypting to the exact expected value (59), tampered output refused
@@ -56,7 +78,10 @@ impostor and wrong-worker refusals, late/future receipts refused, double
 settlement refused, malformed tasks (identity/off-curve keys, over-cap
 weights, empty inputs, zero nonce/deadline) refused, wire round-trips —
 plus exact operation-cost pricing (`task_cost`/`price_task`) with overflow
-refusal.
+refusal — and 11 TFHE unit tests: LWE round-trips, bit-exact gadget
+decomposition, negacyclic wrap, external product scaling by the secret bit,
+sample extraction, and full truth tables plus randomized trials for every
+gate (NAND/AND/OR/XOR/NOT/MUX/ReLU2, including a chained MUX).
 
 Measured on this machine (debug build): full 11-test suite in ~42 s, dominated
 by BSGS table builds at bound 2^32 (~65k entries). Production bounds should be
@@ -64,8 +89,10 @@ set per workload; smaller bounds decode proportionally faster.
 
 ## Next milestones
 
-1. TFHE-style runtime for non-linear ops (ReLU, argmax) and bootstrapping —
-   research work, explicitly out of scope for this prototype.
+1. TFHE-style runtime for non-linear ops: **toy engine done**
+   (`src/tfhe.rs`, gates + rebind into circuits). What remains is
+   productionizing it — standard parameters, NTT kernels, constant-time
+   code, and wiring TFHE ciphertexts into task envelopes (wire v2).
 2. Encrypted-weight inference (both model and input private) — research work.
 3. Range proofs on inputs so overflow fails closed instead of wrapping —
    partially covered by static bound analysis (`cost::eval_bounded`

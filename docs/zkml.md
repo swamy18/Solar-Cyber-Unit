@@ -26,6 +26,14 @@ no new dependencies:
 - **Fiat-Shamir:** every challenge hashes the statement (weights, bias,
   commitments — or threshold, commitment) plus the prover's first messages,
   so proofs cannot be transplanted to another evaluation.
+- **Batch folding** (`src/fold.rs`): several proofs of the *same* statement
+  fold into one check — Fiat-Shamir challenges combine the linear
+  constraints (bit recombination and weighted evaluation) into a single
+  verification, so a cheating proof is caught with soundness error `1/p`,
+  not `N/p`. The per-bit CDS OR-proofs are Sigma protocols rather than
+  linear equations, so each is still verified on its own against its own
+  statement. This is linear batch verification, **not** Nova-style
+  recursive folding (which needs a cycle group and is research work).
 
 ## Workflow
 
@@ -45,9 +53,9 @@ ZkReceipt = version || task_hash || worker || bit_proofs ||
 ## Honest limits
 
 - **One linear layer plus one gate.** At most 8 inputs of 16 bits, plus
-  threshold assertions. No folding/recursion (Nova-style systems are future),
-  and threshold assertions are not yet bound to task envelopes (that binding
-  is a wire-version decision).
+  threshold assertions. Linear batch folding is done; recursive folding
+  (Nova-style) is future research, and threshold assertions are not yet
+  bound to task envelopes (that binding is a wire-version decision).
 - **Public model.** Weights and bias are public; only inputs/outputs are
   private. Model privacy is future.
 - **Prototype generator.** `H` is derived from a fixed label, not a true
@@ -65,14 +73,17 @@ option, so this prototype uses only the workspace's existing `k256`.
 
 ## Verified behavior
 
-`cargo test -p srct-zkml` passes 10 acceptance tests in ~6 s: circuit
+`cargo test -p srct-zkml` passes 14 acceptance tests in ~10 s: circuit
 prove/verify with a plaintext cross-check (68), a threshold gate proving
 `value >= bound` (including boundary and false-statement refusal), a full
 task→receipt→verify workflow, tampered output commitments and wrong-statement
 proofs refused as `InvalidProof`, tampered commitments breaking the task
 signature, impostor and wrong-worker refusals, late/future/replay refusals,
 malformed tasks (over-cap weights, count mismatches, zero deadline/nonce)
-and receipts (wrong bit shape) refused, and wire round-trips.
+and receipts (wrong bit shape) refused, wire round-trips — plus batch
+folding: a fold of three same-statement proofs verifies and pins a summary,
+a cheating proof inside a fold is caught, and mismatched or empty batches
+are refused.
 
 ## Next milestones
 
@@ -80,7 +91,9 @@ and receipts (wrong bit shape) refused, and wire round-trips.
    `verify_threshold` with bound blinding and domain separation). Step and
    clipped activations compose on top; task-envelope binding is a wire-v2
    decision.
-2. Folding/recursion (Nova-style) to aggregate many proofs cheaply.
+2. Recursive folding (Nova-style) to aggregate many proofs cheaply —
+   linear batch folding is done (`src/fold.rs`); the recursive form is
+   research work.
 3. Model-commitment privacy: prove over committed weights too.
 4. Ceremonied NUMS generator to replace the prototype `H`.
 5. Escrow-rail integration: fund on task, release on verified receipt, refund

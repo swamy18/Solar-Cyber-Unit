@@ -53,7 +53,7 @@ const DOM_CHALLENGE: &[u8] = b"srct/zkml-or-challenge/v1";
 /// Second generator for Pedersen commitments. `H = h*G` with `h` derived
 /// from a fixed label — a prototype stand-in for a real nothing-up-my-sleeve
 /// point (documented, not hidden).
-fn h_generator() -> ProjectivePoint {
+pub(crate) fn h_generator() -> ProjectivePoint {
     let mut counter: u64 = 0;
     loop {
         let mut label = b"srct-zkml-H/".to_vec();
@@ -73,7 +73,7 @@ fn scalar_from_key(key: &SecretKey) -> Scalar {
         .expect("secret-key bytes are a valid non-zero scalar")
 }
 
-fn scalar_of_weight(w: i64) -> Scalar {
+pub(crate) fn scalar_of_weight(w: i64) -> Scalar {
     if w >= 0 {
         Scalar::from(w as u64)
     } else {
@@ -81,7 +81,7 @@ fn scalar_of_weight(w: i64) -> Scalar {
     }
 }
 
-fn encode_point(p: &ProjectivePoint) -> Result<[u8; POINT_LEN], ZkError> {
+pub(crate) fn encode_point(p: &ProjectivePoint) -> Result<[u8; POINT_LEN], ZkError> {
     let affine = p.to_affine();
     if affine == AffinePoint::IDENTITY {
         return Err(ZkError::Malformed("zk commitment is the identity".into()));
@@ -93,7 +93,7 @@ fn encode_point(p: &ProjectivePoint) -> Result<[u8; POINT_LEN], ZkError> {
     Ok(out)
 }
 
-fn decode_point(raw: &[u8; POINT_LEN]) -> Result<ProjectivePoint, ZkError> {
+pub(crate) fn decode_point(raw: &[u8; POINT_LEN]) -> Result<ProjectivePoint, ZkError> {
     let enc = EncodedPoint::from_bytes(raw.as_slice())
         .map_err(|_| ZkError::Malformed("zk point encoding is invalid".into()))?;
     Option::from(<ProjectivePoint as FromEncodedPoint<Secp256k1>>::from_encoded_point(&enc))
@@ -295,7 +295,11 @@ pub fn prove_linear(
     })
 }
 
-fn statement_bytes(weights: &[i64], bias: u64, input_coms: &[[u8; POINT_LEN]]) -> Vec<u8> {
+pub(crate) fn statement_bytes(
+    weights: &[i64],
+    bias: u64,
+    input_coms: &[[u8; POINT_LEN]],
+) -> Vec<u8> {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&bias.to_be_bytes());
     bytes.extend_from_slice(&(weights.len() as u64).to_be_bytes());
@@ -400,7 +404,11 @@ pub fn verify_linear(weights: &[i64], bias: u64, package: &LinearProof) -> Resul
     Ok(())
 }
 
-fn verify_bit(statement: &[u8], proof: &BitProof, h: &ProjectivePoint) -> Result<(), ZkError> {
+pub(crate) fn verify_bit(
+    statement: &[u8],
+    proof: &BitProof,
+    h: &ProjectivePoint,
+) -> Result<(), ZkError> {
     let g = ProjectivePoint::GENERATOR;
     let b_com = decode_point(&proof.commitment)?;
     let a0 = decode_point(&proof.a0)?;
