@@ -196,8 +196,11 @@ BondDispute     = version || network || requester || provider || assignment ||
 - **Admission** (`BondBook::admit_offer`): an offer is schedulable only if it
   verifies, belongs to the book's network, stands behind a bond of at least
   `MIN_BOND_SAT` (10,000 sat) registered before the current height, and its
-  provider's score is above `BAN_SCORE` (−100). A fraud slash therefore bans a
-  provider permanently — re-bonding restores the stake, not the score — and a
+  provider's score is above `BAN_SCORE` (−100). A fraud slash subtracts
+  100 from the score (`score = settled_units − 10 × timeouts − 100 ×
+  slashes`), so it bans a provider whose settled volume does not cover the
+  penalty — a high-volume provider can survive one fraud event. Re-bonding
+  restores the stake and clears timeouts, not fraud slashes — and a
   provider that times out ten assignments without settling any units is also
   out until it settles work or re-bonds.
 
@@ -285,8 +288,10 @@ correct or useful — that is challenge re-execution / ZKML, still future.
   admitted;
 - forged, tampered and replayed bond registrations are refused, and a
   different registration tops the bond up;
-- a fraud dispute halves the bond, drops the score to the ban threshold, and
-  the provider stays banned even after re-bonding;
+- a fraud dispute halves the bond and subtracts 100 from the score, which
+  bans the provider unless settled volume covers the penalty (ban iff
+  `settled_units − 10 × timeouts − 100 × slashes ≤ −100`); fraud slashes
+  survive re-bonding;
 - only the assignment's requester can slash: a stranger's dispute fails on the
   requester binding, a rewritten one fails the signature;
 - a dispute must name the exact assignment it slashes; a duplicate dispute is

@@ -23,7 +23,7 @@ cargo test -p srct-diloco
 | Block reward, fee split, rate anchor | Active | **Yes** |
 | L2 task escrow, VWC, disputes, exits | Active | **Yes** (L2 state root) |
 | Node-local credit, reputation, FX, ramps | Service layer | No |
-| AI training in mining | **Absent** | — |
+| AI training inside consensus mining | **Absent** — the prototype in this crate trains off-consensus | — |
 
 The README and `docs/status.md` already say plainly that the current neural
 stage is ML-shaped integer work, not training. This crate is the first actual
@@ -150,7 +150,11 @@ cross-platform consensus guarantee.
 
 ## 7. Consensus activation: required work before any fork
 
-Nothing below has been done, and none of it should be improvised:
+The mechanism for items 1–5 and 7 below is implemented and tested in
+`crates/srct-diloco/src/consensus.rs` (fixed-point kernel, round anchor,
+bounded mint, eligibility floor, re-execution challenge, low-participation
+rule); what has not been done is activating it. None of the activation work
+should be improvised:
 
 1. **Training kernel determinism.** Fixed-point or integer forward/backward
    passes, with cross-platform vectors. Without this, two validators can
@@ -189,7 +193,10 @@ The separation is mandatory:
 - **Hardware-specific:** kernel implementations, device memory, collectives,
   device discovery and resource measurement.
 
-A planned `TrainBackend` seam (not implemented yet) carries:
+The `TrainBackend` seam is implemented (`srct_diloco::backend::TrainBackend`
+with `BackendCapabilities { device, determinism, dtype, max_batch,
+memory_bytes }`, `check_backend` conformance and the `require_determinism`
+gate). It carries:
 
 ```text
 Capabilities {
@@ -317,24 +324,24 @@ The ordered plan is:
    primitive, wired through the same CDS machinery with its own domain tag.
    Task-envelope binding for threshold assertions (wire v2) and folding
    remain next.
-8. CNNP nonlinear/tokenizer adapters and transport — the representation,
+9. CNNP nonlinear/tokenizer adapters and transport — the representation,
    linear-adapter, quadratic-adapter, tokenizer-map, held-out evaluation
    harness, discovery and metering core is done (non-consensus). The
    network transport remains operator-run.
-9. Intent persistence, chain adapters and solver discovery — the lifecycle
+10. Intent persistence, chain adapters and solver discovery — the lifecycle
    state machine plus snapshot/replay, FHE-privacy enforcement on delivery,
    a solver directory with verified quote gossip, atomic multi-intent opens
    for multi-solver stages, bonded disputes (release-on-honest,
    slash-to-solver-on-frivolous), a settlement-adapter seam with an
    executing in-memory rail, and end-to-end settle-via-rail tests are done
    (non-consensus). External-chain adapters remain per-rail work.
-10. Work-graph attribution and reuse compensation — **done, non-consensus**
+11. Work-graph attribution and reuse compensation — **done, non-consensus**
     (`srct-workgraph`: lineage, licenses, exact royalty settlement, plus
     cross-crate evidence checks at registration, a bounded content store, a
     metered-reuse oracle fed by verified CNNP receipts, and a revenue escrow
     with per-payout release and exactly-once refund). Rail execution of the
     payout/refund instructions is next.
-11. SDK adapters — the JS client covers the agent surface with mock-transport
+12. SDK adapters — the JS client covers the agent surface with mock-transport
     tests and client-side input hardening; live-node end-to-end and Python/
     Rust/MCP SDK production hardening remain next.
 

@@ -56,10 +56,10 @@ also exists now, with a conservation gate before its first pass.)
   |---|---|---|
   | 1 | `cargo fmt --all --check` | clean |
   | 2 | `cargo clippy --workspace --all-targets --all-features -- -D warnings` | clean |
-   | 3 | `cargo test --workspace` | 1707 passed, 0 failed, 1 ignored (`vwc_perf_probe`) |
+    | 3 | `cargo test --workspace` | 1924 passed, 0 failed, 4 ignored (last recorded 2026-11-13 working tree; re-run `scripts/test_count.sh` — counts move with the tree) |
   | 4 | `cargo build --workspace --release` | succeeds |
   | 5 | vector cross-check: `python verification/sim/verify_vectors.py --check` | see `docs/status.md` |
-  | 6 | confirm the only `#[ignore]`d test is the manual `vwc_perf_probe` | confirmed |
+  | 6 | confirm every `#[ignore]`d test is a documented manual/benchmark probe, not a skipped regression | re-check on each run (4 ignored at last count; the set moves with the tree) |
   | 7 | update `CHANGELOG.md` | **no CHANGELOG exists yet** |
   | 8 | tag `vMAJOR.MINOR.PATCH`, publish to GitHub Releases | **not yet done** |
 
@@ -260,7 +260,7 @@ reached.
 |---|---|
 | `cargo fmt --all --check` clean | ✅ |
 | `cargo clippy --workspace --all-targets --all-features -- -D warnings` clean | ✅ |
-| `cargo test --workspace` passes | ✅ 1707 passed, 0 failed, 1 ignored |
+| `cargo test --workspace` passes | ✅ 1924 passed, 0 failed, 4 ignored (last recorded 2026-11-13 working tree; see `docs/status.md`) |
 | Release build compiles | ✅ |
 | Vector cross-check (Python vs Rust) | ✅ (`docs/status.md`) |
 | Fuzz: 17 targets executed, real campaigns | ✅ see `docs/fuzz.md` |
@@ -313,3 +313,22 @@ resolved by code changes made to the repository:
 
 No independent security review has been completed. A third-party security review
 is recommended before any mainnet deployment with real value.
+
+## Evidence-based status key (2026-11-13 documentation audit)
+
+Read every ✅ above as **implemented + tested only**:
+
+- **Implemented** — the code exists on `main` and is referenced by path.
+- **Tested** — an automated test exercises the claim (counts in
+  `docs/status.md`, reproducible via `scripts/test_count.sh`).
+- **Audited** — ❌ nothing in this repository has had an external security
+  audit. Author-run red-team and adversarial suites are recorded in
+  `docs/status.md`; they are not a substitute.
+- **Operationally deployed** — ❌ no public network with real value exists;
+  multi-node runs are local scripts and operator-verified relays.
+- **Still required before mainnet** — release tagging + `CHANGELOG.md`,
+  published PGP disclosure key, log-shipping/OTLP observability, backup
+  runbooks, external audit, and (for any PoUW activation) the fork schedule,
+  migration plan, and wire-v2 commitments in `docs/dual-mining.md` §7–§8.
+
+A green test column is not a launch decision.

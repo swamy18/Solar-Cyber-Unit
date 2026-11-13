@@ -65,7 +65,9 @@ FheReceipt = version || task_hash || worker || output || height || nonce
   worst case exceeds the decryption bound, so an over-bound sum never reaches
   a receipt — but there is still no zero-knowledge range proof on inputs.
 - **No range proofs.** Ciphertexts are validated on-curve, not on-range.
-- A requester's keypair is self-managed; there is no on-chain key registry.
+- A requester's keypair is self-managed through the operator-curated
+  `KeyRegistry` (rotation keeps old keys resolvable, revocation distrusts
+  entirely); there is no consensus-anchored on-chain registry.
 
 ## Verified behavior
 

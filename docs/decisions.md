@@ -1890,3 +1890,29 @@ gate as intake; a regression test pins both directions (refused under a
 stepped-back clock, admitted under the intake clock). No consensus change:
 the clock policy was and stays node-local; replay and historical paths still
 pass `None`.
+
+## Addendum 2026-11-13 — documentation synchronization (not a protocol decision)
+
+A repository-wide documentation audit against the implementation at `main`
+changed no rule and made no decision; it recorded the verified state so docs
+stop drifting from code. Findings, all reflected in the docs themselves:
+
+1. The README's pre-audit development summaries overstated integration:
+   PoUW, hardware backends, TFHE, ZKML folding, prototype settlement, TEE
+   trust, and intents are now labeled by maturity in `README.md`.
+2. `dual-mining.md` §§7–8 described mechanism work as unstarted after it had
+   shipped (`consensus.rs`, `backend.rs`, `devices.rs`); corrected with the
+   remaining activation work itemized.
+3. `compute-sharing.md` stated a fraud slash always bans; the code bans
+   conditionally on volume (`BAN_SCORE`). Corrected.
+4. `intents.md` stated only the privacy label is enforced; the delivery gate
+   also enforces verified FHE evidence for `Privacy::Fhe`. Corrected.
+5. `fhe.md` stated no key registry; `KeyRegistry` exists. Corrected.
+6. `status.md` stated the HBM puzzle is unregistered; `puzzle_id = 2` is
+   registered and inactive. Corrected.
+7. `mainnet-readiness.md` carried a stale test count (1707/0/1) and a
+   single-ignored-test checklist; updated to the last recorded run with an
+   explicit implemented/tested/audited/deployed/required key.
+8. Stale in-code comments found but not touched (docs task changes no code):
+   agentnet ratchet/lib headers, zkml folding header — recorded in
+   `status.md` for a future code-touching pass.

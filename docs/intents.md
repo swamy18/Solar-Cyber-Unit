@@ -160,8 +160,11 @@ hold custody and cannot release funds by itself.
   worker binding and cryptographic validity through `srct-verify`, then
   `settle` releases. Dispute/resolve stays available as the arbitration
   fallback.
-- `Privacy::{Public, Sealed, Tee, Fhe}` is the same seam as CNNP. Only the
-  label is enforced here; actual privacy must come from the execution layer.
+- `Privacy::{Public, Sealed, Tee, Fhe}` is the same seam as CNNP. The label
+  is always enforced as an admission floor, and `Privacy::Fhe` is
+  additionally enforced at delivery: FHE-privacy intents settle only on
+  verified FHE evidence (`book.rs` delivery gate). Other levels' actual
+  privacy must still come from the execution layer.
 
 ## 8. Roadmap
 

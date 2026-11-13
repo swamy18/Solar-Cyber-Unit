@@ -17,7 +17,7 @@ finality is consensus-active on activated profiles** (Decisions 11–12, §14.7�
 | M1 | 50/50 PSCB (Protocol Security & Compute Buffer) fee split; PSCB leg subdivides into retained PSCB + 5% B-Saver + 10% SRCT Treats backing | **Yes** — SPEC.md §8 | `fees.rs`, `bsaver.rs`, `treats.rs`, `chain.rs` |
 | M2 | Time-Locked Compute Reserve & 50/50 Anti-Collusion Slash Vault | No — no rule creates a slash record yet | `slash.rs` |
 | M3 | Universal Hardware-Agnostic Canonical Compute IR | No — envelopes only | `compute_ir.rs` |
-| M4 | Memory-bound HBM scratchpad PoW puzzle | No — not a registered `puzzle_id` | `hbm_pow.rs` |
+| M4 | Memory-bound HBM scratchpad PoW puzzle | No — registered as `puzzle_id = 2` (`PuzzleSpec::hbm_v1`) but not the active mining puzzle on any profile | `hbm_pow.rs` |
 | M5 | Sovereign BLS aggregate finality gadget checkpoints | **Conditional** — real `blst` verification; **binding** on profiles with a non-zero `finality_activation_height` (`testnet` at 20, `mainnet` at 100 with its 21-key bootstrap committee per Decision 27), observation-only on `mini` | `bls_checkpoint.rs`, `bls.rs`, `finality.rs` |
 
 SPEC.md §14 carries the same table. M5's missing rules arrived as Decisions 11
@@ -2521,3 +2521,39 @@ and the node harness; all toy/prototype systems, no consensus rule touched.
   passed, 0 failed, 4 ignored; `npm --prefix sdk-js test` 8/8;
   `cargo clippy --workspace --all-targets -- -D warnings` clean;
   `cargo fmt --all --check` clean.
+
+## Documentation audit 2026-11-13
+
+A repository-wide documentation audit (commits 2026-11-10 through 2026-11-13,
+19 workspace crates, 34 docs) verified every subsystem doc against its
+implementation and synchronized the following, with no protocol, consensus, or
+economic-rule changes:
+
+- `README.md` rewritten as a status-labeled technical overview (maturity
+  legend `[L1 ACTIVE]` / `[STAGED · DISABLED]` / `[PROTOTYPE]` /
+  `[EMULATED]` / `[INSTRUCTIONS]` / `[PLANNED]`); PoUW described as
+  implemented-but-disabled, hardware backends as emulated, TFHE as a toy,
+  ZKML folding as linear batching, prototype payouts as instructions.
+- `docs/dual-mining.md`: §1 table clarifies no AI training in consensus
+  mining; §7 records the implemented-but-unactivated consensus mechanism;
+  §8 records the shipped `TrainBackend` seam (actual capability fields);
+  milestone numbering fixed (was two §9 item 8s).
+- `docs/compute-sharing.md`: fraud-slash ban corrected to the conditional
+  rule (ban iff `settled − 10×timeouts − 100×slashes ≤ −100`); L1-job vs
+  compute-pot escrow namespace disambiguated in README.
+- `docs/intents.md`: `Privacy::Fhe` delivery gate (verified FHE evidence
+  required) recorded alongside the label floor.
+- `docs/fhe.md`: key-registry limit bullet corrected (`KeyRegistry` exists,
+  operator-curated, not consensus-anchored).
+- `docs/status.md` M4 row: HBM puzzle is registered (`puzzle_id = 2`) but
+  inactive — was "not a registered puzzle_id".
+- `docs/mainnet-readiness.md`: test counts updated to the last recorded run
+  (1924/0/4), ignored-test checklist generalized, five-column
+  implemented/tested/audited/deployed/required key appended.
+
+Known stale in-code comments intentionally left untouched (documentation task
+changes no code): `srct-agentnet/src/message.rs` ("double ratchet is not
+implemented" — `ratchet.rs` implements it), `srct-agentnet/src/lib.rs`
+("not provided yet" list predates sealed/groups/MLS), and
+`srct-zkml/src/lib.rs` ("no folding/recursion" — linear batch folding in
+`fold.rs` exists and is not recursive).
