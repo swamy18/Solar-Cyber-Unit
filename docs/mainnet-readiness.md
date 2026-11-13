@@ -59,7 +59,7 @@ also exists now, with a conservation gate before its first pass.)
     | 3 | `cargo test --workspace` | 1924 passed, 0 failed, 4 ignored (last recorded 2026-11-13 working tree; re-run `scripts/test_count.sh` — counts move with the tree) |
   | 4 | `cargo build --workspace --release` | succeeds |
   | 5 | vector cross-check: `python verification/sim/verify_vectors.py --check` | see `docs/status.md` |
-  | 6 | confirm every `#[ignore]`d test is a documented manual/benchmark probe, not a skipped regression | re-check on each run (4 ignored at last count; the set moves with the tree) |
+  | 6 | confirm every `#[ignore]`d test is a documented manual/benchmark probe, not a skipped regression | re-check on each run; the ignored set is exactly these four probes: `vwc_perf_probe` (`srct-l2`), `bench_zk_prove_verify` (`srct-zkml`), `bench_fhe_ops` (`srct-fhe`), `bench_tee_quote_verify` (`srct-compute`) — a fifth name means something got skipped that should not have been |
   | 7 | update `CHANGELOG.md` | **no CHANGELOG exists yet** |
   | 8 | tag `vMAJOR.MINOR.PATCH`, publish to GitHub Releases | **not yet done** |
 

@@ -29,12 +29,14 @@
 //! - sender and recipient agent identities, roles and addresses;
 //! - thread id, sequence number, expiry height and ciphertext size.
 //!
-//! Not provided yet:
+//! Shipped in-tree; the operator still runs the edges:
 //!
-//! - **sealed-sender relay hosting**: sealed envelopes verify recipient-side
-//!   only ([`sealed`]), so an untrusted relay can route but never host them.
-//! - **group key agreement**: groups use creator-distributed sender keys
-//!   ([`groups`]); MLS-style agreement is a later milestone.
+//! - **sealed-sender envelopes** ([`sealed`]) verify recipient-side only, so
+//!   an untrusted relay can route and store them but never read them; relay
+//!   hosting and push daemons are the operator's.
+//! - **group messaging**: creator-distributed sender keys ([`groups`]) and
+//!   MLS-style agreement ([`mls`], not RFC 9420); group transport daemons
+//!   are the operator's.
 //! - **network sockets**: [`transport`] is the delivery seam with an
 //!   in-memory reference, [`http`] the wire codecs and [`presence`] the
 //!   liveness book. P2P/HTTP/MCP sockets, push and multi-device fan-out

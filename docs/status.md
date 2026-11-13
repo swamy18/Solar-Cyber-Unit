@@ -2551,9 +2551,19 @@ economic-rule changes:
   (1924/0/4), ignored-test checklist generalized, five-column
   implemented/tested/audited/deployed/required key appended.
 
-Known stale in-code comments intentionally left untouched (documentation task
-changes no code): `srct-agentnet/src/message.rs` ("double ratchet is not
-implemented" — `ratchet.rs` implements it), `srct-agentnet/src/lib.rs`
-("not provided yet" list predates sealed/groups/MLS), and
-`srct-zkml/src/lib.rs` ("no folding/recursion" — linear batch folding in
-`fold.rs` exists and is not recursive).
+Known stale in-code comments — resolved 2026-11-13 by comment-only edits (no
+logic touched): `srct-agentnet/src/message.rs` now points plain envelopes at
+[`crate::ratchet`] for cross-message forward secrecy,
+`srct-agentnet/src/lib.rs` lists sealed/groups/MLS as shipped with
+operator-run edges, and `srct-zkml/src/lib.rs` distinguishes linear batch
+verification ([`fold`]) from future recursive folding.
+
+## Ignored-test inventory 2026-11-13
+
+Exhaustive `#[ignore]` search over `crates/` finds exactly four, matching the
+last recorded `4 ignored` count. All are manual perf probes, none a skipped
+regression: `vwc_perf_probe` (`crates/srct-l2/src/vwc.rs`),
+`bench_zk_prove_verify` (`crates/srct-zkml/tests/zkml.rs`),
+`bench_fhe_ops` (`crates/srct-fhe/tests/fhe.rs`),
+`bench_tee_quote_verify` (`crates/srct-compute/tests/tee.rs`). The next full
+run must confirm the set is still exactly these four names.

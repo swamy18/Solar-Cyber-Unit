@@ -12,12 +12,12 @@ because it relays and validates but never grinds. Run it relay-only:
 
 ```sh
 ./target/release/srct-node serve --network mainnet --data-dir ./chain \
-  --no-mine --listen 0.0.0.0:9833
+  --no-mine --listen 0.0.0.0:8333
 ```
 
 Three things matter here: `--no-mine` (no CPU burn), `--data-dir` on a disk
 that survives restarts (lose it and the node resyncs from genesis), and port
-`9833` reachable from the internet so other nodes can dial in. Point
+`8333` reachable from the internet so other nodes can dial in. Point
 `srct-miner --node` at this box's API port and your laptop keeps mining while
 the box keeps the chain.
 

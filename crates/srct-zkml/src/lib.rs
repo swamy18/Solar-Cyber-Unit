@@ -16,8 +16,9 @@
 //! # What this is not
 //!
 //! - **Not general ZKML.** One linear layer, at most 8 inputs of 16 bits, plus
-//!   a threshold-assertion gate. No folding/recursion (Nova-style systems are
-//!   future), and threshold assertions are not yet bound to task envelopes
+//!   a threshold-assertion gate. No recursive folding (Nova-style recursion is
+//!   future; [`fold`] is linear batch verification, not recursion), and
+//!   threshold assertions are not yet bound to task envelopes
 //!   (that binding is a wire-version decision).
 //! - **Not a usefulness proof.** The proof shows the specified computation
 //!   ran, not that the output is factually correct or useful.

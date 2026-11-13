@@ -13,10 +13,11 @@
 //! - **Visible:** the sender and recipient agent identities, the thread id,
 //!   sequence number, expiry and ciphertext size. This is a metadata leak by
 //!   design in this version; sealed-sender routing is a later milestone.
-//! - **Not forward-secret across messages:** the recipient's static key plus a
-//!   captured ephemeral key decrypts that message. A double ratchet is not
-//!   implemented. Per-message ephemeral keys do prevent one message's key from
-//!   decrypting another.
+//! - **Not forward-secret across messages on this path:** the recipient's
+//!   static key plus a captured ephemeral key decrypts that message. Ordered
+//!   threads that need forward secrecy across messages should use the
+//!   double-ratchet sessions in [`crate::ratchet`]. Per-message ephemeral
+//!   keys do prevent one message's key from decrypting another.
 //!
 //! The signature covers the AAD (network, thread, sequence, both identities and
 //! addresses, ephemeral key) as well as the nonce, expiry and ciphertext, so a
