@@ -512,7 +512,11 @@ yield — the fastest truthful chip wins blocks honestly;
 `python templates/srct_silicon.py --selftest`), and agents share memory
 without bloating L1 through `templates/srct_memory.py` — a hash-chained
 syncable log whose tip anchors task claims
-(`python templates/srct_memory.py --selftest`).
+(`python templates/srct_memory.py --selftest`). A participant node joins
+with a bounded share of its own box through `templates/srct_node.py` — RAM and
+a token-bucket compute cap that cannot be exceeded, dual-hash mine + infer
+work, SRCT earnings at the global rate, and an optional cross-asset payout
+(`python templates/srct_node.py --selftest`).
 
 **Trial faucet (operator setup).** Trials stay disabled until a sponsor is
 configured — with no sponsor there is no money behind a trial, so every
@@ -753,6 +757,7 @@ Off-chain Python helpers (`templates/*.py`, each with `--selftest`). No template
 | `srct_memory.py` | Hash-chained syncable agent log whose tip anchors task claims | Keeps memory off L1 |
 | `srct_frameworks.py` | `langchain_tool` / `crewai_tool` / `llamaindex_tool` spend-policy guard | Policy checked before the function runs |
 | `srct_fund.py` | `ensure_funded()` — cheapest live ramp quote, open intent, wait for provider fill | Custody never touches the node |
+| `srct_node.py` | Participant node: contribute RAM + compute under strict fail-closed caps; dual-hash mine + infer; earn SRCT at the global rate; optional cross-asset payout | Every reservation and token spend is refuse-over-budget — exceeding caps is impossible |
 
 ## Performance and verification
 
