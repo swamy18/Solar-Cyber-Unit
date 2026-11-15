@@ -27,6 +27,10 @@ wallets.json
 coverage/
 tarpaulin-report.html
 
+# Local Cargo config (build-job caps, offline mirrors, per-machine flags).
+# Per-developer tuning — never committed, never pushed.
+.cargo/
+
 # Editor and OS cruft.
 .DS_Store
 Thumbs.db

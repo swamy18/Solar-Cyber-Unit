@@ -10,7 +10,7 @@ the numbers a specific execution produced, and they are labelled as such.
 
 ## Target inventory
 
-Seventeen targets in `fuzz/fuzz_targets/`, each asserting a property, not merely
+Eighteen targets in `fuzz/fuzz_targets/`, each asserting a property, not merely
 panic-freedom.
 
 | # | Target | Surface | Invariant asserted |
@@ -32,6 +32,7 @@ panic-freedom.
 | 15 | `deliverable_codec` | L2 deliverable codec | Round-trip identity; unknown types rejected; survives truncation |
 | 16 | `l2_policy_apply` | L2 policy state machine | Value conservation; grant caps never exceeded; revocation absolute; authority narrows; replay refused |
 | 17 | `l2_credit_apply` | L2 credit state machine | Conservation; collateral locked not spent; debt one-way; default not early; interest once per period |
+| 18 | `compute_state_decode` | Compute state decoders + revoke accumulator | Total decode; encode stability; re-filing never grows the book |
 
 Not yet covered: the PoW boundary (template construction, header solving,
 `extra_nonce` rolling) and the stratum wire protocol (`getjob`/`submit`

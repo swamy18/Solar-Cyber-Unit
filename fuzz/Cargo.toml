@@ -26,6 +26,9 @@ path = "../crates/srct-store"
 [dependencies.srct-net]
 path = "../crates/srct-net"
 
+[dependencies.srct-compute]
+path = "../crates/srct-compute"
+
 [dependencies.srct-worker]
 path = "../crates/srct-worker"
 
@@ -150,6 +153,13 @@ bench = false
 [[bin]]
 name = "l2_credit_apply"
 path = "fuzz_targets/l2_credit_apply.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "compute_state_decode"
+path = "fuzz_targets/compute_state_decode.rs"
 test = false
 doc = false
 bench = false

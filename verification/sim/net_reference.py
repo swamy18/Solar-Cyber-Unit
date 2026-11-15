@@ -45,6 +45,8 @@ MSG_GETBLOCKS = 8
 MSG_ADDR = 9
 MSG_TX = 10
 MSG_CHECKPOINT = 11
+MSG_ARBITRATION_VOTE = 12
+MSG_GUARD_REVOKE = 13
 
 # --- SPEC.md section 13.3: per-profile identity ---------------------------
 # A new profile MUST pick a magic no existing profile uses.

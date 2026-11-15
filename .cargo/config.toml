@@ -1,4 +1,0 @@
-# 8 GB laptop: cap parallel compilation jobs. Slower per build, far less RAM
-# pressure, no machine freeze. Drop to 1 if it still thrashes.
-[build]
-jobs = 2

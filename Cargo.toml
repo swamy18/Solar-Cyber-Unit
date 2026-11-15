@@ -9,7 +9,7 @@ rust-version = "1.75"
 authors = ["Swamy Gadila"]
 license = "MIT"
 repository = "https://github.com/swamy18/Solar-Cyber-Unit"
-description = "Solar Cyber Unit: an AI-native cryptocurrency whose mining does real work on AI hardware."
+description = "Solar Cyber Unit: programmable money for machines — mined UTXO coin, agent spending policies enforced at admission, escrow for verifiable compute work."
 
 [workspace.dependencies]
 srct-core = { path = "crates/srct-core" }
@@ -18,12 +18,10 @@ srct-net = { path = "crates/srct-net" }
 srct-store = { path = "crates/srct-store" }
 srct-diloco = { path = "crates/srct-diloco" }
 srct-cnnp = { path = "crates/srct-cnnp" }
-srct-intent = { path = "crates/srct-intent" }
 srct-agentnet = { path = "crates/srct-agentnet" }
 srct-compute = { path = "crates/srct-compute" }
 srct-fhe = { path = "crates/srct-fhe" }
 srct-zkml = { path = "crates/srct-zkml" }
-srct-workgraph = { path = "crates/srct-workgraph" }
 srct-verify = { path = "crates/srct-verify" }
 sha2 = "0.10"
 k256 = { version = "0.13", features = ["ecdsa", "schnorr", "arithmetic", "ecdh"] }

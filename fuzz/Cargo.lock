@@ -208,6 +208,7 @@ dependencies = [
  "ff",
  "generic-array",
  "group",
+ "hkdf",
  "pkcs8 0.10.2",
  "rand_core",
  "sec1",
@@ -292,6 +293,15 @@ name = "hex"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
+
+[[package]]
+name = "hkdf"
+version = "0.12.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7b5f8eb2ad728638ea2c7d47a21db23b7b58a72ed6a38256b8a1849f15fbbdf7"
+dependencies = [
+ "hmac",
+]
 
 [[package]]
 name = "hmac"
@@ -649,6 +659,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a0219bd7d979d58245a4f41f695e1ac9f8befdffadd7f61f1bae9e39abc6620"
 
 [[package]]
+name = "srct-compute"
+version = "0.1.0"
+dependencies = [
+ "srct-core",
+]
+
+[[package]]
 name = "srct-core"
 version = "0.1.0"
 dependencies = [
@@ -668,6 +685,7 @@ name = "srct-core-fuzz"
 version = "0.0.0"
 dependencies = [
  "libfuzzer-sys",
+ "srct-compute",
  "srct-core",
  "srct-l2",
  "srct-net",
@@ -676,10 +694,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "srct-fhe"
+version = "0.1.0"
+dependencies = [
+ "k256",
+ "rand",
+ "srct-core",
+]
+
+[[package]]
 name = "srct-l2"
 version = "0.1.0"
 dependencies = [
  "srct-core",
+ "srct-verify",
 ]
 
 [[package]]
@@ -700,6 +728,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "srct-verify"
+version = "0.1.0"
+dependencies = [
+ "srct-compute",
+ "srct-core",
+ "srct-fhe",
+ "srct-zkml",
+]
+
+[[package]]
 name = "srct-worker"
 version = "0.1.0"
 dependencies = [
@@ -708,6 +746,15 @@ dependencies = [
  "serde_json",
  "srct-core",
  "srct-l2",
+]
+
+[[package]]
+name = "srct-zkml"
+version = "0.1.0"
+dependencies = [
+ "k256",
+ "rand",
+ "srct-core",
 ]
 
 [[package]]
