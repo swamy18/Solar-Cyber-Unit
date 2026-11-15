@@ -411,10 +411,7 @@ impl ComputeJob {
         // Version 2 appends throughput and bandwidth floors. Version 1 jobs
         // decode with both at 0, which every profile satisfies.
         let (min_units_per_sec, min_bandwidth_kbps) = if version == JOB_VERSION {
-            (
-                r.u32le().map_err(malformed)?,
-                r.u32le().map_err(malformed)?,
-            )
+            (r.u32le().map_err(malformed)?, r.u32le().map_err(malformed)?)
         } else {
             (0, 0)
         };

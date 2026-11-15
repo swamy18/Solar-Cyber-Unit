@@ -174,7 +174,11 @@ fn post_job(node: &Node, requester: &Wallet, units: u32, max_total: u64) -> Stri
     };
     let signed = srct_compute::SignedJob::sign(job, requester).unwrap();
     let hash = hex::encode(signed.hash());
-    let (s, body) = post(node, "/v1/compute/jobs", &json!({ "job_hex": hex::encode(signed.encode()) }));
+    let (s, body) = post(
+        node,
+        "/v1/compute/jobs",
+        &json!({ "job_hex": hex::encode(signed.encode()) }),
+    );
     assert_eq!(s, 200, "job post failed: {body}");
     hash
 }
@@ -309,7 +313,12 @@ fn post_ticket(
     body
 }
 
-fn build_exit(requester: &Wallet, nonce: u64, amount: u64, dest: &srct_core::hash::Address) -> String {
+fn build_exit(
+    requester: &Wallet,
+    nonce: u64,
+    amount: u64,
+    dest: &srct_core::hash::Address,
+) -> String {
     let payload =
         srct_core::l2::ExitQueuePayload::build(requester, nonce, amount, *dest, EXIT_FEE).unwrap();
     let tx = srct_core::l2::L2Transaction::new(srct_core::l2::L2Payload::ExitQueue(payload));
@@ -345,8 +354,16 @@ fn settle_claim(
     units: u32,
     height: u64,
 ) -> Value {
-    let t: [u8; 32] = hex::decode(ticket_hash).unwrap().try_into().map_err(|_| "x").unwrap();
-    let c: [u8; 32] = hex::decode(claim_hash).unwrap().try_into().map_err(|_| "x").unwrap();
+    let t: [u8; 32] = hex::decode(ticket_hash)
+        .unwrap()
+        .try_into()
+        .map_err(|_| "x")
+        .unwrap();
+    let c: [u8; 32] = hex::decode(claim_hash)
+        .unwrap()
+        .try_into()
+        .map_err(|_| "x")
+        .unwrap();
     let t_full = node
         .shared
         .lock()
@@ -364,8 +381,9 @@ fn settle_claim(
         .find(|x| x.hash() == c)
         .cloned()
         .expect("claim stored");
-    let r = srct_compute::ComputeReceipt::for_claim(&t_full, &c_full, units, [4u8; 32], 500, height, 7)
-        .unwrap();
+    let r =
+        srct_compute::ComputeReceipt::for_claim(&t_full, &c_full, units, [4u8; 32], 500, height, 7)
+            .unwrap();
     let signed = srct_compute::SignedReceipt::sign(r, provider).unwrap();
     let (s, body) = post(
         node,
@@ -463,7 +481,11 @@ fn first_claim_wins_and_second_refuses() {
     let c = srct_compute::ShardClaim {
         version: srct_compute::ticket::CLAIM_VERSION,
         network_id: NET.to_string(),
-        ticket: hex::decode(&th).unwrap().try_into().map_err(|_| "x").unwrap(),
+        ticket: hex::decode(&th)
+            .unwrap()
+            .try_into()
+            .map_err(|_| "x")
+            .unwrap(),
         provider: fast.address().unwrap(),
         units: 10,
         nonce: 1,
@@ -492,7 +514,16 @@ fn preauth_exit_fires_once_after_settlement_and_never_redirects() {
 
     // Designated ticket with a pre-signed exit for the exact total.
     let exit = build_exit(&r, 1, 2_000, &p.address().unwrap());
-    let t = post_ticket(&node, &r, &job, 10, 200, 1, Some(p.address().unwrap()), Some(exit));
+    let t = post_ticket(
+        &node,
+        &r,
+        &job,
+        10,
+        200,
+        1,
+        Some(p.address().unwrap()),
+        Some(exit),
+    );
     assert_eq!(t["preauth"], true);
     let th = t["ticket_hash"].as_str().unwrap().to_string();
 
@@ -556,7 +587,11 @@ fn preauth_exit_fires_once_after_settlement_and_never_redirects() {
         version: srct_compute::ticket::TICKET_VERSION,
         network_id: NET.to_string(),
         requester: r.address().unwrap(),
-        job: hex::decode(&job2).unwrap().try_into().map_err(|_| "x").unwrap(),
+        job: hex::decode(&job2)
+            .unwrap()
+            .try_into()
+            .map_err(|_| "x")
+            .unwrap(),
         shard: 0,
         units: 10,
         unit_price_sat: 200,

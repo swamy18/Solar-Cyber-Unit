@@ -749,7 +749,7 @@ fn post_ok(
 /// already on the board (idempotent rejoin).
 fn cmd_compute_join(args: &[String]) -> Result<i32, String> {
     use srct_compute::{
-        ComputeOffer, DeviceClass, DeviceProfile, Determinism, ProviderBond, SignedBond,
+        ComputeOffer, Determinism, DeviceClass, DeviceProfile, ProviderBond, SignedBond,
         SignedOffer, Verification, BOND_VERSION, OFFER_VERSION,
     };
 
@@ -845,7 +845,8 @@ fn cmd_compute_claim_ticket(args: &[String]) -> Result<i32, String> {
     use srct_compute::{ShardClaim, SignedClaim, SignedTicket, CLAIM_VERSION};
 
     let node_url = str_arg(args, "--node").ok_or("compute-claim-ticket needs --node <base-url>")?;
-    let file = str_arg(args, "--from-file").ok_or("compute-claim-ticket needs --from-file <wallet>")?;
+    let file =
+        str_arg(args, "--from-file").ok_or("compute-claim-ticket needs --from-file <wallet>")?;
     let network = str_arg(args, "--network")
         .map(String::as_str)
         .unwrap_or("mini");
@@ -854,7 +855,8 @@ fn cmd_compute_claim_ticket(args: &[String]) -> Result<i32, String> {
     let provider = wallet
         .address()
         .map_err(|e| format!("wallet unusable: {e}"))?;
-    let ticket_hex = str_arg(args, "--ticket").ok_or("compute-claim-ticket needs --ticket <hex>")?;
+    let ticket_hex =
+        str_arg(args, "--ticket").ok_or("compute-claim-ticket needs --ticket <hex>")?;
     let ticket_bytes = hex::decode(ticket_hex).map_err(|e| format!("--ticket: {e}"))?;
     let ticket = SignedTicket::decode(&ticket_bytes).map_err(|e| format!("ticket decode: {e}"))?;
     let claim = ShardClaim {
@@ -865,7 +867,8 @@ fn cmd_compute_claim_ticket(args: &[String]) -> Result<i32, String> {
         units: num_arg(args, "--units", 0)? as u32,
         nonce: num_arg(args, "--nonce", 0)?,
     };
-    let signed = SignedClaim::sign(claim, &wallet).map_err(|e| format!("claim sign failed: {e}"))?;
+    let signed =
+        SignedClaim::sign(claim, &wallet).map_err(|e| format!("claim sign failed: {e}"))?;
     let view = HttpNode::for_network(node_url, &params.network_id).map_err(|e| e.to_string())?;
     let posted = post_ok(
         &view,
@@ -890,20 +893,24 @@ fn cmd_compute_claim_ticket(args: &[String]) -> Result<i32, String> {
 fn cmd_compute_submit_receipt(args: &[String]) -> Result<i32, String> {
     use srct_compute::{ComputeReceipt, SignedClaim, SignedReceipt, SignedTicket};
 
-    let node_url = str_arg(args, "--node").ok_or("compute-submit-receipt needs --node <base-url>")?;
-    let file = str_arg(args, "--from-file").ok_or("compute-submit-receipt needs --from-file <wallet>")?;
+    let node_url =
+        str_arg(args, "--node").ok_or("compute-submit-receipt needs --node <base-url>")?;
+    let file =
+        str_arg(args, "--from-file").ok_or("compute-submit-receipt needs --from-file <wallet>")?;
     let network = str_arg(args, "--network")
         .map(String::as_str)
         .unwrap_or("mini");
     let params = NetworkParams::by_name(network).map_err(|e| e.to_string())?;
     let wallet = load_wallet(file)?;
-    let ticket_hex = str_arg(args, "--ticket").ok_or("compute-submit-receipt needs --ticket <hex>")?;
+    let ticket_hex =
+        str_arg(args, "--ticket").ok_or("compute-submit-receipt needs --ticket <hex>")?;
     let claim_hex = str_arg(args, "--claim").ok_or("compute-submit-receipt needs --claim <hex>")?;
     let ticket_bytes = hex::decode(ticket_hex).map_err(|e| format!("--ticket: {e}"))?;
     let claim_bytes = hex::decode(claim_hex).map_err(|e| format!("--claim: {e}"))?;
     let ticket = SignedTicket::decode(&ticket_bytes).map_err(|e| format!("ticket decode: {e}"))?;
     let claim = SignedClaim::decode(&claim_bytes).map_err(|e| format!("claim decode: {e}"))?;
-    let output_hex = str_arg(args, "--output").ok_or("compute-submit-receipt needs --output <hex>")?;
+    let output_hex =
+        str_arg(args, "--output").ok_or("compute-submit-receipt needs --output <hex>")?;
     let output_bytes = hex::decode(output_hex).map_err(|e| format!("--output: {e}"))?;
     if output_bytes.len() != 32 {
         return Err("--output must be exactly 32 bytes".to_string());
@@ -933,7 +940,10 @@ fn cmd_compute_submit_receipt(args: &[String]) -> Result<i32, String> {
     println!("receipt_hash  {}", hash_to_hex(&signed.hash()));
     println!(
         "auto_queued   {}",
-        settled.get("auto_queued").and_then(|v| v.as_bool()).unwrap_or(false)
+        settled
+            .get("auto_queued")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
     );
     Ok(0)
 }

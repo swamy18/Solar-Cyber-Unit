@@ -184,8 +184,7 @@ impl DeviceProfile {
             ));
         }
         if self.version == PROFILE_VERSION
-            && (self.claimed_units_per_sec == 0
-                || self.claimed_units_per_sec > MAX_UNITS_PER_SEC)
+            && (self.claimed_units_per_sec == 0 || self.claimed_units_per_sec > MAX_UNITS_PER_SEC)
         {
             return Err(ComputeError::Malformed(
                 "device throughput out of range".into(),

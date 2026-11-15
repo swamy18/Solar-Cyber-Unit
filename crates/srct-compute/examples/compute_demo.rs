@@ -74,7 +74,15 @@ fn main() {
 
     let offers = vec![
         offer(&phone, DeviceClass::Cpu, 2_048, 4, 8, 500, 10),
-        offer(&laptop, DeviceClass::AppleSilicon, 16_384, 10, 20, 2_000, 12),
+        offer(
+            &laptop,
+            DeviceClass::AppleSilicon,
+            16_384,
+            10,
+            20,
+            2_000,
+            12,
+        ),
         offer(&desktop, DeviceClass::Gpu, 65_536, 25, 20, 5_000, 7),
     ];
 

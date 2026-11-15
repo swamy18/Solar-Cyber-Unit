@@ -211,7 +211,7 @@ const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
 /// would mix scopes that must never meet. Version 10 appends the Smart Gate
 /// sections (grant registry, revocations, capability book) last; v8/v9 files
 /// migrate with empty gate state.
-    const STATE_ENVELOPE_VERSION: u8 = 16;
+const STATE_ENVELOPE_VERSION: u8 = 16;
 
 /// Largest entry count any single map section in the state envelope may
 /// declare, checked before allocation. Real books are bounded by their own
@@ -2024,10 +2024,7 @@ impl SharedNode {
                     (cb, pa)
                 } else {
                     r.expect_end().map_err(|e| format!("state envelope: {e}"))?;
-                    (
-                        srct_compute::ClaimBook::new(mine.clone()),
-                        BTreeMap::new(),
-                    )
+                    (srct_compute::ClaimBook::new(mine.clone()), BTreeMap::new())
                 };
                 (
                     co, cj, ca, cr, cp, ce, escrow, bonds, challenges, rb, claims, preauth,
@@ -8855,14 +8852,8 @@ fn bind_exit_to_payout(
         }
     };
     sh.l2_to_include.push(tx);
-    sh.compute_payout_exit.insert(
-        id,
-        EscrowExitBinding {
-            txid,
-            owner,
-            nonce,
-        },
-    );
+    sh.compute_payout_exit
+        .insert(id, EscrowExitBinding { txid, owner, nonce });
     Ok((txid, true))
 }
 
@@ -8918,7 +8909,10 @@ fn try_auto_preauth(
                 "compute_preauth_skipped",
                 Some(id),
                 None,
-                format!("stored exit refused at settle time: {status} {}", body.0.detail),
+                format!(
+                    "stored exit refused at settle time: {status} {}",
+                    body.0.detail
+                ),
             );
             false
         }
@@ -9290,7 +9284,9 @@ async fn compute_receipt_post(
             ),
             _ => fail(StatusCode::BAD_REQUEST, "invalid_receipt", e.to_string()),
         };
-        let (payout, preauth_key) = if let Some(assignment) = sh.compute_assignments.get(&auth_id).cloned() {
+        let (payout, preauth_key) = if let Some(assignment) =
+            sh.compute_assignments.get(&auth_id).cloned()
+        {
             // Push path: the receipt fulfils a planned assignment.
             let payout = sh
                 .compute_escrow
@@ -9356,9 +9352,9 @@ async fn compute_receipt_post(
                         format!("ledger diverged from escrow: {e}"),
                     )
                 })?;
-            if let Err(e) = sh
-                .compute_bonds
-                .record_claim_settlement(&signed_receipt, &ticket, &claim)
+            if let Err(e) =
+                sh.compute_bonds
+                    .record_claim_settlement(&signed_receipt, &ticket, &claim)
             {
                 return Err(fail(
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -9514,7 +9510,11 @@ async fn compute_assign_post(
                 a.units,
                 a.total_sat,
                 address_to_hex(&a.provider),
-                if preauth { " (payout pre-authorized)" } else { "" },
+                if preauth {
+                    " (payout pre-authorized)"
+                } else {
+                    ""
+                },
             ),
         );
         Ok(Json(json!({
@@ -9571,14 +9571,13 @@ async fn compute_ticket_post(
     State(state): State<ApiState>,
     Json(req): Json<ComputeTicketReq>,
 ) -> ApiResult {
-    let bytes = hex::decode(&req.ticket_hex).map_err(|e| bad(format!("ticket_hex is not hex: {e}")))?;
+    let bytes =
+        hex::decode(&req.ticket_hex).map_err(|e| bad(format!("ticket_hex is not hex: {e}")))?;
     let signed = srct_compute::SignedTicket::decode(&bytes)
         .map_err(|e| fail(StatusCode::BAD_REQUEST, "invalid_ticket", e.to_string()))?;
     let exit_bytes = req
         .exit_tx_hex
-        .map(|h| {
-            hex::decode(&h).map_err(|e| bad(format!("exit_tx_hex is not hex: {e}")))
-        })
+        .map(|h| hex::decode(&h).map_err(|e| bad(format!("exit_tx_hex is not hex: {e}"))))
         .transpose()?;
     with_shared(&state, |sh| {
         let network = sh.chain.params().network_id.clone();
@@ -9654,7 +9653,9 @@ async fn compute_ticket_post(
                 "ticket for {} units at {} sat to {}",
                 t.units,
                 t.total_sat,
-                t.provider.map(|p| address_to_hex(&p)).unwrap_or_else(|| "open".into())
+                t.provider
+                    .map(|p| address_to_hex(&p))
+                    .unwrap_or_else(|| "open".into())
             ),
         );
         Ok(Json(json!({
@@ -9714,7 +9715,8 @@ async fn compute_claim_post(
     State(state): State<ApiState>,
     Json(req): Json<ComputeClaimReq>,
 ) -> ApiResult {
-    let bytes = hex::decode(&req.claim_hex).map_err(|e| bad(format!("claim_hex is not hex: {e}")))?;
+    let bytes =
+        hex::decode(&req.claim_hex).map_err(|e| bad(format!("claim_hex is not hex: {e}")))?;
     let signed = srct_compute::SignedClaim::decode(&bytes)
         .map_err(|e| fail(StatusCode::BAD_REQUEST, "invalid_claim", e.to_string()))?;
     with_shared(&state, |sh| {
@@ -10342,29 +10344,32 @@ async fn compute_bond_dispute(
             ),
             _ => fail(StatusCode::BAD_REQUEST, "invalid_dispute", e.to_string()),
         };
-        let remaining =
-            if let Some(assignment) = sh.compute_assignments.get(&dispute.dispute.assignment).cloned() {
-                // Push path: dispute binds a planned assignment.
-                sh.compute_bonds
-                    .slash(&dispute, &assignment, height)
-                    .map_err(map_dispute_err)?
-            } else {
-                // Pull path: dispute binds a ticket claim.
-                let claim = sh
-                    .compute_claims
-                    .all_claims()
-                    .find(|c| c.hash() == dispute.dispute.assignment)
-                    .cloned()
-                    .ok_or_else(|| not_found("unknown compute assignment or claim"))?;
-                let ticket = sh
-                    .compute_claims
-                    .ticket(&claim.claim.ticket)
-                    .cloned()
-                    .ok_or_else(|| not_found("the claim's ticket is no longer on the board"))?;
-                sh.compute_bonds
-                    .slash_for_claim(&dispute, &ticket, &claim, height)
-                    .map_err(map_dispute_err)?
-            };
+        let remaining = if let Some(assignment) = sh
+            .compute_assignments
+            .get(&dispute.dispute.assignment)
+            .cloned()
+        {
+            // Push path: dispute binds a planned assignment.
+            sh.compute_bonds
+                .slash(&dispute, &assignment, height)
+                .map_err(map_dispute_err)?
+        } else {
+            // Pull path: dispute binds a ticket claim.
+            let claim = sh
+                .compute_claims
+                .all_claims()
+                .find(|c| c.hash() == dispute.dispute.assignment)
+                .cloned()
+                .ok_or_else(|| not_found("unknown compute assignment or claim"))?;
+            let ticket = sh
+                .compute_claims
+                .ticket(&claim.claim.ticket)
+                .cloned()
+                .ok_or_else(|| not_found("the claim's ticket is no longer on the board"))?;
+            sh.compute_bonds
+                .slash_for_claim(&dispute, &ticket, &claim, height)
+                .map_err(map_dispute_err)?
+        };
         audit_push(
             sh,
             "compute_bond_slash",

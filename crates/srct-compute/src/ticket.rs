@@ -29,9 +29,7 @@ use srct_core::ser::{Reader, Writer};
 use srct_core::sig::{verify_bundle, Bundle};
 use srct_core::wallet::Wallet;
 
-use crate::device::{
-    Determinism, MAX_BANDWIDTH_KBPS, MAX_RAM_MIB, MAX_UNITS_PER_SEC, MIN_RAM_MIB,
-};
+use crate::device::{Determinism, MAX_BANDWIDTH_KBPS, MAX_RAM_MIB, MAX_UNITS_PER_SEC, MIN_RAM_MIB};
 use crate::market::{Verification, MAX_JOB_UNITS};
 use crate::settle::{decode_signed, encode_signed};
 use crate::ComputeError;
@@ -184,15 +182,11 @@ impl ClaimTicket {
         let min_ram_mib = r.u32le().map_err(malformed)?;
         let min_units_per_sec = r.u32le().map_err(malformed)?;
         let min_bandwidth_kbps = r.u32le().map_err(malformed)?;
-        let determinism =
-            Determinism::from_u8(r.u8().map_err(malformed)?).ok_or_else(|| {
-                ComputeError::Malformed("ticket determinism class".into())
-            })?;
+        let determinism = Determinism::from_u8(r.u8().map_err(malformed)?)
+            .ok_or_else(|| ComputeError::Malformed("ticket determinism class".into()))?;
         let required_kernel: Hash = r.fixed().map_err(malformed)?;
-        let min_verification =
-            Verification::from_u8(r.u8().map_err(malformed)?).ok_or_else(|| {
-                ComputeError::Malformed("ticket verification level".into())
-            })?;
+        let min_verification = Verification::from_u8(r.u8().map_err(malformed)?)
+            .ok_or_else(|| ComputeError::Malformed("ticket verification level".into()))?;
         let sealed_input = r.u8().map_err(malformed)?;
         if sealed_input > 1 {
             return Err(ComputeError::Malformed("ticket sealed-input flag".into()));
@@ -288,11 +282,7 @@ impl SignedTicket {
     pub fn decode(bytes: &[u8]) -> Result<Self, ComputeError> {
         let (body, sigs, keys) = decode_signed(bytes, "ticket")?;
         let ticket = ClaimTicket::decode(&body)?;
-        let signed = SignedTicket {
-            ticket,
-            sigs,
-            keys,
-        };
+        let signed = SignedTicket { ticket, sigs, keys };
         signed.verify()?;
         Ok(signed)
     }
@@ -328,7 +318,9 @@ impl ShardClaim {
             return Err(ComputeError::Malformed("claim network id length".into()));
         }
         if self.ticket == [0u8; 32] {
-            return Err(ComputeError::Malformed("claim names an empty ticket".into()));
+            return Err(ComputeError::Malformed(
+                "claim names an empty ticket".into(),
+            ));
         }
         if self.units == 0 || self.units > MAX_JOB_UNITS {
             return Err(ComputeError::Malformed("claim units out of range".into()));
@@ -429,11 +421,7 @@ impl SignedClaim {
     pub fn decode(bytes: &[u8]) -> Result<Self, ComputeError> {
         let (body, sigs, keys) = decode_signed(bytes, "claim")?;
         let claim = ShardClaim::decode(&body)?;
-        let signed = SignedClaim {
-            claim,
-            sigs,
-            keys,
-        };
+        let signed = SignedClaim { claim, sigs, keys };
         signed.verify()?;
         Ok(signed)
     }
@@ -608,7 +596,9 @@ impl ClaimBook {
         let mut r = Reader::new(bytes);
         let net_len = r.u16le().map_err(malformed)? as usize;
         if net_len == 0 || net_len > srct_core::agent::MAX_NETWORK_ID_LEN {
-            return Err(ComputeError::Malformed("claim book network id length".into()));
+            return Err(ComputeError::Malformed(
+                "claim book network id length".into(),
+            ));
         }
         let net_bytes = r.fixed_slice(net_len).map_err(malformed)?;
         let stored = std::str::from_utf8(net_bytes)

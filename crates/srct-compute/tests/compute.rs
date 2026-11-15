@@ -27,7 +27,14 @@ fn profile(
     kernel: Hash,
 ) -> DeviceProfile {
     DeviceProfile::new(
-        class, determinism, ram_mib, 8, shard, 50_000, throughput_per_sec, kernel,
+        class,
+        determinism,
+        ram_mib,
+        8,
+        shard,
+        50_000,
+        throughput_per_sec,
+        kernel,
     )
 }
 

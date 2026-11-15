@@ -3,9 +3,9 @@
 
 use srct_compute::market::Verification;
 use srct_compute::{
-    ChallengeBook, ClaimBook, ClaimTicket, ComputeError, ComputeLedger, ComputeReceipt, Determinism,
-    EscrowBook, EscrowFunding, ShardClaim, SignedClaim, SignedFunding, SignedReceipt, SignedTicket,
-    ESCROW_VERSION,
+    ChallengeBook, ClaimBook, ClaimTicket, ComputeError, ComputeLedger, ComputeReceipt,
+    Determinism, EscrowBook, EscrowFunding, ShardClaim, SignedClaim, SignedFunding, SignedReceipt,
+    SignedTicket, ESCROW_VERSION,
 };
 use srct_core::hash::Hash;
 use srct_core::wallet::Wallet;
@@ -84,7 +84,10 @@ fn ticket_sign_verify_and_tamper_refusal() {
     let provider = wallet(2);
     let t = ticket(&requester, [9u8; 32], 10, 5, 100, 1, None);
     t.verify().unwrap();
-    assert_eq!(t.hash(), ticket(&requester, [9u8; 32], 10, 5, 100, 1, None).hash());
+    assert_eq!(
+        t.hash(),
+        ticket(&requester, [9u8; 32], 10, 5, 100, 1, None).hash()
+    );
 
     // A stranger cannot re-sign the terms.
     assert!(SignedTicket::sign(t.ticket.clone(), &provider).is_err());
@@ -108,10 +111,7 @@ fn first_valid_claim_wins_and_replays_refuse() {
     book.post(&t, 5).unwrap();
 
     // Duplicate posting is a replay, not a second ticket.
-    assert_eq!(
-        book.post(&t, 5),
-        Err(ComputeError::Replay)
-    );
+    assert_eq!(book.post(&t, 5), Err(ComputeError::Replay));
 
     // Slow provider's claim lands first and wins.
     let won = claim(&slow, &t, 1);

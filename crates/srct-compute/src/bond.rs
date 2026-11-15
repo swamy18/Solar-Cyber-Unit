@@ -872,8 +872,7 @@ impl BondBook {
         // Multiply before dividing: `amount / 10_000 * bps` truncates to zero
         // for any bond under 10,000 sat, which would make small-bond slashes
         // no-ops. u128 arithmetic cannot overflow here (both inputs are u64).
-        let penalty =
-            (bond.amount_sat as u128 * d.reason.penalty_bps() as u128 / 10_000) as u64;
+        let penalty = (bond.amount_sat as u128 * d.reason.penalty_bps() as u128 / 10_000) as u64;
         bond.amount_sat -= penalty;
         self.reputation.entry(d.provider).or_default().slashes += 1;
         Ok(bond.amount_sat)
@@ -964,12 +963,10 @@ impl BondBook {
     /// caps at `u64::MAX`, never wraps.
     pub fn capacity(&self, provider: &Address) -> u64 {
         let bonded = self.bonds.get(provider).map(|b| b.amount_sat).unwrap_or(0);
-        bonded
-            .saturating_mul(MAX_EXPOSURE_MULT)
-            .saturating_add(
-                self.effective_units(provider)
-                    .saturating_mul(SETTLED_UNIT_CREDIT_SAT),
-            )
+        bonded.saturating_mul(MAX_EXPOSURE_MULT).saturating_add(
+            self.effective_units(provider)
+                .saturating_mul(SETTLED_UNIT_CREDIT_SAT),
+        )
     }
 
     /// Count settled units from a ticket claim toward reputation and the
@@ -1023,7 +1020,8 @@ impl BondBook {
     }
 
     /// Count one timed-out assignment against a provider.
-    pub fn record_timeout(        &mut self,
+    pub fn record_timeout(
+        &mut self,
         assignment: &SignedAssignment,
         height: u64,
     ) -> Result<(), ComputeError> {
@@ -1099,8 +1097,7 @@ impl BondBook {
             .bonds
             .get_mut(&d.provider)
             .ok_or(ComputeError::NotBonded)?;
-        let penalty =
-            (bond.amount_sat as u128 * d.reason.penalty_bps() as u128 / 10_000) as u64;
+        let penalty = (bond.amount_sat as u128 * d.reason.penalty_bps() as u128 / 10_000) as u64;
         bond.amount_sat -= penalty;
         self.reputation.entry(d.provider).or_default().slashes += 1;
         Ok(bond.amount_sat)
