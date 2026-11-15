@@ -173,6 +173,10 @@ pub struct NodeState<'a> {
     /// the node rather than by this layer so it survives across polls; see
     /// `srct_node::mediation` for what the node does with a reaching quorum.
     pub votes: &'a mut srct_core::arbitration::VoteBook,
+    /// Inbound Smart Gate revocations, verified per statement. Owned by the
+    /// node so it survives across polls; the node drains them into its own
+    /// revocation set through the same path as its HTTP revoke endpoint.
+    pub revokes: &'a mut srct_core::guard::GuardRevokeBook,
 }
 
 impl<'a> NodeState<'a> {
@@ -187,6 +191,7 @@ impl<'a> NodeState<'a> {
             syncer: self.syncer,
             relay: self.relay,
             votes: self.votes,
+            revokes: self.revokes,
         }
     }
 }
@@ -577,6 +582,25 @@ impl P2pNode {
         }
     }
 
+    /// Relay a verified Smart Gate revocation to every peer.
+    ///
+    /// Complete statement rather than a hash, for the same reason
+    /// `broadcast_vote` carries the whole vote: the receiver verifies the
+    /// owner's signature itself, and there is no revocation store to serve a
+    /// getdata from.
+    ///
+    /// The caller must have verified the statement first
+    /// (`GuardRevokeBook::record`, against this node's own network id) — for
+    /// the same amplifier reason as votes. A peer receiving a revocation that
+    /// fails its own checks drops it and does not re-relay, so a bad revoke
+    /// travels at most one hop.
+    pub fn broadcast_revoke(&self, msg: crate::msg::GuardRevokeMsg) {
+        let peers = self.peers.lock().unwrap_or_else(|e| e.into_inner()); // poison-tolerant: a prior panic while holding the lock must not cascade into a node shutdown
+        for peer in peers.values() {
+            let _ = peer.send(crate::msg::Message::GuardRevoke(msg.clone()));
+        }
+    }
+
     /// Announce transaction ids to all peers except `exclude_peer` (§13.14).
     ///
     /// The caller is expected to have admitted these to its own pool first.
@@ -802,6 +826,7 @@ impl P2pNode {
             syncer,
             relay,
             votes,
+            revokes,
         } = state;
         match msg {
             Message::GetBlocks { locator, stop } => {
@@ -1073,6 +1098,39 @@ impl P2pNode {
                     for (id, peer) in peers.iter() {
                         if *id != peer_id {
                             let _ = peer.send(Message::ArbitrationVote(vote.clone()));
+                        }
+                    }
+                }
+            }
+            Message::GuardRevoke(revoke) => {
+                // Same flood gate as votes and checkpoints: revokes are as
+                // cheap to forge structurally as either (§13.8).
+                let clock = now_ms.unwrap_or_else(crate::net::now_ms);
+                if !relay.allow_control_from(peer_id, clock) {
+                    let peers = self.peers.lock().unwrap_or_else(|e| e.into_inner()); // poison-tolerant: a prior panic while holding the lock must not cascade into a node shutdown
+                    if let Some(peer) = peers.get(&peer_id) {
+                        peer.add_ban_score(INBOUND_VIOLATION_SCORE);
+                    }
+                    return;
+                }
+                // Record against this node's own network id — never the
+                // sender's say-so — then relay only what this node itself
+                // accepts, so a revoke that fails verification here does not
+                // travel further. The book is the relay accumulator; the node
+                // applies drained revocations through its own revoke path.
+                let accepted = revokes
+                    .record(
+                        &revoke.policy,
+                        &revoke.sigs,
+                        &revoke.keys,
+                        &chain.params().network_id,
+                    )
+                    .is_ok();
+                if accepted {
+                    let peers = self.peers.lock().unwrap_or_else(|e| e.into_inner()); // poison-tolerant: a prior panic while holding the lock must not cascade into a node shutdown
+                    for (id, peer) in peers.iter() {
+                        if *id != peer_id {
+                            let _ = peer.send(Message::GuardRevoke(revoke.clone()));
                         }
                     }
                 }

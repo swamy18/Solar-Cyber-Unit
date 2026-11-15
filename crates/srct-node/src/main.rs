@@ -2210,6 +2210,12 @@ fn cmd_serve(args: &Args) -> Result<(), String> {
     // persisted — see `srct_node::mediation` for why losing it costs only the
     // ability to *propose*, never the ability to verify or relay.
     let mut votes = srct_core::arbitration::VoteBook::new();
+    // Smart Gate revocation relay: inbound revokes, verified by the net layer
+    // against this node's own network id. Not persisted — the net layer
+    // re-verifies every statement, and the node applies drained revocations
+    // through the same path as its HTTP revoke endpoint (tombstone +
+    // descendant propagation in `state.bin`).
+    let mut revoke_book = srct_core::guard::GuardRevokeBook::new();
     // L2 follows the tip by replay; nothing L2 is persisted.
     let l2 = NodeL2::replay_from(&chain, &store.params).map_err(|e| e.to_string())?;
     let mut l2_skipped_seen = l2.skipped().len();
@@ -2523,9 +2529,51 @@ fn cmd_serve(args: &Args) -> Result<(), String> {
                 syncer: &mut syncer,
                 relay: &mut relay,
                 votes: &mut votes,
+                revokes: &mut revoke_book,
             },
             Some(now_ms()),
         );
+
+        // Smart Gate revocation relay. Statements the net layer verified land
+        // in `revoke_book`; each is applied through the same path as the HTTP
+        // revoke endpoint (registry lookup, descendant propagation, book
+        // forget), and newly applied ones are relayed onward. Then locally
+        // created revokes queued by `POST /v1/guard/revoke` are broadcast.
+        // Relay-if-accepted both ways: this node never amplifies a statement
+        // it did not itself verify, so a bad revoke travels at most one hop.
+        for rev in revoke_book.drain() {
+            let target = rev.target();
+            match srct_node::api::apply_guard_revocation(
+                &mut *sh,
+                &rev.policy,
+                &rev.sigs,
+                &rev.keys,
+            ) {
+                Ok((_, true)) => {
+                    node.broadcast_revoke(srct_net::msg::GuardRevokeMsg {
+                        policy: rev.policy.serialize(),
+                        sigs: rev.sigs.to_bytes(),
+                        keys: rev.keys.to_bytes(),
+                    });
+                    println!(
+                        "guard          revoke applied and relayed for grant {}",
+                        &hash_to_hex(&target)[..16]
+                    );
+                }
+                Ok((_, false)) => {}
+                Err((status, body)) => {
+                    eprintln!(
+                        "guard          p2p revoke refused ({status} {}): {}",
+                        body.0.error, body.0.detail
+                    );
+                }
+            }
+        }
+        let pending_revokes: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> =
+            std::mem::take(&mut sh.revoke_broadcast);
+        for (policy, sigs, keys) in pending_revokes {
+            node.broadcast_revoke(srct_net::msg::GuardRevokeMsg { policy, sigs, keys });
+        }
 
         // §13.6 reconnect sweep: dial back to bootnodes and address-book peers
         // that dropped. Tries at most one address per cycle (3 s timeout) so

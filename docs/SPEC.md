@@ -965,6 +965,17 @@ certificate is not relayed. The payload is `CheckpointPayload.serialize()` (§14
 every length field is bounded (`MAX_CHECKPOINT_PAYLOAD_BYTES`,
 `MAX_SIGNER_BITMAP_BYTES`) before allocation, per the rule below.
 
+`msg_type = 12` (`ArbitrationVote`) and `msg_type = 13` (`GuardRevoke`) are
+additive under the same freeze rule. Each carries a complete signed statement
+— a fraud-arbitration vote, or an owner-signed grant revocation — never an id
+to fetch, because no store serves them. A receiver verifies the statement
+against its own chain (committee + height for votes; owner signature, network
+id and revoked flag for revokes), files what verifies, and relays only what
+it accepted, so a statement that fails verification travels at most one hop.
+Votes are tallied per dispute by the node; revokes are applied through the
+node's own revoke path (registry lookup, descendant propagation, book forget)
+and locally created revokes are queued for broadcast. Neither moves consensus.
+
 Every `count` field MUST be bounded by the smallest entry that could follow,
 checked before allocating — `INV` entries are 65 bytes, `ADDR` entries 18,
 `GETBLOCKS` locators 64. Bounding by remaining bytes alone is the defect already

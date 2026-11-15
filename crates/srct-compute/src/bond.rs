@@ -51,6 +51,9 @@ pub const BAN_SCORE: i64 = -100;
 pub const TIMEOUT_PENALTY: i64 = 10;
 /// Reputation cost of one slash.
 pub const SLASH_PENALTY: i64 = 100;
+/// Cap for persisted bonds, reputations and single-use id sets. Bounds the
+/// worst-case allocation when decoding an untrusted `state.bin` section.
+pub const MAX_BONDS: usize = 100_000;
 
 const DOM_BOND: &[u8] = b"srct/compute/bond/v1";
 const DOM_WITHDRAW: &[u8] = b"srct/compute/withdraw/v1";
@@ -560,6 +563,113 @@ impl BondBook {
 
     pub fn network_id(&self) -> &str {
         &self.network_id
+    }
+
+    /// Encode the whole book for `state.bin`.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = Writer::with_capacity(64 + self.bonds.len() * 160);
+        w.u16le(self.network_id.len() as u16)
+            .raw(self.network_id.as_bytes());
+        w.u32le(self.bonds.len() as u32);
+        for (provider, bond) in &self.bonds {
+            let bond_bytes = bond.encode();
+            w.fixed(provider)
+                .u32le(bond_bytes.len() as u32)
+                .raw(&bond_bytes);
+        }
+        w.u32le(self.reputation.len() as u32);
+        for (provider, rep) in &self.reputation {
+            w.fixed(provider)
+                .u64le(rep.settled_units)
+                .u64le(rep.settled_count)
+                .u64le(rep.timeouts)
+                .u64le(rep.slashes);
+        }
+        for set in [&self.registrations, &self.withdrawals, &self.disputes] {
+            w.u32le(set.len() as u32);
+            for h in set {
+                w.fixed(h);
+            }
+        }
+        w.into_vec()
+    }
+
+    /// Decode a book written by [`BondBook::encode`]. Fail-closed: any
+    /// truncation, trailing garbage, over-cap count, duplicate id, network
+    /// mismatch or inconsistent bond entry refuses the whole blob. Bonds
+    /// re-verify through their own codec.
+    pub fn decode(bytes: &[u8], network_id: &str) -> Result<Self, ComputeError> {
+        let mut r = Reader::new(bytes);
+        let net_len = r.u16le().map_err(malformed)? as usize;
+        if net_len == 0 || net_len > MAX_NETWORK_ID_LEN {
+            return Err(ComputeError::Malformed("bond network id length".into()));
+        }
+        let net_bytes = r.fixed_slice(net_len).map_err(malformed)?;
+        let stored = std::str::from_utf8(net_bytes)
+            .map_err(|_| ComputeError::Malformed("bond network is not utf-8".into()))?;
+        if stored != network_id {
+            return Err(ComputeError::WrongNetwork);
+        }
+        let mut bonds = BTreeMap::new();
+        let n_bonds = r.u32le().map_err(malformed)? as usize;
+        if n_bonds > MAX_BONDS {
+            return Err(ComputeError::Malformed("bonds over cap".into()));
+        }
+        for _ in 0..n_bonds {
+            let provider: Address = r.fixed().map_err(malformed)?;
+            let bond_len = r.u32le().map_err(malformed)? as usize;
+            if bond_len > 8 * 1024 {
+                return Err(ComputeError::Malformed("bond over cap".into()));
+            }
+            let bond_bytes = r.fixed_slice(bond_len).map_err(malformed)?;
+            let bond = ProviderBond::decode(bond_bytes)?;
+            if bond.provider != provider {
+                return Err(ComputeError::Malformed("bond provider mismatch".into()));
+            }
+            if bonds.insert(provider, bond).is_some() {
+                return Err(ComputeError::Malformed("duplicate bond".into()));
+            }
+        }
+        let mut reputation = BTreeMap::new();
+        let n_rep = r.u32le().map_err(malformed)? as usize;
+        if n_rep > MAX_BONDS {
+            return Err(ComputeError::Malformed("reputations over cap".into()));
+        }
+        for _ in 0..n_rep {
+            let provider: Address = r.fixed().map_err(malformed)?;
+            let rep = Reputation {
+                settled_units: r.u64le().map_err(malformed)?,
+                settled_count: r.u64le().map_err(malformed)?,
+                timeouts: r.u64le().map_err(malformed)?,
+                slashes: r.u64le().map_err(malformed)?,
+            };
+            if reputation.insert(provider, rep).is_some() {
+                return Err(ComputeError::Malformed("duplicate reputation".into()));
+            }
+        }
+        let mut sets = [BTreeSet::new(), BTreeSet::new(), BTreeSet::new()];
+        for set in sets.iter_mut() {
+            let n = r.u32le().map_err(malformed)? as usize;
+            if n > MAX_BONDS {
+                return Err(ComputeError::Malformed("bond set over cap".into()));
+            }
+            for _ in 0..n {
+                let h: Hash = r.fixed().map_err(malformed)?;
+                if !set.insert(h) {
+                    return Err(ComputeError::Malformed("duplicate bond id".into()));
+                }
+            }
+        }
+        r.expect_end().map_err(malformed)?;
+        let [registrations, withdrawals, disputes] = sets;
+        Ok(BondBook {
+            network_id: network_id.into(),
+            bonds,
+            reputation,
+            registrations,
+            withdrawals,
+            disputes,
+        })
     }
 
     /// A provider's current bond, if any.

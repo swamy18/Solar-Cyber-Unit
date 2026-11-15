@@ -17,6 +17,7 @@
 use crate::agent::AgentId;
 use crate::hash::{sha256_dom, Address, Hash};
 use crate::ser::{Reader, Writer};
+use crate::sig::Bundle;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Version of the infra grant encoding. A future format MUST use a new value.
@@ -2553,5 +2554,118 @@ mod tests {
             ),
             Decision::Deny(GuardError::BadCredential(_))
         ));
+    }
+}
+
+/// Most verified P2P revocations one node accumulates before refusing new
+/// ones. Cap-with-refusal like the guard registry: an unbounded book is a
+/// remote memory button, and a rotation that outruns the cap is an operator
+/// job (re-grant under a fresh agent id), not a silent eviction.
+pub const MAX_GUARD_REVOKE_BOOK: usize = 4096;
+
+/// One owner-signed grant revocation, verified and ready to apply.
+///
+/// The statement is the grant itself with `revoked` set, signed by the owner
+/// — exactly what `POST /v1/guard/revoke` accepts. Carrying the full grant
+/// (rather than a hash) means a receiving node verifies the owner's signature
+/// itself instead of trusting the sender, which is what makes relay safe.
+#[derive(Debug, Clone)]
+pub struct GuardRevocation {
+    /// The revoked grant bytes as received (with `revoked` set).
+    pub policy: InfraPolicy,
+    pub sigs: Bundle,
+    pub keys: Bundle,
+}
+
+impl GuardRevocation {
+    /// The registry hash this revocation kills (flag cleared first, because
+    /// the revoked statement hashes differently from the live grant).
+    pub fn target(&self) -> Hash {
+        let mut original = self.policy.clone();
+        original.revoked = false;
+        original.hash()
+    }
+}
+
+/// Verified grant revocations heard over P2P, keyed by the grant they kill.
+///
+/// A transport accumulator like `VoteBook`: recording verifies the owner's
+/// signature against this node's expectations (right network, revoked flag
+/// set, signer is the owner) and nothing else. Enforcement — registry lookup,
+/// descendant propagation, book forgetting — stays in the node, which applies
+/// drained revocations through the same path as its HTTP revoke endpoint.
+#[derive(Debug, Clone, Default)]
+pub struct GuardRevokeBook {
+    revocations: BTreeMap<Hash, GuardRevocation>,
+}
+
+impl GuardRevokeBook {
+    pub fn new() -> Self {
+        GuardRevokeBook::default()
+    }
+
+    pub fn len(&self) -> usize {
+        self.revocations.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.revocations.is_empty()
+    }
+
+    /// Verify a received revocation and file it. Idempotent: a revocation for
+    /// an already-filed grant returns its target without growing the book.
+    /// Returns the registry hash the revocation kills.
+    pub fn record(
+        &mut self,
+        policy_bytes: &[u8],
+        sigs_bytes: &[u8],
+        keys_bytes: &[u8],
+        network_id: &str,
+    ) -> Result<Hash, GuardError> {
+        if policy_bytes.len() > 4096 || sigs_bytes.len() > 8192 || keys_bytes.len() > 8192 {
+            return Err(GuardError::Malformed("revocation over cap"));
+        }
+        let policy = InfraPolicy::deserialize(policy_bytes)
+            .map_err(|_| GuardError::Malformed("revocation policy malformed"))?;
+        if !policy.revoked {
+            return Err(GuardError::Malformed("revocation names a live grant"));
+        }
+        if policy.network_id != network_id {
+            return Err(GuardError::NetworkMismatch);
+        }
+        let sigs = Bundle::deserialize(sigs_bytes)
+            .map_err(|_| GuardError::Malformed("revocation sigs"))?;
+        let keys = Bundle::deserialize(keys_bytes)
+            .map_err(|_| GuardError::Malformed("revocation keys"))?;
+        let owner = keys
+            .address()
+            .map_err(|_| GuardError::Malformed("revocation keys have no address"))?;
+        if owner != policy.owner {
+            return Err(GuardError::Malformed("revocation signer is not the owner"));
+        }
+        crate::sig::verify_bundle(&sigs, &keys, &policy.signing_hash())
+            .map_err(|_| GuardError::Malformed("revocation signature invalid"))?;
+        let mut original = policy.clone();
+        original.revoked = false;
+        let target = original.hash();
+        if self.revocations.contains_key(&target) {
+            return Ok(target);
+        }
+        if self.revocations.len() >= MAX_GUARD_REVOKE_BOOK {
+            return Err(GuardError::BookFull {
+                cap: MAX_GUARD_REVOKE_BOOK,
+            });
+        }
+        self.revocations
+            .insert(target, GuardRevocation { policy, sigs, keys });
+        Ok(target)
+    }
+
+    /// Take every filed revocation, clearing the book. The node applies each
+    /// through its revoke path and relays the accepted ones.
+    pub fn drain(&mut self) -> Vec<GuardRevocation> {
+        std::mem::take(&mut self.revocations)
+            .into_values()
+            .collect()
     }
 }

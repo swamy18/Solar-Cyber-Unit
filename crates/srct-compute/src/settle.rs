@@ -222,6 +222,40 @@ pub struct PayoutInstruction {
     pub receipt: Hash,
 }
 
+impl PayoutInstruction {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = Writer::with_capacity(20 + 20 + 8 + 32 * 3);
+        w.fixed(&self.from)
+            .fixed(&self.to)
+            .u64le(self.amount_sat)
+            .fixed(&self.job)
+            .fixed(&self.assignment)
+            .fixed(&self.receipt);
+        w.into_vec()
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, ComputeError> {
+        let mut r = Reader::new(bytes);
+        let payout = PayoutInstruction {
+            from: r.fixed().map_err(malformed)?,
+            to: r.fixed().map_err(malformed)?,
+            amount_sat: r.u64le().map_err(malformed)?,
+            job: r.fixed().map_err(malformed)?,
+            assignment: r.fixed().map_err(malformed)?,
+            receipt: r.fixed().map_err(malformed)?,
+        };
+        r.expect_end().map_err(malformed)?;
+        if payout.amount_sat == 0 {
+            return Err(ComputeError::Malformed("payout amount is zero".into()));
+        }
+        if payout.job == [0u8; 32] || payout.assignment == [0u8; 32] || payout.receipt == [0u8; 32]
+        {
+            return Err(ComputeError::Malformed("payout names an empty id".into()));
+        }
+        Ok(payout)
+    }
+}
+
 /// Settlement state of one assignment.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SettlementStatus {
@@ -262,6 +296,30 @@ impl ComputeLedger {
 
     pub fn settled_total_sat(&self) -> u64 {
         self.settled.values().map(|p| p.amount_sat).sum()
+    }
+
+    /// Restore a settled payout on restart.
+    ///
+    /// The payout was verified when it was first recorded and `state.bin` is
+    /// digest-checked with a fail-closed load, so replay re-inserts without
+    /// re-applying the deadline/height checks that only held at settle time.
+    /// Verification of the underlying receipt and assignment is the caller's
+    /// job before calling this (the node re-decodes both from its stores).
+    pub fn restore(&mut self, payout: PayoutInstruction) -> Result<(), ComputeError> {
+        if payout.amount_sat == 0
+            || payout.job == [0u8; 32]
+            || payout.assignment == [0u8; 32]
+            || payout.receipt == [0u8; 32]
+        {
+            return Err(ComputeError::Malformed("payout names an empty id".into()));
+        }
+        if self.settled.contains_key(&payout.assignment)
+            || self.expired.contains(&payout.assignment)
+        {
+            return Err(ComputeError::Replay);
+        }
+        self.settled.insert(payout.assignment, payout);
+        Ok(())
     }
 
     /// Verify a receipt against its assignment and record the payout.

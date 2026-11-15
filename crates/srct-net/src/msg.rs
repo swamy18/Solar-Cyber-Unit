@@ -5,12 +5,12 @@
 //! little-endian; short handshake strings (network_id, user_agent) are
 //! length-prefixed by a single byte, both being bounded to 64.
 
+use crate::error::{NetError, NetResult};
+use srct_core::arbitration::ArbitrationVote;
 use srct_core::block::Block;
 use srct_core::hash::Hash512;
 use srct_core::ser::{Reader, Writer};
 use srct_core::tx::Transaction;
-
-use crate::error::{NetError, NetResult};
 
 /// Protocol version for the `VERSION` message. Bump when the message set or a
 /// payload layout changes in a backwards-compatible way.
@@ -59,6 +59,15 @@ pub enum MessageType {
     /// Carry the complete vote rather than an id, because there is no vote
     /// store to serve a getdata from and the signature *is* the content.
     ArbitrationVote = 12,
+    /// Smart Gate grant revocation relay. An owner-signed grant with the
+    /// revoked flag set, plus the owner's signature and key bundles — the same
+    /// statement `POST /v1/guard/revoke` accepts. Additive per the freeze
+    /// rule: older nodes ignore it without disconnecting.
+    ///
+    /// Carry the complete statement rather than a hash, because the receiver
+    /// verifies the owner's signature itself instead of trusting the sender,
+    /// and there is no revocation store to serve a getdata from.
+    GuardRevoke = 13,
 }
 
 impl MessageType {
@@ -76,6 +85,7 @@ impl MessageType {
             10 => MessageType::Tx,
             11 => MessageType::Checkpoint,
             12 => MessageType::ArbitrationVote,
+            13 => MessageType::GuardRevoke,
             _ => return None,
         })
     }
@@ -114,7 +124,12 @@ pub enum Message {
     /// A fraud-arbitration vote. Verified on receipt against the chain's own
     /// committee and its own height; consensus never consults it. See
     /// `srct_node::mediation` for what the node does with one that checks out.
-    ArbitrationVote(Box<srct_core::arbitration::ArbitrationVote>),
+    ArbitrationVote(Box<ArbitrationVote>),
+    /// A Smart Gate grant revocation: the revoked grant bytes plus the owner's
+    /// signature and key bundles. Verified on receipt (owner signature, right
+    /// network, revoked flag set) and applied to the node's revocation set;
+    /// enforcement stays in the node, exactly like votes.
+    GuardRevoke(GuardRevokeMsg),
     /// An unknown type number — ignored, per the freeze rule. Retained so
     /// tests can assert that unknown types are dropped without disconnect.
     Unknown {
@@ -148,6 +163,21 @@ pub struct SocketAddr {
     pub ip: [u8; 16],
     pub port: u16,
 }
+
+/// A Smart Gate grant revocation on the wire: the revoked grant bytes plus
+/// the owner's signature and key bundles. Bounds mirror
+/// `GuardRevokeBook::record` so an over-cap message is refused at decode,
+/// before any signature work.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuardRevokeMsg {
+    pub policy: Vec<u8>,
+    pub sigs: Vec<u8>,
+    pub keys: Vec<u8>,
+}
+
+/// Longest accepted field of a [`GuardRevokeMsg`]. Matches the book's caps.
+pub const MAX_REVOKE_POLICY_BYTES: usize = 4096;
+pub const MAX_REVOKE_BUNDLE_BYTES: usize = 8192;
 
 impl Message {
     /// Encode to the payload bytes (without the frame envelope).
@@ -232,6 +262,14 @@ impl Message {
             Message::ArbitrationVote(v) => {
                 w.raw(&v.serialize());
             }
+            Message::GuardRevoke(m) => {
+                w.u32le(m.policy.len() as u32)
+                    .raw(&m.policy)
+                    .u32le(m.sigs.len() as u32)
+                    .raw(&m.sigs)
+                    .u32le(m.keys.len() as u32)
+                    .raw(&m.keys);
+            }
             Message::Unknown { raw, .. } => {
                 // `raw` is the payload verbatim as received — decode stores the
                 // whole payload, not a re-framed copy — so encoding is a
@@ -278,6 +316,7 @@ impl Message {
                 srct_core::arbitration::ArbitrationVote::deserialize(payload)
                     .map_err(|e| NetError::Decode(format!("arbitration vote deserialize: {e}")))?,
             )),
+            Some(MessageType::GuardRevoke) => Message::GuardRevoke(decode_revoke(payload)?),
             None => {
                 // Unknown: preserve the raw payload so callers can log it, but
                 // do not act on it. §13.5 freeze rule.
@@ -346,6 +385,41 @@ fn decode_version(r: &mut Reader<'_>) -> NetResult<Version> {
         user_agent,
         nonce,
     })
+}
+
+/// Decode a [`GuardRevokeMsg`]. Over-cap lengths are refused before any
+/// allocation, and trailing garbage is a protocol violation — same posture
+/// as every other known message type.
+fn decode_revoke(payload: &[u8]) -> NetResult<GuardRevokeMsg> {
+    let mut r = Reader::new(payload);
+    let policy_len = r.u32le()? as usize;
+    if policy_len == 0 || policy_len > MAX_REVOKE_POLICY_BYTES {
+        return Err(NetError::Decode(format!(
+            "revoke policy length {policy_len} over cap"
+        )));
+    }
+    let policy = r.fixed_slice(policy_len)?.to_vec();
+    let sigs_len = r.u32le()? as usize;
+    if sigs_len == 0 || sigs_len > MAX_REVOKE_BUNDLE_BYTES {
+        return Err(NetError::Decode(format!(
+            "revoke sigs length {sigs_len} over cap"
+        )));
+    }
+    let sigs = r.fixed_slice(sigs_len)?.to_vec();
+    let keys_len = r.u32le()? as usize;
+    if keys_len == 0 || keys_len > MAX_REVOKE_BUNDLE_BYTES {
+        return Err(NetError::Decode(format!(
+            "revoke keys length {keys_len} over cap"
+        )));
+    }
+    let keys = r.fixed_slice(keys_len)?.to_vec();
+    if r.remaining() != 0 {
+        return Err(NetError::Decode(format!(
+            "trailing {} bytes after guard revoke",
+            r.remaining()
+        )));
+    }
+    Ok(GuardRevokeMsg { policy, sigs, keys })
 }
 
 fn decode_inv(r: &mut Reader<'_>) -> NetResult<Vec<InvEntry>> {

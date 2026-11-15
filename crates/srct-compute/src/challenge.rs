@@ -331,6 +331,19 @@ impl ChallengeBook {
         Ok(())
     }
 
+    /// Whether any challenge is open against this assignment.
+    pub fn is_open(&self, assignment: &Hash) -> bool {
+        self.records.contains_key(assignment)
+    }
+
+    /// Whether the challenger's second receipt has arrived.
+    pub fn has_second(&self, assignment: &Hash) -> bool {
+        self.records
+            .get(assignment)
+            .map(|r| r.second.is_some())
+            .unwrap_or(false)
+    }
+
     /// Compare the original receipt against the submitted re-execution.
     pub fn verdict(
         &self,
@@ -361,6 +374,106 @@ impl ChallengeBook {
                 evidence: second.receipt.output,
             })
         }
+    }
+
+    /// Encode the whole book for `state.bin`: network id, open challenges
+    /// with their optional second receipts, and the replay set.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = Writer::with_capacity(64 + self.records.len() * 256);
+        w.u16le(self.network_id.len() as u16)
+            .raw(self.network_id.as_bytes());
+        w.u32le(self.records.len() as u32);
+        for (assignment, record) in &self.records {
+            let challenge_bytes = record.challenge.encode();
+            w.fixed(assignment)
+                .u32le(challenge_bytes.len() as u32)
+                .raw(&challenge_bytes);
+            match &record.second {
+                Some(second) => {
+                    let second_bytes = second.encode();
+                    w.u8(1).u32le(second_bytes.len() as u32).raw(&second_bytes);
+                }
+                None => {
+                    w.u8(0);
+                }
+            }
+        }
+        w.u32le(self.seen.len() as u32);
+        for h in &self.seen {
+            w.fixed(h);
+        }
+        w.into_vec()
+    }
+
+    /// Decode a book written by [`ChallengeBook::encode`]. Fail-closed: any
+    /// truncation, trailing garbage, over-cap count, duplicate entry or
+    /// network mismatch refuses the whole blob. Challenge and receipt
+    /// signatures re-verify on decode through their own codecs.
+    pub fn decode(bytes: &[u8], network_id: &str) -> Result<Self, ComputeError> {
+        let mut r = Reader::new(bytes);
+        let net_len = r.u16le().map_err(malformed)? as usize;
+        if net_len == 0 || net_len > MAX_NETWORK_ID_LEN {
+            return Err(ComputeError::Malformed(
+                "challenge network id length".into(),
+            ));
+        }
+        let net_bytes = r.fixed_slice(net_len).map_err(malformed)?;
+        let stored = std::str::from_utf8(net_bytes)
+            .map_err(|_| ComputeError::Malformed("challenge network is not utf-8".into()))?;
+        if stored != network_id {
+            return Err(ComputeError::WrongNetwork);
+        }
+        let n_records = r.u32le().map_err(malformed)? as usize;
+        if n_records > crate::escrow::MAX_ESCROW_ACCOUNTS {
+            return Err(ComputeError::Malformed("challenges over cap".into()));
+        }
+        let mut records = BTreeMap::new();
+        for _ in 0..n_records {
+            let assignment: Hash = r.fixed().map_err(malformed)?;
+            let challenge_len = r.u32le().map_err(malformed)? as usize;
+            if challenge_len > 64 * 1024 {
+                return Err(ComputeError::Malformed("challenge over cap".into()));
+            }
+            let challenge_bytes = r.fixed_slice(challenge_len).map_err(malformed)?;
+            let challenge = SignedChallenge::decode(challenge_bytes)?;
+            let second = match r.u8().map_err(malformed)? {
+                0 => None,
+                1 => {
+                    let second_len = r.u32le().map_err(malformed)? as usize;
+                    if second_len > 64 * 1024 {
+                        return Err(ComputeError::Malformed("second receipt over cap".into()));
+                    }
+                    let second_bytes = r.fixed_slice(second_len).map_err(malformed)?;
+                    Some(SignedReceipt::decode(second_bytes)?)
+                }
+                _ => return Err(ComputeError::Malformed("challenge second flag".into())),
+            };
+            if records
+                .insert(assignment, ChallengeRecord { challenge, second })
+                .is_some()
+            {
+                return Err(ComputeError::Malformed("duplicate challenge".into()));
+            }
+        }
+        let n_seen = r.u32le().map_err(malformed)? as usize;
+        if n_seen > crate::escrow::MAX_ESCROW_ACCOUNTS {
+            return Err(ComputeError::Malformed(
+                "challenge seen set over cap".into(),
+            ));
+        }
+        let mut seen = BTreeSet::new();
+        for _ in 0..n_seen {
+            let h: Hash = r.fixed().map_err(malformed)?;
+            if !seen.insert(h) {
+                return Err(ComputeError::Malformed("duplicate challenge id".into()));
+            }
+        }
+        r.expect_end().map_err(malformed)?;
+        Ok(ChallengeBook {
+            network_id: network_id.into(),
+            records,
+            seen,
+        })
     }
 }
 

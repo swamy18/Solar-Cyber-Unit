@@ -222,6 +222,10 @@ pub struct EscrowBook {
     releases: BTreeSet<Hash>,
 }
 
+/// Cap for persisted escrow accounts and single-use sets. Bounds the worst-case
+/// allocation when decoding an untrusted `state.bin` section.
+pub const MAX_ESCROW_ACCOUNTS: usize = 100_000;
+
 impl EscrowBook {
     pub fn new(network_id: impl Into<String>) -> Self {
         EscrowBook {
@@ -230,6 +234,109 @@ impl EscrowBook {
         }
     }
 
+    /// Encode the whole book for `state.bin`. Accounts first (they carry the
+    /// money state), then the single-use funding and release sets.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = Writer::with_capacity(64 + self.accounts.len() * 120);
+        w.u16le(self.network_id.len() as u16)
+            .raw(self.network_id.as_bytes());
+        w.u32le(self.accounts.len() as u32);
+        for (job, a) in &self.accounts {
+            w.fixed(job)
+                .fixed(&a.requester)
+                .u64le(a.funded_sat)
+                .u64le(a.released_sat)
+                .u64le(a.refunded_sat)
+                .u64le(a.deadline)
+                .u8(u8::from(a.refunded));
+        }
+        w.u32le(self.fundings.len() as u32);
+        for h in &self.fundings {
+            w.fixed(h);
+        }
+        w.u32le(self.releases.len() as u32);
+        for h in &self.releases {
+            w.fixed(h);
+        }
+        w.into_vec()
+    }
+
+    /// Decode a book written by [`EscrowBook::encode`]. Fail-closed: any
+    /// truncation, trailing garbage, over-cap count, duplicate id, network
+    /// mismatch or internally inconsistent account (released + refunded above
+    /// funded) refuses the whole blob.
+    pub fn decode(bytes: &[u8], network_id: &str) -> Result<Self, ComputeError> {
+        let mut r = Reader::new(bytes);
+        let net_len = r.u16le().map_err(malformed)? as usize;
+        if net_len == 0 || net_len > MAX_NETWORK_ID_LEN {
+            return Err(ComputeError::Malformed("escrow network id length".into()));
+        }
+        let net_bytes = r.fixed_slice(net_len).map_err(malformed)?;
+        let stored = std::str::from_utf8(net_bytes)
+            .map_err(|_| ComputeError::Malformed("escrow network is not utf-8".into()))?;
+        if stored != network_id {
+            return Err(ComputeError::WrongNetwork);
+        }
+        let n_accounts = r.u32le().map_err(malformed)? as usize;
+        if n_accounts > MAX_ESCROW_ACCOUNTS {
+            return Err(ComputeError::Malformed("escrow accounts over cap".into()));
+        }
+        let mut accounts = BTreeMap::new();
+        for _ in 0..n_accounts {
+            let job: Hash = r.fixed().map_err(malformed)?;
+            let account = EscrowAccount {
+                job,
+                requester: r.fixed().map_err(malformed)?,
+                funded_sat: r.u64le().map_err(malformed)?,
+                released_sat: r.u64le().map_err(malformed)?,
+                refunded_sat: r.u64le().map_err(malformed)?,
+                deadline: r.u64le().map_err(malformed)?,
+                refunded: match r.u8().map_err(malformed)? {
+                    0 => false,
+                    1 => true,
+                    _ => return Err(ComputeError::Malformed("escrow refund flag".into())),
+                },
+            };
+            if account.released_sat.saturating_add(account.refunded_sat) > account.funded_sat {
+                return Err(ComputeError::Malformed("escrow account over-spent".into()));
+            }
+            if accounts.insert(job, account).is_some() {
+                return Err(ComputeError::Malformed("duplicate escrow account".into()));
+            }
+        }
+        let n_fundings = r.u32le().map_err(malformed)? as usize;
+        if n_fundings > MAX_ESCROW_ACCOUNTS {
+            return Err(ComputeError::Malformed("escrow fundings over cap".into()));
+        }
+        let mut fundings = BTreeSet::new();
+        for _ in 0..n_fundings {
+            let h: Hash = r.fixed().map_err(malformed)?;
+            if !fundings.insert(h) {
+                return Err(ComputeError::Malformed("duplicate escrow funding".into()));
+            }
+        }
+        let n_releases = r.u32le().map_err(malformed)? as usize;
+        if n_releases > MAX_ESCROW_ACCOUNTS {
+            return Err(ComputeError::Malformed("escrow releases over cap".into()));
+        }
+        let mut releases = BTreeSet::new();
+        for _ in 0..n_releases {
+            let h: Hash = r.fixed().map_err(malformed)?;
+            if !releases.insert(h) {
+                return Err(ComputeError::Malformed("duplicate escrow release".into()));
+            }
+        }
+        r.expect_end().map_err(malformed)?;
+        Ok(EscrowBook {
+            network_id: network_id.into(),
+            accounts,
+            fundings,
+            releases,
+        })
+    }
+}
+
+impl EscrowBook {
     pub fn network_id(&self) -> &str {
         &self.network_id
     }

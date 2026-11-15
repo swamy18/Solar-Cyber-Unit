@@ -76,8 +76,11 @@ Node contract mirrored here (the operator keeps these in sync with the node):
     POST /v1/ramp/intent                -> open a fill intent
 """
 
+import hashlib
 import json
+import math
 import os
+import struct
 import subprocess
 import sys
 import tempfile
@@ -103,6 +106,90 @@ _VALID_MODES = {MODE_MINE, MODE_AI_COMPUTE}
 
 _MIN_MINE_SHARE = 0.0
 _MAX_MINE_SHARE = 1.0
+
+
+def _task_seed(task):
+    """Deterministic seed bytes for a task dict (id, units, kind)."""
+    tid = task.get("task_id", "")
+    units = str(task.get("compute_units", 1))
+    kind = task.get("type") or task.get("service") or "inference"
+    return f"{tid}|{units}|{kind}".encode("utf-8")
+
+
+def _prng_stream(seed, n):
+    """`n` deterministic floats in [-1, 1] from SHA-256 counter mode.
+
+    Same task, same stream, on every machine — so a challenger can re-run
+    the work and compare bytes.
+    """
+    out = []
+    counter = 0
+    while len(out) < n:
+        digest = hashlib.sha256(seed + counter.to_bytes(4, "little")).digest()
+        for byte in digest:
+            out.append(byte / 127.5 - 1.0)
+            if len(out) >= n:
+                break
+        counter += 1
+    return out
+
+
+def default_cpu_infer(task):
+    """Default inference: a real 16->16->8->4 MLP forward pass on CPU.
+
+    Weights and inputs derive deterministically from the task, hidden layers
+    use tanh, and the four outputs are quantized to int16. Small on purpose:
+    a participant proves it did the arithmetic, and a challenger re-running
+    the same task gets the same bytes. Returns the packed result bytes.
+    """
+    seed = _task_seed(task)
+    x = _prng_stream(b"srct/infer|x|" + seed, 16)
+    w1 = _prng_stream(b"srct/infer|w1|" + seed, 16 * 16)
+    b1 = _prng_stream(b"srct/infer|b1|" + seed, 16)
+
+    def layer(x, w, b, rows, cols):
+        y = [0.0] * rows
+        for r in range(rows):
+            s = b[r]
+            base = r * cols
+            for c in range(cols):
+                s += w[base + c] * x[c]
+            y[r] = math.tanh(s)
+        return y
+
+    h1 = layer(x, w1, b1, 16, 16)
+    w2 = _prng_stream(b"srct/infer|w2|" + seed, 16 * 8)
+    b2 = _prng_stream(b"srct/infer|b2|" + seed, 8)
+    h2 = layer(h1, w2, b2, 8, 16)
+    w3 = _prng_stream(b"srct/infer|w3|" + seed, 8 * 4)
+    b3 = _prng_stream(b"srct/infer|b3|" + seed, 4)
+    out = layer(h2, w3, b3, 4, 8)
+    q = [max(-32768, min(32767, int(round(v * 1000.0)))) for v in out]
+    return b"mlp1" + struct.pack(">4h", *q)
+
+
+def default_cpu_train(task):
+    """Default training: real gradient descent on CPU.
+
+    Fits `y = w*x + b` to 8 deterministic points of the fixed target
+    `y = 2*x + 1` with full-batch MSE, learning rate 0.1, 24 steps. Returns
+    the packed final weights and loss — proof the steps ran, reproducible by
+    anyone holding the task.
+    """
+    seed = _task_seed(task)
+    xs = _prng_stream(b"srct/train|x|" + seed, 8)
+    ys = [2.0 * x + 1.0 for x in xs]
+    init = _prng_stream(b"srct/train|w0|" + seed, 2)
+    w, b = init[0], init[1]
+    lr = 0.1
+    n = float(len(xs))
+    for _ in range(24):
+        dw = sum(2.0 * (w * x + b - y) * x for x, y in zip(xs, ys)) / n
+        db = sum(2.0 * (w * x + b - y) for x, y in zip(xs, ys)) / n
+        w -= lr * dw
+        b -= lr * db
+    loss = sum((w * x + b - y) ** 2 for x, y in zip(xs, ys)) / n
+    return b"sgd1" + struct.pack(">ddd", w, b, loss)
 
 
 class SrctError(Exception):
@@ -554,16 +641,21 @@ class Participant:
             task_fn is not required.
         If mode == MODE_AI_COMPUTE:
             Pulls and executes incoming AI inference or training tasks with 100%
-            of allocatable resources. Does not run a miner.
+            of allocatable resources. Does not run a miner. With no handlers
+            given, the built-in CPU workers (`default_cpu_infer`,
+            `default_cpu_train`) run real deterministic arithmetic; explicit
+            handlers still override them.
         """
         if self.mode == MODE_MINE:
             if not self.miner_address_hex:
                 raise SrctError(f"mode='{MODE_MINE}' requires miner_address_hex")
             self.start_miner()
         else:
+            # No explicit handler: fall back to the built-in CPU workers, so a
+            # fresh box contributes real arithmetic out of the box instead of
+            # refusing every task. Explicit handlers still win when given.
             if task_fn is None and infer_fn is None and train_fn is None:
-                raise SrctError(
-                    f"mode='{MODE_AI_COMPUTE}' requires task_fn or (infer_fn, train_fn)")
+                infer_fn, train_fn = default_cpu_infer, default_cpu_train
 
         cycles = 0
         try:
@@ -832,14 +924,19 @@ def _selftest():
             raise AssertionError("mine track without address must refuse")
         except SrctError:
             pass
-        try:
-            p_missing_handler = Participant(node="http://fake", wallet="w.json",
-                                            caps=caps, mode=MODE_AI_COMPUTE,
-                                            poll_secs=0)
-            p_missing_handler.run(max_cycles=1)
-            raise AssertionError("ai_compute without handler must refuse")
-        except SrctError:
-            pass
+        p_missing_handler = Participant(node="http://fake", wallet="w.json",
+                                        caps=caps, mode=MODE_AI_COMPUTE,
+                                        poll_secs=0)
+        # No explicit handler: the built-in CPU workers engage instead of
+        # refusing. Deterministic: same task, same bytes, every machine.
+        probe = {"task_id": "zz", "compute_units": 4, "type": "inference"}
+        assert default_cpu_infer(probe) == default_cpu_infer(probe)
+        assert default_cpu_train(probe) == default_cpu_train(probe)
+        assert isinstance(default_cpu_infer(probe), bytes)
+        assert isinstance(default_cpu_train(probe), bytes)
+        install(p_missing_handler)
+        n_missing = p_missing_handler.run(max_cycles=1)
+        assert n_missing == 1
     finally:
         subprocess.Popen = real_popen
     print("srct_node selftest: ok "

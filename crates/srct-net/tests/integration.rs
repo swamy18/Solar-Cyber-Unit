@@ -166,6 +166,7 @@ fn pump(
                 syncer,
                 relay,
                 votes: &mut srct_core::arbitration::VoteBook::new(),
+                revokes: &mut srct_core::guard::GuardRevokeBook::new(),
             },
             None,
         );
@@ -262,6 +263,7 @@ fn a_node_syncs_a_peer_over_real_sockets() {
                 syncer: &mut client_syncer,
                 relay: &mut client_relay,
                 votes: &mut srct_core::arbitration::VoteBook::new(),
+                revokes: &mut srct_core::guard::GuardRevokeBook::new(),
             },
             None,
         );

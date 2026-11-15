@@ -1,6 +1,6 @@
 # Decentralized compute sharing
 
-Status: **wired to node REST API** with core in `crates/srct-compute` and endpoints in `crates/srct-node`. Heterogeneous devices advertise compute behind a signed bond, requesters shard work across them, and verified receipts settle completed units. Offers, jobs, receipts, and settlements persist in `state.bin` (envelope v14).
+Status: **production money loop** with core in `crates/srct-compute` and endpoints in `crates/srct-node`. Heterogeneous devices advertise compute behind a signed bond, requesters shard work across them, and verified receipts settle completed units. Offers, jobs, assignments, receipts, payouts, escrow and bond books, and challenges persist in `state.bin` (envelope v15).
 
 ```bash
 cargo test -p srct-compute
@@ -22,11 +22,33 @@ be able to earn SRCT for spare compute without four separate protocols:
 - a timed-out provider must not be able to settle after the work moved.
 
 `srct-compute` answers those with signed data formats, a deterministic planner
-and a settlement ledger. `srct-node` exposes these via REST endpoints:
-- `POST /v1/compute/offers` & `GET /v1/compute/offers/list`
-- `POST /v1/compute/jobs` & `GET /v1/compute/jobs/list`
-- `POST /v1/compute/plan`
-- `POST /v1/compute/receipt` & `GET /v1/compute/receipts/list`
+and a settlement ledger. `srct-node` runs the full money loop over REST:
+
+- market: `POST /v1/compute/offers` & `GET /v1/compute/offers/list`
+  (list reports each provider's bond, score and bonded state)
+- jobs: `POST /v1/compute/jobs` & `GET /v1/compute/jobs/list`
+- planning: `POST /v1/compute/plan`
+- authorization to pay: `POST /v1/compute/assign` & `GET /v1/compute/assignments/list`
+- money in: `POST /v1/compute/escrow/fund`, money back: `POST /v1/compute/escrow/refund`
+- settlement: `POST /v1/compute/receipt` & `GET /v1/compute/receipts/list`
+- money out: `GET /v1/compute/payouts`,
+  `GET /v1/compute/payouts/{receipt}/exit-template`,
+  `POST /v1/compute/payouts/{receipt}/claim`
+- disputes: `POST /v1/compute/challenge/open`,
+  `POST /v1/compute/challenge/second`,
+  `GET /v1/compute/challenge/{assignment}`
+- stake: `POST /v1/compute/bonds/register`, `POST /v1/compute/bonds/withdraw`,
+  `POST /v1/compute/bonds/dispute`, `GET /v1/compute/bonds/{provider}`
+
+The loop, end to end: the requester posts a job, funds its escrow, plans
+shards and signs one assignment per shard. The provider runs the work
+(`templates/srct_node.py` ships built-in CPU inference and training workers,
+so a fresh box contributes real deterministic arithmetic out of the box) and
+posts a receipt. Settlement verifies the receipt against the assignment,
+releases exactly its total from the funded escrow, and records the exact
+payout. The requester signs an exit from the template; anyone submits the
+claim; consensus pays the provider when the exit releases — the same
+permissionless crank pattern as the L2 exit path.
 
 ### Dedicated Resource Modes and Consumer Dispatch
 
@@ -142,8 +164,12 @@ The provider signs `receipt_hash`. `ComputeLedger::settle` then checks:
 - the assignment was not already settled and was not expired.
 
 It records a `PayoutInstruction { from, to, amount_sat, job, assignment, receipt }`
-and returns it. The instruction moves no coin; the existing payment or escrow
-layer executes it. Duplicate settlement returns `AlreadySettled`.
+and returns it. The node executes the instruction through the claim path:
+the payout binds to a requester-signed L2 exit (`exit-template` then `claim`),
+queues with the same admission gate as every other L2 write, and pays the
+provider when consensus releases the exit. The crate itself never holds or
+moves coin; the node moves it only through signed exits the requester
+authorized. Duplicate settlement returns `AlreadySettled`.
 
 `expire` marks an assignment as timed out only after its deadline. Expired
 assignments can never settle, so a late receipt cannot resurrect work that was
@@ -216,6 +242,11 @@ Honest limits: the book verifies *who* signed a dispute, not the evidence
 behind it (arbitration belongs to the escrow layer); slashes and bonds are
 instructions, not coin movement; and a provider that can afford many bonds can
 still present many identities.
+
+Node wiring: bonds, reputations and single-use ids persist in `state.bin`
+(`BondBook::encode`/`decode`, fail-closed); the offers list reports each
+provider's live `bonded` state, bond total and score; settled receipts feed
+`record_settlement` automatically, so reputation follows real paid work.
 
 ## 7. TEE-backed execution evidence
 

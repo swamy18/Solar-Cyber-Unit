@@ -41,6 +41,7 @@ struct LocalNode {
     syncer: SyncManager,
     relay: RelayManager,
     votes: srct_core::arbitration::VoteBook,
+    revokes: srct_core::guard::GuardRevokeBook,
 }
 
 impl LocalNode {
@@ -71,6 +72,7 @@ impl LocalNode {
             syncer: SyncManager::new(),
             relay: RelayManager::new(),
             votes: srct_core::arbitration::VoteBook::new(),
+            revokes: srct_core::guard::GuardRevokeBook::new(),
         }
     }
 
@@ -84,6 +86,7 @@ impl LocalNode {
                     syncer: &mut self.syncer,
                     relay: &mut self.relay,
                     votes: &mut self.votes,
+                    revokes: &mut self.revokes,
                 },
                 None,
             );

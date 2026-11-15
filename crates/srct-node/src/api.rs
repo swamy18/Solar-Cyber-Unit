@@ -211,7 +211,7 @@ const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
 /// would mix scopes that must never meet. Version 10 appends the Smart Gate
 /// sections (grant registry, revocations, capability book) last; v8/v9 files
 /// migrate with empty gate state.
-const STATE_ENVELOPE_VERSION: u8 = 14;
+const STATE_ENVELOPE_VERSION: u8 = 15;
 
 /// Largest entry count any single map section in the state envelope may
 /// declare, checked before allocation. Real books are bounded by their own
@@ -313,6 +313,45 @@ fn decode_state_map<T>(
         }
     }
     Ok(map)
+}
+
+/// Cap for pending P2P revoke broadcasts in `state.bin`. Same bound as the
+/// node's relay book: a rotation that outruns it is an operator job.
+const MAX_REVOKE_QUEUE: usize = 4096;
+
+/// One pending P2P revoke broadcast: the revoked grant bytes plus the owner's
+/// signature and key bundles.
+type RevokeTriple = (Vec<u8>, Vec<u8>, Vec<u8>);
+
+/// Decode the persisted pending-revoke queue: `count + (policy, sigs, keys)*`,
+/// each length-prefixed and capped exactly like the wire message, so a
+/// hostile file cannot grow node memory without bound.
+fn decode_revoke_queue(r: &mut Reader<'_>) -> Result<Vec<RevokeTriple>, String> {
+    let count = r.u32le().map_err(|e| format!("revoke_broadcast: {e}"))? as usize;
+    if count > MAX_REVOKE_QUEUE {
+        return Err(format!(
+            "revoke_broadcast: {count} entries over the {MAX_REVOKE_QUEUE} cap"
+        ));
+    }
+    let mut out = Vec::with_capacity(count);
+    for _ in 0..count {
+        let mut part = |what: &str, cap: usize| -> Result<Vec<u8>, String> {
+            let len =
+                r.u32le()
+                    .map_err(|e| format!("revoke_broadcast {what}: {e}"))? as usize;
+            if len == 0 || len > cap {
+                return Err(format!("revoke_broadcast {what} over cap"));
+            }
+            r.fixed_slice(len)
+                .map(|b| b.to_vec())
+                .map_err(|e| format!("revoke_broadcast {what}: {e}"))
+        };
+        let policy = part("policy", 4096)?;
+        let sigs = part("sigs", 8192)?;
+        let keys = part("keys", 8192)?;
+        out.push((policy, sigs, keys));
+    }
+    Ok(out)
 }
 
 /// Locate a transaction in the chain (as a confirmed height) or the mempool
@@ -552,8 +591,34 @@ pub struct SharedNode {
     pub compute_offers: BTreeMap<Hash, srct_compute::SignedOffer>,
     /// Active consumer compute jobs by job hash.
     pub compute_jobs: BTreeMap<Hash, srct_compute::SignedJob>,
-    /// Verified compute receipts by receipt hash.
+    /// Requester-signed compute assignments by assignment hash. An assignment
+    /// is the requester's authorization to pay: receipts settle only against
+    /// an assignment the requester actually signed.
+    pub compute_assignments: BTreeMap<Hash, srct_compute::SignedAssignment>,
+    /// Verified compute receipts by receipt hash. A receipt is stored only
+    /// once it has settled against its assignment and the job's escrow has
+    /// released exactly its total — `compute_receipts` is the settled set.
     pub compute_receipts: BTreeMap<Hash, srct_compute::SignedReceipt>,
+    /// Settlement mirror over `compute_payouts` (binding, once-only and
+    /// replay checks). Rebuilt from the persisted payouts on load.
+    pub compute_ledger: srct_compute::ComputeLedger,
+    /// Settled compute payouts by receipt hash: the exact transfers the
+    /// payment rail must execute. Persisted; the money record.
+    pub compute_payouts: BTreeMap<Hash, srct_compute::PayoutInstruction>,
+    /// Receipt hash -> the L2 exit queued to pay that compute payout. Same
+    /// binding discipline as `escrow_exit`: the coin actually moves when
+    /// consensus releases the exit, and `Finalized` is never written early.
+    pub compute_payout_exit: BTreeMap<Hash, EscrowExitBinding>,
+    /// Funded compute job escrows. Persisted; releases are exact and once-only.
+    pub compute_escrow: srct_compute::EscrowBook,
+    /// Provider bond and reputation book. Persisted; slashes are once-only.
+    pub compute_bonds: srct_compute::BondBook,
+    /// Open compute challenges with optional second receipts. Persisted.
+    pub compute_challenges: srct_compute::ChallengeBook,
+    /// Locally created Smart Gate revocations awaiting P2P broadcast, as
+    /// (policy, sigs, keys) bytes. Drained by the serve loop; persisted so a
+    /// restart never silently drops a revocation no peer has heard yet.
+    pub revoke_broadcast: Vec<RevokeTriple>,
     /// Bounded in-memory audit ring (hash-chained, tamper-evident). The full
     /// history lives in the payment/receipt stores this ring references;
     /// intentionally not persisted, so a restart starts a fresh chain.
@@ -665,7 +730,15 @@ impl SharedNode {
             trials: BTreeMap::new(),
             compute_offers: BTreeMap::new(),
             compute_jobs: BTreeMap::new(),
+            compute_assignments: BTreeMap::new(),
             compute_receipts: BTreeMap::new(),
+            compute_ledger: srct_compute::ComputeLedger::new(),
+            compute_payouts: BTreeMap::new(),
+            compute_payout_exit: BTreeMap::new(),
+            compute_escrow: srct_compute::EscrowBook::new(network_id.clone()),
+            compute_bonds: srct_compute::BondBook::new(network_id.clone()),
+            compute_challenges: srct_compute::ChallengeBook::new(network_id.clone()),
+            revoke_broadcast: Vec::new(),
             audit: srct_core::safety::AuditLog::default(),
             escrows: BTreeMap::new(),
             escrow_exit: BTreeMap::new(),
@@ -963,8 +1036,42 @@ impl SharedNode {
         );
         put_section(
             &mut w,
+            &encode_state_map(&self.compute_assignments, |sa| sa.encode()),
+        );
+        put_section(
+            &mut w,
             &encode_state_map(&self.compute_receipts, |sr| sr.encode()),
         );
+        // Compute settlement (v15): payouts, exit bindings, escrow book,
+        // challenge book, pending revoke broadcasts.
+        put_section(
+            &mut w,
+            &encode_state_map(&self.compute_payouts, |p| p.encode()),
+        );
+        put_section(
+            &mut w,
+            &encode_state_map(&self.compute_payout_exit, |b| {
+                let mut bw = Writer::with_capacity(76);
+                bw.fixed(&b.txid).fixed(&b.owner).u64le(b.nonce);
+                bw.into_vec()
+            }),
+        );
+        put_section(&mut w, &self.compute_escrow.encode());
+        put_section(&mut w, &self.compute_bonds.encode());
+        put_section(&mut w, &self.compute_challenges.encode());
+        {
+            let mut rb = Writer::with_capacity(4 + self.revoke_broadcast.len() * 96);
+            rb.u32le(self.revoke_broadcast.len() as u32);
+            for (policy, sigs, keys) in &self.revoke_broadcast {
+                rb.u32le(policy.len() as u32)
+                    .raw(policy)
+                    .u32le(sigs.len() as u32)
+                    .raw(sigs)
+                    .u32le(keys.len() as u32)
+                    .raw(keys);
+            }
+            put_section(&mut w, &rb.into_vec());
+        }
         w.into_vec()
     }
 
@@ -983,6 +1090,7 @@ impl SharedNode {
         // Smart Gate sections: migrate them with empty books instead of
         // refusing to boot.
         if version != STATE_ENVELOPE_VERSION
+            && version != 14
             && version != 13
             && version != 12
             && version != 11
@@ -991,7 +1099,7 @@ impl SharedNode {
             && version != 8
         {
             return Err(format!(
-                "state envelope version {version}, this build reads {STATE_ENVELOPE_VERSION} (and migrates 8/9/10/11/12/13)"
+                "state envelope version {version}, this build reads {STATE_ENVELOPE_VERSION} (and migrates 8/9/10/11/12/13/14)"
             ));
         }
 
@@ -1550,6 +1658,8 @@ impl SharedNode {
         // v10 appends the Smart Gate sections after trials. v11 appends Treats last.
         // v12 extends Treats with last-kind tracking. v13 adds persistent redemption nonces; older Treats sections migrate with empty nonce state.
         // v14 adds compute marketplace persistence (offers, jobs, receipts).
+        // v15 adds compute settlement: assignments, payouts, exit bindings,
+        // escrow and bond books, challenges, pending revoke broadcasts.
         let (
             trials,
             guard_registry,
@@ -1558,7 +1668,14 @@ impl SharedNode {
             treats,
             compute_offers,
             compute_jobs,
+            compute_assignments,
             compute_receipts,
+            compute_payouts,
+            compute_payout_exit,
+            compute_escrow,
+            compute_bonds,
+            compute_challenges,
+            revoke_broadcast,
         ) = if version == 8 {
             r.expect_end().map_err(|e| format!("state envelope: {e}"))?;
             (
@@ -1570,6 +1687,13 @@ impl SharedNode {
                 BTreeMap::new(),
                 BTreeMap::new(),
                 BTreeMap::new(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+                srct_compute::EscrowBook::new(mine.clone()),
+                srct_compute::BondBook::new(mine.clone()),
+                srct_compute::ChallengeBook::new(mine),
+                Vec::new(),
             )
         } else if version == 9 {
             let t = decode_section(&mut r, "trials", |sr| {
@@ -1650,6 +1774,13 @@ impl SharedNode {
                 BTreeMap::new(),
                 BTreeMap::new(),
                 BTreeMap::new(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+                srct_compute::EscrowBook::new(mine.clone()),
+                srct_compute::BondBook::new(mine.clone()),
+                srct_compute::ChallengeBook::new(mine),
+                Vec::new(),
             )
         } else {
             let t = decode_section(&mut r, "trials", |sr| {
@@ -1762,8 +1893,93 @@ impl SharedNode {
                 }
                 tr
             };
-            // Compute marketplace (v14): offers, jobs, receipts.
-            let (compute_offers, compute_jobs, compute_receipts) = if version >= 14 {
+            // Compute marketplace (v14): offers, jobs, assignments, receipts.
+            // Compute settlement (v15): payouts, exit bindings, escrow book,
+            // challenge book, pending revoke broadcasts.
+            let (
+                compute_offers,
+                compute_jobs,
+                compute_assignments,
+                compute_receipts,
+                compute_payouts,
+                compute_payout_exit,
+                compute_escrow,
+                compute_bonds,
+                compute_challenges,
+                revoke_broadcast,
+            ) = if version >= 15 {
+                let co = decode_section(&mut r, "compute_offers", |sr| {
+                    decode_state_map(sr, "compute_offers", |b| {
+                        srct_compute::SignedOffer::decode(b)
+                            .map_err(|e| format!("compute_offers: {e}"))
+                    })
+                })?;
+                let cj = decode_section(&mut r, "compute_jobs", |sr| {
+                    decode_state_map(sr, "compute_jobs", |b| {
+                        srct_compute::SignedJob::decode(b).map_err(|e| format!("compute_jobs: {e}"))
+                    })
+                })?;
+                let ca = decode_section(&mut r, "compute_assignments", |sr| {
+                    decode_state_map(sr, "compute_assignments", |b| {
+                        srct_compute::SignedAssignment::decode(b)
+                            .map_err(|e| format!("compute_assignments: {e}"))
+                    })
+                })?;
+                let cr = decode_section(&mut r, "compute_receipts", |sr| {
+                    decode_state_map(sr, "compute_receipts", |b| {
+                        srct_compute::SignedReceipt::decode(b)
+                            .map_err(|e| format!("compute_receipts: {e}"))
+                    })
+                })?;
+                let cp = decode_section(&mut r, "compute_payouts", |sr| {
+                    decode_state_map(sr, "compute_payouts", |b| {
+                        srct_compute::PayoutInstruction::decode(b)
+                            .map_err(|e| format!("compute_payouts: {e}"))
+                    })
+                })?;
+                let ce = decode_section(&mut r, "compute_payout_exit", |sr| {
+                    decode_state_map(sr, "compute_payout_exit", |b| {
+                        let mut br = Reader::new(b);
+                        let binding = EscrowExitBinding {
+                            txid: br.fixed().map_err(|e| format!("payout exit txid: {e}"))?,
+                            owner: br.fixed().map_err(|e| format!("payout exit owner: {e}"))?,
+                            nonce: br.u64le().map_err(|e| format!("payout exit nonce: {e}"))?,
+                        };
+                        br.expect_end()
+                            .map_err(|e| format!("payout exit trailing: {e}"))?;
+                        Ok(binding)
+                    })
+                })?;
+                let escrow = decode_section(&mut r, "compute_escrow", |sr| {
+                    let n = sr.remaining();
+                    let bytes = sr
+                        .fixed_slice(n)
+                        .map_err(|e| format!("compute_escrow: {e}"))?;
+                    srct_compute::EscrowBook::decode(bytes, &mine)
+                        .map_err(|e| format!("compute_escrow: {e}"))
+                })?;
+                let bonds = decode_section(&mut r, "compute_bonds", |sr| {
+                    let n = sr.remaining();
+                    let bytes = sr
+                        .fixed_slice(n)
+                        .map_err(|e| format!("compute_bonds: {e}"))?;
+                    srct_compute::BondBook::decode(bytes, &mine)
+                        .map_err(|e| format!("compute_bonds: {e}"))
+                })?;
+                let challenges = decode_section(&mut r, "compute_challenges", |sr| {
+                    let n = sr.remaining();
+                    let bytes = sr
+                        .fixed_slice(n)
+                        .map_err(|e| format!("compute_challenges: {e}"))?;
+                    srct_compute::ChallengeBook::decode(bytes, &mine)
+                        .map_err(|e| format!("compute_challenges: {e}"))
+                })?;
+                let rb = decode_section(&mut r, "revoke_broadcast", |sr| {
+                    decode_revoke_queue(sr).map_err(|e| format!("revoke_broadcast: {e}"))
+                })?;
+                r.expect_end().map_err(|e| format!("state envelope: {e}"))?;
+                (co, cj, ca, cr, cp, ce, escrow, bonds, challenges, rb)
+            } else if version == 14 {
                 let co = decode_section(&mut r, "compute_offers", |sr| {
                     decode_state_map(sr, "compute_offers", |b| {
                         srct_compute::SignedOffer::decode(b)
@@ -1782,9 +1998,31 @@ impl SharedNode {
                     })
                 })?;
                 r.expect_end().map_err(|e| format!("state envelope: {e}"))?;
-                (co, cj, cr)
+                (
+                    co,
+                    cj,
+                    BTreeMap::new(),
+                    cr,
+                    BTreeMap::new(),
+                    BTreeMap::new(),
+                    srct_compute::EscrowBook::new(mine.clone()),
+                    srct_compute::BondBook::new(mine.clone()),
+                    srct_compute::ChallengeBook::new(mine),
+                    Vec::new(),
+                )
             } else {
-                (BTreeMap::new(), BTreeMap::new(), BTreeMap::new())
+                (
+                    BTreeMap::new(),
+                    BTreeMap::new(),
+                    BTreeMap::new(),
+                    BTreeMap::new(),
+                    BTreeMap::new(),
+                    BTreeMap::new(),
+                    srct_compute::EscrowBook::new(mine.clone()),
+                    srct_compute::BondBook::new(mine.clone()),
+                    srct_compute::ChallengeBook::new(mine),
+                    Vec::new(),
+                )
             };
             (
                 t,
@@ -1794,7 +2032,14 @@ impl SharedNode {
                 treats,
                 compute_offers,
                 compute_jobs,
+                compute_assignments,
                 compute_receipts,
+                compute_payouts,
+                compute_payout_exit,
+                compute_escrow,
+                compute_bonds,
+                compute_challenges,
+                revoke_broadcast,
             )
         };
 
@@ -1853,7 +2098,54 @@ impl SharedNode {
         self.treats = treats;
         self.compute_offers = compute_offers;
         self.compute_jobs = compute_jobs;
+        // Prune dangling compute references the same way: a payout whose
+        // receipt or assignment is gone settles nothing, and an exit binding
+        // whose payout is gone pays nothing. Orphans are dropped.
+        let mut compute_payouts = compute_payouts;
+        compute_payouts.retain(|receipt_hash, payout| {
+            if !compute_receipts.contains_key(receipt_hash) {
+                return false;
+            }
+            match compute_assignments.get(&payout.assignment) {
+                Some(a) => a.hash() == payout.assignment,
+                None => false,
+            }
+        });
+        let mut compute_payout_exit = compute_payout_exit;
+        compute_payout_exit.retain(|receipt_hash, _| compute_payouts.contains_key(receipt_hash));
+        self.compute_assignments = compute_assignments;
         self.compute_receipts = compute_receipts;
+        self.compute_payouts = compute_payouts;
+        self.compute_payout_exit = compute_payout_exit;
+        self.compute_escrow = compute_escrow;
+        self.compute_bonds = compute_bonds;
+        self.compute_challenges = compute_challenges;
+        self.revoke_broadcast = revoke_broadcast;
+        // Rebuild the settlement mirror from the persisted payouts. Receipts
+        // and assignments re-verify through their own codecs before one is
+        // restored, so a payout that lost its evidence fails the load
+        // fail-closed instead of resurrecting an unverified settlement.
+        let mut ledger = srct_compute::ComputeLedger::new();
+        for (receipt_hash, payout) in self.compute_payouts.iter() {
+            let receipt = match self.compute_receipts.get(receipt_hash) {
+                Some(r) => r,
+                None => return Err("compute_payouts: receipt missing".into()),
+            };
+            let assignment = match self.compute_assignments.get(&payout.assignment) {
+                Some(a) => a,
+                None => return Err("compute_payouts: assignment missing".into()),
+            };
+            receipt
+                .verify()
+                .map_err(|e| format!("compute_payouts: receipt re-verify: {e}"))?;
+            assignment
+                .verify()
+                .map_err(|e| format!("compute_payouts: assignment re-verify: {e}"))?;
+            ledger
+                .restore(payout.clone())
+                .map_err(|e| format!("compute_payouts: ledger restore: {e}"))?;
+        }
+        self.compute_ledger = ledger;
         Ok(())
     }
 
@@ -4140,80 +4432,108 @@ async fn guard_revoke(State(state): State<ApiState>, Json(req): Json<GuardRevoke
         .map_err(|e| bad(format!("policy: {e}")))?;
     let sigs = decode_bundle(&req.sigs_hex, "sigs")?;
     let keys = decode_bundle(&req.keys_hex, "keys")?;
+    let policy_bytes = bytes.clone();
+    let sigs_bytes = decode_hex_bytes(&req.sigs_hex, "sigs")?;
+    let keys_bytes = decode_hex_bytes(&req.keys_hex, "keys")?;
     with_shared(&state, |sh| {
-        let owner = keys.address().map_err(|e| bad(format!("keys: {e}")))?;
-        if owner != variant.owner {
-            return Err(fail(
-                StatusCode::BAD_REQUEST,
-                "guard_refused",
-                "the revocation is signed by someone other than the grant owner",
-            ));
+        let (target, was_new) = apply_guard_revocation(sh, &variant, &sigs, &keys)?;
+        // Queue for P2P broadcast: the serve loop relays what this node
+        // itself accepted, so every connected node converges on the kill
+        // without any cross-node lock. Best-effort past the cap — the local
+        // kill is already committed; a full queue only delays propagation.
+        if was_new && sh.revoke_broadcast.len() < MAX_REVOKE_QUEUE {
+            sh.revoke_broadcast
+                .push((policy_bytes, sigs_bytes, keys_bytes));
         }
-        srct_core::sig::verify_bundle(&sigs, &keys, &variant.signing_hash())
-            .map_err(|e| bad(format!("revocation signature: {e}")))?;
-        let mut original = variant.clone();
-        original.revoked = false;
-        if !sh.guard_registry.contains_key(&original.hash()) {
-            return Err(fail(
-                StatusCode::CONFLICT,
-                "guard_refused",
-                "this node never enforced the grant being revoked",
-            ));
-        }
-        // Revocation propagates: any registered grant whose parent chain
-        // leads to this grant dies with it, so a delegated leaf cannot
-        // outlive the root that authorized it (delegation narrowing +
-        // kill-switch rule, enforced here at the authoritative registry).
-        let target = original.hash();
-        let mut agent_of: std::collections::BTreeMap<[u8; 20], [u8; 32]> =
-            std::collections::BTreeMap::new();
-        for (h, p) in sh.guard_registry.iter() {
-            agent_of.insert(p.agent_id, *h);
-        }
-        let mut dead: Vec<[u8; 32]> = vec![target];
-        for (h, p) in sh.guard_registry.iter() {
-            let mut cursor = p.parent_agent_id;
-            let mut hops = 0usize;
-            while let Some(parent_agent) = cursor {
-                hops += 1;
-                if hops > 64 {
-                    break;
-                }
-                match agent_of.get(&parent_agent) {
-                    None => break,
-                    Some(parent_hash) => {
-                        if *parent_hash == target {
-                            dead.push(*h);
-                            break;
-                        }
-                        cursor = sh
-                            .guard_registry
-                            .get(parent_hash)
-                            .and_then(|pp| pp.parent_agent_id);
-                    }
-                }
-            }
-        }
-        let mut newly = 0usize;
-        for h in dead {
-            if sh.guard_revoked.insert(h) {
-                newly += 1;
-            }
-            sh.guards.forget(&h);
-        }
-        let was_new = newly > 0;
         audit_push(
             sh,
             "guard_revoke",
-            Some(original.hash()),
+            Some(target),
             None,
-            format!("grant {} revoked", hash_to_hex(&original.hash())),
+            format!("grant {} revoked", hash_to_hex(&target)),
         );
         Ok(Json(json!({
-            "policy_hash": hash_to_hex(&original.hash()),
+            "policy_hash": hash_to_hex(&target),
             "revoked": was_new,
         })))
     })?
+}
+
+/// Apply one verified revocation statement to this node's Smart Gate state.
+///
+/// Shared by `POST /v1/guard/revoke` and the P2P revoke path: verify the
+/// owner's signature over the revoked grant, map it back to the registry hash
+/// this node enforces, propagate the kill to every descendant, and forget
+/// live book state so a restart cannot resurrect spent nonces. Returns the
+/// killed registry hash and whether this call newly revoked it (replays and
+/// P2P duplicates report `false` rather than failing).
+pub fn apply_guard_revocation(
+    sh: &mut SharedNode,
+    variant: &srct_core::guard::InfraPolicy,
+    sigs: &srct_core::sig::Bundle,
+    keys: &srct_core::sig::Bundle,
+) -> Result<(Hash, bool), (StatusCode, Json<ErrorBody>)> {
+    let owner = keys.address().map_err(|e| bad(format!("keys: {e}")))?;
+    if owner != variant.owner {
+        return Err(fail(
+            StatusCode::BAD_REQUEST,
+            "guard_refused",
+            "the revocation is signed by someone other than the grant owner",
+        ));
+    }
+    srct_core::sig::verify_bundle(sigs, keys, &variant.signing_hash())
+        .map_err(|e| bad(format!("revocation signature: {e}")))?;
+    let mut original = variant.clone();
+    original.revoked = false;
+    if !sh.guard_registry.contains_key(&original.hash()) {
+        return Err(fail(
+            StatusCode::CONFLICT,
+            "guard_refused",
+            "this node never enforced the grant being revoked",
+        ));
+    }
+    // Revocation propagates: any registered grant whose parent chain leads
+    // to this grant dies with it, so a delegated leaf cannot outlive the
+    // root that authorized it (delegation narrowing + kill-switch rule,
+    // enforced here at the authoritative registry).
+    let target = original.hash();
+    let mut agent_of: std::collections::BTreeMap<[u8; 20], [u8; 32]> =
+        std::collections::BTreeMap::new();
+    for (h, p) in sh.guard_registry.iter() {
+        agent_of.insert(p.agent_id, *h);
+    }
+    let mut dead: Vec<[u8; 32]> = vec![target];
+    for (h, p) in sh.guard_registry.iter() {
+        let mut cursor = p.parent_agent_id;
+        let mut hops = 0usize;
+        while let Some(parent_agent) = cursor {
+            hops += 1;
+            if hops > 64 {
+                break;
+            }
+            match agent_of.get(&parent_agent) {
+                None => break,
+                Some(parent_hash) => {
+                    if *parent_hash == target {
+                        dead.push(*h);
+                        break;
+                    }
+                    cursor = sh
+                        .guard_registry
+                        .get(parent_hash)
+                        .and_then(|pp| pp.parent_agent_id);
+                }
+            }
+        }
+    }
+    let mut newly = false;
+    for h in dead {
+        if sh.guard_revoked.insert(h) {
+            newly = true;
+        }
+        sh.guards.forget(&h);
+    }
+    Ok((target, newly))
 }
 
 /// `POST /v1/guard/authorize` — stateful Smart Gate admission on this node.
@@ -8230,6 +8550,51 @@ struct ComputeReceiptReq {
     receipt_hex: String,
 }
 
+#[derive(Deserialize)]
+struct ComputeAssignReq {
+    assignment_hex: String,
+}
+
+#[derive(Deserialize)]
+struct ComputeEscrowFundReq {
+    funding_hex: String,
+}
+
+#[derive(Deserialize)]
+struct ComputeEscrowRefundReq {
+    job_hash: String,
+}
+
+#[derive(Deserialize)]
+struct ComputeChallengeOpenReq {
+    challenge_hex: String,
+}
+
+#[derive(Deserialize)]
+struct ComputeChallengeSecondReq {
+    receipt_hex: String,
+}
+
+#[derive(Deserialize)]
+struct ComputeBondReq {
+    bond_hex: String,
+}
+
+#[derive(Deserialize)]
+struct ComputeBondWithdrawReq {
+    withdrawal_hex: String,
+}
+
+#[derive(Deserialize)]
+struct ComputeBondDisputeReq {
+    dispute_hex: String,
+}
+
+#[derive(Deserialize)]
+struct ComputePayoutClaimReq {
+    l2_tx_hex: String,
+}
+
 #[derive(Deserialize, Default)]
 struct ComputeQuery {
     service: Option<String>,
@@ -8313,6 +8678,18 @@ async fn compute_offers_list(
                     continue;
                 }
             }
+            // Stake state, not a re-verification: every offer verified its
+            // provider signature at POST. `bonded` mirrors
+            // `BondBook::admit_offer` (stake floor + reputation) without
+            // paying verification per list item.
+            let bonded_sat = sh
+                .compute_bonds
+                .bond(&so.offer.provider)
+                .map(|b| b.amount_sat)
+                .unwrap_or(0);
+            let provider_score = sh.compute_bonds.score(&so.offer.provider);
+            let bonded = bonded_sat >= srct_compute::bond::MIN_BOND_SAT
+                && provider_score > srct_compute::bond::BAN_SCORE;
             list.push(json!({
                 "offer_hash": hash_to_hex(hash),
                 "provider": address_to_hex(&so.offer.provider),
@@ -8324,6 +8701,9 @@ async fn compute_offers_list(
                 "cores": so.offer.profile.cores,
                 "available_from": so.offer.available_from,
                 "available_until": so.offer.available_until,
+                "bonded": bonded,
+                "bonded_sat": bonded_sat,
+                "provider_score": provider_score,
             }));
         }
         Ok(Json(json!({
@@ -8470,7 +8850,17 @@ async fn compute_plan_post(
     })?
 }
 
-/// `POST /v1/compute/receipt` — verify and record completed compute receipt.
+/// `POST /v1/compute/receipt` — settle a receipt: verify, release escrow,
+/// record the exact payout.
+///
+/// This is the step that turned the marketplace from a bulletin board into a
+/// market. A receipt settles only when every check passes in this order:
+/// the signature, the job it names, the requester's assignment it fulfils
+/// (price, units, deadline, binding), and the job's escrow release for
+/// exactly its total. A receipt with no assignment behind it, or no funded
+/// escrow in front of it, is refused — work without authorization or without
+/// money settles nothing. The stored payout is the exact transfer the claim
+/// path executes; the receipt map holds settled receipts only.
 async fn compute_receipt_post(
     State(state): State<ApiState>,
     Json(req): Json<ComputeReceiptReq>,
@@ -8524,12 +8914,86 @@ async fn compute_receipt_post(
                 "receipt total exceeds job price ceiling",
             ));
         }
+        // The requester's authorization to pay: without the signed assignment
+        // this receipt fulfils, there is nothing to settle against.
+        let assignment = sh
+            .compute_assignments
+            .get(&signed_receipt.receipt.assignment)
+            .ok_or_else(|| {
+                fail(
+                    StatusCode::NOT_FOUND,
+                    "assignment_required",
+                    "no requester-signed assignment for this receipt: POST /v1/compute/assign first",
+                )
+            })?
+            .clone();
+        // The money move, before anything is recorded: the escrow release
+        // re-checks binding, price, deadline and once-only, and refuses when
+        // the job was never funded. Settlement without funding is not a
+        // settlement — it is a promise the requester's balance never made.
+        let payout = sh
+            .compute_escrow
+            .release(&signed_receipt, &assignment, height)
+            .map_err(|e| match e {
+                srct_compute::ComputeError::NotFunded => fail(
+                    StatusCode::CONFLICT,
+                    "escrow_unfunded",
+                    "the job's escrow holds nothing: POST /v1/compute/escrow/fund first",
+                ),
+                srct_compute::ComputeError::BudgetExceeded => fail(
+                    StatusCode::CONFLICT,
+                    "escrow_budget_exceeded",
+                    "the job's escrow cannot cover this receipt",
+                ),
+                srct_compute::ComputeError::Overclaim => {
+                    fail(StatusCode::BAD_REQUEST, "overclaim", e.to_string())
+                }
+                srct_compute::ComputeError::PriceMismatch => {
+                    fail(StatusCode::CONFLICT, "price_mismatch", e.to_string())
+                }
+                srct_compute::ComputeError::BindingMismatch => {
+                    fail(StatusCode::BAD_REQUEST, "binding_mismatch", e.to_string())
+                }
+                srct_compute::ComputeError::Expired => {
+                    fail(StatusCode::CONFLICT, "receipt_expired", e.to_string())
+                }
+                srct_compute::ComputeError::Replay => fail(
+                    StatusCode::CONFLICT,
+                    "already_settled",
+                    "this assignment already settled",
+                ),
+                _ => fail(StatusCode::BAD_REQUEST, "invalid_receipt", e.to_string()),
+            })?;
+        // Mirror the settlement: the ledger is the binding/once-only record
+        // the status and claim paths read.
+        sh.compute_ledger
+            .settle(&signed_receipt, &assignment, height)
+            .map_err(|e| {
+                fail(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal",
+                    format!("ledger diverged from escrow: {e}"),
+                )
+            })?;
+        // Reputation follows the money, never precedes it: only a settled
+        // receipt counts toward the provider's score.
+        if let Err(e) = sh
+            .compute_bonds
+            .record_settlement(&signed_receipt, &assignment)
+        {
+            return Err(fail(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                format!("bond book diverged from settlement: {e}"),
+            ));
+        }
 
         let provider = address_to_hex(&signed_receipt.receipt.provider);
         let total_sat = signed_receipt.receipt.total_sat;
         let units_done = signed_receipt.receipt.units_done;
 
         sh.compute_receipts.insert(hash, signed_receipt);
+        sh.compute_payouts.insert(hash, payout.clone());
         audit_push(
             sh,
             "compute_receipt",
@@ -8544,6 +9008,786 @@ async fn compute_receipt_post(
             "provider": provider,
             "units_done": units_done,
             "total_sat": total_sat,
+            "payout": {
+                "from": address_to_hex(&payout.from),
+                "to": address_to_hex(&payout.to),
+                "amount_sat": payout.amount_sat,
+            },
+            "claim": format!("/v1/compute/payouts/{}/exit-template", hash_to_hex(&hash)),
+        })))
+    })?
+}
+
+/// `POST /v1/compute/assign` — record the requester's signed authorization
+/// to pay for one planned shard.
+///
+/// A plan is advice; an assignment is authority. It is requester-signed and
+/// binds job, offer, shard, units, price, total and deadline together. The
+/// node checks it against the job and offer it names (same requester, same
+/// provider, within the job's price ceilings, deadline inside the job's
+/// window), because a requester's signature on numbers that contradict its
+/// own job is a mistake the node refuses to file. Receipts settle only
+/// against a stored assignment.
+async fn compute_assign_post(
+    State(state): State<ApiState>,
+    Json(req): Json<ComputeAssignReq>,
+) -> ApiResult {
+    let bytes = hex::decode(&req.assignment_hex)
+        .map_err(|e| bad(format!("assignment_hex is not hex: {e}")))?;
+    let signed = srct_compute::SignedAssignment::decode(&bytes)
+        .map_err(|e| fail(StatusCode::BAD_REQUEST, "invalid_assignment", e.to_string()))?;
+    with_shared(&state, |sh| {
+        let hash = signed.hash();
+        if sh.compute_assignments.contains_key(&hash) {
+            return Ok(Json(json!({
+                "status": "already_assigned",
+                "assignment_hash": hash_to_hex(&hash),
+                "duplicate": true,
+            })));
+        }
+        let a = &signed.assignment;
+        let job = sh.compute_jobs.get(&a.job).ok_or_else(|| {
+            fail(
+                StatusCode::BAD_REQUEST,
+                "unknown_job",
+                "assignment references unknown compute job",
+            )
+        })?;
+        let offer = sh.compute_offers.get(&a.offer).ok_or_else(|| {
+            fail(
+                StatusCode::BAD_REQUEST,
+                "unknown_offer",
+                "assignment references unknown compute offer",
+            )
+        })?;
+        if a.requester != job.job.requester {
+            return Err(fail(
+                StatusCode::BAD_REQUEST,
+                "assignment_requester_mismatch",
+                "the assignment's requester is not the job's requester",
+            ));
+        }
+        if a.provider != offer.offer.provider {
+            return Err(fail(
+                StatusCode::BAD_REQUEST,
+                "assignment_provider_mismatch",
+                "the assignment's provider is not the offer's provider",
+            ));
+        }
+        if a.units == 0 || a.units > offer.offer.max_units_per_job {
+            return Err(fail(
+                StatusCode::BAD_REQUEST,
+                "assignment_units",
+                "assignment units outside the offer's per-job range",
+            ));
+        }
+        if a.unit_price_sat != offer.offer.unit_price_sat {
+            return Err(fail(
+                StatusCode::BAD_REQUEST,
+                "assignment_price",
+                "assignment price differs from the offer's price",
+            ));
+        }
+        if a.unit_price_sat > job.job.max_unit_price_sat || a.total_sat > job.job.max_total_sat {
+            return Err(fail(
+                StatusCode::BAD_REQUEST,
+                "assignment_over_job_ceiling",
+                "assignment exceeds the job's price ceilings",
+            ));
+        }
+        let height = sh.chain.height();
+        if height > a.deadline || a.deadline > job.job.deadline {
+            return Err(fail(
+                StatusCode::BAD_REQUEST,
+                "assignment_deadline",
+                "assignment deadline is past or outside the job window",
+            ));
+        }
+        sh.compute_assignments.insert(hash, signed.clone());
+        audit_push(
+            sh,
+            "compute_assign",
+            Some(hash),
+            None,
+            format!(
+                "assignment for {} units at {} sat to {}",
+                a.units,
+                a.total_sat,
+                address_to_hex(&a.provider)
+            ),
+        );
+        Ok(Json(json!({
+            "status": "assigned",
+            "assignment_hash": hash_to_hex(&hash),
+            "job_hash": hash_to_hex(&a.job),
+            "provider": address_to_hex(&a.provider),
+            "units": a.units,
+            "total_sat": a.total_sat,
+            "deadline": a.deadline,
+        })))
+    })?
+}
+
+/// `GET /v1/compute/assignments/list` — list stored requester assignments.
+async fn compute_assignments_list(State(state): State<ApiState>) -> ApiResult {
+    with_shared(&state, |sh| {
+        let list: Vec<Value> = sh
+            .compute_assignments
+            .iter()
+            .map(|(hash, sa)| {
+                let a = &sa.assignment;
+                json!({
+                    "assignment_hash": hash_to_hex(hash),
+                    "job_hash": hash_to_hex(&a.job),
+                    "provider": address_to_hex(&a.provider),
+                    "units": a.units,
+                    "total_sat": a.total_sat,
+                    "deadline": a.deadline,
+                    "settled": sh.compute_ledger.is_settled(hash),
+                })
+            })
+            .collect();
+        Ok(Json(json!({
+            "count": list.len(),
+            "assignments": list,
+        })))
+    })?
+}
+
+/// `POST /v1/compute/escrow/fund` — fund a job's compute escrow.
+///
+/// The funding is requester-signed and single-use per job: one funding per
+/// job, ever. It moves no coin by itself — it records that this much of the
+/// requester's money answers for this job, and releases draw it down exactly.
+/// A receipt cannot settle against an unfunded job.
+async fn compute_escrow_fund_post(
+    State(state): State<ApiState>,
+    Json(req): Json<ComputeEscrowFundReq>,
+) -> ApiResult {
+    let bytes =
+        hex::decode(&req.funding_hex).map_err(|e| bad(format!("funding_hex is not hex: {e}")))?;
+    let funding = srct_compute::SignedFunding::decode(&bytes)
+        .map_err(|e| fail(StatusCode::BAD_REQUEST, "invalid_funding", e.to_string()))?;
+    with_shared(&state, |sh| {
+        let f = &funding.funding;
+        let job = sh.compute_jobs.get(&f.job).ok_or_else(|| {
+            fail(
+                StatusCode::BAD_REQUEST,
+                "unknown_job",
+                "funding references unknown compute job",
+            )
+        })?;
+        if f.requester != job.job.requester {
+            return Err(fail(
+                StatusCode::BAD_REQUEST,
+                "funding_requester_mismatch",
+                "the funding's requester is not the job's requester",
+            ));
+        }
+        if f.deadline != job.job.deadline {
+            return Err(fail(
+                StatusCode::BAD_REQUEST,
+                "funding_deadline_mismatch",
+                "the funding's deadline must equal the job's deadline",
+            ));
+        }
+        let height = sh.chain.height();
+        let funded = sh
+            .compute_escrow
+            .fund(&funding, height)
+            .map_err(|e| match e {
+                srct_compute::ComputeError::Replay => fail(
+                    StatusCode::CONFLICT,
+                    "already_funded",
+                    "this job already has an escrow funding",
+                ),
+                _ => fail(StatusCode::BAD_REQUEST, "invalid_funding", e.to_string()),
+            })?;
+        audit_push(
+            sh,
+            "compute_escrow_fund",
+            Some(f.job),
+            None,
+            format!("funded {funded} sat for job {}", hash_to_hex(&f.job)),
+        );
+        Ok(Json(json!({
+            "status": "funded",
+            "job_hash": hash_to_hex(&f.job),
+            "funded_sat": funded,
+            "remaining_sat": sh.compute_escrow.remaining_sat(&f.job),
+        })))
+    })?
+}
+
+/// `POST /v1/compute/escrow/refund` — refund an expired job's unspent escrow
+/// to the requester.
+async fn compute_escrow_refund_post(
+    State(state): State<ApiState>,
+    Json(req): Json<ComputeEscrowRefundReq>,
+) -> ApiResult {
+    let job_hash = decode_hash(&req.job_hash)?;
+    with_shared(&state, |sh| {
+        let height = sh.chain.height();
+        let refund = sh
+            .compute_escrow
+            .refund(&job_hash, height)
+            .map_err(|e| match e {
+                srct_compute::ComputeError::NotExpired => fail(
+                    StatusCode::CONFLICT,
+                    "escrow_not_expired",
+                    "refunds unlock only after the job deadline",
+                ),
+                srct_compute::ComputeError::BindingMismatch => not_found("unknown compute escrow"),
+                _ => fail(StatusCode::BAD_REQUEST, "refund_failed", e.to_string()),
+            })?;
+        let (to, amount) = (refund.to, refund.amount_sat);
+        audit_push(
+            sh,
+            "compute_escrow_refund",
+            Some(job_hash),
+            None,
+            format!("refunded {amount} sat to {}", address_to_hex(&to)),
+        );
+        Ok(Json(json!({
+            "status": "refunded",
+            "job_hash": hash_to_hex(&job_hash),
+            "to": address_to_hex(&to),
+            "amount_sat": amount,
+        })))
+    })?
+}
+
+/// `GET /v1/compute/payouts` — list settled payouts: the exact transfers the
+/// payment rail must execute, with their claim state.
+///
+/// A payout with no exit binding is money owed but not yet moving; a payout
+/// whose bound exit released on chain is money paid. Between them sits the
+/// queued claim — permissionless to submit, consensus to release.
+async fn compute_payouts_list(State(state): State<ApiState>) -> ApiResult {
+    with_shared(&state, |sh| {
+        let list: Vec<Value> = sh
+            .compute_payouts
+            .iter()
+            .map(|(receipt_hash, p)| {
+                let binding = sh.compute_payout_exit.get(receipt_hash);
+                json!({
+                    "receipt_hash": hash_to_hex(receipt_hash),
+                    "job_hash": hash_to_hex(&p.job),
+                    "from": address_to_hex(&p.from),
+                    "to": address_to_hex(&p.to),
+                    "amount_sat": p.amount_sat,
+                    "claimed": binding.is_some(),
+                    "exit_txid": binding.map(|b| hash512_to_hex(&b.txid)),
+                })
+            })
+            .collect();
+        Ok(Json(json!({
+            "count": list.len(),
+            "payouts": list,
+        })))
+    })?
+}
+
+/// `GET /v1/compute/payouts/{receipt}/exit-template` — the unsigned exit the
+/// requester signs to pay a settled payout.
+///
+/// Same shape as the L1 template pattern (`GET /v1/mine/template`): the node
+/// builds the exact bytes, the keyholder signs, anyone submits. The response
+/// names owner, destination, amount, the fee floor, and a suggested nonce
+/// (one past the highest the node has seen for this owner); the claim path
+/// re-checks everything, so a stale suggestion fails safely rather than
+/// paying wrong.
+async fn compute_payout_template(
+    State(state): State<ApiState>,
+    Path(receipt_hash): Path<String>,
+) -> ApiResult {
+    let id = decode_hash(&receipt_hash)?;
+    with_shared(&state, |sh| {
+        let payout = sh
+            .compute_payouts
+            .get(&id)
+            .ok_or_else(|| not_found("unknown compute payout"))?
+            .clone();
+        let mut next_nonce: u64 = 1;
+        for watch in sh.l2.pending_exits() {
+            if watch.owner == payout.from {
+                next_nonce = next_nonce.max(watch.nonce.saturating_add(1));
+            }
+        }
+        for tx in &sh.l2_to_include {
+            if let L2Payload::ExitQueue(e) = &tx.payload {
+                if e.owner == payout.from {
+                    next_nonce = next_nonce.max(e.nonce.saturating_add(1));
+                }
+            }
+        }
+        for binding in sh.compute_payout_exit.values() {
+            if binding.owner == payout.from {
+                next_nonce = next_nonce.max(binding.nonce.saturating_add(1));
+            }
+        }
+        Ok(Json(json!({
+            "receipt_hash": hash_to_hex(&id),
+            "owner": address_to_hex(&payout.from),
+            "destination": address_to_hex(&payout.to),
+            "amount_sat": payout.amount_sat,
+            "exit_fee_floor_sat": srct_core::l2::MIN_EXIT_FEE_SAT,
+            "suggested_nonce": next_nonce,
+            "sign_with": "ExitQueuePayload::build(wallet, nonce, amount_sat, destination, exit_fee_sat)",
+            "submit_to": format!("/v1/compute/payouts/{}/claim", hash_to_hex(&id)),
+        })))
+    })?
+}
+
+/// `POST /v1/compute/payouts/{receipt}/claim` — bind a settled payout to a
+/// requester-signed L2 exit and queue it for inclusion.
+///
+/// This is where the marketplace's accounting becomes money. The caller
+/// supplies the owner's signed `ExitQueue` (built from the template); the
+/// node checks it names exactly this payout's owner, destination and amount,
+/// dry-runs it against current L2 state, and queues it. Anyone may submit —
+/// the signature is the authority, not the submitter — and the crank pays the
+/// provider when consensus releases the exit, exactly like the escrow claim
+/// path. A binding to a dead exit is dropped and replaced rather than
+/// locking the payout against an exit that will never land.
+async fn compute_payout_claim(
+    State(state): State<ApiState>,
+    Path(receipt_hash): Path<String>,
+    Json(req): Json<ComputePayoutClaimReq>,
+) -> ApiResult {
+    ensure_funding_allowed(&state, FundingPath::L2Write)?;
+    let id = decode_hash(&receipt_hash)?;
+    let bytes =
+        hex::decode(&req.l2_tx_hex).map_err(|e| bad(format!("l2_tx_hex is not hex: {e}")))?;
+    let tx = L2Transaction::deserialize(&bytes).map_err(|e| bad(format!("l2 tx decode: {e}")))?;
+    with_shared(&state, |sh| {
+        let payout = sh
+            .compute_payouts
+            .get(&id)
+            .ok_or_else(|| not_found("unknown compute payout"))?
+            .clone();
+        let txid = tx.txid();
+        let (exit_owner, exit_destination, exit_amount, exit_nonce) = match &tx.payload {
+            L2Payload::ExitQueue(e) => (e.owner, e.destination, e.amount_sat, e.nonce),
+            _ => {
+                return Err(fail(
+                    StatusCode::BAD_REQUEST,
+                    "not_an_exit",
+                    "a payout claim must carry an ExitQueue transaction",
+                ))
+            }
+        };
+        if exit_owner != payout.from {
+            return Err(fail(
+                StatusCode::BAD_REQUEST,
+                "claim_owner_mismatch",
+                "the exit's owner must be the payout's payer",
+            ));
+        }
+        if exit_destination != payout.to {
+            return Err(fail(
+                StatusCode::BAD_REQUEST,
+                "claim_destination_mismatch",
+                "the exit's destination must be the payout's provider",
+            ));
+        }
+        if exit_amount != payout.amount_sat {
+            return Err(fail(
+                StatusCode::BAD_REQUEST,
+                "claim_amount_mismatch",
+                "the exit must pay exactly the settled payout",
+            ));
+        }
+        if let Some(bound) = sh.compute_payout_exit.get(&id) {
+            if bound.txid == txid {
+                return Ok(Json(json!({
+                    "receipt_hash": hash_to_hex(&id),
+                    "txid": hash512_to_hex(&txid),
+                    "duplicate": true,
+                })));
+            }
+            let stale = !sh.chain.exit_released(&bound.owner, bound.nonce)
+                && !sh
+                    .l2
+                    .pending_exits()
+                    .iter()
+                    .any(|w| w.owner == bound.owner && w.nonce == bound.nonce)
+                && !sh.l2_to_include.iter().any(|t| t.txid() == bound.txid);
+            if !stale {
+                return Err(fail(
+                    StatusCode::CONFLICT,
+                    "payout_claimed",
+                    "this payout's coin move is already bound to another exit",
+                ));
+            }
+            sh.compute_payout_exit.remove(&id);
+        }
+        // Same inclusion gate as every other L2 write: the exit must dry-run
+        // clean against this node's current state, or it is refused here
+        // rather than skipped in a block.
+        sh.l2
+            .check(&sh.chain, &tx, sh.chain.height() + 1)
+            .map_err(|e| {
+                fail(
+                    StatusCode::CONFLICT,
+                    "exit_rejected",
+                    format!("the bound exit fails admission: {e}"),
+                )
+            })?;
+        if sh.l2_to_include.len() >= MAX_L2_QUEUE {
+            return Err(fail(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "l2_queue_full",
+                "inclusion queue is full; retry shortly",
+            ));
+        }
+        sh.l2_to_include.push(tx);
+        sh.compute_payout_exit.insert(
+            id,
+            EscrowExitBinding {
+                txid,
+                owner: exit_owner,
+                nonce: exit_nonce,
+            },
+        );
+        audit_push(
+            sh,
+            "compute_payout_claim",
+            Some(id),
+            None,
+            format!(
+                "payout {} sat bound to exit {}",
+                payout.amount_sat,
+                hash512_to_hex(&txid)
+            ),
+        );
+        Ok(Json(json!({
+            "status": "queued",
+            "receipt_hash": hash_to_hex(&id),
+            "txid": hash512_to_hex(&txid),
+            "owner": address_to_hex(&exit_owner),
+            "destination": address_to_hex(&exit_destination),
+            "amount_sat": exit_amount,
+        })))
+    })?
+}
+
+/// `POST /v1/compute/challenge/open` — open a re-execution challenge against
+/// a settled assignment.
+///
+/// The requester names an independent challenger to re-run the work; the
+/// challenger submits its own receipt, and the two result hashes are
+/// compared. Challenges open only against settled assignments — there is
+/// nothing to dispute before settlement — and one challenge per assignment,
+/// ever, so a failed challenge cannot fork the audit trail.
+async fn compute_challenge_open(
+    State(state): State<ApiState>,
+    Json(req): Json<ComputeChallengeOpenReq>,
+) -> ApiResult {
+    let bytes = hex::decode(&req.challenge_hex)
+        .map_err(|e| bad(format!("challenge_hex is not hex: {e}")))?;
+    let challenge = srct_compute::SignedChallenge::decode(&bytes)
+        .map_err(|e| fail(StatusCode::BAD_REQUEST, "invalid_challenge", e.to_string()))?;
+    with_shared(&state, |sh| {
+        let assignment = sh
+            .compute_assignments
+            .get(&challenge.challenge.assignment)
+            .ok_or_else(|| not_found("unknown compute assignment"))?
+            .clone();
+        if !sh.compute_ledger.is_settled(&assignment.hash()) {
+            return Err(fail(
+                StatusCode::CONFLICT,
+                "challenge_needs_settlement",
+                "challenges open against settled assignments only",
+            ));
+        }
+        let height = sh.chain.height();
+        sh.compute_challenges
+            .open(&challenge, &assignment, height)
+            .map_err(|e| match e {
+                srct_compute::ComputeError::Replay => fail(
+                    StatusCode::CONFLICT,
+                    "already_challenged",
+                    "this assignment already has a challenge",
+                ),
+                _ => fail(StatusCode::BAD_REQUEST, "invalid_challenge", e.to_string()),
+            })?;
+        audit_push(
+            sh,
+            "compute_challenge_open",
+            Some(challenge.challenge.assignment),
+            None,
+            "challenge opened: awaiting challenger receipt".to_string(),
+        );
+        Ok(Json(json!({
+            "status": "challenged",
+            "assignment_hash": hash_to_hex(&challenge.challenge.assignment),
+            "challenger": address_to_hex(&challenge.challenge.challenger),
+            "deadline": challenge.challenge.deadline_height,
+        })))
+    })?
+}
+
+/// `POST /v1/compute/challenge/second` — submit the challenger's
+/// re-execution receipt.
+async fn compute_challenge_second(
+    State(state): State<ApiState>,
+    Json(req): Json<ComputeChallengeSecondReq>,
+) -> ApiResult {
+    let bytes =
+        hex::decode(&req.receipt_hex).map_err(|e| bad(format!("receipt_hex is not hex: {e}")))?;
+    let receipt = srct_compute::SignedReceipt::decode(&bytes)
+        .map_err(|e| fail(StatusCode::BAD_REQUEST, "invalid_receipt", e.to_string()))?;
+    with_shared(&state, |sh| {
+        let height = sh.chain.height();
+        sh.compute_challenges
+            .submit_second(&receipt, height)
+            .map_err(|e| match e {
+                srct_compute::ComputeError::BindingMismatch => {
+                    not_found("no open challenge for this assignment")
+                }
+                srct_compute::ComputeError::Replay => fail(
+                    StatusCode::CONFLICT,
+                    "second_already_submitted",
+                    "the challenger's receipt is already filed",
+                ),
+                _ => fail(StatusCode::BAD_REQUEST, "invalid_second", e.to_string()),
+            })?;
+        audit_push(
+            sh,
+            "compute_challenge_second",
+            Some(receipt.receipt.assignment),
+            None,
+            "challenger receipt filed".to_string(),
+        );
+        Ok(Json(json!({
+            "status": "second_filed",
+            "assignment_hash": hash_to_hex(&receipt.receipt.assignment),
+        })))
+    })?
+}
+
+/// `GET /v1/compute/challenge/{assignment}` — challenge status and verdict.
+///
+/// `awaiting_second` means the challenger has not re-run yet; `match` means
+/// the original receipt stands; `mismatch` means the result was fabricated
+/// and carries the dispute fields the requester signs and posts to
+/// `POST /v1/compute/bonds/dispute` to slash the provider's bond.
+async fn compute_challenge_get(
+    State(state): State<ApiState>,
+    Path(assignment_hash): Path<String>,
+) -> ApiResult {
+    let id = decode_hash(&assignment_hash)?;
+    with_shared(&state, |sh| {
+        if !sh.compute_challenges.is_open(&id) {
+            return Err(not_found("no challenge for this assignment"));
+        }
+        if !sh.compute_challenges.has_second(&id) {
+            return Ok(Json(json!({
+                "assignment_hash": hash_to_hex(&id),
+                "status": "awaiting_second",
+            })));
+        }
+        let first = sh
+            .compute_receipts
+            .values()
+            .find(|r| r.receipt.assignment == id)
+            .ok_or_else(|| not_found("settled receipt for this assignment is gone"))?
+            .clone();
+        match sh
+            .compute_challenges
+            .verdict(&id, &first)
+            .map_err(|e| fail(StatusCode::CONFLICT, "no_verdict", e.to_string()))?
+        {
+            srct_compute::ChallengeVerdict::Match { .. } => Ok(Json(json!({
+                "assignment_hash": hash_to_hex(&id),
+                "status": "match",
+                "detail": "re-execution agrees: the original receipt stands",
+            }))),
+            srct_compute::ChallengeVerdict::Mismatch {
+                provider,
+                requester,
+                evidence,
+                ..
+            } => Ok(Json(json!({
+                "assignment_hash": hash_to_hex(&id),
+                "status": "mismatch",
+                "detail": "re-execution disagrees: the original result is fabricated",
+                "slash_with": {
+                    "requester": address_to_hex(&requester),
+                    "provider": address_to_hex(&provider),
+                    "assignment": hash_to_hex(&id),
+                    "reason": "WrongResult",
+                    "evidence": hash_to_hex(&evidence),
+                },
+                "submit_to": "/v1/compute/bonds/dispute",
+            }))),
+        }
+    })?
+}
+
+/// `POST /v1/compute/bonds/register` — stake a provider-signed bond.
+///
+/// A bond is skin in the game behind a provider's offers: re-registering
+/// tops it up and clears accumulated timeouts. Registration verifies the
+/// provider's signature and records the stake; it moves no coin by itself —
+/// the slash and withdraw paths below are the instructions the payment
+/// layer executes.
+async fn compute_bond_register(
+    State(state): State<ApiState>,
+    Json(req): Json<ComputeBondReq>,
+) -> ApiResult {
+    let bytes = hex::decode(&req.bond_hex).map_err(|e| bad(format!("bond_hex is not hex: {e}")))?;
+    let bond = srct_compute::SignedBond::decode(&bytes)
+        .map_err(|e| fail(StatusCode::BAD_REQUEST, "invalid_bond", e.to_string()))?;
+    with_shared(&state, |sh| {
+        let height = sh.chain.height();
+        let total = sh
+            .compute_bonds
+            .register(&bond, height)
+            .map_err(|e| match e {
+                srct_compute::ComputeError::Replay => fail(
+                    StatusCode::CONFLICT,
+                    "already_registered",
+                    "this bond registration is already filed",
+                ),
+                _ => fail(StatusCode::BAD_REQUEST, "invalid_bond", e.to_string()),
+            })?;
+        let provider = address_to_hex(&bond.bond.provider);
+        audit_push(
+            sh,
+            "compute_bond",
+            None,
+            None,
+            format!("bond registered for {provider}: {total} sat staked"),
+        );
+        Ok(Json(json!({
+            "status": "registered",
+            "provider": provider,
+            "total_bonded_sat": total,
+        })))
+    })?
+}
+
+/// `POST /v1/compute/bonds/withdraw` — release part of a bond after lockup.
+async fn compute_bond_withdraw(
+    State(state): State<ApiState>,
+    Json(req): Json<ComputeBondWithdrawReq>,
+) -> ApiResult {
+    let bytes = hex::decode(&req.withdrawal_hex)
+        .map_err(|e| bad(format!("withdrawal_hex is not hex: {e}")))?;
+    let withdrawal = srct_compute::SignedWithdrawal::decode(&bytes)
+        .map_err(|e| fail(StatusCode::BAD_REQUEST, "invalid_withdrawal", e.to_string()))?;
+    with_shared(&state, |sh| {
+        let height = sh.chain.height();
+        let remaining = sh
+            .compute_bonds
+            .withdraw(&withdrawal, height)
+            .map_err(|e| match e {
+                srct_compute::ComputeError::LockupActive => fail(
+                    StatusCode::CONFLICT,
+                    "bond_locked",
+                    "the bond is still in lockup",
+                ),
+                srct_compute::ComputeError::InsufficientBond => fail(
+                    StatusCode::CONFLICT,
+                    "insufficient_bond",
+                    "withdrawal exceeds the bonded amount",
+                ),
+                _ => fail(StatusCode::BAD_REQUEST, "invalid_withdrawal", e.to_string()),
+            })?;
+        audit_push(
+            sh,
+            "compute_bond_withdraw",
+            None,
+            None,
+            format!(
+                "bond withdrawal for {}: {remaining} sat remain",
+                address_to_hex(&withdrawal.withdrawal.provider)
+            ),
+        );
+        Ok(Json(json!({
+            "status": "withdrawn",
+            "provider": address_to_hex(&withdrawal.withdrawal.provider),
+            "remaining_bonded_sat": remaining,
+        })))
+    })?
+}
+
+/// `POST /v1/compute/bonds/dispute` — slash a provider's bond with a
+/// requester-signed dispute bound to a real assignment.
+///
+/// `NoShow` after the deadline takes 10% of the bond; fraud (`Overclaim`,
+/// `Impostor`, `WrongResult`) takes 50%. Each dispute executes once — a
+/// replayed dispute is refused, never double-counted — and every slash is
+/// recorded against the provider's reputation.
+async fn compute_bond_dispute(
+    State(state): State<ApiState>,
+    Json(req): Json<ComputeBondDisputeReq>,
+) -> ApiResult {
+    let bytes =
+        hex::decode(&req.dispute_hex).map_err(|e| bad(format!("dispute_hex is not hex: {e}")))?;
+    let dispute = srct_compute::SignedDispute::decode(&bytes)
+        .map_err(|e| fail(StatusCode::BAD_REQUEST, "invalid_dispute", e.to_string()))?;
+    with_shared(&state, |sh| {
+        let assignment = sh
+            .compute_assignments
+            .get(&dispute.dispute.assignment)
+            .ok_or_else(|| not_found("unknown compute assignment"))?
+            .clone();
+        let height = sh.chain.height();
+        let remaining = sh
+            .compute_bonds
+            .slash(&dispute, &assignment, height)
+            .map_err(|e| match e {
+                srct_compute::ComputeError::AlreadySlashed => fail(
+                    StatusCode::CONFLICT,
+                    "already_slashed",
+                    "this dispute already executed",
+                ),
+                srct_compute::ComputeError::NotBonded => fail(
+                    StatusCode::CONFLICT,
+                    "not_bonded",
+                    "the provider holds no bond to slash",
+                ),
+                _ => fail(StatusCode::BAD_REQUEST, "invalid_dispute", e.to_string()),
+            })?;
+        audit_push(
+            sh,
+            "compute_bond_slash",
+            Some(dispute.dispute.assignment),
+            None,
+            format!(
+                "slashed {}: {remaining} sat remain",
+                address_to_hex(&dispute.dispute.provider)
+            ),
+        );
+        Ok(Json(json!({
+            "status": "slashed",
+            "provider": address_to_hex(&dispute.dispute.provider),
+            "remaining_bonded_sat": remaining,
+            "score": sh.compute_bonds.score(&dispute.dispute.provider),
+        })))
+    })?
+}
+
+/// `GET /v1/compute/bonds/{provider}` — a provider's bond and reputation.
+async fn compute_bond_get(
+    State(state): State<ApiState>,
+    Path(provider): Path<String>,
+) -> ApiResult {
+    let addr = decode_address(&provider)?;
+    with_shared(&state, |sh| {
+        let bond = sh.compute_bonds.bond(&addr);
+        let rep = sh.compute_bonds.reputation(&addr);
+        Ok(Json(json!({
+            "provider": address_to_hex(&addr),
+            "bonded_sat": bond.map(|b| b.amount_sat).unwrap_or(0),
+            "score": rep.score(),
+            "settled_units": rep.settled_units,
+            "settled_count": rep.settled_count,
+            "timeouts": rep.timeouts,
+            "slashes": rep.slashes,
         })))
     })?
 }
@@ -10756,8 +12000,40 @@ pub fn router(state: ApiState, cfg: &ApiConfig) -> Router {
         .route("/v1/compute/jobs", post(compute_job_post))
         .route("/v1/compute/jobs/list", get(compute_jobs_list))
         .route("/v1/compute/plan", post(compute_plan_post))
+        .route("/v1/compute/assign", post(compute_assign_post))
+        .route(
+            "/v1/compute/assignments/list",
+            get(compute_assignments_list),
+        )
+        .route("/v1/compute/escrow/fund", post(compute_escrow_fund_post))
+        .route(
+            "/v1/compute/escrow/refund",
+            post(compute_escrow_refund_post),
+        )
         .route("/v1/compute/receipt", post(compute_receipt_post))
-        .route("/v1/compute/receipts/list", get(compute_receipts_list));
+        .route("/v1/compute/receipts/list", get(compute_receipts_list))
+        .route("/v1/compute/payouts", get(compute_payouts_list))
+        .route(
+            "/v1/compute/payouts/{receipt}/exit-template",
+            get(compute_payout_template),
+        )
+        .route(
+            "/v1/compute/payouts/{receipt}/claim",
+            post(compute_payout_claim),
+        )
+        .route("/v1/compute/challenge/open", post(compute_challenge_open))
+        .route(
+            "/v1/compute/challenge/second",
+            post(compute_challenge_second),
+        )
+        .route(
+            "/v1/compute/challenge/{assignment}",
+            get(compute_challenge_get),
+        )
+        .route("/v1/compute/bonds/register", post(compute_bond_register))
+        .route("/v1/compute/bonds/withdraw", post(compute_bond_withdraw))
+        .route("/v1/compute/bonds/dispute", post(compute_bond_dispute))
+        .route("/v1/compute/bonds/{provider}", get(compute_bond_get));
     // The stack stays `Router<ApiState>` (no state yet) until the end, where a
     // single `with_state` resolves it to the servable `Router<()>`.
     let mut app: Router<ApiState> = app.layer(DefaultBodyLimit::max(MAX_BODY_BYTES));

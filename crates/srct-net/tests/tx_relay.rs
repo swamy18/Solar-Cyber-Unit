@@ -61,6 +61,8 @@ struct Peer {
     relay: RelayManager,
     /// Inbound arbitration votes, tallied per dispute.
     votes: srct_core::arbitration::VoteBook,
+    /// Inbound Smart Gate revocations, verified per statement.
+    revokes: srct_core::guard::GuardRevokeBook,
     /// Height the pool was last reconciled against.
     cursor: u64,
     /// Synthetic clock handed to `poll_events`.
@@ -103,6 +105,7 @@ impl Peer {
             syncer: SyncManager::new(),
             relay: RelayManager::new(),
             votes: srct_core::arbitration::VoteBook::new(),
+            revokes: srct_core::guard::GuardRevokeBook::new(),
             cursor,
             clock: None,
         }
@@ -118,6 +121,7 @@ impl Peer {
                 syncer: &mut self.syncer,
                 relay: &mut self.relay,
                 votes: &mut self.votes,
+                revokes: &mut self.revokes,
             },
             self.clock,
         );

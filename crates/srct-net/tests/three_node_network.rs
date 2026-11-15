@@ -72,6 +72,7 @@ struct Peer {
     syncer: SyncManager,
     relay: RelayManager,
     votes: srct_core::arbitration::VoteBook,
+    revokes: srct_core::guard::GuardRevokeBook,
     cursor: u64,
 }
 
@@ -104,6 +105,7 @@ impl Peer {
             syncer: SyncManager::new(),
             relay: RelayManager::new(),
             votes: srct_core::arbitration::VoteBook::new(),
+            revokes: srct_core::guard::GuardRevokeBook::new(),
             cursor,
         }
     }
@@ -118,6 +120,7 @@ impl Peer {
                 syncer: &mut self.syncer,
                 relay: &mut self.relay,
                 votes: &mut self.votes,
+                revokes: &mut self.revokes,
             },
             None,
         );
