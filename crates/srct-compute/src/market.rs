@@ -470,6 +470,18 @@ impl SignedJob {
     pub fn hash(&self) -> Hash {
         self.job.hash()
     }
+
+    pub fn encode(&self) -> Vec<u8> {
+        encode_signed(&self.job.encode(), &self.sigs, &self.keys)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, ComputeError> {
+        let (body, sigs, keys) = decode_signed(bytes, "job")?;
+        let job = ComputeJob::decode(&body)?;
+        let signed = SignedJob { job, sigs, keys };
+        signed.verify()?;
+        Ok(signed)
+    }
 }
 
 /// One shard of a job assigned to one provider.

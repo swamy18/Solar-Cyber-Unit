@@ -1266,6 +1266,7 @@ dependencies = [
  "rand",
  "serde",
  "serde_json",
+ "srct-compute",
  "srct-core",
  "srct-l2",
  "srct-net",

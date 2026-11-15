@@ -1,13 +1,11 @@
 # Decentralized compute sharing
 
-Status: **working non-consensus prototype** in `crates/srct-compute`. It lets
-heterogeneous devices advertise compute behind a signed bond, lets a requester
-shard work across them, and settles exactly the units each provider finished.
-It moves no coin and does not change consensus.
+Status: **wired to node REST API** with core in `crates/srct-compute` and endpoints in `crates/srct-node`. Heterogeneous devices advertise compute behind a signed bond, requesters shard work across them, and verified receipts settle completed units. Offers, jobs, receipts, and settlements persist in `state.bin` (envelope v14).
 
 ```bash
 cargo test -p srct-compute
-cargo run --release -p srct-compute --example compute_demo
+cargo test -p srct-node --test agent_economy
+python templates/srct_node.py --selftest
 ```
 
 ## 1. What problem it solves
@@ -24,8 +22,18 @@ be able to earn SRCT for spare compute without four separate protocols:
 - a timed-out provider must not be able to settle after the work moved.
 
 `srct-compute` answers those with signed data formats, a deterministic planner
-and a settlement ledger. Running the work, gossiping offers and executing the
-payout are the operator's layers.
+and a settlement ledger. `srct-node` exposes these via REST endpoints:
+- `POST /v1/compute/offers` & `GET /v1/compute/offers/list`
+- `POST /v1/compute/jobs` & `GET /v1/compute/jobs/list`
+- `POST /v1/compute/plan`
+- `POST /v1/compute/receipt` & `GET /v1/compute/receipts/list`
+
+### Dedicated Resource Modes and Consumer Dispatch
+
+In `templates/srct_node.py`, participants operate under 100% dedicated allocation:
+- **`mode="mine"`**: 100% of CPU/threads allocated to PoW mining.
+- **`mode="ai_compute"`**: 100% of RAM/compute allocated to AI compute tasks.
+- **Consumer Task Dispatch**: Incoming consumer requests dynamically dispatch between AI inference (`task["type"] == "inference"`) and AI training (`task["type"] == "training"`).
 
 ## 2. Device profile
 

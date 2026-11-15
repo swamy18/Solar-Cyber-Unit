@@ -13,6 +13,7 @@ srct-core.workspace = true
 srct-l2.workspace = true
 srct-net.workspace = true
 srct-store.workspace = true
+srct-compute.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 hex.workspace = true

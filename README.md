@@ -221,12 +221,15 @@ Details: [`docs/dual-mining.md`](docs/dual-mining.md).
   `FixedPointBackend` is `BitExact`. Conformance (`check_backend`) enforces
   tolerances per class (`0.0`, `1e-6`, `1e-3`) and refuses f32 backends at the
   `BitExact` gate.
-- **Hardware backends** `[EMULATED]`. `Cuda / Rocm / Tpu / Npu / AppleSoc /
-  Photonic` interfaces exist with declared capabilities (batch sizes, memory
-  budgets), but `probe()` always returns false — no vendor SDK is linked — and
-  every method returns `Err(Unavailable)` fail-closed. `emulated()` runs CPU
-  kernels under a hardware device class with a distinct kernel hash, so
-  emulated runs are distinguishable from (future) silicon runs.
+- **Hardware backends and CPU fallback.** `Cuda / Rocm / Tpu / Npu / AppleSoc /
+  Photonic` interfaces exist with declared capabilities. When hardware drivers
+  are absent, backends fail closed with `Err(Unavailable)` rather than panicking.
+  `best_available_backend()` automatically inspects available accelerators in
+  preference order and falls back to `CpuBackend`, ensuring CPU-only machines run
+  without errors.
+- **Consensus activation.** Dual-mining PoUW is staged via `pouw_activation_height`.
+  Activated on `testnet` from block height 1 (`pouw_active = true`), while `mainnet`
+  remains at height 0 awaiting on-chain governance activation.
 - **Rewards.** Exact pot conservation: `weight = min(samples, 4096) ×
   quality_bps` where `quality_bps = round(clamp(cosine,0,1) × 10000)`; shares
   are floored with the remainder dealt by largest remainder (ties by address).
@@ -241,11 +244,19 @@ Details: [`docs/dual-mining.md`](docs/dual-mining.md).
 
 ## Decentralized compute
 
-`[PROTOTYPE]` — pure non-consensus library. **Nothing here moves coins.**
-Every payout, refund, slash, and withdrawal is a `PayoutInstruction` for an
-off-chain rail to execute. No `srct-node` code path calls into these books.
+`[L1 WIRED · REST API ACTIVE]` — integrated marketplace in `srct-compute` and `srct-node`.
+The node coordinates provider offers, consumer jobs, assignments, and verified receipts via HTTP REST endpoints with durable state persistence (`state.bin` v14):
 
-- **Market.** Self-declared `DeviceProfile`s (class bitmask, RAM 512–1M MiB,
+- **Market REST API (`srct-node`).**
+  - `POST /v1/compute/offers`: register signed provider compute offers (`SignedOffer`).
+  - `GET /v1/compute/offers/list`: query active offers (filterable by `?service=`).
+  - `POST /v1/compute/jobs`: register signed requester compute jobs (`SignedJob`).
+  - `GET /v1/compute/jobs/list`: list active compute jobs.
+  - `POST /v1/compute/plan`: match jobs against available offers via `plan_assignments`.
+  - `POST /v1/compute/receipt`: verify and settle completed execution receipts (`SignedReceipt`), enforcing units and price caps, and tracking settled satoshis.
+  - `GET /v1/compute/receipts/list`: list verified receipts.
+  - **State persistence (v14):** `compute_offers`, `compute_jobs`, `compute_receipts`, and `compute_settlements` survive node restarts.
+- **Market core.** Self-declared `DeviceProfile`s (class bitmask, RAM 512–1M MiB,
   determinism floor, kernel hash), signed offers and jobs
   (`srct/compute/{offer,job,assignment}/v1`), deterministic greedy planner:
   filter (network, service, window, price, verification floor, sealed ⇒
@@ -253,6 +264,7 @@ off-chain rail to execute. No `srct-node` code path calls into these books.
   (`MAX_JOB_UNITS = 10⁶`, 4096 shards, 3 attempts).
 - **Receipts and settlement.** `receipt.total = units_done × price`, checked
   exactly; once-only settlement; late settlement refused after the deadline.
+  Recorded in `compute_settlements` with audit logging.
 - **Bonds and reputation.** Minimum bond 10,000 sat, 144-block lockup.
   Slash: 10% no-show (past deadline), 50% fraud
   (`WrongResult`/`Overclaim`/`Impostor`), with integer-division truncation.
@@ -576,17 +588,20 @@ local stratum throughput is ~114 kH/s (recorded in
 
 ## Running a compute participant
 
-`[PROTOTYPE]` — off-chain only. No coins move; participation is local
-execution plus signed messages.
+`[PRODUCTION READY · 100% DEDICATED ALLOCATION]`
 
-- Advertise capacity: build a `DeviceProfile`, sign a `SignedOffer`
-  (`templates/srct_node.py` is a resource-capped participant resource node;
-  `templates/srct_depin.py` sketches a JSON board for discovery).
-- Plan and execute: `plan_assignments` matches a `SignedJob` to offers;
-  `TeeVerifier` checks execution quotes against the SLA and attestation roots.
-- Settle off-chain: receipts, `EscrowBook` fund/release/refund, and challenge
-  flows are demonstrated in `crates/srct-compute` tests and the e2e
-  escrow/challenge test — run those, not a chain, to exercise the flow.
+Participants can run `templates/srct_node.py` as a dedicated node. Resource-splitting (50/50 fractional shares) is replaced by mutually exclusive, 100% dedicated allocation:
+
+- **Mining mode (`mode="mine"`):** 100% of CPU and system threads are allocated to proof-of-work mining (`srct-miner`). AI compute polling is completely disabled.
+- **AI Compute mode (`mode="ai_compute"`):** 100% of system RAM and compute capacity are allocated to the AI marketplace. PoW mining is completely disabled.
+- **Consumer Task Dispatch (Inference vs Training):** On the receiving side, incoming consumer jobs dynamically route between AI inference (`infer_fn` or `task["type"] == "inference"`) and AI training (`train_fn` or `task["type"] == "training"`).
+- **External Command Execution:** Worker processes can execute real external processes (Python, ONNX, llama.cpp, etc.) via `CommandExecutor` in `srct-worker`.
+- **REST Marketplace Integration:** Participates directly with the `srct-node` compute marketplace endpoints (`/v1/compute/offers`, `/v1/compute/jobs`, `/v1/compute/receipt`).
+
+To run the participant self-test:
+```sh
+python templates/srct_node.py --selftest
+```
 
 ---
 

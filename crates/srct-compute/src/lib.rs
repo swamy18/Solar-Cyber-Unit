@@ -80,7 +80,8 @@ pub use gossip::{
 };
 pub use market::{
     plan_assignments, Assignment, ComputeJob, ComputeOffer, Plan, SignedAssignment, SignedJob,
-    SignedOffer, SignedPlan, MAX_ATTEMPTS, MAX_JOB_UNITS, MAX_SERVICE_LEN,
+    SignedOffer, SignedPlan, Verification, JOB_VERSION, MAX_ATTEMPTS, MAX_JOB_UNITS,
+    MAX_SERVICE_LEN, OFFER_VERSION,
 };
 pub use settle::{
     ComputeLedger, ComputeReceipt, PayoutInstruction, SettlementStatus, SignedReceipt,

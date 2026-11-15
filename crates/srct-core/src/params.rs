@@ -729,8 +729,10 @@ impl NetworkParams {
             exit_activation_height: 1,
             // PQ enforcement off on testnet too; activated by governance.
             pq_activation_height: 0,
-            // PoUW off on testnet too; activated by governance.
-            pouw_activation_height: 0,
+            // PoUW active from height 1 on testnet: staging/integration proof
+            // that the activation mechanism works end-to-end.  Mainnet keeps 0
+            // (governance decision required to set a fork height).
+            pouw_activation_height: 1,
             // No bond floor on testnet either: play money, dust is test data.
             min_bond_sat: 0,
             // Exit throttle disabled on testnet too.

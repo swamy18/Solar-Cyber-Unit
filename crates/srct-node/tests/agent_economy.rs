@@ -1082,3 +1082,110 @@ fn productive_lending_from_offer_to_autorepay() {
     assert_eq!(s, 200);
     assert_eq!(status["receipt_present"], true);
 }
+
+#[test]
+fn compute_marketplace_offer_job_plan_and_settle() {
+    let node = start();
+    let provider_wallet = wallet(81, "compute-provider");
+    let provider_addr = provider_wallet.address().unwrap();
+    let requester_wallet = wallet(82, "compute-requester");
+    let requester_addr = requester_wallet.address().unwrap();
+
+    // 1. Provider creates a signed offer for AI inference
+    let profile = srct_compute::DeviceProfile::new(
+        srct_compute::DeviceClass::Gpu,
+        srct_compute::Determinism::Reproducible,
+        16384, // 16 GB RAM
+        8,     // 8 cores
+        1000,  // max units per shard
+        100_000,
+        [0u8; 32],
+    );
+    let offer = srct_compute::ComputeOffer {
+        version: srct_compute::OFFER_VERSION,
+        network_id: NET.to_string(),
+        provider: provider_addr,
+        service: "ai/inference".to_string(),
+        profile,
+        unit_price_sat: 200,
+        min_units: 10,
+        max_units_per_job: 1000,
+        privacy: false,
+        verification: srct_compute::Verification::Receipt,
+        available_from: 0,
+        available_until: 10_000,
+        nonce: 1,
+    };
+    let signed_offer = srct_compute::SignedOffer::sign(offer, &provider_wallet).unwrap();
+    let offer_hex = hex::encode(signed_offer.encode());
+
+    let (s, res) = post(&node, "/v1/compute/offers", &json!({ "offer_hex": offer_hex }));
+    assert_eq!(s, 200, "offer post failed: {res}");
+    assert_eq!(res["status"], "ok");
+
+    // List offers
+    let (s, list) = get(&node, "/v1/compute/offers/list?service=ai/inference");
+    assert_eq!(s, 200);
+    assert_eq!(list["count"], 1);
+
+    // 2. Requester posts a signed compute job
+    let job = srct_compute::ComputeJob {
+        version: srct_compute::JOB_VERSION,
+        network_id: NET.to_string(),
+        requester: requester_addr,
+        service: "ai/inference".to_string(),
+        units: 100,
+        max_unit_price_sat: 250,
+        max_total_sat: 25_000,
+        class_mask: srct_compute::DeviceClass::Gpu.mask(),
+        min_ram_mib: 8192,
+        determinism: srct_compute::Determinism::Reproducible,
+        required_kernel: [0u8; 32],
+        min_verification: srct_compute::Verification::Receipt,
+        sealed_input: false,
+        input: [42u8; 32],
+        deadline: 9_000,
+        nonce: 100,
+    };
+    let signed_job = srct_compute::SignedJob::sign(job, &requester_wallet).unwrap();
+    let job_hex = hex::encode(signed_job.encode());
+    let job_hash_hex = hex::encode(signed_job.hash());
+
+    let (s, res) = post(&node, "/v1/compute/jobs", &json!({ "job_hex": job_hex }));
+    assert_eq!(s, 200, "job post failed: {res}");
+    assert_eq!(res["status"], "ok");
+
+    // 3. Matchmaker plans the assignment
+    let (s, plan_res) = post(&node, "/v1/compute/plan", &json!({ "job_hash": job_hash_hex }));
+    assert_eq!(s, 200, "plan failed: {plan_res}");
+    assert_eq!(plan_res["status"], "planned");
+    assert_eq!(plan_res["shards_count"], 1);
+    assert_eq!(plan_res["total_sat"], 20_000); // 100 units * 200 sat
+
+    // 4. Provider executes and signs a receipt
+    let plan = srct_compute::market::plan_assignments(&signed_job, &[signed_offer], 1, 0).unwrap();
+    let signed_plan = plan.sign(&requester_wallet).unwrap();
+    let assignment = &signed_plan.assignments[0];
+
+    let receipt = srct_compute::ComputeReceipt::new(
+        assignment,
+        100,
+        [99u8; 32],
+        500,
+        0,
+        200,
+    )
+    .unwrap();
+    let signed_receipt = srct_compute::SignedReceipt::sign(receipt, &provider_wallet).unwrap();
+    let receipt_hex = hex::encode(signed_receipt.encode());
+
+    let (s, settle_res) = post(&node, "/v1/compute/receipt", &json!({ "receipt_hex": receipt_hex }));
+    assert_eq!(s, 200, "settle failed: {settle_res}");
+    assert_eq!(settle_res["status"], "settled");
+    assert_eq!(settle_res["total_sat"], 20_000);
+
+    // 5. Verify receipts list
+    let (s, receipts_list) = get(&node, "/v1/compute/receipts/list");
+    assert_eq!(s, 200);
+    assert_eq!(receipts_list["count"], 1);
+}

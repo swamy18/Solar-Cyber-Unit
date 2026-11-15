@@ -1,37 +1,43 @@
 #!/usr/bin/env python3
-"""SRCT participant node: contribute RAM + compute under strict fail-closed caps.
+"""SRCT participant node: contribute 100% dedicated RAM + compute under strict fail-closed caps.
 
-Any box with 8 GB of CPU RAM or 8 GB of GPU RAM can join the network:
+Any box with CPU RAM or GPU RAM can join the network in one of two dedicated modes:
 
-    from srct_node import Participant, ResourceCaps
+1. 100% Mining (mode="mine"):
+   Full CPU/GPU resources are dedicated to solving PoW blocks via srct-miner.
+
+2. 100% AI Compute (mode="ai_compute"):
+   Full allocatable RAM and compute capacity are made available to the network.
+   Requesters/consumers can submit either AI Inference or AI Training workloads,
+   and this node executes them using dedicated resources:
+
+    from srct_node import Participant, ResourceCaps, MODE_AI_COMPUTE, MODE_MINE
 
     caps = ResourceCaps(
         total_ram_mib=8192,                  # physical RAM the box has
         allocatable_ram_mib=6144,            # the network may use this much
         max_compute_units_per_sec=2_000_000, # candidates/s or inferences/s cap
     )
-    p = Participant(
+
+    # Example 1: 100% AI Compute Provider (serves inference and training)
+    p_ai = Participant(
         node="http://127.0.0.1:8080",
         wallet="node.json",
         caps=caps,
-        payout_asset="SRCT",    # or "USDC" -> cross-network intent for another coin
-        mine_share=0.5,         # half the compute budget mines, half infers/trains
-        miner_address_hex="...",# where mined blocks pay
-        rate_sat_per_unit=250,  # globally determined SRCT rate, sat per compute unit
+        mode=MODE_AI_COMPUTE,
+        rate_sat_per_unit=250,
     )
-    p.run(my_inference_fn)      # mine + infer until interrupted
+    p_ai.run(infer_fn=my_inference_fn, train_fn=my_training_fn)
 
-Two tracks share one compute budget (a token bucket that can never spend more
-than `max_compute_units_per_sec`):
-
-- mine: `start_miner()` launches `srct-miner` with `--threads`/`--batch`
-  derived from `caps` (so the configured ceiling cannot be exceeded) and the
-  node re-validates every submitted block. Earnings credit the miner's
-  authorized throughput, clamped to its share of the token bucket.
-- infer: `run(task_fn)` pulls open tasks from `GET /v1/tasks/open`, runs
-  `task_fn(task) -> bytes` (your model inference or training step) inside the
-  RAM cap, and submits the result to `POST /v1/mine/submit`-style work through
-  `srct-worker` (claims/signs/submits; private keys never enter Python).
+    # Example 2: 100% Dedicated Miner
+    p_mine = Participant(
+        node="http://127.0.0.1:8080",
+        wallet="node.json",
+        caps=caps,
+        mode=MODE_MINE,
+        miner_address_hex="...",
+    )
+    p_mine.run()
 
 Earnings track actual contribution (`guard.credited_units`) at the globally
 determined SRCT rate (`rate_sat_per_unit`, or `compute_sat_per_unit` from
@@ -91,6 +97,10 @@ _MIN_TOTAL_RAM_MIB = 1024
 _DEFAULT_TOTAL_RAM_MIB = 8192
 _DEFAULT_ALLOCATABLE_RAM_MIB = 6144
 
+MODE_MINE = "mine"
+MODE_AI_COMPUTE = "ai_compute"
+_VALID_MODES = {MODE_MINE, MODE_AI_COMPUTE}
+
 _MIN_MINE_SHARE = 0.0
 _MAX_MINE_SHARE = 1.0
 
@@ -105,7 +115,7 @@ class ResourceCaps:
     `total_ram_mib` is physical RAM. `allocatable_ram_mib` is what the
     network may use; it must not exceed `total_ram_mib` so the OS and peers
     always keep headroom. `max_compute_units_per_sec` is the ceiling on
-    candidate evaluations + inference steps per second.
+    candidate evaluations + inference/training steps per second.
     """
 
     def __init__(self, total_ram_mib, allocatable_ram_mib,
@@ -189,12 +199,13 @@ class ResourceGuard:
 
 
 class Participant:
-    """One network contributor: mines + infers under `caps`, earns SRCT."""
+    """One network contributor: 100% dedicated mining OR 100% AI compute under `caps`, earns SRCT."""
 
     def __init__(self, node, wallet, caps, *,
+                 mode=MODE_MINE,
                  rate_sat_per_unit=None,
                  payout_asset="SRCT",
-                 mine_share=0.5,
+                 mine_share=None,
                  miner_address_hex=None,
                  infer_ram_mib=512,
                  miner_ram_mib=1024,
@@ -203,14 +214,24 @@ class Participant:
                  binary="srct-miner",
                  worker_binary="srct-worker",
                  poll_secs=5):
-        if not (_MIN_MINE_SHARE <= mine_share <= _MAX_MINE_SHARE):
-            raise SrctError(f"mine_share {mine_share} outside [0, 1]")
+        if mine_share is not None:
+            if mine_share == 1.0:
+                mode = MODE_MINE
+            elif mine_share == 0.0:
+                mode = MODE_AI_COMPUTE
+            else:
+                raise SrctError(
+                    f"fractional mine_share {mine_share} is not permitted: "
+                    f"resources must be 100% dedicated to mode='{MODE_MINE}' or mode='{MODE_AI_COMPUTE}'")
+        if mode not in _VALID_MODES:
+            raise SrctError(f"mode '{mode}' unknown; must be '{MODE_MINE}' or '{MODE_AI_COMPUTE}'")
+        self.mode = mode
+        self.mine_share = 1.0 if mode == MODE_MINE else 0.0
         self.node = node.rstrip("/")
         self.wallet = wallet
         self.network = network
         self.caps = caps
         self.guard = ResourceGuard(caps)
-        self.mine_share = float(mine_share)
         self.rate_sat_per_unit = rate_sat_per_unit
         self.payout_asset = payout_asset
         self.miner_address_hex = miner_address_hex
@@ -222,9 +243,8 @@ class Participant:
         self.poll_secs = poll_secs
         self._miner_proc = None
         self._miner_started_at = None
-        self._mine_cursor = 0.0  # weighted mine / infer alternation
-        if self.mine_share > 0 and not self.miner_address_hex:
-            raise SrctError("mine_share > 0 requires miner_address_hex")
+        if self.mode == MODE_MINE and not self.miner_address_hex:
+            raise SrctError(f"mode='{MODE_MINE}' requires miner_address_hex")
 
     # -- transport (reads only) -------------------------------------------
 
@@ -385,13 +405,7 @@ class Participant:
         self._miner_started_at = None
 
     def _mine_cycle(self):
-        """Credit the miner's authorized throughput, clamped to its budget.
-
-        Mining earns at `mine_units_per_sec` (default: the full compute cap)
-        per second of miner runtime, but never more than the mine share of the
-        token bucket — so mining + inference together stay under
-        `max_compute_units_per_sec`.
-        """
+        """Credit the miner's authorized throughput up to 100% of the compute budget."""
         if self._miner_proc is None or self._miner_proc.poll() is not None:
             return  # miner not running; nothing to credit
         now = time.monotonic()
@@ -400,18 +414,18 @@ class Participant:
         rate = (self.mine_units_per_sec
                 if self.mine_units_per_sec is not None
                 else self.caps.max_compute_units_per_sec)
-        budget = self.mine_share * self.guard.tokens
-        credit = min(rate * elapsed, budget, self.guard.tokens)
+        credit = min(rate * elapsed, self.guard.tokens)
         if credit > 0:
             self.guard.spend(int(credit))
         self._miner_started_at = now
 
-    # -- infer track: claimed L2 tasks ------------------------------------
+    # -- AI compute track: serves inference and training ------------------
 
-    def _infer_cycle(self, task_fn):
+    def _compute_cycle(self, task_fn=None, *, infer_fn=None, train_fn=None):
+        """Execute one available AI compute task (inference or training) using 100% capacity."""
         status, body = self._get(_OPEN_TASKS)
         if status != 200:
-            print(f"[infer] node answered {status}, skipping cycle")
+            print(f"[compute] node answered {status}, skipping cycle")
             return
         tasks = sorted(body.get("tasks", []),
                        key=lambda t: t.get("payment_sat", 0), reverse=True)
@@ -424,33 +438,55 @@ class Participant:
             try:
                 self.guard.reserve_ram(ram)
             except SrctError as exc:
-                print(f"[infer] {task_id[:12]} RAM refused: {exc}")
+                print(f"[compute] {task_id[:12]} RAM refused: {exc}")
                 continue  # never admit over-cap work
             try:
                 self.guard.spend(units)
             except SrctError as exc:
                 self.guard.release_ram(ram)
-                print(f"[infer] {task_id[:12]} compute refused: {exc}")
+                print(f"[compute] {task_id[:12]} compute refused: {exc}")
                 continue
+
+            # Check whether the consumer requested inference or training
+            kind = task.get("type") or task.get("service") or "inference"
+            is_training = kind in ("training", "ai/training")
+
+            handler = None
+            if is_training:
+                handler = train_fn or task_fn
+            else:
+                handler = infer_fn or task_fn
+
+            if handler is None:
+                self.guard.release_ram(ram)
+                tag = "training" if is_training else "inference"
+                print(f"[compute] {task_id[:12]} no handler provided for {tag} task")
+                continue
+
             try:
-                result = task_fn(task)
+                result = handler(task)
             except Exception as exc:  # noqa: BLE001 - operator sees it
                 self.guard.release_ram(ram)
-                print(f"[infer] {task_id[:12]} framework raised: {exc}")
+                print(f"[compute] {task_id[:12]} handler raised: {exc}")
                 continue
             if not isinstance(result, (bytes, bytearray)):
                 self.guard.release_ram(ram)
-                print(f"[infer] {task_id[:12]} task_fn must return bytes")
+                print(f"[compute] {task_id[:12]} handler must return bytes")
                 continue
             try:
                 self.submit(task_id, bytes(result))
             except SrctError as exc:
                 self.guard.release_ram(ram)
-                print(f"[infer] {task_id[:12]} submit refused: {exc}")
+                print(f"[compute] {task_id[:12]} submit refused: {exc}")
                 continue
             self.guard.release_ram(ram)
-            print(f"[infer] {task_id[:12]} submitted, {units} units")
+            tag = "training" if is_training else "inference"
+            print(f"[compute] {task_id[:12]} ({tag}) submitted, {units} units")
             return  # one task per cycle, then recompute the budget
+
+    def _infer_cycle(self, task_fn):
+        """Backward-compatible alias for _compute_cycle."""
+        return self._compute_cycle(task_fn=task_fn)
 
     # -- payout: SRCT or cross-network asset ------------------------------
 
@@ -508,31 +544,36 @@ class Participant:
             return {"asset": "SRCT", "amount_sat": amount, "out": out}
         return self.open_cross_asset_payout(asset, amount, **kwargs)
 
-    # -- the dual-hash loop ----------------------------------------------
+    # -- main execution loop ---------------------------------------------
 
-    def run(self, task_fn, max_cycles=0):
-        """Mine + infer until interrupted (or `max_cycles` cycles).
+    def run(self, task_fn=None, *, infer_fn=None, train_fn=None, max_cycles=0):
+        """Execute 100% mining OR 100% AI compute until interrupted (or `max_cycles`).
 
-        Each cycle refills the compute budget, picks mine or infer by
-        `mine_share`, executes exactly one unit of that track, and recomputes
-        the budget. Returns the completed cycle count.
+        If mode == MODE_MINE:
+            Launches srct-miner with 100% resources and credits mining throughput.
+            task_fn is not required.
+        If mode == MODE_AI_COMPUTE:
+            Pulls and executes incoming AI inference or training tasks with 100%
+            of allocatable resources. Does not run a miner.
         """
-        if self.mine_share > 0 and not self.miner_address_hex:
-            raise SrctError("mine_share > 0 requires miner_address_hex")
-        if self.mine_share < 1 and task_fn is None:
-            raise SrctError("infer track requires task_fn")
-        self.start_miner()
+        if self.mode == MODE_MINE:
+            if not self.miner_address_hex:
+                raise SrctError(f"mode='{MODE_MINE}' requires miner_address_hex")
+            self.start_miner()
+        else:
+            if task_fn is None and infer_fn is None and train_fn is None:
+                raise SrctError(
+                    f"mode='{MODE_AI_COMPUTE}' requires task_fn or (infer_fn, train_fn)")
+
         cycles = 0
         try:
             while True:
                 cycles += 1
                 self.guard.refill()
-                self._mine_cursor += self.mine_share
-                if self._mine_cursor >= 1.0:
-                    self._mine_cursor -= 1.0
+                if self.mode == MODE_MINE:
                     self._mine_cycle()
                 else:
-                    self._infer_cycle(task_fn)
+                    self._compute_cycle(task_fn=task_fn, infer_fn=infer_fn, train_fn=train_fn)
                 if max_cycles and cycles >= max_cycles:
                     return cycles
                 time.sleep(self.poll_secs)
@@ -540,7 +581,8 @@ class Participant:
             print("stopped by operator.")
             return cycles
         finally:
-            self.stop_miner()
+            if self.mode == MODE_MINE:
+                self.stop_miner()
 
 
 # -- selftest: fake node + fake binaries, real cap enforcement -----------
@@ -574,9 +616,9 @@ def _selftest():
             return None
 
     tasks = [
-        {"task_id": "aa", "payment_sat": 5, "compute_units": 100},
-        {"task_id": "bb", "payment_sat": 3, "compute_units": 100},
-        {"task_id": "cc", "payment_sat": 9, "compute_units": 100},
+        {"task_id": "aa", "payment_sat": 5, "compute_units": 100, "type": "inference"},
+        {"task_id": "bb", "payment_sat": 3, "compute_units": 100, "type": "training"},
+        {"task_id": "cc", "payment_sat": 9, "compute_units": 100, "type": "inference"},
     ]
     consumed = set()
     submitted = []
@@ -679,21 +721,36 @@ def _selftest():
         guard.refill()
         assert guard.tokens == 1_000_000, guard.tokens  # refilled to ceiling
 
-        # 4. Dual-hash loop: one infer task per cycle, miner launched + credited.
+        # 4. 100% AI Compute Mode: serves inference + training, miner never started.
         p = Participant(node="http://fake", wallet="w.json", caps=caps,
-                        rate_sat_per_unit=250, mine_share=0.0,
+                        rate_sat_per_unit=250, mode=MODE_AI_COMPUTE,
                         miner_address_hex="aa" * 10, poll_secs=0)
         install(p)
+        assert p.mode == MODE_AI_COMPUTE
+        assert p.mine_share == 0.0
+        assert p._miner_proc is None
         ran = []
-        n = p.run(lambda t: ran.append(t["task_id"]) or b"r",
+        n = p.run(infer_fn=lambda t: ran.append(f"infer:{t['task_id']}") or b"ri",
+                  train_fn=lambda t: ran.append(f"train:{t['task_id']}") or b"rt",
                   max_cycles=3)
         assert n == 3, n
         # Highest-paid first within each cycle; claimed tasks leave the pool.
-        assert ran == ["cc", "aa", "bb"], ran
+        assert ran == ["infer:cc", "infer:aa", "train:bb"], ran
         assert len(submitted) == 3, submitted
         assert p.guard.credited_units == 300, p.guard.credited_units
         assert p.earnings_sat() == 300 * 250, p.earnings_sat()
-        # Miner launched with args derived from (and bounded by) caps.
+        assert p._miner_proc is None  # Never launched in AI compute mode
+
+        # 5. 100% Mine Mode: launches miner with args from caps, credits 100% of budget.
+        p2 = Participant(node="http://fake", wallet="w.json", caps=caps,
+                         rate_sat_per_unit=250, mode=MODE_MINE,
+                         miner_address_hex="aa" * 10, poll_secs=0,
+                         mine_units_per_sec=1_000_000)
+        install(p2)
+        assert p2.mode == MODE_MINE
+        assert p2.mine_share == 1.0
+        p2.start_miner()
+        assert p2._miner_proc is not None
         assert miner_launched["threads"] is not None, miner_launched
         t = int(miner_launched["threads"])
         b = int(miner_launched["batch"])
@@ -701,18 +758,11 @@ def _selftest():
         assert 1 <= t <= n_cpu, (t, n_cpu)
         assert 1 <= b <= 65_536, b
 
-        # 5. Mine track: crediting clamps to the mine share of the budget.
-        p2 = Participant(node="http://fake", wallet="w.json", caps=caps,
-                         rate_sat_per_unit=250, mine_share=0.5,
-                         miner_address_hex="aa" * 10, poll_secs=0,
-                         mine_units_per_sec=1_000_000)
-        install(p2)
-        p2.start_miner()
         p2._mine_cycle()  # elapsed ~0 -> ~0 credit
         p2._miner_started_at = time.monotonic() - 2.0  # pretend 2s ran
         before = p2.guard.tokens
         p2._mine_cycle()
-        # 2s * 1M units/s = 2M, clamped to mine_share(0.5) * tokens (~500k)
+        # 2s * 1M units/s = 2M, credits up to 100% of available tokens
         assert p2.guard.tokens < before, (p2.guard.tokens, before)
         assert p2.guard.tokens >= 0
         assert p2.guard.credited_units > 0
@@ -723,7 +773,7 @@ def _selftest():
         fat_caps = ResourceCaps(total_ram_mib=8192, allocatable_ram_mib=6144,
                                 max_compute_units_per_sec=1_000_000)
         p3 = Participant(node="http://fake", wallet="w.json", caps=fat_caps,
-                         rate_sat_per_unit=250, mine_share=0.0,
+                         rate_sat_per_unit=250, mode=MODE_AI_COMPUTE,
                          miner_address_hex="aa" * 10, poll_secs=0,
                          infer_ram_mib=7000)  # over allocatable
         install(p3)
@@ -735,7 +785,7 @@ def _selftest():
         # 7. Global rate: configured value wins; missing published rate refuses.
         assert p.global_rate() == 250
         p4 = Participant(node="http://fake", wallet="w.json", caps=caps,
-                         mine_share=0.0, miner_address_hex="aa" * 10,
+                         mode=MODE_AI_COMPUTE, miner_address_hex="aa" * 10,
                          poll_secs=0)
         install(p4)
         p4._get = lambda path: fake_get_no_rate("http://fake", path)
@@ -760,25 +810,40 @@ def _selftest():
         except SrctError:
             pass
 
-        # 9. Bad mine_share and missing task_fn refuse at construction.
+        # 9. Fractional mine_share, unknown modes, and missing config refuse.
         try:
             Participant(node="http://fake", wallet="w.json", caps=caps,
-                        mine_share=1.5, miner_address_hex="aa" * 10,
+                        mine_share=0.5, miner_address_hex="aa" * 10,
                         poll_secs=0)
-            raise AssertionError("bad mine_share must refuse")
+            raise AssertionError("fractional mine_share must refuse")
         except SrctError:
             pass
         try:
             Participant(node="http://fake", wallet="w.json", caps=caps,
-                        mine_share=0.5, miner_address_hex=None,
+                        mode="unknown_mode", miner_address_hex="aa" * 10,
+                        poll_secs=0)
+            raise AssertionError("unknown mode must refuse")
+        except SrctError:
+            pass
+        try:
+            Participant(node="http://fake", wallet="w.json", caps=caps,
+                        mode=MODE_MINE, miner_address_hex=None,
                         poll_secs=0)
             raise AssertionError("mine track without address must refuse")
+        except SrctError:
+            pass
+        try:
+            p_missing_handler = Participant(node="http://fake", wallet="w.json",
+                                            caps=caps, mode=MODE_AI_COMPUTE,
+                                            poll_secs=0)
+            p_missing_handler.run(max_cycles=1)
+            raise AssertionError("ai_compute without handler must refuse")
         except SrctError:
             pass
     finally:
         subprocess.Popen = real_popen
     print("srct_node selftest: ok "
-          f"(caps, RAM guard, token bucket, dual-hash, payout)")
+          f"(caps, RAM guard, token bucket, dedicated modes, payout)")
 
 
 if __name__ == "__main__":

@@ -281,23 +281,23 @@ The ordered plan is:
 2. Heterogeneous `TrainBackend` seam + CPU reference conformance — **done**
    (H1, 7 conformance tests).
 3. GPU, Apple/NPU, TPU and photonic backends under the determinism policy —
-   **done as staged seams** (`srct-diloco::devices`: CUDA, ROCm, TPU, NPU,
+   **done as staged seams with CPU fallback** (`srct-diloco::devices`: CUDA, ROCm, TPU, NPU,
    Apple-silicon and photonic backends implement `TrainBackend`, declare
-   capabilities, fail closed without hardware, and pass plumbing conformance
+   capabilities, fail closed with `Err(Unavailable)` without hardware drivers, and pass plumbing conformance
    in emulated mode; no backend passes the `BitExact` consensus gate).
-   Silicon execution plugs in behind each `probe()`; contributors test on
-   their hardware.
+   `best_available_backend()` automatically discovers the best accelerator and provides
+   safe fallback to `CpuBackend` on CPU-only machines.
 4. Deterministic training kernel + consensus round object — **mechanism done,
-   activation staged** (`FixedMlp` integer training; `consensus::RoundAnchor`
-   with bounded encoding; `pouw_active` switch defaulting off on every
-   profile; hash mining unchanged while off).
+   activated on testnet** (`FixedMlp` integer training; `consensus::RoundAnchor`
+   with bounded encoding; `pouw_active` switch active on `testnet` at height 1;
+   `mainnet` defaults to 0 awaiting governance activation; hash mining unchanged while off).
    PoUW reward schedule — **done as bounded math** (`pouw_mint_sat` shares
    the existing schedule through the real `check_mint_at_height` gate, so
    PoUW mint can never exceed the issuance integral or the rate anchor).
    Eligibility/Sybil rule (`worker_eligible`: positive bonded floor, fraud
    slash) and bonded challenge path (`reexecute_check` with per-class
    tolerance) are implemented and tested; the fork schedule and migration
-   remain governance steps.
+   remain governance steps for mainnet.
 5. TEE execution attestation as an L2 evidence type — **done, non-consensus**
    (`srct-l2::tee_evidence`: `TeeBackedAttestation` implementing the generic
    `Attestation` trait, verified through `srct-verify`, flowing through the

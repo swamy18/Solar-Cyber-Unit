@@ -83,6 +83,18 @@ impl std::error::Error for PouwError {}
 
 /// Whether PoUW minting and anchoring apply at `height`. `0` means never —
 /// the same convention as `pq_activation_height`.
+///
+/// # Activating PoUW on a live network
+///
+/// Set `pouw_activation_height` in [`srct_core::params::NetworkParams`] to a
+/// future block height chosen by governance. Once that height is reached every
+/// node will accept PoUW round anchors and mint PoUW rewards; before it every
+/// nonzero PoUW claim is refused. Hash mining is unaffected either way.
+///
+/// **Testnet** ships with `pouw_activation_height = 1` (active from block 1)
+/// so the full activation path — anchor commitment, eligibility, reward
+/// schedule — is exercisable before mainnet. **Mainnet and mini** ship with
+/// `0` (never), requiring an explicit governance decision to set a fork height.
 pub fn pouw_active(params: &NetworkParams, height: u64) -> bool {
     params.pouw_activation_height != 0 && height >= params.pouw_activation_height
 }
@@ -324,11 +336,10 @@ mod tests {
 
     #[test]
     fn pouw_is_inactive_on_every_shipped_profile() {
-        for params in [
-            NetworkParams::mainnet(),
-            NetworkParams::testnet(),
-            NetworkParams::mini(),
-        ] {
+        // mainnet and mini ship with pouw_activation_height = 0 (never active).
+        // Testnet ships with pouw_activation_height = 1 (active from block 1),
+        // so it is handled separately in `can_activate_pouw`.
+        for params in [NetworkParams::mainnet(), NetworkParams::mini()] {
             assert_eq!(params.pouw_activation_height, 0);
             assert!(!pouw_active(&params, u64::MAX));
             // Inactive: a nonzero claim is refused, zero mint is a no-op.
@@ -338,6 +349,29 @@ mod tests {
             );
             assert_eq!(pouw_mint_sat(&params, 1_000, 50, 0, 1_000_000), Ok(1_000));
         }
+    }
+
+    #[test]
+    fn can_activate_pouw() {
+        // Testnet ships with pouw_activation_height = 1, proving the activation
+        // mechanism works end-to-end.  To activate PoUW on a live network, set
+        // `pouw_activation_height` to a future block height in NetworkParams;
+        // height 0 means never (same convention as pq_activation_height).
+        let params = NetworkParams::testnet();
+        assert_eq!(params.pouw_activation_height, 1);
+        // At height 0 (genesis), PoUW is not yet active.
+        assert!(!pouw_active(&params, 0));
+        // At or after the activation height, PoUW is active.
+        assert!(pouw_active(&params, 1));
+        assert!(pouw_active(&params, u64::MAX));
+        // An inactive height still refuses a nonzero mint claim.
+        assert_eq!(
+            pouw_mint_sat(&params, 1_000, 50, 1, 0),
+            Err(PouwError::NotActive)
+        );
+        // Once active (height >= 1), the mint adds coinbase_reward (50) + pouw_requested (0)
+        // to issued_so_far (1000), giving Ok(1050).
+        assert_eq!(pouw_mint_sat(&params, 1_000, 50, 0, 1), Ok(1_050));
     }
 
     #[test]

@@ -172,6 +172,70 @@ impl Executor for CpuExecutor {
     }
 }
 
+/// An executor that delegates to a real external AI process, command or script.
+///
+/// Passes task commitment parameters via environment variables and captures
+/// stdout as the raw result bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandExecutor {
+    pub backend: ComputeBackend,
+    pub command: String,
+    pub args: Vec<String>,
+    pub max_memory_bytes: u64,
+}
+
+impl CommandExecutor {
+    pub fn new(backend: ComputeBackend, command: impl Into<String>, args: Vec<String>) -> Self {
+        Self {
+            backend,
+            command: command.into(),
+            args,
+            max_memory_bytes: u64::MAX,
+        }
+    }
+}
+
+impl Executor for CommandExecutor {
+    fn capabilities(&self) -> ExecutorCapabilities {
+        ExecutorCapabilities {
+            backend: self.backend,
+            max_memory_bytes: self.max_memory_bytes,
+        }
+    }
+
+    fn execute(&self, work: &ExecutionWork) -> Result<ExecutionOutput, ExecError> {
+        let mut cmd = std::process::Command::new(&self.command);
+        cmd.args(&self.args);
+        cmd.env("SRCT_TASK_ID", srct_core::hash::hash_to_hex(&work.task_id));
+        cmd.env("SRCT_IR_HASH", srct_core::hash::hash_to_hex(&work.ir_hash));
+        cmd.env("SRCT_INPUT_HASH", srct_core::hash::hash_to_hex(&work.input_hash));
+        cmd.env("SRCT_REQUIRED_MEMORY_BYTES", work.required_memory_bytes.to_string());
+        cmd.env("SRCT_BACKEND", self.backend.name());
+
+        let out = cmd.output().map_err(|e| ExecError {
+            reason: format!("failed to spawn '{}': {}", self.command, e),
+        })?;
+
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            return Err(ExecError {
+                reason: format!("command exited with {}: {}", out.status, stderr),
+            });
+        }
+
+        if out.stdout.is_empty() {
+            return Err(ExecError {
+                reason: "command produced empty output".into(),
+            });
+        }
+
+        Ok(ExecutionOutput {
+            output: out.stdout,
+            backend: self.backend,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -225,5 +289,21 @@ mod tests {
         let mut later = w.clone();
         later.current_height = 99_999;
         assert_eq!(e.execute(&later).unwrap(), out);
+    }
+
+    #[test]
+    fn command_executor_runs_external_task() {
+        let e = CommandExecutor::new(
+            ComputeBackend::Cpu,
+            "python",
+            vec![
+                "-c".into(),
+                "import os; print(f'result:{os.environ.get(\"SRCT_TASK_ID\", \"\")}')".into(),
+            ],
+        );
+        let w = work(42);
+        let out = e.execute(&w).expect("command execution should succeed");
+        assert!(out.output.starts_with(b"result:"), "output must match python script output");
+        assert_eq!(out.backend, ComputeBackend::Cpu);
     }
 }

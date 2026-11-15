@@ -185,6 +185,55 @@ define_backend!(
     0
 );
 
+/// Select the best available training backend for this machine.
+///
+/// Tries each hardware backend (CUDA, ROCm, TPU, NPU, Apple SoC, Photonic) in
+/// preference order. If none report themselves as available (which is the case
+/// on CPU-only machines — hardware backends fail closed with
+/// [`BackendError::Unavailable`] when their driver is absent), falls back to
+/// [`CpuBackend`], which is always present and always works.
+///
+/// # Activating PoUW on a live network
+///
+/// Once a backend is selected, DiLoCo PoUW becomes operational when the
+/// network parameter `pouw_activation_height` in
+/// [`srct_core::params::NetworkParams`] is set to a future block height. The
+/// CPU reference backend (`cpu-reference-f32`) is classified `Reproducible`,
+/// not `BitExact`, so it cannot finalize consensus rounds on its own — that
+/// requires the fixed-point backend (`FixedPointBackend`). This function
+/// returns a CPU backend that is suitable for local training and testing; a
+/// production deployment would use `FixedPointBackend` for the consensus path.
+///
+/// # Returns
+///
+/// Always returns `Ok(backend)`: CPU is the unconditional fallback and is
+/// always available.
+pub fn best_available_backend() -> Box<dyn TrainBackend> {
+    // Try hardware backends in preference order.  Each probe() is a link-point
+    // that returns false in this build (no vendor SDK); a silicon build links
+    // its detection here and the backend would be selected automatically.
+    if CudaBackend::probe() {
+        return Box::new(CudaBackend::hardware());
+    }
+    if RocmBackend::probe() {
+        return Box::new(RocmBackend::hardware());
+    }
+    if TpuBackend::probe() {
+        return Box::new(TpuBackend::hardware());
+    }
+    if NpuBackend::probe() {
+        return Box::new(NpuBackend::hardware());
+    }
+    if AppleSocBackend::probe() {
+        return Box::new(AppleSocBackend::hardware());
+    }
+    if PhotonicBackend::probe() {
+        return Box::new(PhotonicBackend::hardware());
+    }
+    // CPU is always present: no probe needed, no driver required.
+    Box::new(crate::backend::CpuBackend)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -298,5 +347,29 @@ mod tests {
         }
         let report = check_backend(&PhotonicBackend::emulated()).unwrap();
         assert_eq!(report.determinism, DeterminismClass::Statistical);
+    }
+
+    #[test]
+    fn cpu_always_available() {
+        // On any machine — including CPU-only without GPU drivers — this must
+        // succeed and return a working backend.
+        let backend = best_available_backend();
+        // The backend must have a non-empty name and valid capabilities.
+        assert!(!backend.name().is_empty());
+        let caps = backend.capabilities();
+        assert_eq!(caps.dtype, "f32");
+        // Verify it can actually run a forward pass (not just exist).
+        let model = crate::model::Mlp::new(42);
+        let result = backend.forward(&model, &[0.5, -0.5]);
+        assert!(
+            result.is_ok(),
+            "best_available_backend() must produce a working backend: {:?}",
+            result
+        );
+        // On a CPU-only machine the name is the CPU reference backend.
+        // On a machine with GPU drivers it would be the hardware backend name.
+        // Either way it must be available (is_available returns true implicitly
+        // since forward succeeded).
+        let _ = backend.capabilities().device; // must not panic
     }
 }

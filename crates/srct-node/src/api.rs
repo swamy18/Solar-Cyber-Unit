@@ -211,7 +211,7 @@ const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
 /// would mix scopes that must never meet. Version 10 appends the Smart Gate
 /// sections (grant registry, revocations, capability book) last; v8/v9 files
 /// migrate with empty gate state.
-const STATE_ENVELOPE_VERSION: u8 = 13;
+const STATE_ENVELOPE_VERSION: u8 = 14;
 
 /// Largest entry count any single map section in the state envelope may
 /// declare, checked before allocation. Real books are bounded by their own
@@ -548,6 +548,12 @@ pub struct SharedNode {
     /// Node-local like jobs and ramps (never consensus, never committed); the
     /// money itself moves through ordinary L1 payments the node verifies.
     pub trials: BTreeMap<Address, TrialRecord>,
+    /// Active provider compute offers by offer hash.
+    pub compute_offers: BTreeMap<Hash, srct_compute::SignedOffer>,
+    /// Active consumer compute jobs by job hash.
+    pub compute_jobs: BTreeMap<Hash, srct_compute::SignedJob>,
+    /// Verified compute receipts by receipt hash.
+    pub compute_receipts: BTreeMap<Hash, srct_compute::SignedReceipt>,
     /// Bounded in-memory audit ring (hash-chained, tamper-evident). The full
     /// history lives in the payment/receipt stores this ring references;
     /// intentionally not persisted, so a restart starts a fresh chain.
@@ -657,6 +663,9 @@ impl SharedNode {
             loan_offers: BTreeMap::new(),
             standing_repay: BTreeMap::new(),
             trials: BTreeMap::new(),
+            compute_offers: BTreeMap::new(),
+            compute_jobs: BTreeMap::new(),
+            compute_receipts: BTreeMap::new(),
             audit: srct_core::safety::AuditLog::default(),
             escrows: BTreeMap::new(),
             escrow_exit: BTreeMap::new(),
@@ -943,6 +952,19 @@ impl SharedNode {
         put_section(&mut w, &guard_revoked.into_vec());
         put_section(&mut w, &self.guards.encode());
         put_section(&mut w, &self.treats.encode());
+        // Compute marketplace (v14): offers, jobs, receipts.
+        put_section(
+            &mut w,
+            &encode_state_map(&self.compute_offers, |so| so.encode()),
+        );
+        put_section(
+            &mut w,
+            &encode_state_map(&self.compute_jobs, |sj| sj.encode()),
+        );
+        put_section(
+            &mut w,
+            &encode_state_map(&self.compute_receipts, |sr| sr.encode()),
+        );
         w.into_vec()
     }
 
@@ -961,6 +983,7 @@ impl SharedNode {
         // Smart Gate sections: migrate them with empty books instead of
         // refusing to boot.
         if version != STATE_ENVELOPE_VERSION
+            && version != 13
             && version != 12
             && version != 11
             && version != 10
@@ -968,7 +991,7 @@ impl SharedNode {
             && version != 8
         {
             return Err(format!(
-                "state envelope version {version}, this build reads {STATE_ENVELOPE_VERSION} (and migrates 8/9/10/11/12)"
+                "state envelope version {version}, this build reads {STATE_ENVELOPE_VERSION} (and migrates 8/9/10/11/12/13)"
             ));
         }
 
@@ -1526,7 +1549,8 @@ impl SharedNode {
         // v8 files end here: no trials section. v9 appends trials last.
         // v10 appends the Smart Gate sections after trials. v11 appends Treats last.
         // v12 extends Treats with last-kind tracking. v13 adds persistent redemption nonces; older Treats sections migrate with empty nonce state.
-        let (trials, guard_registry, guard_revoked, guards, treats) = if version == 8 {
+        // v14 adds compute marketplace persistence (offers, jobs, receipts).
+        let (trials, guard_registry, guard_revoked, guards, treats, compute_offers, compute_jobs, compute_receipts) = if version == 8 {
             r.expect_end().map_err(|e| format!("state envelope: {e}"))?;
             (
                 BTreeMap::new(),
@@ -1534,6 +1558,9 @@ impl SharedNode {
                 BTreeSet::new(),
                 srct_core::guard::GuardBook::default(),
                 srct_core::treats::TreatLedger::new(mine.clone()),
+                BTreeMap::new(),
+                BTreeMap::new(),
+                BTreeMap::new(),
             )
         } else if version == 9 {
             let t = decode_section(&mut r, "trials", |sr| {
@@ -1611,6 +1638,9 @@ impl SharedNode {
                 BTreeSet::new(),
                 srct_core::guard::GuardBook::default(),
                 srct_core::treats::TreatLedger::new(mine.clone()),
+                BTreeMap::new(),
+                BTreeMap::new(),
+                BTreeMap::new(),
             )
         } else {
             let t = decode_section(&mut r, "trials", |sr| {
@@ -1718,10 +1748,37 @@ impl SharedNode {
                 if tr.network_id() != mine {
                     return Err("treats: network mismatch".into());
                 }
-                r.expect_end().map_err(|e| format!("state envelope: {e}"))?;
+                if version <= 13 {
+                    r.expect_end().map_err(|e| format!("state envelope: {e}"))?;
+                }
                 tr
             };
-            (t, guard_registry, guard_revoked, guards, treats)
+            // Compute marketplace (v14): offers, jobs, receipts.
+            let (compute_offers, compute_jobs, compute_receipts) = if version >= 14 {
+                let co = decode_section(&mut r, "compute_offers", |sr| {
+                    decode_state_map(sr, "compute_offers", |b| {
+                        srct_compute::SignedOffer::decode(b)
+                            .map_err(|e| format!("compute_offers: {e}"))
+                    })
+                })?;
+                let cj = decode_section(&mut r, "compute_jobs", |sr| {
+                    decode_state_map(sr, "compute_jobs", |b| {
+                        srct_compute::SignedJob::decode(b)
+                            .map_err(|e| format!("compute_jobs: {e}"))
+                    })
+                })?;
+                let cr = decode_section(&mut r, "compute_receipts", |sr| {
+                    decode_state_map(sr, "compute_receipts", |b| {
+                        srct_compute::SignedReceipt::decode(b)
+                            .map_err(|e| format!("compute_receipts: {e}"))
+                    })
+                })?;
+                r.expect_end().map_err(|e| format!("state envelope: {e}"))?;
+                (co, cj, cr)
+            } else {
+                (BTreeMap::new(), BTreeMap::new(), BTreeMap::new())
+            };
+            (t, guard_registry, guard_revoked, guards, treats, compute_offers, compute_jobs, compute_receipts)
         };
 
         self.receipts = receipts;
@@ -1777,6 +1834,9 @@ impl SharedNode {
         self.guard_revoked = guard_revoked;
         self.guards = guards;
         self.treats = treats;
+        self.compute_offers = compute_offers;
+        self.compute_jobs = compute_jobs;
+        self.compute_receipts = compute_receipts;
         Ok(())
     }
 
@@ -8131,6 +8191,309 @@ async fn job_get(State(state): State<ApiState>, Path(raw): Path<String>) -> ApiR
     })?
 }
 
+// --- Decentralized Compute Marketplace (Production API) ---
+
+#[derive(Deserialize)]
+struct ComputeOfferReq {
+    offer_hex: String,
+}
+
+#[derive(Deserialize)]
+struct ComputeJobReq {
+    job_hex: String,
+}
+
+#[derive(Deserialize)]
+struct ComputePlanReq {
+    job_hash: String,
+}
+
+#[derive(Deserialize)]
+struct ComputeReceiptReq {
+    receipt_hex: String,
+}
+
+#[derive(Deserialize, Default)]
+struct ComputeQuery {
+    service: Option<String>,
+}
+
+/// `POST /v1/compute/offers` — publish a provider-signed compute offer.
+async fn compute_offer_post(
+    State(state): State<ApiState>,
+    Json(req): Json<ComputeOfferReq>,
+) -> ApiResult {
+    let bytes = hex::decode(&req.offer_hex).map_err(|e| bad(format!("offer_hex is not hex: {e}")))?;
+    let signed_offer = srct_compute::SignedOffer::decode(&bytes)
+        .map_err(|e| fail(StatusCode::BAD_REQUEST, "invalid_offer", e.to_string()))?;
+
+    with_shared(&state, |sh| {
+        let network = sh.chain.params().network_id.clone();
+        if signed_offer.offer.network_id != network {
+            return Err(fail(
+                StatusCode::BAD_REQUEST,
+                "wrong_network",
+                format!("offer network {} != node network {}", signed_offer.offer.network_id, network),
+            ));
+        }
+        let height = sh.chain.height();
+        if signed_offer.offer.available_until < height {
+            return Err(fail(
+                StatusCode::BAD_REQUEST,
+                "offer_expired",
+                format!("offer available_until {} < current height {}", signed_offer.offer.available_until, height),
+            ));
+        }
+        let hash = signed_offer.hash();
+        let service = signed_offer.offer.service.clone();
+        let provider = address_to_hex(&signed_offer.offer.provider);
+        let unit_price_sat = signed_offer.offer.unit_price_sat;
+        let ram_mib = signed_offer.offer.profile.ram_mib;
+        let max_units = signed_offer.offer.max_units_per_job;
+
+        sh.compute_offers.insert(hash, signed_offer);
+        audit_push(sh, "compute_offer", Some(hash), None, format!("registered {service} offer from {provider}"));
+
+        Ok(Json(json!({
+            "status": "ok",
+            "offer_hash": hash_to_hex(&hash),
+            "provider": provider,
+            "service": service,
+            "unit_price_sat": unit_price_sat,
+            "ram_mib": ram_mib,
+            "max_units": max_units,
+        })))
+    })?
+}
+
+/// `GET /v1/compute/offers/list` — list live compute offers.
+async fn compute_offers_list(
+    State(state): State<ApiState>,
+    Query(q): Query<ComputeQuery>,
+) -> ApiResult {
+    with_shared(&state, |sh| {
+        let height = sh.chain.height();
+        let mut list = Vec::new();
+        for (hash, so) in &sh.compute_offers {
+            if so.offer.available_until < height {
+                continue;
+            }
+            if let Some(ref svc) = q.service {
+                if &so.offer.service != svc {
+                    continue;
+                }
+            }
+            list.push(json!({
+                "offer_hash": hash_to_hex(hash),
+                "provider": address_to_hex(&so.offer.provider),
+                "service": so.offer.service,
+                "unit_price_sat": so.offer.unit_price_sat,
+                "min_units": so.offer.min_units,
+                "max_units_per_job": so.offer.max_units_per_job,
+                "ram_mib": so.offer.profile.ram_mib,
+                "cores": so.offer.profile.cores,
+                "available_from": so.offer.available_from,
+                "available_until": so.offer.available_until,
+            }));
+        }
+        Ok(Json(json!({
+            "count": list.len(),
+            "offers": list,
+        })))
+    })?
+}
+
+/// `POST /v1/compute/jobs` — publish a requester-signed compute job.
+async fn compute_job_post(
+    State(state): State<ApiState>,
+    Json(req): Json<ComputeJobReq>,
+) -> ApiResult {
+    let bytes = hex::decode(&req.job_hex).map_err(|e| bad(format!("job_hex is not hex: {e}")))?;
+    let signed_job = srct_compute::SignedJob::decode(&bytes)
+        .map_err(|e| fail(StatusCode::BAD_REQUEST, "invalid_job", e.to_string()))?;
+
+    with_shared(&state, |sh| {
+        let network = sh.chain.params().network_id.clone();
+        if signed_job.job.network_id != network {
+            return Err(fail(
+                StatusCode::BAD_REQUEST,
+                "wrong_network",
+                format!("job network {} != node network {}", signed_job.job.network_id, network),
+            ));
+        }
+        let height = sh.chain.height();
+        if signed_job.job.deadline < height {
+            return Err(fail(
+                StatusCode::BAD_REQUEST,
+                "job_expired",
+                format!("job deadline {} < current height {}", signed_job.job.deadline, height),
+            ));
+        }
+        let hash = signed_job.hash();
+        let service = signed_job.job.service.clone();
+        let requester = address_to_hex(&signed_job.job.requester);
+        let units = signed_job.job.units;
+        let max_total_sat = signed_job.job.max_total_sat;
+
+        sh.compute_jobs.insert(hash, signed_job.clone());
+        audit_push(sh, "compute_job", Some(hash), None, format!("registered {service} job from {requester}"));
+
+        Ok(Json(json!({
+            "status": "ok",
+            "job_hash": hash_to_hex(&hash),
+            "requester": requester,
+            "service": service,
+            "units": units,
+            "max_total_sat": max_total_sat,
+            "deadline": signed_job.job.deadline,
+        })))
+    })?
+}
+
+/// `GET /v1/compute/jobs/list` — list open compute jobs.
+async fn compute_jobs_list(
+    State(state): State<ApiState>,
+    Query(q): Query<ComputeQuery>,
+) -> ApiResult {
+    with_shared(&state, |sh| {
+        let height = sh.chain.height();
+        let mut list = Vec::new();
+        for (hash, sj) in &sh.compute_jobs {
+            if sj.job.deadline < height {
+                continue;
+            }
+            if let Some(ref svc) = q.service {
+                if &sj.job.service != svc {
+                    continue;
+                }
+            }
+            list.push(json!({
+                "job_hash": hash_to_hex(hash),
+                "requester": address_to_hex(&sj.job.requester),
+                "service": sj.job.service,
+                "units": sj.job.units,
+                "max_unit_price_sat": sj.job.max_unit_price_sat,
+                "max_total_sat": sj.job.max_total_sat,
+                "min_ram_mib": sj.job.min_ram_mib,
+                "input_hash": hash_to_hex(&sj.job.input),
+                "deadline": sj.job.deadline,
+            }));
+        }
+        Ok(Json(json!({
+            "count": list.len(),
+            "jobs": list,
+        })))
+    })?
+}
+
+/// `POST /v1/compute/plan` — match active offers against a job.
+async fn compute_plan_post(
+    State(state): State<ApiState>,
+    Json(req): Json<ComputePlanReq>,
+) -> ApiResult {
+    let job_hash = decode_hash(&req.job_hash)?;
+    with_shared(&state, |sh| {
+        let job = sh.compute_jobs.get(&job_hash).ok_or_else(|| not_found("unknown compute job"))?;
+        let height = sh.chain.height();
+        let offers: Vec<srct_compute::SignedOffer> = sh.compute_offers.values().cloned().collect();
+
+        let plan = srct_compute::market::plan_assignments(job, &offers, height, 0)
+            .map_err(|e| fail(StatusCode::CONFLICT, "plan_failed", e.to_string()))?;
+
+        let shards: Vec<Value> = plan.assignments.iter().map(|a| {
+            json!({
+                "shard": a.shard,
+                "provider": address_to_hex(&a.provider),
+                "units": a.units,
+                "unit_price_sat": a.unit_price_sat,
+                "total_sat": a.total_sat,
+                "deadline": a.deadline,
+            })
+        }).collect();
+
+        Ok(Json(json!({
+            "status": "planned",
+            "job_hash": hash_to_hex(&job_hash),
+            "total_sat": plan.total_sat,
+            "shards_count": shards.len(),
+            "assignments": shards,
+        })))
+    })?
+}
+
+/// `POST /v1/compute/receipt` — verify and record completed compute receipt.
+async fn compute_receipt_post(
+    State(state): State<ApiState>,
+    Json(req): Json<ComputeReceiptReq>,
+) -> ApiResult {
+    let bytes = hex::decode(&req.receipt_hex).map_err(|e| bad(format!("receipt_hex is not hex: {e}")))?;
+    let signed_receipt = srct_compute::SignedReceipt::decode(&bytes)
+        .map_err(|e| fail(StatusCode::BAD_REQUEST, "invalid_receipt", e.to_string()))?;
+
+    with_shared(&state, |sh| {
+        let hash = signed_receipt.hash();
+        if sh.compute_receipts.contains_key(&hash) {
+            return Ok(Json(json!({
+                "status": "already_settled",
+                "receipt_hash": hash_to_hex(&hash),
+                "duplicate": true,
+            })));
+        }
+        let job = sh.compute_jobs.get(&signed_receipt.receipt.job)
+            .ok_or_else(|| fail(StatusCode::BAD_REQUEST, "unknown_job", "receipt references unknown compute job"))?;
+
+        let height = sh.chain.height();
+        if signed_receipt.receipt.height > height {
+            return Err(fail(StatusCode::BAD_REQUEST, "future_receipt", "receipt height is in the future"));
+        }
+        if signed_receipt.receipt.units_done > job.job.units {
+            return Err(fail(StatusCode::BAD_REQUEST, "overclaim", "receipt units exceed job units"));
+        }
+        let max_total = (signed_receipt.receipt.units_done as u64).saturating_mul(job.job.max_unit_price_sat);
+        if signed_receipt.receipt.total_sat > max_total {
+            return Err(fail(StatusCode::BAD_REQUEST, "price_exceeded", "receipt total exceeds job price ceiling"));
+        }
+
+        let provider = address_to_hex(&signed_receipt.receipt.provider);
+        let total_sat = signed_receipt.receipt.total_sat;
+        let units_done = signed_receipt.receipt.units_done;
+
+        sh.compute_receipts.insert(hash, signed_receipt);
+        audit_push(sh, "compute_receipt", Some(hash), None, format!("settled {units_done} units ({total_sat} sat) for {provider}"));
+
+        Ok(Json(json!({
+            "status": "settled",
+            "receipt_hash": hash_to_hex(&hash),
+            "provider": provider,
+            "units_done": units_done,
+            "total_sat": total_sat,
+        })))
+    })?
+}
+
+/// `GET /v1/compute/receipts/list` — list verified compute receipts.
+async fn compute_receipts_list(
+    State(state): State<ApiState>,
+) -> ApiResult {
+    with_shared(&state, |sh| {
+        let list: Vec<Value> = sh.compute_receipts.iter().map(|(hash, sr)| {
+            json!({
+                "receipt_hash": hash_to_hex(hash),
+                "job_hash": hash_to_hex(&sr.receipt.job),
+                "provider": address_to_hex(&sr.receipt.provider),
+                "units_done": sr.receipt.units_done,
+                "total_sat": sr.receipt.total_sat,
+                "output_hash": hash_to_hex(&sr.receipt.output),
+                "height": sr.receipt.height,
+            })
+        }).collect();
+        Ok(Json(json!({
+            "count": list.len(),
+            "receipts": list,
+        })))
+    })?
+}
+
 // --- Receipt status (every payment gets its receipt) ---
 
 /// `GET /v1/payments/{id}/receipt_status` — is the payment recorded, is its
@@ -10308,7 +10671,14 @@ pub fn router(state: ApiState, cfg: &ApiConfig) -> Router {
         .route("/v1/treats/claim-work", post(treats_claim_work))
         .route("/v1/treats/redeem", post(treats_redeem))
         .route("/v1/treats/voucher/consume", post(treats_voucher_consume))
-        .route("/v1/treats/reserve", get(treats_reserve));
+        .route("/v1/treats/reserve", get(treats_reserve))
+        .route("/v1/compute/offers", post(compute_offer_post))
+        .route("/v1/compute/offers/list", get(compute_offers_list))
+        .route("/v1/compute/jobs", post(compute_job_post))
+        .route("/v1/compute/jobs/list", get(compute_jobs_list))
+        .route("/v1/compute/plan", post(compute_plan_post))
+        .route("/v1/compute/receipt", post(compute_receipt_post))
+        .route("/v1/compute/receipts/list", get(compute_receipts_list));
     // The stack stays `Router<ApiState>` (no state yet) until the end, where a
     // single `with_state` resolves it to the servable `Router<()>`.
     let mut app: Router<ApiState> = app.layer(DefaultBodyLimit::max(MAX_BODY_BYTES));
