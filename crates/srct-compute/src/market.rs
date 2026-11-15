@@ -33,7 +33,9 @@ use crate::device::{
 use crate::ComputeError;
 
 pub const OFFER_VERSION: u8 = 1;
-pub const JOB_VERSION: u8 = 1;
+/// Job wire version 2 appends throughput and bandwidth floors. Version 1
+/// jobs still decode, with both floors 0 (require nothing).
+pub const JOB_VERSION: u8 = 2;
 pub const ASSIGNMENT_VERSION: u8 = 1;
 /// Longest accepted service tag.
 pub const MAX_SERVICE_LEN: usize = 64;
@@ -285,6 +287,12 @@ pub struct ComputeJob {
     pub max_total_sat: u64,
     pub class_mask: u8,
     pub min_ram_mib: u32,
+    /// Minimum sustained throughput in units per second. Version 1 jobs
+    /// decode with 0 (require nothing); version 2 jobs name a floor that
+    /// the provider's self-declared throughput must meet.
+    pub min_units_per_sec: u32,
+    /// Minimum bandwidth in kbit/s. Same versioning rule as throughput.
+    pub min_bandwidth_kbps: u32,
     pub determinism: Determinism,
     /// Exact kernel hash required, or zero for any.
     pub required_kernel: Hash,
@@ -299,7 +307,7 @@ pub struct ComputeJob {
 
 impl ComputeJob {
     pub fn validate(&self) -> Result<(), ComputeError> {
-        if self.version != JOB_VERSION {
+        if self.version != 1 && self.version != JOB_VERSION {
             return Err(ComputeError::Malformed(format!(
                 "unsupported job version {}",
                 self.version
@@ -338,8 +346,11 @@ impl ComputeJob {
 
     pub fn requirement(&self) -> DeviceRequirement {
         DeviceRequirement {
+            // Kept on the wire for compatibility; matching ignores it.
             class_mask: self.class_mask,
             min_ram_mib: self.min_ram_mib,
+            min_units_per_sec: self.min_units_per_sec,
+            min_bandwidth_kbps: self.min_bandwidth_kbps,
             determinism: self.determinism,
             kernel: self.required_kernel,
         }
@@ -358,6 +369,8 @@ impl ComputeJob {
             .u64le(self.max_total_sat)
             .u8(self.class_mask)
             .u32le(self.min_ram_mib)
+            .u32le(self.min_units_per_sec)
+            .u32le(self.min_bandwidth_kbps)
             .u8(self.determinism.as_u8())
             .fixed(&self.required_kernel)
             .u8(self.min_verification.as_u8())
@@ -395,6 +408,16 @@ impl ComputeJob {
         let max_total_sat = r.u64le().map_err(malformed)?;
         let class_mask = r.u8().map_err(malformed)?;
         let min_ram_mib = r.u32le().map_err(malformed)?;
+        // Version 2 appends throughput and bandwidth floors. Version 1 jobs
+        // decode with both at 0, which every profile satisfies.
+        let (min_units_per_sec, min_bandwidth_kbps) = if version == JOB_VERSION {
+            (
+                r.u32le().map_err(malformed)?,
+                r.u32le().map_err(malformed)?,
+            )
+        } else {
+            (0, 0)
+        };
         let determinism = Determinism::from_u8(r.u8().map_err(malformed)?)
             .ok_or_else(|| ComputeError::Malformed("job determinism class".into()))?;
         let required_kernel = r.fixed().map_err(malformed)?;
@@ -414,6 +437,8 @@ impl ComputeJob {
             max_total_sat,
             class_mask,
             min_ram_mib,
+            min_units_per_sec,
+            min_bandwidth_kbps,
             determinism,
             required_kernel,
             min_verification,

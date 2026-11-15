@@ -463,6 +463,73 @@ impl EscrowBook {
         })
     }
 
+    /// Release exactly one settled receipt's total for a ticket claim.
+    ///
+    /// Mirrors [`EscrowBook::release`]: both signatures plus the claim are
+    /// re-verified, the funded job pot pays exactly the receipt's total, and
+    /// the claim hash enters the once-only release set. A claim against an
+    /// unfunded job settles nothing.
+    pub fn release_for_claim(
+        &mut self,
+        receipt: &SignedReceipt,
+        ticket: &crate::ticket::SignedTicket,
+        claim: &crate::ticket::SignedClaim,
+        height: u64,
+    ) -> Result<PayoutInstruction, ComputeError> {
+        receipt.verify()?;
+        ticket.verify()?;
+        claim.verify()?;
+        let t = &ticket.ticket;
+        let c = &claim.claim;
+        let r = &receipt.receipt;
+        let claim_id = claim.hash();
+        if c.ticket != ticket.hash() {
+            return Err(ComputeError::BindingMismatch);
+        }
+        if r.job != t.job || r.assignment != claim_id || r.provider != c.provider {
+            return Err(ComputeError::BindingMismatch);
+        }
+        if r.units_done > t.units {
+            return Err(ComputeError::Overclaim);
+        }
+        if r.unit_price_sat != t.unit_price_sat {
+            return Err(ComputeError::PriceMismatch);
+        }
+        if height > t.deadline || r.height > t.deadline {
+            return Err(ComputeError::Expired);
+        }
+        let account = self
+            .accounts
+            .get_mut(&t.job)
+            .ok_or(ComputeError::NotFunded)?;
+        if account.requester != t.requester || account.deadline != t.deadline {
+            return Err(ComputeError::BindingMismatch);
+        }
+        if account.refunded {
+            return Err(ComputeError::AlreadyRefunded);
+        }
+        if self.releases.contains(&claim_id) {
+            return Err(ComputeError::AlreadySettled);
+        }
+        let released = account
+            .released_sat
+            .checked_add(r.total_sat)
+            .ok_or_else(|| ComputeError::Malformed("escrow release overflows".into()))?;
+        if released > account.funded_sat {
+            return Err(ComputeError::BudgetExceeded);
+        }
+        self.releases.insert(claim_id);
+        account.released_sat = released;
+        Ok(PayoutInstruction {
+            from: t.requester,
+            to: c.provider,
+            amount_sat: r.total_sat,
+            job: t.job,
+            assignment: claim_id,
+            receipt: receipt.hash(),
+        })
+    }
+
     /// Refund the unspent remainder after the job deadline, exactly once.
     ///
     /// A fully released pot refunds zero and still closes, so a later release

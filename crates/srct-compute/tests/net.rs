@@ -31,6 +31,7 @@ fn mk_offer(provider: &Wallet, nonce: u64, until: u64) -> SignedOffer {
         8,
         20,
         50_000,
+        5_000,
         KERNEL,
     );
     SignedOffer::sign(
@@ -69,6 +70,8 @@ fn flow() -> (SignedOffer, SignedAssignment, SignedReceipt, Wallet) {
             max_total_sat: 100,
             class_mask: DeviceClass::Gpu.mask(),
             min_ram_mib: 512,
+            min_units_per_sec: 400,
+            min_bandwidth_kbps: 0,
             determinism: Determinism::Reproducible,
             required_kernel: KERNEL,
             min_verification: Verification::Receipt,

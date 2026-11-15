@@ -62,6 +62,7 @@ pub mod market;
 pub mod settle;
 pub mod store;
 pub mod tee;
+pub mod ticket;
 
 pub use bond::{
     BondBook, BondDispute, BondWithdrawal, DisputeReason, ProviderBond, Reputation, SignedBond,
@@ -92,6 +93,10 @@ pub use store::{
 };
 pub use tee::{
     AttestationRoots, SignedTeeQuote, TeeError, TeeQuote, TeeSla, TeeType, TeeVerifier, TEE_VERSION,
+};
+pub use ticket::{
+    ClaimBook, ClaimTicket, ShardClaim, SignedClaim, SignedTicket, CLAIM_VERSION, MAX_TICKETS,
+    TICKET_VERSION,
 };
 
 /// Why a compute-sharing operation was refused.
@@ -149,6 +154,12 @@ pub enum ComputeError {
     NotFunded,
     /// The escrow remainder was already refunded.
     AlreadyRefunded,
+    /// No ticket, claim or object with that id exists.
+    NotFound,
+    /// This ticket was already claimed; first valid claim wins.
+    AlreadyClaimed,
+    /// This ticket names a designated provider and the claim is from another.
+    DesignatedProvider,
 }
 
 impl std::fmt::Display for ComputeError {
@@ -180,6 +191,11 @@ impl std::fmt::Display for ComputeError {
             ComputeError::Replay => write!(f, "instruction was already applied"),
             ComputeError::NotFunded => write!(f, "job has no escrow funding"),
             ComputeError::AlreadyRefunded => write!(f, "escrow remainder was already refunded"),
+            ComputeError::NotFound => write!(f, "no such ticket, claim or object"),
+            ComputeError::AlreadyClaimed => write!(f, "ticket was already claimed"),
+            ComputeError::DesignatedProvider => {
+                write!(f, "ticket names a different designated provider")
+            }
         }
     }
 }

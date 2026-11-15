@@ -35,6 +35,7 @@ fn offer(
     ram_mib: u32,
     shard_units: u32,
     max_units_per_job: u32,
+    throughput_per_sec: u32,
     price: u64,
 ) -> SignedOffer {
     let offer = ComputeOffer {
@@ -49,6 +50,7 @@ fn offer(
             8,
             shard_units,
             50_000,
+            throughput_per_sec,
             KERNEL,
         ),
         unit_price_sat: price,
@@ -71,9 +73,9 @@ fn main() {
     let challenger = wallet(4);
 
     let offers = vec![
-        offer(&phone, DeviceClass::Cpu, 2_048, 4, 8, 10),
-        offer(&laptop, DeviceClass::AppleSilicon, 16_384, 10, 20, 12),
-        offer(&desktop, DeviceClass::Gpu, 65_536, 25, 20, 7),
+        offer(&phone, DeviceClass::Cpu, 2_048, 4, 8, 500, 10),
+        offer(&laptop, DeviceClass::AppleSilicon, 16_384, 10, 20, 2_000, 12),
+        offer(&desktop, DeviceClass::Gpu, 65_536, 25, 20, 5_000, 7),
     ];
 
     let job = ComputeJob {
@@ -86,6 +88,8 @@ fn main() {
         max_total_sat: 1_000,
         class_mask: DeviceClass::ALL_MASK,
         min_ram_mib: 512,
+        min_units_per_sec: 400,
+        min_bandwidth_kbps: 0,
         determinism: Determinism::Reproducible,
         required_kernel: KERNEL,
         min_verification: Verification::Receipt,

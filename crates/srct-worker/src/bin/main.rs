@@ -98,6 +98,20 @@ fn usage() -> String {
   srct-worker trial-fund --node <base-url> --agent <agent-hex> --txid <txid-hex>
                        [--network <name>]
   srct-worker trial-status --node <base-url> --agent <agent-hex> [--network <name>]
+  srct-worker compute-join --node <base-url> --from-file <wallet>
+                        --service <name> --ram-mib <n> --cores <n>
+                        --max-units-per-shard <n> --max-units-per-job <n>
+                        --price <sat/unit> --units-per-sec <n>
+                        [--class <cpu|gpu|tpu|npu|apple|photonic>]
+                        [--bandwidth-kbps <n>] [--available-from <h>]
+                        [--available-until <h>] [--bond-sat <n>]
+                        [--bond-nonce <n>] [--offer-nonce <n>] [--network <name>]
+  srct-worker compute-claim-ticket --node <base-url> --from-file <wallet>
+                        --ticket <hex> --units <n> --nonce <n> [--network <name>]
+  srct-worker compute-submit-receipt --node <base-url> --from-file <wallet>
+                        --ticket <hex> --claim <hex> --units <n>
+                        --output <hex> --elapsed-ms <ms> --height <h>
+                        --nonce <n> [--network <name>]
   srct-worker trial-repay --node <base-url> --agent <agent-hex> --txid <txid-hex>
   srct-worker treats-balance --node <base-url> --agent <agent-hex> [--role <role>]
                        [--network <name>]
@@ -143,6 +157,9 @@ fn run(args: &[String]) -> Result<i32, String> {
         "trial-repay" => cmd_trial_repay(args),
         "treats-balance" => cmd_treats_balance(args),
         "verify-cert" => cmd_verify_cert(args),
+        "compute-join" => cmd_compute_join(args),
+        "compute-claim-ticket" => cmd_compute_claim_ticket(args),
+        "compute-submit-receipt" => cmd_compute_submit_receipt(args),
         other => Err(format!("unknown command `{other}`\n{}", usage())),
     }
 }
@@ -723,6 +740,202 @@ fn post_ok(
     }
     let why = HttpNode::refusal_detail(&answer).unwrap_or_else(|| format!("HTTP {code}"));
     Err(format!("{verb} refused: {why}"))
+}
+
+/// Join the compute marketplace in one command: stake a bond, then post an
+/// offer built from a measured capability profile. Keys never leave this
+/// process; both objects are signed here and only hex travels onward.
+/// Prints `bond_hex`, `offer_hash`, and whether each step posted or was
+/// already on the board (idempotent rejoin).
+fn cmd_compute_join(args: &[String]) -> Result<i32, String> {
+    use srct_compute::{
+        ComputeOffer, DeviceClass, DeviceProfile, Determinism, ProviderBond, SignedBond,
+        SignedOffer, Verification, BOND_VERSION, OFFER_VERSION,
+    };
+
+    let node_url = str_arg(args, "--node").ok_or("compute-join needs --node <base-url>")?;
+    let file = str_arg(args, "--from-file").ok_or("compute-join needs --from-file <wallet>")?;
+    let network = str_arg(args, "--network")
+        .map(String::as_str)
+        .unwrap_or("mini");
+    let params = NetworkParams::by_name(network).map_err(|e| e.to_string())?;
+    let wallet = load_wallet(file)?;
+    let provider = wallet
+        .address()
+        .map_err(|e| format!("wallet unusable: {e}"))?;
+    let view = HttpNode::for_network(node_url, &params.network_id).map_err(|e| e.to_string())?;
+
+    let class = match str_arg(args, "--class")
+        .map(String::as_str)
+        .unwrap_or("cpu")
+    {
+        "cpu" => DeviceClass::Cpu,
+        "gpu" => DeviceClass::Gpu,
+        "tpu" => DeviceClass::Tpu,
+        "npu" => DeviceClass::Npu,
+        "apple" => DeviceClass::AppleSilicon,
+        "photonic" => DeviceClass::Photonic,
+        other => return Err(format!("--class must be cpu|gpu|tpu|npu|apple|photonic, got `{other}` (display label only; matching runs on capabilities)")),
+    };
+    let profile = DeviceProfile::new(
+        class,
+        Determinism::Reproducible,
+        num_arg(args, "--ram-mib", 0)? as u32,
+        num_arg(args, "--cores", 0)? as u16,
+        num_arg(args, "--max-units-per-shard", 0)? as u32,
+        num_arg(args, "--bandwidth-kbps", 50_000)? as u32,
+        num_arg(args, "--units-per-sec", 0)? as u32,
+        [0u8; 32],
+    );
+    let offer = ComputeOffer {
+        version: OFFER_VERSION,
+        network_id: params.network_id.clone(),
+        provider,
+        service: str_arg(args, "--service")
+            .ok_or("compute-join needs --service <name>")?
+            .to_string(),
+        profile,
+        unit_price_sat: num_arg(args, "--price", 0)?,
+        min_units: 1,
+        max_units_per_job: num_arg(args, "--max-units-per-job", 0)? as u32,
+        privacy: false,
+        verification: Verification::Receipt,
+        available_from: num_arg(args, "--available-from", 0)?,
+        available_until: num_arg(args, "--available-until", 0)?,
+        nonce: num_arg(args, "--offer-nonce", 1)?,
+    };
+    let bond = ProviderBond {
+        version: BOND_VERSION,
+        network_id: params.network_id.clone(),
+        provider,
+        amount_sat: num_arg(args, "--bond-sat", 1_000)?,
+        registered_height: 0,
+        nonce: num_arg(args, "--bond-nonce", 1)?,
+    };
+    let signed_bond =
+        SignedBond::sign(bond, &wallet).map_err(|e| format!("bond sign failed: {e}"))?;
+    match post_ok(
+        &view,
+        "/v1/compute/bonds/register",
+        &serde_json::json!({ "bond_hex": hex::encode(signed_bond.encode()) }),
+        "bond register",
+    ) {
+        Ok(_) => println!("bond          posted"),
+        Err(e) if e.contains("already_registered") => println!("bond          already on board"),
+        Err(e) => return Err(e),
+    }
+    let signed_offer =
+        SignedOffer::sign(offer, &wallet).map_err(|e| format!("offer sign failed: {e}"))?;
+    let offer_hash = signed_offer.hash();
+    let posted = post_ok(
+        &view,
+        "/v1/compute/offers",
+        &serde_json::json!({ "offer_hex": hex::encode(signed_offer.encode()) }),
+        "offer post",
+    )?;
+    let _ = posted;
+    use srct_core::hash::hash_to_hex;
+    println!("offer_hash    {}", hash_to_hex(&offer_hash));
+    Ok(0)
+}
+
+/// Claim an open ticket: sign the take and file it. First valid claim wins;
+/// the node refuses anything later for the same ticket. Prints `claim_hash`.
+fn cmd_compute_claim_ticket(args: &[String]) -> Result<i32, String> {
+    use srct_compute::{ShardClaim, SignedClaim, SignedTicket, CLAIM_VERSION};
+
+    let node_url = str_arg(args, "--node").ok_or("compute-claim-ticket needs --node <base-url>")?;
+    let file = str_arg(args, "--from-file").ok_or("compute-claim-ticket needs --from-file <wallet>")?;
+    let network = str_arg(args, "--network")
+        .map(String::as_str)
+        .unwrap_or("mini");
+    let params = NetworkParams::by_name(network).map_err(|e| e.to_string())?;
+    let wallet = load_wallet(file)?;
+    let provider = wallet
+        .address()
+        .map_err(|e| format!("wallet unusable: {e}"))?;
+    let ticket_hex = str_arg(args, "--ticket").ok_or("compute-claim-ticket needs --ticket <hex>")?;
+    let ticket_bytes = hex::decode(ticket_hex).map_err(|e| format!("--ticket: {e}"))?;
+    let ticket = SignedTicket::decode(&ticket_bytes).map_err(|e| format!("ticket decode: {e}"))?;
+    let claim = ShardClaim {
+        version: CLAIM_VERSION,
+        network_id: params.network_id.clone(),
+        ticket: ticket.hash(),
+        provider,
+        units: num_arg(args, "--units", 0)? as u32,
+        nonce: num_arg(args, "--nonce", 0)?,
+    };
+    let signed = SignedClaim::sign(claim, &wallet).map_err(|e| format!("claim sign failed: {e}"))?;
+    let view = HttpNode::for_network(node_url, &params.network_id).map_err(|e| e.to_string())?;
+    let posted = post_ok(
+        &view,
+        "/v1/compute/claims",
+        &serde_json::json!({ "claim_hex": hex::encode(signed.encode()) }),
+        "claim file",
+    )?;
+    use srct_core::hash::hash_to_hex;
+    let posted_hash = posted
+        .get("claim_hash")
+        .and_then(|v| v.as_str())
+        .unwrap_or("<unreported>");
+    println!("claim_hash    {posted_hash}");
+    println!("local_hash    {}", hash_to_hex(&signed.hash()));
+    Ok(0)
+}
+
+/// Submit a finished shard: sign the receipt against the ticket claim and
+/// file it. Settlement, escrow release and any pre-authorized payout happen
+/// server-side; the printed `auto_queued` says whether the payout is already
+/// moving (`true`) or waits for a manual claim (`false`).
+fn cmd_compute_submit_receipt(args: &[String]) -> Result<i32, String> {
+    use srct_compute::{ComputeReceipt, SignedClaim, SignedReceipt, SignedTicket};
+
+    let node_url = str_arg(args, "--node").ok_or("compute-submit-receipt needs --node <base-url>")?;
+    let file = str_arg(args, "--from-file").ok_or("compute-submit-receipt needs --from-file <wallet>")?;
+    let network = str_arg(args, "--network")
+        .map(String::as_str)
+        .unwrap_or("mini");
+    let params = NetworkParams::by_name(network).map_err(|e| e.to_string())?;
+    let wallet = load_wallet(file)?;
+    let ticket_hex = str_arg(args, "--ticket").ok_or("compute-submit-receipt needs --ticket <hex>")?;
+    let claim_hex = str_arg(args, "--claim").ok_or("compute-submit-receipt needs --claim <hex>")?;
+    let ticket_bytes = hex::decode(ticket_hex).map_err(|e| format!("--ticket: {e}"))?;
+    let claim_bytes = hex::decode(claim_hex).map_err(|e| format!("--claim: {e}"))?;
+    let ticket = SignedTicket::decode(&ticket_bytes).map_err(|e| format!("ticket decode: {e}"))?;
+    let claim = SignedClaim::decode(&claim_bytes).map_err(|e| format!("claim decode: {e}"))?;
+    let output_hex = str_arg(args, "--output").ok_or("compute-submit-receipt needs --output <hex>")?;
+    let output_bytes = hex::decode(output_hex).map_err(|e| format!("--output: {e}"))?;
+    if output_bytes.len() != 32 {
+        return Err("--output must be exactly 32 bytes".to_string());
+    }
+    let mut output = [0u8; 32];
+    output.copy_from_slice(&output_bytes);
+    let receipt = ComputeReceipt::for_claim(
+        &ticket,
+        &claim,
+        num_arg(args, "--units", 0)? as u32,
+        output,
+        num_arg(args, "--elapsed-ms", 0)?,
+        num_arg(args, "--height", 0)?,
+        num_arg(args, "--nonce", 1)?,
+    )
+    .map_err(|e| format!("receipt build failed: {e}"))?;
+    let signed =
+        SignedReceipt::sign(receipt, &wallet).map_err(|e| format!("receipt sign failed: {e}"))?;
+    let view = HttpNode::for_network(node_url, &params.network_id).map_err(|e| e.to_string())?;
+    let settled = post_ok(
+        &view,
+        "/v1/compute/receipt",
+        &serde_json::json!({ "receipt_hex": hex::encode(signed.encode()) }),
+        "receipt settle",
+    )?;
+    use srct_core::hash::hash_to_hex;
+    println!("receipt_hash  {}", hash_to_hex(&signed.hash()));
+    println!(
+        "auto_queued   {}",
+        settled.get("auto_queued").and_then(|v| v.as_bool()).unwrap_or(false)
+    );
+    Ok(0)
 }
 
 /// Open a pay-as-you-use stream channel (SPEC.md §21, micro-payments).

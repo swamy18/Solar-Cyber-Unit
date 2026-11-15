@@ -11,6 +11,7 @@ description = "Worker SDK for the Solar Cyber Unit L2 task marketplace (SPEC.md 
 [dependencies]
 srct-core = { path = "../srct-core" }
 srct-l2 = { path = "../srct-l2" }
+srct-compute = { path = "../srct-compute" }
 hex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -13,6 +13,11 @@
 //! - settlements raise and timeouts lower a **reputation score**; a provider
 //!   whose score falls below the ban threshold, or whose bond falls below the
 //!   minimum, is refused by [`BondBook::admit_offer`].
+//! - open exposure is limited by **capacity**: bond times ten plus dampened
+//!   settled volume. Settled units count per counterparty at their integer
+//!   square root, so wash trading with one counterparty (including yourself)
+//!   grows the limit sublinearly. Small bond, small capacity; reputation
+//!   raises it over time.
 //!
 //! Failure behaviour is fail-closed: an unbonded, under-bonded or banned
 //! provider's offers are never scheduled, a bond cannot be withdrawn during
@@ -37,8 +42,23 @@ use crate::settle::{decode_signed, encode_signed, SignedReceipt};
 use crate::{market::SignedAssignment, ComputeError};
 
 pub const BOND_VERSION: u8 = 1;
-/// The smallest bond an offer may stand behind.
-pub const MIN_BOND_SAT: u64 = 10_000;
+/// The smallest bond an offer may stand behind: 1,000 sat.
+///
+/// Lowered from 10,000 so anyone with a device can join with one command.
+/// The Sybil protection this gives up is recovered by the capacity rule
+/// below: a small bond means small open exposure, and only settled work —
+/// dampened per counterparty against wash trading — raises the limit over
+/// time. The bond itself stays slashable at this size (NoShow 10% = 100 sat,
+/// fraud 50% = 500 sat: both non-dust) and the score penalty (-100) still
+/// bans on a single slash.
+pub const MIN_BOND_SAT: u64 = 1_000;
+/// Open exposure a provider may carry per sat of bond.
+pub const MAX_EXPOSURE_MULT: u64 = 10;
+/// Capacity satoshis earned per unit of dampened settled volume. See
+/// [`BondBook::effective_units`]: repeat business with one counterparty
+/// counts at its integer square root, so a provider cannot self-settle
+/// fake jobs to raise its own limit.
+pub const SETTLED_UNIT_CREDIT_SAT: u64 = 100;
 /// `NoShow` penalty, in basis points of the bond.
 pub const SLASH_NOSHOW_BPS: u64 = 1_000;
 /// Fraud (`Overclaim`, `Impostor`) penalty, in basis points of the bond.
@@ -548,6 +568,11 @@ pub struct BondBook {
     network_id: String,
     bonds: BTreeMap<Address, ProviderBond>,
     reputation: BTreeMap<Address, Reputation>,
+    /// Settled units per (provider, requester) pair. The wash-trading
+    /// defense: capacity counts each pair at its integer square root, so
+    /// one counterparty — including the provider itself — grows the limit
+    /// sublinearly no matter how much volume it fakes.
+    pair_settled: BTreeMap<(Address, Address), u64>,
     registrations: BTreeSet<Hash>,
     disputes: BTreeSet<Hash>,
     withdrawals: BTreeSet<Hash>,
@@ -565,9 +590,18 @@ impl BondBook {
         &self.network_id
     }
 
-    /// Encode the whole book for `state.bin`.
+    /// Wire version of the [`BondBook::encode`] layout. Version 1 is the
+    /// pre-capacity layout (no pair map); version 2 appends it.
+    pub const BOOK_VERSION: u8 = 2;
+
+    /// Encode the whole book for `state.bin`. A zero `u16` sentinel marks
+    /// the versioned layout (legacy version-1 bytes always start with a
+    /// nonzero network-id length, so the two never collide), then the
+    /// version byte, then the same fields as before plus the per-pair
+    /// settled-units map.
     pub fn encode(&self) -> Vec<u8> {
         let mut w = Writer::with_capacity(64 + self.bonds.len() * 160);
+        w.u16le(0).u8(Self::BOOK_VERSION);
         w.u16le(self.network_id.len() as u16)
             .raw(self.network_id.as_bytes());
         w.u32le(self.bonds.len() as u32);
@@ -591,16 +625,44 @@ impl BondBook {
                 w.fixed(h);
             }
         }
+        let n_pairs = self.pair_settled.len();
+        assert!(
+            n_pairs <= MAX_BONDS,
+            "pair map over cap: refusing encode rather than writing unbounded state"
+        );
+        w.u32le(n_pairs as u32);
+        for ((provider, requester), units) in &self.pair_settled {
+            w.fixed(provider).fixed(requester).u64le(*units);
+        }
         w.into_vec()
     }
 
     /// Decode a book written by [`BondBook::encode`]. Fail-closed: any
     /// truncation, trailing garbage, over-cap count, duplicate id, network
     /// mismatch or inconsistent bond entry refuses the whole blob. Bonds
-    /// re-verify through their own codec.
+    /// re-verify through their own codec. Version-1 bytes (no sentinel,
+    /// no pair map) still decode, with an empty pair map.
     pub fn decode(bytes: &[u8], network_id: &str) -> Result<Self, ComputeError> {
         let mut r = Reader::new(bytes);
-        let net_len = r.u16le().map_err(malformed)? as usize;
+        let first = r.u16le().map_err(malformed)? as usize;
+        let versioned = first == 0;
+        let book_version = if versioned {
+            match r.u8().map_err(malformed)? {
+                Self::BOOK_VERSION => Self::BOOK_VERSION,
+                v => {
+                    return Err(ComputeError::Malformed(format!(
+                        "unsupported bond book version {v}"
+                    )))
+                }
+            }
+        } else {
+            1
+        };
+        let net_len = if versioned {
+            r.u16le().map_err(malformed)? as usize
+        } else {
+            first
+        };
         if net_len == 0 || net_len > MAX_NETWORK_ID_LEN {
             return Err(ComputeError::Malformed("bond network id length".into()));
         }
@@ -660,12 +722,29 @@ impl BondBook {
                 }
             }
         }
-        r.expect_end().map_err(malformed)?;
         let [registrations, withdrawals, disputes] = sets;
+        // Version 1 bytes end here. Version 2 appends the per-pair map.
+        let mut pair_settled = BTreeMap::new();
+        if book_version >= Self::BOOK_VERSION {
+            let n_pairs = r.u32le().map_err(malformed)? as usize;
+            if n_pairs > MAX_BONDS {
+                return Err(ComputeError::Malformed("bond pairs over cap".into()));
+            }
+            for _ in 0..n_pairs {
+                let provider: Address = r.fixed().map_err(malformed)?;
+                let requester: Address = r.fixed().map_err(malformed)?;
+                let units = r.u64le().map_err(malformed)?;
+                if pair_settled.insert((provider, requester), units).is_some() {
+                    return Err(ComputeError::Malformed("duplicate bond pair".into()));
+                }
+            }
+        }
+        r.expect_end().map_err(malformed)?;
         Ok(BondBook {
             network_id: network_id.into(),
             bonds,
             reputation,
+            pair_settled,
             registrations,
             withdrawals,
             disputes,
@@ -790,7 +869,11 @@ impl BondBook {
             .bonds
             .get_mut(&d.provider)
             .ok_or(ComputeError::NotBonded)?;
-        let penalty = bond.amount_sat / 10_000 * d.reason.penalty_bps();
+        // Multiply before dividing: `amount / 10_000 * bps` truncates to zero
+        // for any bond under 10,000 sat, which would make small-bond slashes
+        // no-ops. u128 arithmetic cannot overflow here (both inputs are u64).
+        let penalty =
+            (bond.amount_sat as u128 * d.reason.penalty_bps() as u128 / 10_000) as u64;
         bond.amount_sat -= penalty;
         self.reputation.entry(d.provider).or_default().slashes += 1;
         Ok(bond.amount_sat)
@@ -821,12 +904,126 @@ impl BondBook {
             .checked_add(r.units_done as u64)
             .ok_or_else(|| ComputeError::Malformed("reputation units overflow".into()))?;
         rep.settled_count += 1;
+        // Per-pair volume for the capacity rule. The map only grows with
+        // distinct counterparties, so cap it like every other persisted set:
+        // a full map refuses new pairs rather than growing without bound.
+        let pair = (a.provider, a.requester);
+        match self.pair_settled.get_mut(&pair) {
+            Some(units) => {
+                *units = units
+                    .checked_add(r.units_done as u64)
+                    .ok_or_else(|| ComputeError::Malformed("pair units overflow".into()))?;
+            }
+            None => {
+                if self.pair_settled.len() >= MAX_BONDS {
+                    return Err(ComputeError::Malformed("bond pairs over cap".into()));
+                }
+                self.pair_settled.insert(pair, r.units_done as u64);
+            }
+        }
+        Ok(())
+    }
+
+    /// Integer square root (floor). No floats anywhere in this crate; the
+    /// capacity rule needs `isqrt` and the MSRV (1.75) predates
+    /// `u64::isqrt`, so this is the binary version.
+    fn isqrt(n: u64) -> u64 {
+        if n < 2 {
+            return n;
+        }
+        let mut low = 1u64;
+        let mut high = n.min(1 << 32);
+        while low <= high {
+            let mid = low + (high - low) / 2;
+            let sq = (mid as u128) * (mid as u128);
+            match sq.cmp(&(n as u128)) {
+                std::cmp::Ordering::Equal => return mid,
+                std::cmp::Ordering::Less => low = mid + 1,
+                std::cmp::Ordering::Greater => high = mid - 1,
+            }
+        }
+        high
+    }
+
+    /// Dampened settled volume: the sum over counterparties of the integer
+    /// square root of per-pair units. Ten jobs with ten different requesters
+    /// count ten times more than ten jobs with one — including the provider
+    /// itself. Wash trading buys sublinear capacity no matter the volume.
+    pub fn effective_units(&self, provider: &Address) -> u64 {
+        self.pair_settled
+            .iter()
+            .filter(|((p, _), _)| p == provider)
+            .map(|(_, units)| Self::isqrt(*units))
+            .fold(0u64, |acc, v| acc.saturating_add(v))
+    }
+
+    /// The open exposure a provider may carry, in satoshis: bond times the
+    /// multiple, plus dampened settled volume times the per-unit credit. A
+    /// fresh 1,000-sat bond opens at 10,000 sat; only settled work —
+    /// wash-dampened — raises it. Saturating: a huge bond plus huge volume
+    /// caps at `u64::MAX`, never wraps.
+    pub fn capacity(&self, provider: &Address) -> u64 {
+        let bonded = self.bonds.get(provider).map(|b| b.amount_sat).unwrap_or(0);
+        bonded
+            .saturating_mul(MAX_EXPOSURE_MULT)
+            .saturating_add(
+                self.effective_units(provider)
+                    .saturating_mul(SETTLED_UNIT_CREDIT_SAT),
+            )
+    }
+
+    /// Count settled units from a ticket claim toward reputation and the
+    /// per-pair capacity map. Mirrors `record_settlement`: binding, price
+    /// and overclaim are re-verified, so only real paid work counts.
+    pub fn record_claim_settlement(
+        &mut self,
+        receipt: &SignedReceipt,
+        ticket: &crate::ticket::SignedTicket,
+        claim: &crate::ticket::SignedClaim,
+    ) -> Result<(), ComputeError> {
+        receipt.verify()?;
+        ticket.verify()?;
+        claim.verify()?;
+        let t = &ticket.ticket;
+        let c = &claim.claim;
+        let r = &receipt.receipt;
+        if c.ticket != ticket.hash() {
+            return Err(ComputeError::BindingMismatch);
+        }
+        if r.job != t.job || r.assignment != claim.hash() || r.provider != c.provider {
+            return Err(ComputeError::BindingMismatch);
+        }
+        if r.units_done > t.units {
+            return Err(ComputeError::Overclaim);
+        }
+        if r.unit_price_sat != t.unit_price_sat {
+            return Err(ComputeError::PriceMismatch);
+        }
+        let rep = self.reputation.entry(c.provider).or_default();
+        rep.settled_units = rep
+            .settled_units
+            .checked_add(r.units_done as u64)
+            .ok_or_else(|| ComputeError::Malformed("reputation units overflow".into()))?;
+        rep.settled_count += 1;
+        let pair = (c.provider, t.requester);
+        match self.pair_settled.get_mut(&pair) {
+            Some(units) => {
+                *units = units
+                    .checked_add(r.units_done as u64)
+                    .ok_or_else(|| ComputeError::Malformed("pair units overflow".into()))?;
+            }
+            None => {
+                if self.pair_settled.len() >= MAX_BONDS {
+                    return Err(ComputeError::Malformed("bond pairs over cap".into()));
+                }
+                self.pair_settled.insert(pair, r.units_done as u64);
+            }
+        }
         Ok(())
     }
 
     /// Count one timed-out assignment against a provider.
-    pub fn record_timeout(
-        &mut self,
+    pub fn record_timeout(        &mut self,
         assignment: &SignedAssignment,
         height: u64,
     ) -> Result<(), ComputeError> {
@@ -860,6 +1057,53 @@ impl BondBook {
             return Err(ComputeError::Banned);
         }
         Ok(())
+    }
+
+    /// Slash a bond with a requester-signed dispute bound to a ticket claim.
+    ///
+    /// Mirrors [`BondBook::slash`]: the dispute must name the claim, its
+    /// provider and its requester; `NoShow` needs a past deadline. The claim
+    /// hash enters the once-only dispute set, so one dispute slashes once
+    /// whether it arrives via the push or the pull path.
+    pub fn slash_for_claim(
+        &mut self,
+        dispute: &SignedDispute,
+        ticket: &crate::ticket::SignedTicket,
+        claim: &crate::ticket::SignedClaim,
+        height: u64,
+    ) -> Result<u64, ComputeError> {
+        dispute.verify()?;
+        ticket.verify()?;
+        claim.verify()?;
+        let d = &dispute.dispute;
+        if d.network_id != self.network_id {
+            return Err(ComputeError::WrongNetwork);
+        }
+        if claim.claim.ticket != ticket.hash() {
+            return Err(ComputeError::BindingMismatch);
+        }
+        let claim_id = claim.hash();
+        if d.assignment != claim_id
+            || d.provider != claim.claim.provider
+            || d.requester != ticket.ticket.requester
+        {
+            return Err(ComputeError::BindingMismatch);
+        }
+        if d.reason == DisputeReason::NoShow && height <= ticket.ticket.deadline {
+            return Err(ComputeError::NotExpired);
+        }
+        if !self.disputes.insert(dispute.dispute.hash()) {
+            return Err(ComputeError::AlreadySlashed);
+        }
+        let bond = self
+            .bonds
+            .get_mut(&d.provider)
+            .ok_or(ComputeError::NotBonded)?;
+        let penalty =
+            (bond.amount_sat as u128 * d.reason.penalty_bps() as u128 / 10_000) as u64;
+        bond.amount_sat -= penalty;
+        self.reputation.entry(d.provider).or_default().slashes += 1;
+        Ok(bond.amount_sat)
     }
 
     /// Restore timeout counts from an operator checkpoint. Timeouts are

@@ -306,6 +306,54 @@ impl ChallengeBook {
         Ok(())
     }
 
+    /// Open a challenge against a settled ticket claim, keyed by the claim
+    /// hash exactly like the assignment path. Verifies the requester,
+    /// provider and claim binding, the open window, and once-only.
+    pub fn open_for_claim(
+        &mut self,
+        challenge: &SignedChallenge,
+        ticket: &crate::ticket::SignedTicket,
+        claim: &crate::ticket::SignedClaim,
+        height: u64,
+    ) -> Result<(), ComputeError> {
+        challenge.verify()?;
+        ticket.verify()?;
+        claim.verify()?;
+        let c = &challenge.challenge;
+        if c.network_id != self.network_id {
+            return Err(ComputeError::WrongNetwork);
+        }
+        if claim.claim.ticket != ticket.hash() {
+            return Err(ComputeError::BindingMismatch);
+        }
+        if c.requester != ticket.ticket.requester {
+            return Err(ComputeError::WrongRequester);
+        }
+        if c.provider != claim.claim.provider {
+            return Err(ComputeError::BindingMismatch);
+        }
+        if c.assignment != claim.hash() {
+            return Err(ComputeError::BindingMismatch);
+        }
+        if height >= c.deadline_height {
+            return Err(ComputeError::Expired);
+        }
+        if self.records.contains_key(&c.assignment) {
+            return Err(ComputeError::Replay);
+        }
+        if !self.seen.insert(challenge.hash()) {
+            return Err(ComputeError::Replay);
+        }
+        self.records.insert(
+            c.assignment,
+            ChallengeRecord {
+                challenge: challenge.clone(),
+                second: None,
+            },
+        );
+        Ok(())
+    }
+
     /// Submit the challenger's re-execution receipt. Exactly once, before the
     /// deadline, signed by the challenger and bound to the same assignment.
     pub fn submit_second(

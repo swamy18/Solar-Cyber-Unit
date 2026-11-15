@@ -23,9 +23,12 @@ fn profile(
     determinism: Determinism,
     ram_mib: u32,
     shard: u32,
+    throughput_per_sec: u32,
     kernel: Hash,
 ) -> DeviceProfile {
-    DeviceProfile::new(class, determinism, ram_mib, 8, shard, 50_000, kernel)
+    DeviceProfile::new(
+        class, determinism, ram_mib, 8, shard, 50_000, throughput_per_sec, kernel,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -67,6 +70,7 @@ fn signed_job(
     max_total_sat: u64,
     class_mask: u8,
     min_ram_mib: u32,
+    min_units_per_sec: u32,
     determinism: Determinism,
     required_kernel: Hash,
     min_verification: Verification,
@@ -83,6 +87,8 @@ fn signed_job(
         max_total_sat,
         class_mask,
         min_ram_mib,
+        min_units_per_sec,
+        min_bandwidth_kbps: 0,
         determinism,
         required_kernel,
         min_verification,
@@ -109,6 +115,7 @@ fn fleet() -> (Vec<SignedOffer>, Wallet, Wallet, Wallet, Wallet) {
                 Determinism::Reproducible,
                 2_048,
                 4,
+                500,
                 KERNEL,
             ),
             10,
@@ -127,6 +134,7 @@ fn fleet() -> (Vec<SignedOffer>, Wallet, Wallet, Wallet, Wallet) {
                 Determinism::Reproducible,
                 16_384,
                 10,
+                2_000,
                 KERNEL,
             ),
             12,
@@ -145,6 +153,7 @@ fn fleet() -> (Vec<SignedOffer>, Wallet, Wallet, Wallet, Wallet) {
                 Determinism::Reproducible,
                 65_536,
                 25,
+                5_000,
                 KERNEL,
             ),
             7,
@@ -162,7 +171,8 @@ fn fleet() -> (Vec<SignedOffer>, Wallet, Wallet, Wallet, Wallet) {
 #[test]
 fn a_job_is_split_across_heterogeneous_devices() {
     let (offers, phone, laptop, desktop, requester) = fleet();
-    // CPU + Apple silicon + GPU are all acceptable.
+    // CPU + Apple silicon + GPU are all acceptable: matching runs on
+    // capabilities (RAM, throughput, determinism), never on class.
     let job = signed_job(
         &requester,
         30,
@@ -170,6 +180,7 @@ fn a_job_is_split_across_heterogeneous_devices() {
         1_000,
         DeviceClass::ALL_MASK,
         512,
+        400,
         Determinism::Reproducible,
         KERNEL,
         Verification::Receipt,
@@ -216,6 +227,10 @@ fn a_job_is_split_across_heterogeneous_devices() {
 #[test]
 fn a_small_phone_can_take_a_small_job_alone() {
     let (offers, phone, _, _, requester) = fleet();
+    // Only the phone's offer is on the table: with class ignored, the
+    // cheapest capable device would otherwise win, so isolation here is
+    // about fit, not class.
+    let phone_only = vec![offers[0].clone()];
     let job = signed_job(
         &requester,
         4,
@@ -223,13 +238,14 @@ fn a_small_phone_can_take_a_small_job_alone() {
         100,
         DeviceClass::Cpu.mask(),
         1_024,
+        400,
         Determinism::Reproducible,
         [0u8; 32],
         Verification::Receipt,
         false,
         100,
     );
-    let plan = plan_assignments(&job, &offers, 10, 1).unwrap();
+    let plan = plan_assignments(&job, &phone_only, 10, 1).unwrap();
     assert_eq!(plan.assignments.len(), 1);
     assert_eq!(plan.assignments[0].provider, phone.address().unwrap());
     assert_eq!(plan.assignments[0].units, 4);
@@ -247,6 +263,7 @@ fn a_small_device_can_take_several_shards_up_to_its_cap() {
             Determinism::Reproducible,
             2_048,
             4,
+            500,
             KERNEL,
         ),
         10,
@@ -264,6 +281,7 @@ fn a_small_device_can_take_several_shards_up_to_its_cap() {
         1_000,
         DeviceClass::Cpu.mask(),
         512,
+        400,
         Determinism::Reproducible,
         KERNEL,
         Verification::Receipt,
@@ -289,6 +307,7 @@ fn ineligible_offers_are_never_scheduled() {
         100,
         DeviceClass::Cpu.mask(),
         512,
+        400,
         Determinism::Reproducible,
         [0u8; 32],
         Verification::Receipt,
@@ -322,9 +341,17 @@ fn ineligible_offers_are_never_scheduled() {
             vec![offers[0].clone()],
         ),
         (
-            "wrong device class",
+            "throughput below the floor",
             ComputeJob {
-                class_mask: DeviceClass::Photonic.mask(),
+                min_units_per_sec: 50_000,
+                ..base.job.clone()
+            },
+            vec![offers[0].clone()],
+        ),
+        (
+            "bandwidth below the floor",
+            ComputeJob {
+                min_bandwidth_kbps: 500_000,
                 ..base.job.clone()
             },
             vec![offers[0].clone()],
@@ -381,6 +408,16 @@ fn ineligible_offers_are_never_scheduled() {
             "{name}: got {err:?}"
         );
     }
+
+    // Class is a display label, not a matching rule: a photonic-only mask
+    // still matches a CPU offer when every capability floor passes.
+    let photonic = ComputeJob {
+        class_mask: DeviceClass::Photonic.mask(),
+        ..base.job.clone()
+    };
+    let photonic = SignedJob::sign(photonic, &requester).unwrap();
+    let plan = plan_assignments(&photonic, &[offers[0].clone()], 10, 1).unwrap();
+    assert_eq!(plan.units(), 4);
 }
 
 #[test]
@@ -395,6 +432,7 @@ fn capacity_budget_and_minimum_shard_are_enforced() {
             Determinism::Reproducible,
             2_048,
             4,
+            500,
             KERNEL,
         ),
         10,
@@ -413,6 +451,7 @@ fn capacity_budget_and_minimum_shard_are_enforced() {
         1_000,
         DeviceClass::ALL_MASK,
         512,
+        400,
         Determinism::Reproducible,
         KERNEL,
         Verification::Receipt,
@@ -431,6 +470,7 @@ fn capacity_budget_and_minimum_shard_are_enforced() {
         1_000,
         DeviceClass::ALL_MASK,
         512,
+        400,
         Determinism::Reproducible,
         KERNEL,
         Verification::Receipt,
@@ -449,6 +489,7 @@ fn capacity_budget_and_minimum_shard_are_enforced() {
         39,
         DeviceClass::ALL_MASK,
         512,
+        400,
         Determinism::Reproducible,
         KERNEL,
         Verification::Receipt,
@@ -471,6 +512,7 @@ fn only_the_requester_can_authorize_a_plan() {
         100,
         DeviceClass::Cpu.mask(),
         512,
+        400,
         Determinism::Reproducible,
         KERNEL,
         Verification::Receipt,
@@ -504,6 +546,7 @@ fn a_receipt_settles_exactly_once() {
         100,
         DeviceClass::Gpu.mask(),
         512,
+        400,
         Determinism::Reproducible,
         KERNEL,
         Verification::Receipt,
@@ -549,6 +592,7 @@ fn overclaim_price_mismatch_and_wrong_binding_are_refused() {
         100,
         DeviceClass::Gpu.mask(),
         512,
+        400,
         Determinism::Reproducible,
         KERNEL,
         Verification::Receipt,
@@ -615,6 +659,7 @@ fn late_receipts_and_expiry_are_refused() {
         100,
         DeviceClass::Gpu.mask(),
         512,
+        400,
         Determinism::Reproducible,
         KERNEL,
         Verification::Receipt,
@@ -660,6 +705,7 @@ fn attempt_deadline_and_wire_codecs_are_bounded() {
         100,
         DeviceClass::Cpu.mask(),
         512,
+        400,
         Determinism::Reproducible,
         KERNEL,
         Verification::Receipt,

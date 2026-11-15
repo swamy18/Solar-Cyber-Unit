@@ -76,6 +76,42 @@ impl ComputeReceipt {
         })
     }
 
+    /// Build a receipt against a ticket claim instead of an assignment.
+    ///
+    /// The `assignment` field carries the claim hash: every downstream check
+    /// (ledger, escrow, challenge, slash) keys off that hash exactly as it
+    /// keys off an assignment hash on the push path. Fails closed on
+    /// overclaim and arithmetic overflow, like [`ComputeReceipt::new`].
+    pub fn for_claim(
+        ticket: &crate::ticket::SignedTicket,
+        claim: &crate::ticket::SignedClaim,
+        units_done: u32,
+        output: Hash,
+        elapsed_ms: u64,
+        height: u64,
+        nonce: u64,
+    ) -> Result<Self, ComputeError> {
+        if units_done == 0 || units_done > ticket.ticket.units {
+            return Err(ComputeError::Overclaim);
+        }
+        let total = (units_done as u64)
+            .checked_mul(ticket.ticket.unit_price_sat)
+            .ok_or_else(|| ComputeError::Malformed("receipt total overflows".into()))?;
+        Ok(ComputeReceipt {
+            version: RECEIPT_VERSION,
+            job: ticket.ticket.job,
+            assignment: claim.hash(),
+            provider: claim.claim.provider,
+            units_done,
+            unit_price_sat: ticket.ticket.unit_price_sat,
+            total_sat: total,
+            output,
+            elapsed_ms,
+            height,
+            nonce,
+        })
+    }
+
     pub fn validate(&self) -> Result<(), ComputeError> {
         if self.version != RECEIPT_VERSION {
             return Err(ComputeError::Malformed(format!(
@@ -364,6 +400,62 @@ impl ComputeLedger {
             receipt: receipt.hash(),
         };
         self.settled.insert(assignment.hash(), payout.clone());
+        Ok(payout)
+    }
+
+    /// Verify a receipt against a two-signature ticket claim and record the
+    /// payout, keyed by the claim hash.
+    ///
+    /// Mirrors [`ComputeLedger::settle`] check for check: both signatures,
+    /// job/shard/provider/total binding, no overclaim, price match,
+    /// deadline, and once-only. The returned instruction moves no coin;
+    /// the caller executes it.
+    pub fn settle_claim(
+        &mut self,
+        receipt: &SignedReceipt,
+        ticket: &crate::ticket::SignedTicket,
+        claim: &crate::ticket::SignedClaim,
+        height: u64,
+    ) -> Result<PayoutInstruction, ComputeError> {
+        receipt.verify()?;
+        ticket.verify()?;
+        claim.verify()?;
+        let t = &ticket.ticket;
+        let c = &claim.claim;
+        let r = &receipt.receipt;
+        let claim_id = claim.hash();
+
+        if c.ticket != ticket.hash() {
+            return Err(ComputeError::BindingMismatch);
+        }
+        if r.job != t.job || r.assignment != claim_id || r.provider != c.provider {
+            return Err(ComputeError::BindingMismatch);
+        }
+        if r.units_done > t.units {
+            return Err(ComputeError::Overclaim);
+        }
+        if r.unit_price_sat != t.unit_price_sat {
+            return Err(ComputeError::PriceMismatch);
+        }
+        if height > t.deadline || r.height > t.deadline {
+            return Err(ComputeError::Expired);
+        }
+        if self.settled.contains_key(&claim_id) {
+            return Err(ComputeError::AlreadySettled);
+        }
+        if self.expired.contains(&claim_id) {
+            return Err(ComputeError::AssignmentExpired);
+        }
+
+        let payout = PayoutInstruction {
+            from: t.requester,
+            to: c.provider,
+            amount_sat: r.total_sat,
+            job: t.job,
+            assignment: claim_id,
+            receipt: receipt.hash(),
+        };
+        self.settled.insert(claim_id, payout.clone());
         Ok(payout)
     }
 

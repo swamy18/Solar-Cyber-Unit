@@ -3,7 +3,8 @@
 
 use srct_compute::bond::{
     BondBook, BondDispute, BondWithdrawal, DisputeReason, ProviderBond, SignedBond, SignedDispute,
-    SignedWithdrawal, BOND_VERSION, LOCKUP_HEIGHTS, MIN_BOND_SAT,
+    SignedWithdrawal, BOND_VERSION, LOCKUP_HEIGHTS, MAX_EXPOSURE_MULT, MIN_BOND_SAT,
+    SETTLED_UNIT_CREDIT_SAT,
 };
 use srct_compute::market::{ComputeOffer, Verification, ASSIGNMENT_VERSION, OFFER_VERSION};
 use srct_compute::{
@@ -34,6 +35,7 @@ fn gpu_offer(provider: &Wallet) -> SignedOffer {
         16,
         1_000,
         50_000,
+        5_000,
         KERNEL,
     );
     let offer = ComputeOffer {
@@ -461,7 +463,7 @@ fn withdrawing_before_lockup_is_refused_and_after_works() {
         version: BOND_VERSION,
         network_id: NET.into(),
         provider: provider.address().unwrap(),
-        amount_sat: 4_000,
+        amount_sat: 400,
         nonce: 1,
     };
     let signed = SignedWithdrawal::sign(w, &provider).unwrap();
@@ -473,7 +475,7 @@ fn withdrawing_before_lockup_is_refused_and_after_works() {
     ));
     assert_eq!(
         book.withdraw(&signed, locked_until).unwrap(),
-        MIN_BOND_SAT - 4_000
+        MIN_BOND_SAT - 400
     );
 
     // The same withdrawal cannot be replayed.
@@ -592,4 +594,131 @@ fn timeout_checkpoint_restores_without_rewinding() {
     bad[0] = 99;
     assert!(TimeoutCheckpoint::decode(&bad).is_err());
     assert!(TimeoutCheckpoint::decode(&bytes[..bytes.len() - 2]).is_err());
+}
+
+fn big_assignment(
+    requester: &Wallet,
+    provider: &Wallet,
+    units: u32,
+    deadline: u64,
+) -> srct_compute::SignedAssignment {
+    use srct_compute::market::ASSIGNMENT_VERSION;
+    use srct_compute::Assignment;
+    let a = Assignment {
+        version: ASSIGNMENT_VERSION,
+        job: [1u8; 32],
+        offer: [2u8; 32],
+        requester: requester.address().unwrap(),
+        provider: provider.address().unwrap(),
+        shard: 0,
+        units,
+        unit_price_sat: 5,
+        total_sat: units as u64 * 5,
+        deadline,
+        attempt: 1,
+    };
+    srct_compute::SignedAssignment::sign(a, requester).unwrap()
+}
+
+#[test]
+fn capacity_starts_at_ten_times_bond_and_grows_with_settled_work() {
+    let provider = provider_wallet(1);
+    let requester = wallet(9);
+    let addr = provider.address().unwrap();
+    let mut book = BondBook::new(NET);
+    // No bond, no capacity.
+    assert_eq!(book.capacity(&addr), 0);
+    book.register(&bond(&provider, MIN_BOND_SAT, 5, 1), 10)
+        .unwrap();
+    assert_eq!(book.capacity(&addr), MIN_BOND_SAT * MAX_EXPOSURE_MULT);
+
+    // 100 settled units with one requester: sqrt(100) = 10 effective units.
+    let a = big_assignment(&requester, &provider, 100, 100);
+    let r = receipt(&provider, &a, 100, 60);
+    book.record_settlement(&r, &a).unwrap();
+    assert_eq!(book.effective_units(&addr), 10);
+    assert_eq!(
+        book.capacity(&addr),
+        MIN_BOND_SAT * MAX_EXPOSURE_MULT + 10 * SETTLED_UNIT_CREDIT_SAT
+    );
+}
+
+#[test]
+fn wash_trading_grows_capacity_sublinearly() {
+    let provider = provider_wallet(1);
+    let addr = provider.address().unwrap();
+    let mut concentrated = BondBook::new(NET);
+    concentrated
+        .register(&bond(&provider, MIN_BOND_SAT, 5, 1), 10)
+        .unwrap();
+    // 10,000 units all with one counterparty (possibly yourself):
+    // sqrt(10_000) = 100 effective units.
+    let solo = wallet(9);
+    let a = big_assignment(&solo, &provider, 10_000, 100);
+    let r = receipt(&provider, &a, 10_000, 60);
+    concentrated.record_settlement(&r, &a).unwrap();
+    assert_eq!(concentrated.effective_units(&addr), 100);
+
+    // Same 10,000 units spread over ten counterparties: 10 x sqrt(1_000) =
+    // 10 x 31 = 310 effective units — real distribution earns more.
+    let mut distributed = BondBook::new(NET);
+    distributed
+        .register(&bond(&provider, MIN_BOND_SAT, 5, 1), 10)
+        .unwrap();
+    for i in 0..10u8 {
+        let counterparty = wallet(20 + i);
+        let a = big_assignment(&counterparty, &provider, 1_000, 100);
+        let r = receipt(&provider, &a, 1_000, 60);
+        distributed.record_settlement(&r, &a).unwrap();
+    }
+    assert_eq!(distributed.effective_units(&addr), 310);
+    assert!(
+        distributed.capacity(&addr) > concentrated.capacity(&addr),
+        "distributed work must earn more capacity than wash volume"
+    );
+}
+
+#[test]
+fn a_thousand_sat_bond_still_slashes_meaningfully() {
+    let provider = provider_wallet(1);
+    let requester = wallet(9);
+    let addr = provider.address().unwrap();
+
+    // NoShow takes 10%: 100 sat off a 1,000-sat bond — non-dust.
+    let mut book = BondBook::new(NET);
+    book.register(&bond(&provider, MIN_BOND_SAT, 5, 1), 10)
+        .unwrap();
+    let a = assignment(&requester, &provider, 50);
+    let d = dispute(&requester, &provider, &a, DisputeReason::NoShow, 1);
+    let remaining = book.slash(&d, &a, 100).unwrap();
+    assert_eq!(remaining, MIN_BOND_SAT - MIN_BOND_SAT / 10);
+    assert_eq!(remaining, 900);
+
+    // Fraud takes 50%: 500 sat, plus the -100 score ban trigger.
+    let mut book = BondBook::new(NET);
+    book.register(&bond(&provider, MIN_BOND_SAT, 5, 1), 10)
+        .unwrap();
+    let a = assignment(&requester, &provider, 50);
+    let d = dispute(&requester, &provider, &a, DisputeReason::WrongResult, 1);
+    let remaining = book.slash(&d, &a, 60).unwrap();
+    assert_eq!(remaining, MIN_BOND_SAT / 2);
+    assert_eq!(remaining, 500);
+    assert_eq!(book.score(&addr), -100);
+}
+
+#[test]
+fn version_1_book_bytes_still_decode_with_empty_pairs() {
+    // Legacy layout: u16 net_len + net, then five zero counts (bonds,
+    // reputations, and the three single-use sets), then end.
+    let net = NET.as_bytes();
+    let mut legacy = Vec::new();
+    legacy.extend_from_slice(&(net.len() as u16).to_le_bytes());
+    legacy.extend_from_slice(net);
+    for _ in 0..5 {
+        legacy.extend_from_slice(&0u32.to_le_bytes());
+    }
+    let book = BondBook::decode(&legacy, NET).unwrap();
+    let stranger = wallet(77).address().unwrap();
+    assert_eq!(book.capacity(&stranger), 0);
+    assert_eq!(book.effective_units(&stranger), 0);
 }
