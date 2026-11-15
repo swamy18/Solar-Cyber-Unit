@@ -208,8 +208,14 @@ impl Executor for CommandExecutor {
         cmd.args(&self.args);
         cmd.env("SRCT_TASK_ID", srct_core::hash::hash_to_hex(&work.task_id));
         cmd.env("SRCT_IR_HASH", srct_core::hash::hash_to_hex(&work.ir_hash));
-        cmd.env("SRCT_INPUT_HASH", srct_core::hash::hash_to_hex(&work.input_hash));
-        cmd.env("SRCT_REQUIRED_MEMORY_BYTES", work.required_memory_bytes.to_string());
+        cmd.env(
+            "SRCT_INPUT_HASH",
+            srct_core::hash::hash_to_hex(&work.input_hash),
+        );
+        cmd.env(
+            "SRCT_REQUIRED_MEMORY_BYTES",
+            work.required_memory_bytes.to_string(),
+        );
         cmd.env("SRCT_BACKEND", self.backend.name());
 
         let out = cmd.output().map_err(|e| ExecError {
@@ -303,7 +309,10 @@ mod tests {
         );
         let w = work(42);
         let out = e.execute(&w).expect("command execution should succeed");
-        assert!(out.output.starts_with(b"result:"), "output must match python script output");
+        assert!(
+            out.output.starts_with(b"result:"),
+            "output must match python script output"
+        );
         assert_eq!(out.backend, ComputeBackend::Cpu);
     }
 }

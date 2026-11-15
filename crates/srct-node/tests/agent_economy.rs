@@ -1119,7 +1119,11 @@ fn compute_marketplace_offer_job_plan_and_settle() {
     let signed_offer = srct_compute::SignedOffer::sign(offer, &provider_wallet).unwrap();
     let offer_hex = hex::encode(signed_offer.encode());
 
-    let (s, res) = post(&node, "/v1/compute/offers", &json!({ "offer_hex": offer_hex }));
+    let (s, res) = post(
+        &node,
+        "/v1/compute/offers",
+        &json!({ "offer_hex": offer_hex }),
+    );
     assert_eq!(s, 200, "offer post failed: {res}");
     assert_eq!(res["status"], "ok");
 
@@ -1156,7 +1160,11 @@ fn compute_marketplace_offer_job_plan_and_settle() {
     assert_eq!(res["status"], "ok");
 
     // 3. Matchmaker plans the assignment
-    let (s, plan_res) = post(&node, "/v1/compute/plan", &json!({ "job_hash": job_hash_hex }));
+    let (s, plan_res) = post(
+        &node,
+        "/v1/compute/plan",
+        &json!({ "job_hash": job_hash_hex }),
+    );
     assert_eq!(s, 200, "plan failed: {plan_res}");
     assert_eq!(plan_res["status"], "planned");
     assert_eq!(plan_res["shards_count"], 1);
@@ -1167,19 +1175,16 @@ fn compute_marketplace_offer_job_plan_and_settle() {
     let signed_plan = plan.sign(&requester_wallet).unwrap();
     let assignment = &signed_plan.assignments[0];
 
-    let receipt = srct_compute::ComputeReceipt::new(
-        assignment,
-        100,
-        [99u8; 32],
-        500,
-        0,
-        200,
-    )
-    .unwrap();
+    let receipt =
+        srct_compute::ComputeReceipt::new(assignment, 100, [99u8; 32], 500, 0, 200).unwrap();
     let signed_receipt = srct_compute::SignedReceipt::sign(receipt, &provider_wallet).unwrap();
     let receipt_hex = hex::encode(signed_receipt.encode());
 
-    let (s, settle_res) = post(&node, "/v1/compute/receipt", &json!({ "receipt_hex": receipt_hex }));
+    let (s, settle_res) = post(
+        &node,
+        "/v1/compute/receipt",
+        &json!({ "receipt_hex": receipt_hex }),
+    );
     assert_eq!(s, 200, "settle failed: {settle_res}");
     assert_eq!(settle_res["status"], "settled");
     assert_eq!(settle_res["total_sat"], 20_000);

@@ -1550,7 +1550,16 @@ impl SharedNode {
         // v10 appends the Smart Gate sections after trials. v11 appends Treats last.
         // v12 extends Treats with last-kind tracking. v13 adds persistent redemption nonces; older Treats sections migrate with empty nonce state.
         // v14 adds compute marketplace persistence (offers, jobs, receipts).
-        let (trials, guard_registry, guard_revoked, guards, treats, compute_offers, compute_jobs, compute_receipts) = if version == 8 {
+        let (
+            trials,
+            guard_registry,
+            guard_revoked,
+            guards,
+            treats,
+            compute_offers,
+            compute_jobs,
+            compute_receipts,
+        ) = if version == 8 {
             r.expect_end().map_err(|e| format!("state envelope: {e}"))?;
             (
                 BTreeMap::new(),
@@ -1763,8 +1772,7 @@ impl SharedNode {
                 })?;
                 let cj = decode_section(&mut r, "compute_jobs", |sr| {
                     decode_state_map(sr, "compute_jobs", |b| {
-                        srct_compute::SignedJob::decode(b)
-                            .map_err(|e| format!("compute_jobs: {e}"))
+                        srct_compute::SignedJob::decode(b).map_err(|e| format!("compute_jobs: {e}"))
                     })
                 })?;
                 let cr = decode_section(&mut r, "compute_receipts", |sr| {
@@ -1778,7 +1786,16 @@ impl SharedNode {
             } else {
                 (BTreeMap::new(), BTreeMap::new(), BTreeMap::new())
             };
-            (t, guard_registry, guard_revoked, guards, treats, compute_offers, compute_jobs, compute_receipts)
+            (
+                t,
+                guard_registry,
+                guard_revoked,
+                guards,
+                treats,
+                compute_offers,
+                compute_jobs,
+                compute_receipts,
+            )
         };
 
         self.receipts = receipts;
@@ -8223,7 +8240,8 @@ async fn compute_offer_post(
     State(state): State<ApiState>,
     Json(req): Json<ComputeOfferReq>,
 ) -> ApiResult {
-    let bytes = hex::decode(&req.offer_hex).map_err(|e| bad(format!("offer_hex is not hex: {e}")))?;
+    let bytes =
+        hex::decode(&req.offer_hex).map_err(|e| bad(format!("offer_hex is not hex: {e}")))?;
     let signed_offer = srct_compute::SignedOffer::decode(&bytes)
         .map_err(|e| fail(StatusCode::BAD_REQUEST, "invalid_offer", e.to_string()))?;
 
@@ -8233,7 +8251,10 @@ async fn compute_offer_post(
             return Err(fail(
                 StatusCode::BAD_REQUEST,
                 "wrong_network",
-                format!("offer network {} != node network {}", signed_offer.offer.network_id, network),
+                format!(
+                    "offer network {} != node network {}",
+                    signed_offer.offer.network_id, network
+                ),
             ));
         }
         let height = sh.chain.height();
@@ -8241,7 +8262,10 @@ async fn compute_offer_post(
             return Err(fail(
                 StatusCode::BAD_REQUEST,
                 "offer_expired",
-                format!("offer available_until {} < current height {}", signed_offer.offer.available_until, height),
+                format!(
+                    "offer available_until {} < current height {}",
+                    signed_offer.offer.available_until, height
+                ),
             ));
         }
         let hash = signed_offer.hash();
@@ -8252,7 +8276,13 @@ async fn compute_offer_post(
         let max_units = signed_offer.offer.max_units_per_job;
 
         sh.compute_offers.insert(hash, signed_offer);
-        audit_push(sh, "compute_offer", Some(hash), None, format!("registered {service} offer from {provider}"));
+        audit_push(
+            sh,
+            "compute_offer",
+            Some(hash),
+            None,
+            format!("registered {service} offer from {provider}"),
+        );
 
         Ok(Json(json!({
             "status": "ok",
@@ -8318,7 +8348,10 @@ async fn compute_job_post(
             return Err(fail(
                 StatusCode::BAD_REQUEST,
                 "wrong_network",
-                format!("job network {} != node network {}", signed_job.job.network_id, network),
+                format!(
+                    "job network {} != node network {}",
+                    signed_job.job.network_id, network
+                ),
             ));
         }
         let height = sh.chain.height();
@@ -8326,7 +8359,10 @@ async fn compute_job_post(
             return Err(fail(
                 StatusCode::BAD_REQUEST,
                 "job_expired",
-                format!("job deadline {} < current height {}", signed_job.job.deadline, height),
+                format!(
+                    "job deadline {} < current height {}",
+                    signed_job.job.deadline, height
+                ),
             ));
         }
         let hash = signed_job.hash();
@@ -8336,7 +8372,13 @@ async fn compute_job_post(
         let max_total_sat = signed_job.job.max_total_sat;
 
         sh.compute_jobs.insert(hash, signed_job.clone());
-        audit_push(sh, "compute_job", Some(hash), None, format!("registered {service} job from {requester}"));
+        audit_push(
+            sh,
+            "compute_job",
+            Some(hash),
+            None,
+            format!("registered {service} job from {requester}"),
+        );
 
         Ok(Json(json!({
             "status": "ok",
@@ -8393,23 +8435,30 @@ async fn compute_plan_post(
 ) -> ApiResult {
     let job_hash = decode_hash(&req.job_hash)?;
     with_shared(&state, |sh| {
-        let job = sh.compute_jobs.get(&job_hash).ok_or_else(|| not_found("unknown compute job"))?;
+        let job = sh
+            .compute_jobs
+            .get(&job_hash)
+            .ok_or_else(|| not_found("unknown compute job"))?;
         let height = sh.chain.height();
         let offers: Vec<srct_compute::SignedOffer> = sh.compute_offers.values().cloned().collect();
 
         let plan = srct_compute::market::plan_assignments(job, &offers, height, 0)
             .map_err(|e| fail(StatusCode::CONFLICT, "plan_failed", e.to_string()))?;
 
-        let shards: Vec<Value> = plan.assignments.iter().map(|a| {
-            json!({
-                "shard": a.shard,
-                "provider": address_to_hex(&a.provider),
-                "units": a.units,
-                "unit_price_sat": a.unit_price_sat,
-                "total_sat": a.total_sat,
-                "deadline": a.deadline,
+        let shards: Vec<Value> = plan
+            .assignments
+            .iter()
+            .map(|a| {
+                json!({
+                    "shard": a.shard,
+                    "provider": address_to_hex(&a.provider),
+                    "units": a.units,
+                    "unit_price_sat": a.unit_price_sat,
+                    "total_sat": a.total_sat,
+                    "deadline": a.deadline,
+                })
             })
-        }).collect();
+            .collect();
 
         Ok(Json(json!({
             "status": "planned",
@@ -8426,7 +8475,8 @@ async fn compute_receipt_post(
     State(state): State<ApiState>,
     Json(req): Json<ComputeReceiptReq>,
 ) -> ApiResult {
-    let bytes = hex::decode(&req.receipt_hex).map_err(|e| bad(format!("receipt_hex is not hex: {e}")))?;
+    let bytes =
+        hex::decode(&req.receipt_hex).map_err(|e| bad(format!("receipt_hex is not hex: {e}")))?;
     let signed_receipt = srct_compute::SignedReceipt::decode(&bytes)
         .map_err(|e| fail(StatusCode::BAD_REQUEST, "invalid_receipt", e.to_string()))?;
 
@@ -8439,19 +8489,40 @@ async fn compute_receipt_post(
                 "duplicate": true,
             })));
         }
-        let job = sh.compute_jobs.get(&signed_receipt.receipt.job)
-            .ok_or_else(|| fail(StatusCode::BAD_REQUEST, "unknown_job", "receipt references unknown compute job"))?;
+        let job = sh
+            .compute_jobs
+            .get(&signed_receipt.receipt.job)
+            .ok_or_else(|| {
+                fail(
+                    StatusCode::BAD_REQUEST,
+                    "unknown_job",
+                    "receipt references unknown compute job",
+                )
+            })?;
 
         let height = sh.chain.height();
         if signed_receipt.receipt.height > height {
-            return Err(fail(StatusCode::BAD_REQUEST, "future_receipt", "receipt height is in the future"));
+            return Err(fail(
+                StatusCode::BAD_REQUEST,
+                "future_receipt",
+                "receipt height is in the future",
+            ));
         }
         if signed_receipt.receipt.units_done > job.job.units {
-            return Err(fail(StatusCode::BAD_REQUEST, "overclaim", "receipt units exceed job units"));
+            return Err(fail(
+                StatusCode::BAD_REQUEST,
+                "overclaim",
+                "receipt units exceed job units",
+            ));
         }
-        let max_total = (signed_receipt.receipt.units_done as u64).saturating_mul(job.job.max_unit_price_sat);
+        let max_total =
+            (signed_receipt.receipt.units_done as u64).saturating_mul(job.job.max_unit_price_sat);
         if signed_receipt.receipt.total_sat > max_total {
-            return Err(fail(StatusCode::BAD_REQUEST, "price_exceeded", "receipt total exceeds job price ceiling"));
+            return Err(fail(
+                StatusCode::BAD_REQUEST,
+                "price_exceeded",
+                "receipt total exceeds job price ceiling",
+            ));
         }
 
         let provider = address_to_hex(&signed_receipt.receipt.provider);
@@ -8459,7 +8530,13 @@ async fn compute_receipt_post(
         let units_done = signed_receipt.receipt.units_done;
 
         sh.compute_receipts.insert(hash, signed_receipt);
-        audit_push(sh, "compute_receipt", Some(hash), None, format!("settled {units_done} units ({total_sat} sat) for {provider}"));
+        audit_push(
+            sh,
+            "compute_receipt",
+            Some(hash),
+            None,
+            format!("settled {units_done} units ({total_sat} sat) for {provider}"),
+        );
 
         Ok(Json(json!({
             "status": "settled",
@@ -8472,21 +8549,23 @@ async fn compute_receipt_post(
 }
 
 /// `GET /v1/compute/receipts/list` — list verified compute receipts.
-async fn compute_receipts_list(
-    State(state): State<ApiState>,
-) -> ApiResult {
+async fn compute_receipts_list(State(state): State<ApiState>) -> ApiResult {
     with_shared(&state, |sh| {
-        let list: Vec<Value> = sh.compute_receipts.iter().map(|(hash, sr)| {
-            json!({
-                "receipt_hash": hash_to_hex(hash),
-                "job_hash": hash_to_hex(&sr.receipt.job),
-                "provider": address_to_hex(&sr.receipt.provider),
-                "units_done": sr.receipt.units_done,
-                "total_sat": sr.receipt.total_sat,
-                "output_hash": hash_to_hex(&sr.receipt.output),
-                "height": sr.receipt.height,
+        let list: Vec<Value> = sh
+            .compute_receipts
+            .iter()
+            .map(|(hash, sr)| {
+                json!({
+                    "receipt_hash": hash_to_hex(hash),
+                    "job_hash": hash_to_hex(&sr.receipt.job),
+                    "provider": address_to_hex(&sr.receipt.provider),
+                    "units_done": sr.receipt.units_done,
+                    "total_sat": sr.receipt.total_sat,
+                    "output_hash": hash_to_hex(&sr.receipt.output),
+                    "height": sr.receipt.height,
+                })
             })
-        }).collect();
+            .collect();
         Ok(Json(json!({
             "count": list.len(),
             "receipts": list,
