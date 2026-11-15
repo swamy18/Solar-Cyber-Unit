@@ -31,6 +31,10 @@ tarpaulin-report.html
 # Per-developer tuning — never committed, never pushed.
 .cargo/
 
+# Kilo agent workspace (plans, session state, local tool config).
+# Per-developer scratch — never committed, never pushed.
+.kilo/
+
 # Editor and OS cruft.
 .DS_Store
 Thumbs.db
