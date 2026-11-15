@@ -196,6 +196,67 @@ class SrctError(Exception):
     """Anything that stops the participant from contributing safely."""
 
 
+def measure_total_ram_mib():
+    """Physical RAM in MiB, best effort, stdlib only.
+
+    Tries /proc/meminfo (Linux), sysctl (macOS), then os.sysconf, and falls
+    back to the 8 GB reference box. Self-reported like everything else in a
+    capability profile: the network spot-checks with elapsed times and
+    re-execution, it never trusts this number.
+    """
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    return max(_MIN_TOTAL_RAM_MIB,
+                               int(line.split()[1]) // 1024)
+    except OSError:
+        pass
+    try:
+        out = subprocess.run(["sysctl", "-n", "hw.memsize"],
+                             capture_output=True, text=True,
+                             timeout=5).stdout.strip()
+        return max(_MIN_TOTAL_RAM_MIB, int(out) // (1024 * 1024))
+    except Exception:  # noqa: BLE001 - fall through to the next probe
+        pass
+    try:
+        pages = os.sysconf("SC_PHYS_PAGES")
+        page = os.sysconf("SC_PAGE_SIZE")
+        return max(_MIN_TOTAL_RAM_MIB, (pages * page) // (1024 * 1024))
+    except (ValueError, OSError, AttributeError):
+        return _DEFAULT_TOTAL_RAM_MIB
+
+
+def measure_units_per_sec(calls=5):
+    """Canonical benchmark: timed runs of the default inference shape.
+
+    One unit is one inference call. The measured calls/sec is what the
+    provider advertises as `units-per-sec`; requesters match on it, and the
+    node's elapsed-time checks plus challenge re-execution keep it honest.
+    """
+    probe = {"task_id": "benchmark", "compute_units": 1, "type": "inference"}
+    default_cpu_infer(probe)  # warm up: caches hot, first-call cost excluded
+    start = time.monotonic()
+    for _ in range(max(1, int(calls))):
+        default_cpu_infer(probe)
+    elapsed = max(time.monotonic() - start, 1e-9)
+    return max(1, int(round(max(1, int(calls)) / elapsed)))
+
+
+def measure_capability(benchmark_calls=5):
+    """One auto-generated capability profile: measured RAM + benchmarked
+    throughput + core count. No manual hardware description: the provider
+    runs this, posts the result, and the network verifies by spot-check."""
+    total = measure_total_ram_mib()
+    reserve = min(2048, max(1024, total // 4))
+    return {
+        "total_ram_mib": total,
+        "allocatable_ram_mib": total - reserve,
+        "cores": max(1, os.cpu_count() or 1),
+        "units_per_sec": measure_units_per_sec(benchmark_calls),
+    }
+
+
 class ResourceCaps:
     """The participant's binding resource contract with the network.
 
@@ -421,6 +482,131 @@ class Participant:
             raise SrctError(f"block submit refused:\n{out}")
         return out
 
+    # -- compute marketplace: one-command join ---------------------------
+
+    def auto_join(self, service="ai/inference", price_sat=200,
+                  max_units_per_job=100, max_units_per_shard=100,
+                  bond_sat=1_000, window_blocks=14_400,
+                  benchmark_calls=5):
+        """Join the compute marketplace in one command.
+
+        Measures this box (RAM + canonical benchmark), shells `srct-worker
+        compute-join` to stake the bond and post the offer, and returns the
+        measured profile with the posted offer hash. No manual hardware
+        description: the numbers are measured here and spot-checked by the
+        network (elapsed times, challenge re-execution), never trusted.
+        """
+        caps = measure_capability(benchmark_calls)
+        status, body = self._get("/v1/status")
+        if status == 200 and isinstance(body.get("height"), int):
+            available_until = int(body["height"]) + int(window_blocks)
+        else:
+            # No readable tip: post a bounded window is impossible, so refuse
+            # rather than advertise an unbounded offer.
+            raise SrctError("node status unreadable: cannot bound offer window")
+        code, out = self._run([
+            "compute-join", "--node", self.node,
+            "--from-file", self.wallet,
+            "--network", self.network,
+            "--service", service,
+            "--ram-mib", str(caps["allocatable_ram_mib"]),
+            "--cores", str(caps["cores"]),
+            "--max-units-per-shard", str(max_units_per_shard),
+            "--max-units-per-job", str(max_units_per_job),
+            "--price", str(price_sat),
+            "--units-per-sec", str(caps["units_per_sec"]),
+            "--available-from", "0",
+            "--available-until", str(available_until),
+            "--bond-sat", str(bond_sat),
+        ])
+        if code != 0:
+            raise SrctError(f"compute join refused:\n{out}")
+        offer_hash = None
+        for line in out.splitlines():
+            if line.startswith("offer_hash"):
+                offer_hash = line.split()[-1]
+        return {"profile": caps, "offer_hash": offer_hash, "out": out}
+
+    def _ticket_cycle(self, infer_fn=None, train_fn=None):
+        """Grab one open ticket, run it, submit the receipt. Returns True
+        when a ticket was claimed and settled, False when the board is empty
+        or nothing fits this box."""
+        status, body = self._get("/v1/compute/tickets/list?limit=25")
+        if status != 200:
+            print(f"[tickets] node answered {status}, skipping cycle")
+            return False
+        for ticket in body.get("tickets", []):
+            ticket_hash = ticket.get("ticket_hash")
+            units = int(ticket.get("units", 0) or 0)
+            if not ticket_hash or units <= 0:
+                continue
+            try:
+                self.guard.reserve_ram(self.infer_ram_mib)
+            except SrctError as exc:
+                print(f"[tickets] {ticket_hash[:12]} RAM refused: {exc}")
+                continue
+            try:
+                self.guard.spend(units)
+            except SrctError as exc:
+                self.guard.release_ram(self.infer_ram_mib)
+                print(f"[tickets] {ticket_hash[:12]} compute refused: {exc}")
+                continue
+            code, out = self._run([
+                "compute-claim-ticket", "--node", self.node,
+                "--from-file", self.wallet, "--network", self.network,
+                "--ticket", ticket_hash, "--units", str(units),
+                "--nonce", str(int(time.time()) % 1_000_000_000 + 1),
+            ])
+            if code != 0:
+                self.guard.release_ram(self.infer_ram_mib)
+                print(f"[tickets] {ticket_hash[:12]} claim refused (taken?)")
+                continue
+            claim_hash = None
+            for line in out.splitlines():
+                if line.startswith("claim_hash"):
+                    claim_hash = line.split()[-1]
+            if not claim_hash:
+                self.guard.release_ram(self.infer_ram_mib)
+                print(f"[tickets] {ticket_hash[:12]} claim output unreadable")
+                continue
+            service = ticket.get("service") or "inference"
+            is_training = service in ("training", "ai/training")
+            handler = (train_fn if is_training else infer_fn)
+            if handler is None:
+                handler = default_cpu_train if is_training else default_cpu_infer
+            task = {"task_id": ticket_hash, "compute_units": units,
+                    "type": service}
+            started = time.monotonic()
+            try:
+                result = handler(task)
+            except Exception as exc:  # noqa: BLE001 - operator sees it
+                self.guard.release_ram(self.infer_ram_mib)
+                print(f"[tickets] {ticket_hash[:12]} handler raised: {exc}")
+                continue
+            elapsed_ms = int((time.monotonic() - started) * 1000)
+            if not isinstance(result, (bytes, bytearray)):
+                self.guard.release_ram(self.infer_ram_mib)
+                print(f"[tickets] {ticket_hash[:12]} handler must return bytes")
+                continue
+            output = hashlib.sha256(bytes(result)).hexdigest()
+            status_h, body_h = self._get("/v1/status")
+            height = body_h.get("height", 0) if status_h == 200 else 0
+            code, out = self._run([
+                "compute-submit-receipt", "--node", self.node,
+                "--from-file", self.wallet, "--network", self.network,
+                "--ticket", ticket_hash, "--claim", claim_hash,
+                "--units", str(units), "--output", output,
+                "--elapsed-ms", str(elapsed_ms), "--height", str(height),
+                "--nonce", "1",
+            ])
+            self.guard.release_ram(self.infer_ram_mib)
+            if code != 0:
+                print(f"[tickets] {ticket_hash[:12]} submit refused:\n{out}")
+                continue
+            print(f"[tickets] {ticket_hash[:12]} settled, {units} units")
+            return True
+        return False
+
     # -- global SRCT rate --------------------------------------------------
 
     def global_rate(self):
@@ -640,11 +826,13 @@ class Participant:
             Launches srct-miner with 100% resources and credits mining throughput.
             task_fn is not required.
         If mode == MODE_AI_COMPUTE:
-            Pulls and executes incoming AI inference or training tasks with 100%
-            of allocatable resources. Does not run a miner. With no handlers
-            given, the built-in CPU workers (`default_cpu_infer`,
-            `default_cpu_train`) run real deterministic arithmetic; explicit
-            handlers still override them.
+            Pulls open tickets from the compute board, claims one, runs it
+            with 100% of allocatable resources, and submits the receipt —
+            then repeats with no cooldown. With no handlers given, the
+            built-in CPU workers (`default_cpu_infer`, `default_cpu_train`)
+            run real deterministic arithmetic; explicit handlers still
+            override them. An empty board falls back to the legacy task
+            queue (`task_fn` path). Does not run a miner.
         """
         if self.mode == MODE_MINE:
             if not self.miner_address_hex:
@@ -664,6 +852,8 @@ class Participant:
                 self.guard.refill()
                 if self.mode == MODE_MINE:
                     self._mine_cycle()
+                elif self._ticket_cycle(infer_fn=infer_fn, train_fn=train_fn):
+                    pass  # claimed and settled a ticket; loop for the next
                 else:
                     self._compute_cycle(task_fn=task_fn, infer_fn=infer_fn, train_fn=train_fn)
                 if max_cycles and cycles >= max_cycles:
@@ -691,7 +881,7 @@ def _selftest():
     real_get, real_post = Participant._get, Participant._post
     real_popen = subprocess.Popen
 
-    calls = {"get": [], "post": [], "popen": []}
+    calls = {"get": [], "post": [], "popen": [], "run": []}
     miner_launched = {"threads": None, "batch": None}
 
     class FakeProc:
@@ -723,6 +913,10 @@ def _selftest():
         if path == "/v1/fees":
             return 200, {"compute_sat_per_unit": 250,
                          "sat_per_srct": 1_000_000_000}
+        if path == "/v1/compute/tickets/list?limit=25":
+            return 200, {"tickets": []}
+        if path == "/v1/status":
+            return 200, {"height": 41}
         raise AssertionError(path)
 
     def fake_get_no_rate(node, path):
@@ -739,10 +933,18 @@ def _selftest():
         if path == "/v1/ramp/intent":
             return 200, {"intent_id": "ii-1", "quote_id": payload["quote_id"],
                          "fill_ref": payload["fill_ref"]}
+        if path in ("/v1/compute/bonds/register", "/v1/compute/offers",
+                    "/v1/compute/claims"):
+            return 200, {"status": "ok"}
+        if path == "/v1/compute/receipt":
+            return 200, {"status": "settled", "auto_queued": True}
         raise AssertionError(path)
 
     def fake_run(argv):
-        if argv[0] in ("claim", "submit-result", "submit-block", "pay"):
+        calls["run"].append(argv)
+        if argv[0] in ("claim", "submit-result", "submit-block", "pay",
+                       "compute-join", "compute-claim-ticket",
+                       "compute-submit-receipt"):
             if argv[0] == "submit-result":
                 ref = argv[argv.index("--result") + 1]
                 assert ref.startswith("@"), argv
@@ -750,6 +952,12 @@ def _selftest():
                     submitted.append(f.read())
                 task = argv[argv.index("--task") + 1]
                 consumed.add(task)
+            if argv[0] == "compute-join":
+                return 0, "bond          posted\noffer_hash    aa\n"
+            if argv[0] == "compute-claim-ticket":
+                return 0, "claim_hash    cc\nlocal_hash    dd\n"
+            if argv[0] == "compute-submit-receipt":
+                return 0, "receipt_hash  rr\nauto_queued   True\n"
             return 0, "ok\n"
         raise AssertionError(argv)
 
@@ -937,6 +1145,46 @@ def _selftest():
         install(p_missing_handler)
         n_missing = p_missing_handler.run(max_cycles=1)
         assert n_missing == 1
+
+        # 10. Auto capability: measured RAM + benchmarked throughput, then a
+        # one-command join (bond + offer) via the worker. Keys never in Python.
+        measured = measure_capability(benchmark_calls=2)
+        assert measured["total_ram_mib"] >= _MIN_TOTAL_RAM_MIB
+        assert 0 < measured["allocatable_ram_mib"] <= measured["total_ram_mib"]
+        assert measured["units_per_sec"] >= 1
+        assert measured["cores"] >= 1
+        pa = Participant(node="http://fake", wallet="w.json",
+                         caps=caps, mode=MODE_AI_COMPUTE, poll_secs=0)
+        install(pa)
+        joined = pa.auto_join(service="ai/inference", price_sat=200,
+                             max_units_per_job=100, max_units_per_shard=100,
+                             bond_sat=1_000)
+        assert joined["offer_hash"] == "aa", joined
+        assert joined["profile"]["total_ram_mib"] >= _MIN_TOTAL_RAM_MIB
+        # The one-command join shells the worker with measured values; the
+        # worker signs and posts (bond + offer) inside its own process.
+        join_argv = [a for a in calls["run"] if a[0] == "compute-join"]
+        assert len(join_argv) == 1, join_argv
+        join = join_argv[0]
+        assert join[join.index("--bond-sat") + 1] == "1000", join
+        assert join[join.index("--service") + 1] == "ai/inference", join
+        assert int(join[join.index("--units-per-sec") + 1]) >= 1, join
+        assert int(join[join.index("--ram-mib") + 1]) >= _MIN_TOTAL_RAM_MIB, join
+
+        # 11. Ticket cycle: open board -> claim -> run -> submit, no waiting.
+        board = [{"ticket_hash": "tt" * 32, "units": 4,
+                  "service": "ai/inference"}]
+        pt = Participant(node="http://fake", wallet="w.json",
+                         caps=caps, mode=MODE_AI_COMPUTE, poll_secs=0)
+        pt._get = lambda path: (200, {"tickets": board}) \
+            if path == "/v1/compute/tickets/list?limit=25" else \
+            fake_get("http://fake", path)
+        pt._post = lambda path, payload: fake_post("http://fake", path, payload)
+        pt._run = lambda argv: fake_run(argv)
+        assert pt._ticket_cycle() is True
+        ran = [a for a in calls["run"]]
+        assert any(a[0] == "compute-claim-ticket" for a in ran), ran
+        assert any(a[0] == "compute-submit-receipt" for a in ran), ran
     finally:
         subprocess.Popen = real_popen
     print("srct_node selftest: ok "
@@ -946,5 +1194,42 @@ def _selftest():
 if __name__ == "__main__":
     if len(sys.argv) == 2 and sys.argv[1] == "--selftest":
         _selftest()
+    elif "--auto-capability" in sys.argv:
+        # One-command join: measure this box, stake the bond, post the
+        # offer, print the profile. Example:
+        #   python templates/srct_node.py --auto-capability \
+        #       --node http://127.0.0.1:8080 --wallet node.json \
+        #       --network mini --service ai/inference --price 200 \
+        #       --max-units 100 --bond-sat 1000
+        def flag(name, default=None):
+            if name in sys.argv:
+                return sys.argv[sys.argv.index(name) + 1]
+            if default is None:
+                raise SrctError(f"{name} is required")
+            return default
+        node = flag("--node")
+        wallet_file = flag("--wallet")
+        network = flag("--network", "mini")
+        caps_dict = measure_capability()
+        caps = ResourceCaps(
+            total_ram_mib=caps_dict["total_ram_mib"],
+            allocatable_ram_mib=caps_dict["allocatable_ram_mib"],
+            max_compute_units_per_sec=max(
+                caps_dict["units_per_sec"] * 10, 1_000_000),
+        )
+        p = Participant(node=node, wallet=wallet_file, caps=caps,
+                        mode=MODE_AI_COMPUTE, network=network, poll_secs=5)
+        joined = p.auto_join(
+            service=flag("--service", "ai/inference"),
+            price_sat=int(flag("--price", "200")),
+            max_units_per_job=int(flag("--max-units", "100")),
+            max_units_per_shard=int(flag("--max-units", "100")),
+            bond_sat=int(flag("--bond-sat", "1000")),
+        )
+        print(f"measured ram_mib={caps_dict['total_ram_mib']} "
+              f"allocatable={caps_dict['allocatable_ram_mib']} "
+              f"cores={caps_dict['cores']} "
+              f"units_per_sec={caps_dict['units_per_sec']}")
+        print(f"offer_hash={joined['offer_hash']}")
     else:
         print(__doc__)

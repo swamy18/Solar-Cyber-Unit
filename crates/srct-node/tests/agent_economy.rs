@@ -1099,6 +1099,7 @@ fn compute_marketplace_offer_job_plan_and_settle() {
         8,     // 8 cores
         1000,  // max units per shard
         100_000,
+        5_000, // claimed units/sec
         [0u8; 32],
     );
     let offer = srct_compute::ComputeOffer {
@@ -1118,6 +1119,26 @@ fn compute_marketplace_offer_job_plan_and_settle() {
     };
     let signed_offer = srct_compute::SignedOffer::sign(offer, &provider_wallet).unwrap();
     let offer_hex = hex::encode(signed_offer.encode());
+
+    // 1b. Provider registers a bond first: posting offers is
+    // capacity-gated, and an unbonded provider has zero capacity.
+    // The offer below advertises up to 200,000 sat of work, so the bond
+    // must cover that exposure (capacity = bond x 10 to start).
+    let bond = srct_compute::ProviderBond {
+        version: srct_compute::BOND_VERSION,
+        network_id: NET.to_string(),
+        provider: provider_addr,
+        amount_sat: 25_000,
+        registered_height: 0,
+        nonce: 1,
+    };
+    let signed_bond = srct_compute::SignedBond::sign(bond, &provider_wallet).unwrap();
+    let (s, res) = post(
+        &node,
+        "/v1/compute/bonds/register",
+        &json!({ "bond_hex": hex::encode(signed_bond.encode()) }),
+    );
+    assert_eq!(s, 200, "bond register failed: {res}");
 
     let (s, res) = post(
         &node,
@@ -1143,6 +1164,8 @@ fn compute_marketplace_offer_job_plan_and_settle() {
         max_total_sat: 25_000,
         class_mask: srct_compute::DeviceClass::Gpu.mask(),
         min_ram_mib: 8192,
+        min_units_per_sec: 1_000,
+        min_bandwidth_kbps: 0,
         determinism: srct_compute::Determinism::Reproducible,
         required_kernel: [0u8; 32],
         min_verification: srct_compute::Verification::Receipt,

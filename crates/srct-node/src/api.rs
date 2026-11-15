@@ -211,7 +211,7 @@ const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
 /// would mix scopes that must never meet. Version 10 appends the Smart Gate
 /// sections (grant registry, revocations, capability book) last; v8/v9 files
 /// migrate with empty gate state.
-const STATE_ENVELOPE_VERSION: u8 = 15;
+    const STATE_ENVELOPE_VERSION: u8 = 16;
 
 /// Largest entry count any single map section in the state envelope may
 /// declare, checked before allocation. Real books are bounded by their own
@@ -615,6 +615,14 @@ pub struct SharedNode {
     pub compute_bonds: srct_compute::BondBook,
     /// Open compute challenges with optional second receipts. Persisted.
     pub compute_challenges: srct_compute::ChallengeBook,
+    /// Open board and atomic claim set for the pull model. Persisted.
+    pub compute_claims: srct_compute::ClaimBook,
+    /// Pre-authorized payout exits: assignment-or-claim hash -> signed L2
+    /// `ExitQueue` bytes. Stored when the requester attaches an exit to an
+    /// assignment or a designated ticket; executed automatically the moment
+    /// the matching receipt settles. A preauth that fails re-verification
+    /// at settle time is skipped (payout stays manual), never forced.
+    pub compute_preauth: BTreeMap<Hash, Vec<u8>>,
     /// Locally created Smart Gate revocations awaiting P2P broadcast, as
     /// (policy, sigs, keys) bytes. Drained by the serve loop; persisted so a
     /// restart never silently drops a revocation no peer has heard yet.
@@ -737,6 +745,8 @@ impl SharedNode {
             compute_payout_exit: BTreeMap::new(),
             compute_escrow: srct_compute::EscrowBook::new(network_id.clone()),
             compute_bonds: srct_compute::BondBook::new(network_id.clone()),
+            compute_claims: srct_compute::ClaimBook::new(network_id.clone()),
+            compute_preauth: BTreeMap::new(),
             compute_challenges: srct_compute::ChallengeBook::new(network_id.clone()),
             revoke_broadcast: Vec::new(),
             audit: srct_core::safety::AuditLog::default(),
@@ -1059,6 +1069,14 @@ impl SharedNode {
         put_section(&mut w, &self.compute_escrow.encode());
         put_section(&mut w, &self.compute_bonds.encode());
         put_section(&mut w, &self.compute_challenges.encode());
+        // Compute pull model (v16): ticket board with atomic claims, plus
+        // pre-authorized payout exits (signed L2 transactions, opaque bytes
+        // here, re-verified before any queueing).
+        put_section(&mut w, &self.compute_claims.encode());
+        put_section(
+            &mut w,
+            &encode_state_map(&self.compute_preauth, |b| b.clone()),
+        );
         {
             let mut rb = Writer::with_capacity(4 + self.revoke_broadcast.len() * 96);
             rb.u32le(self.revoke_broadcast.len() as u32);
@@ -1090,6 +1108,7 @@ impl SharedNode {
         // Smart Gate sections: migrate them with empty books instead of
         // refusing to boot.
         if version != STATE_ENVELOPE_VERSION
+            && version != 15
             && version != 14
             && version != 13
             && version != 12
@@ -1660,6 +1679,7 @@ impl SharedNode {
         // v14 adds compute marketplace persistence (offers, jobs, receipts).
         // v15 adds compute settlement: assignments, payouts, exit bindings,
         // escrow and bond books, challenges, pending revoke broadcasts.
+        // v16 adds the pull-model claim book and pre-authorized payout exits.
         let (
             trials,
             guard_registry,
@@ -1676,6 +1696,8 @@ impl SharedNode {
             compute_bonds,
             compute_challenges,
             revoke_broadcast,
+            compute_claims,
+            compute_preauth,
         ) = if version == 8 {
             r.expect_end().map_err(|e| format!("state envelope: {e}"))?;
             (
@@ -1692,8 +1714,10 @@ impl SharedNode {
                 BTreeMap::new(),
                 srct_compute::EscrowBook::new(mine.clone()),
                 srct_compute::BondBook::new(mine.clone()),
-                srct_compute::ChallengeBook::new(mine),
+                srct_compute::ChallengeBook::new(mine.clone()),
                 Vec::new(),
+                srct_compute::ClaimBook::new(mine),
+                BTreeMap::new(),
             )
         } else if version == 9 {
             let t = decode_section(&mut r, "trials", |sr| {
@@ -1779,8 +1803,10 @@ impl SharedNode {
                 BTreeMap::new(),
                 srct_compute::EscrowBook::new(mine.clone()),
                 srct_compute::BondBook::new(mine.clone()),
-                srct_compute::ChallengeBook::new(mine),
+                srct_compute::ChallengeBook::new(mine.clone()),
                 Vec::new(),
+                srct_compute::ClaimBook::new(mine),
+                BTreeMap::new(),
             )
         } else {
             let t = decode_section(&mut r, "trials", |sr| {
@@ -1895,7 +1921,8 @@ impl SharedNode {
             };
             // Compute marketplace (v14): offers, jobs, assignments, receipts.
             // Compute settlement (v15): payouts, exit bindings, escrow book,
-            // challenge book, pending revoke broadcasts.
+            // bond book, challenge book, pending revoke broadcasts.
+            // Compute pull model (v16): ticket claim book, preauth exits.
             let (
                 compute_offers,
                 compute_jobs,
@@ -1907,6 +1934,8 @@ impl SharedNode {
                 compute_bonds,
                 compute_challenges,
                 revoke_broadcast,
+                compute_claims,
+                compute_preauth,
             ) = if version >= 15 {
                 let co = decode_section(&mut r, "compute_offers", |sr| {
                     decode_state_map(sr, "compute_offers", |b| {
@@ -1977,8 +2006,32 @@ impl SharedNode {
                 let rb = decode_section(&mut r, "revoke_broadcast", |sr| {
                     decode_revoke_queue(sr).map_err(|e| format!("revoke_broadcast: {e}"))
                 })?;
-                r.expect_end().map_err(|e| format!("state envelope: {e}"))?;
-                (co, cj, ca, cr, cp, ce, escrow, bonds, challenges, rb)
+                // v16 appends the claim book and preauth exits. v15 files
+                // end here and migrate with empty books.
+                let (claims, preauth) = if version >= 16 {
+                    let cb = decode_section(&mut r, "compute_claims", |sr| {
+                        let n = sr.remaining();
+                        let bytes = sr
+                            .fixed_slice(n)
+                            .map_err(|e| format!("compute_claims: {e}"))?;
+                        srct_compute::ClaimBook::decode(bytes, &mine)
+                            .map_err(|e| format!("compute_claims: {e}"))
+                    })?;
+                    let pa = decode_section(&mut r, "compute_preauth", |sr| {
+                        decode_state_map(sr, "compute_preauth", |b| Ok(b.to_vec()))
+                    })?;
+                    r.expect_end().map_err(|e| format!("state envelope: {e}"))?;
+                    (cb, pa)
+                } else {
+                    r.expect_end().map_err(|e| format!("state envelope: {e}"))?;
+                    (
+                        srct_compute::ClaimBook::new(mine.clone()),
+                        BTreeMap::new(),
+                    )
+                };
+                (
+                    co, cj, ca, cr, cp, ce, escrow, bonds, challenges, rb, claims, preauth,
+                )
             } else if version == 14 {
                 let co = decode_section(&mut r, "compute_offers", |sr| {
                     decode_state_map(sr, "compute_offers", |b| {
@@ -2007,8 +2060,10 @@ impl SharedNode {
                     BTreeMap::new(),
                     srct_compute::EscrowBook::new(mine.clone()),
                     srct_compute::BondBook::new(mine.clone()),
-                    srct_compute::ChallengeBook::new(mine),
+                    srct_compute::ChallengeBook::new(mine.clone()),
                     Vec::new(),
+                    srct_compute::ClaimBook::new(mine.clone()),
+                    BTreeMap::new(),
                 )
             } else {
                 (
@@ -2020,8 +2075,10 @@ impl SharedNode {
                     BTreeMap::new(),
                     srct_compute::EscrowBook::new(mine.clone()),
                     srct_compute::BondBook::new(mine.clone()),
-                    srct_compute::ChallengeBook::new(mine),
+                    srct_compute::ChallengeBook::new(mine.clone()),
                     Vec::new(),
+                    srct_compute::ClaimBook::new(mine.clone()),
+                    BTreeMap::new(),
                 )
             };
             (
@@ -2040,6 +2097,8 @@ impl SharedNode {
                 compute_bonds,
                 compute_challenges,
                 revoke_broadcast,
+                compute_claims,
+                compute_preauth,
             )
         };
 
@@ -2113,6 +2172,15 @@ impl SharedNode {
         });
         let mut compute_payout_exit = compute_payout_exit;
         compute_payout_exit.retain(|receipt_hash, _| compute_payouts.contains_key(receipt_hash));
+        // Drop preauth exits whose payout is gone: an orphan preauth pays
+        // nothing and a stale exit must never queue.
+        let mut compute_preauth = compute_preauth;
+        compute_preauth.retain(|id, _| {
+            compute_assignments.contains_key(id)
+                || compute_claims.claim_for(id).is_some()
+                || compute_claims.ticket(id).is_some()
+                || compute_claims.all_claims().any(|c| &c.hash() == id)
+        });
         self.compute_assignments = compute_assignments;
         self.compute_receipts = compute_receipts;
         self.compute_payouts = compute_payouts;
@@ -2120,6 +2188,8 @@ impl SharedNode {
         self.compute_escrow = compute_escrow;
         self.compute_bonds = compute_bonds;
         self.compute_challenges = compute_challenges;
+        self.compute_claims = compute_claims;
+        self.compute_preauth = compute_preauth;
         self.revoke_broadcast = revoke_broadcast;
         // Rebuild the settlement mirror from the persisted payouts. Receipts
         // and assignments re-verify through their own codecs before one is
@@ -2131,16 +2201,36 @@ impl SharedNode {
                 Some(r) => r,
                 None => return Err("compute_payouts: receipt missing".into()),
             };
-            let assignment = match self.compute_assignments.get(&payout.assignment) {
-                Some(a) => a,
-                None => return Err("compute_payouts: assignment missing".into()),
-            };
             receipt
                 .verify()
                 .map_err(|e| format!("compute_payouts: receipt re-verify: {e}"))?;
-            assignment
-                .verify()
-                .map_err(|e| format!("compute_payouts: assignment re-verify: {e}"))?;
+            if let Some(assignment) = self.compute_assignments.get(&payout.assignment) {
+                // Push path: receipt settles against a signed assignment.
+                assignment
+                    .verify()
+                    .map_err(|e| format!("compute_payouts: assignment re-verify: {e}"))?;
+            } else {
+                // Pull path: receipt settles against a ticket claim. Claims
+                // are keyed by ticket while payouts store the claim hash,
+                // so scan for it; a payout whose claim is gone loses its
+                // authorization and the load refuses it.
+                let claim = self
+                    .compute_claims
+                    .all_claims()
+                    .find(|c| c.hash() == payout.assignment)
+                    .cloned()
+                    .ok_or("compute_payouts: claim missing")?;
+                let ticket = self
+                    .compute_claims
+                    .ticket(&claim.claim.ticket)
+                    .ok_or("compute_payouts: ticket missing")?;
+                claim
+                    .verify()
+                    .map_err(|e| format!("compute_payouts: claim re-verify: {e}"))?;
+                ticket
+                    .verify()
+                    .map_err(|e| format!("compute_payouts: ticket re-verify: {e}"))?;
+            }
             ledger
                 .restore(payout.clone())
                 .map_err(|e| format!("compute_payouts: ledger restore: {e}"))?;
@@ -8553,6 +8643,25 @@ struct ComputeReceiptReq {
 #[derive(Deserialize)]
 struct ComputeAssignReq {
     assignment_hex: String,
+    /// Optional pre-signed payout exit. When present it must be an `ExitQueue`
+    /// naming exactly this assignment's requester, provider and total. It is
+    /// stored, re-verified at settle time, and queued automatically the
+    /// moment the matching receipt settles — no second signature.
+    exit_tx_hex: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ComputeTicketReq {
+    ticket_hex: String,
+    /// Optional pre-signed payout exit. Only valid on designated tickets
+    /// (the destination must be known when the requester signs). Queued
+    /// automatically when a receipt settles against the winning claim.
+    exit_tx_hex: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ComputeClaimReq {
+    claim_hex: String,
 }
 
 #[derive(Deserialize)]
@@ -8600,7 +8709,228 @@ struct ComputeQuery {
     service: Option<String>,
 }
 
+/// Open exposure in satoshis for one provider: live (unexpired) offers at
+/// their max value plus unsettled ticket commitments. The capacity rule
+/// compares this against the bond-based limit, so a provider can hold many
+/// offers at once but never promise more than its stake and history back.
+fn provider_open_exposure(sh: &SharedNode, provider: &Address, height: u64) -> u64 {
+    let mut total = 0u64;
+    for offer in sh.compute_offers.values() {
+        if offer.offer.available_until < height {
+            continue;
+        }
+        if offer.offer.provider != *provider {
+            continue;
+        }
+        total = total.saturating_add(
+            (offer.offer.max_units_per_job as u64).saturating_mul(offer.offer.unit_price_sat),
+        );
+    }
+    total.saturating_add(sh.compute_claims.exposure(provider))
+}
+
+/// Refuse when `additional` satoshis of new exposure would overflow the
+/// provider's bond-based capacity. Fail-closed and exact: an unbonded
+/// provider has zero capacity, so posting requires a bond first.
+fn check_compute_capacity(
+    sh: &SharedNode,
+    provider: &Address,
+    additional: u64,
+    height: u64,
+) -> Result<(), (StatusCode, Json<ErrorBody>)> {
+    let capacity = sh.compute_bonds.capacity(provider);
+    let open = provider_open_exposure(sh, provider, height);
+    if open.saturating_add(additional) > capacity {
+        return Err(fail(
+            StatusCode::CONFLICT,
+            "capacity_exceeded",
+            format!(
+                "open exposure {} sat plus {} sat exceeds capacity {} sat: stake a bigger bond or settle work first",
+                open, additional, capacity
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Verify a pre-signed payout exit against the exact transfer it must pay.
+/// The exit must be an `ExitQueue` naming this payout's payer, provider and
+/// amount to the satoshi — anything else is refused at store time, never
+/// queued, so a stale or redirected exit cannot become a queued payment.
+fn decode_preauth_exit(
+    bytes: &[u8],
+    from: &Address,
+    to: &Address,
+    amount: u64,
+) -> Result<L2Transaction, (StatusCode, Json<ErrorBody>)> {
+    let tx = L2Transaction::deserialize(bytes).map_err(|e| bad(format!("exit tx decode: {e}")))?;
+    match &tx.payload {
+        L2Payload::ExitQueue(e) => {
+            if e.owner != *from {
+                return Err(fail(
+                    StatusCode::BAD_REQUEST,
+                    "preauth_owner_mismatch",
+                    "the pre-signed exit's owner must be the payout's payer",
+                ));
+            }
+            if e.destination != *to {
+                return Err(fail(
+                    StatusCode::BAD_REQUEST,
+                    "preauth_destination_mismatch",
+                    "the pre-signed exit's destination must be the payout's provider",
+                ));
+            }
+            if e.amount_sat != amount {
+                return Err(fail(
+                    StatusCode::BAD_REQUEST,
+                    "preauth_amount_mismatch",
+                    "the pre-signed exit must pay exactly the settled total",
+                ));
+            }
+            Ok(tx)
+        }
+        _ => Err(fail(
+            StatusCode::BAD_REQUEST,
+            "not_an_exit",
+            "a pre-authorized payout must carry an ExitQueue transaction",
+        )),
+    }
+}
+
+/// Bind a settled payout to a signed exit and queue it for inclusion.
+/// Shared by the manual claim path and the pre-authorized auto-queue:
+/// binding checks first, then the same L2 admission every other write
+/// passes, then queue plus binding record. Returns the exit id and whether
+/// this call queued it (`false` = idempotent replay of the same exit).
+fn bind_exit_to_payout(
+    sh: &mut SharedNode,
+    id: Hash,
+    tx: L2Transaction,
+) -> Result<(Hash512, bool), (StatusCode, Json<ErrorBody>)> {
+    let txid = tx.txid();
+    if let Some(bound) = sh.compute_payout_exit.get(&id) {
+        if bound.txid == txid {
+            return Ok((txid, false));
+        }
+        let stale = !sh.chain.exit_released(&bound.owner, bound.nonce)
+            && !sh
+                .l2
+                .pending_exits()
+                .iter()
+                .any(|w| w.owner == bound.owner && w.nonce == bound.nonce)
+            && !sh.l2_to_include.iter().any(|t| t.txid() == bound.txid);
+        if !stale {
+            return Err(fail(
+                StatusCode::CONFLICT,
+                "payout_claimed",
+                "this payout's coin move is already bound to another exit",
+            ));
+        }
+        sh.compute_payout_exit.remove(&id);
+    }
+    sh.l2
+        .check(&sh.chain, &tx, sh.chain.height() + 1)
+        .map_err(|e| {
+            fail(
+                StatusCode::CONFLICT,
+                "exit_rejected",
+                format!("the bound exit fails admission: {e}"),
+            )
+        })?;
+    if sh.l2_to_include.len() >= MAX_L2_QUEUE {
+        return Err(fail(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "l2_queue_full",
+            "inclusion queue is full; retry shortly",
+        ));
+    }
+    let (owner, nonce) = match &tx.payload {
+        L2Payload::ExitQueue(e) => (e.owner, e.nonce),
+        _ => {
+            return Err(fail(
+                StatusCode::BAD_REQUEST,
+                "not_an_exit",
+                "a payout claim must carry an ExitQueue transaction",
+            ))
+        }
+    };
+    sh.l2_to_include.push(tx);
+    sh.compute_payout_exit.insert(
+        id,
+        EscrowExitBinding {
+            txid,
+            owner,
+            nonce,
+        },
+    );
+    Ok((txid, true))
+}
+
+/// Execute a stored pre-authorized exit after settlement. Returns `true`
+/// when the exit queued. `key` is the assignment or ticket hash the preauth
+/// was stored under (`id` is the receipt hash the payout is recorded
+/// under). Any failure — corrupt bytes, binding drift, admission refusal,
+/// full queue — leaves the payout manual and records why, instead of
+/// forcing a payment the requester did not authorize. A consumed preauth
+/// is removed whether it queued or not: one preauth pays at most once,
+/// so settling twice cannot queue twice.
+fn try_auto_preauth(
+    sh: &mut SharedNode,
+    id: Hash,
+    key: &Hash,
+    payout: &srct_compute::PayoutInstruction,
+) -> bool {
+    let bytes = match sh.compute_preauth.remove(key) {
+        Some(b) => b,
+        None => return false,
+    };
+    let tx = match decode_preauth_exit(&bytes, &payout.from, &payout.to, payout.amount_sat) {
+        Ok(tx) => tx,
+        Err((status, body)) => {
+            audit_push(
+                sh,
+                "compute_preauth_skipped",
+                Some(id),
+                None,
+                format!("stored exit failed binding: {status} {}", body.0.detail),
+            );
+            return false;
+        }
+    };
+    match bind_exit_to_payout(sh, id, tx) {
+        Ok((txid, _)) => {
+            audit_push(
+                sh,
+                "compute_preauth_queued",
+                Some(id),
+                None,
+                format!(
+                    "pre-authorized payout {} sat bound to exit {}",
+                    payout.amount_sat,
+                    hash512_to_hex(&txid)
+                ),
+            );
+            true
+        }
+        Err((status, body)) => {
+            audit_push(
+                sh,
+                "compute_preauth_skipped",
+                Some(id),
+                None,
+                format!("stored exit refused at settle time: {status} {}", body.0.detail),
+            );
+            false
+        }
+    }
+}
+
 /// `POST /v1/compute/offers` — publish a provider-signed compute offer.
+///
+/// Posting is capacity-gated, not just stake-gated: the new offer must fit
+/// inside the provider's bond-based capacity together with its live offers
+/// and open ticket commitments. Small bond, small capacity; settled work
+/// raises the limit over time.
 async fn compute_offer_post(
     State(state): State<ApiState>,
     Json(req): Json<ComputeOfferReq>,
@@ -8639,6 +8969,18 @@ async fn compute_offer_post(
         let unit_price_sat = signed_offer.offer.unit_price_sat;
         let ram_mib = signed_offer.offer.profile.ram_mib;
         let max_units = signed_offer.offer.max_units_per_job;
+        // Capacity gate: this offer plus everything already open must fit
+        // the bond-based limit, which grows with dampened settled volume.
+        let additional = (signed_offer.offer.max_units_per_job as u64)
+            .checked_mul(signed_offer.offer.unit_price_sat)
+            .ok_or_else(|| {
+                fail(
+                    StatusCode::BAD_REQUEST,
+                    "offer_too_large",
+                    "offer value overflows u64",
+                )
+            })?;
+        check_compute_capacity(sh, &signed_offer.offer.provider, additional, height)?;
 
         sh.compute_offers.insert(hash, signed_offer);
         audit_push(
@@ -8914,79 +9256,118 @@ async fn compute_receipt_post(
                 "receipt total exceeds job price ceiling",
             ));
         }
-        // The requester's authorization to pay: without the signed assignment
-        // this receipt fulfils, there is nothing to settle against.
-        let assignment = sh
-            .compute_assignments
-            .get(&signed_receipt.receipt.assignment)
-            .ok_or_else(|| {
-                fail(
-                    StatusCode::NOT_FOUND,
-                    "assignment_required",
-                    "no requester-signed assignment for this receipt: POST /v1/compute/assign first",
-                )
-            })?
-            .clone();
-        // The money move, before anything is recorded: the escrow release
-        // re-checks binding, price, deadline and once-only, and refuses when
-        // the job was never funded. Settlement without funding is not a
-        // settlement — it is a promise the requester's balance never made.
-        let payout = sh
-            .compute_escrow
-            .release(&signed_receipt, &assignment, height)
-            .map_err(|e| match e {
-                srct_compute::ComputeError::NotFunded => fail(
-                    StatusCode::CONFLICT,
-                    "escrow_unfunded",
-                    "the job's escrow holds nothing: POST /v1/compute/escrow/fund first",
-                ),
-                srct_compute::ComputeError::BudgetExceeded => fail(
-                    StatusCode::CONFLICT,
-                    "escrow_budget_exceeded",
-                    "the job's escrow cannot cover this receipt",
-                ),
-                srct_compute::ComputeError::Overclaim => {
-                    fail(StatusCode::BAD_REQUEST, "overclaim", e.to_string())
-                }
-                srct_compute::ComputeError::PriceMismatch => {
-                    fail(StatusCode::CONFLICT, "price_mismatch", e.to_string())
-                }
-                srct_compute::ComputeError::BindingMismatch => {
-                    fail(StatusCode::BAD_REQUEST, "binding_mismatch", e.to_string())
-                }
-                srct_compute::ComputeError::Expired => {
-                    fail(StatusCode::CONFLICT, "receipt_expired", e.to_string())
-                }
-                srct_compute::ComputeError::Replay => fail(
-                    StatusCode::CONFLICT,
-                    "already_settled",
-                    "this assignment already settled",
-                ),
-                _ => fail(StatusCode::BAD_REQUEST, "invalid_receipt", e.to_string()),
-            })?;
-        // Mirror the settlement: the ledger is the binding/once-only record
-        // the status and claim paths read.
-        sh.compute_ledger
-            .settle(&signed_receipt, &assignment, height)
-            .map_err(|e| {
-                fail(
+        // The requester's authorization to pay: a stored assignment (push) or
+        // a stored ticket claim (pull). One of them must exist; a receipt
+        // with neither behind it settles nothing.
+        let auth_id = signed_receipt.receipt.assignment;
+        let map_settle_err = |e: srct_compute::ComputeError| match e {
+            srct_compute::ComputeError::NotFunded => fail(
+                StatusCode::CONFLICT,
+                "escrow_unfunded",
+                "the job's escrow holds nothing: POST /v1/compute/escrow/fund first",
+            ),
+            srct_compute::ComputeError::BudgetExceeded => fail(
+                StatusCode::CONFLICT,
+                "escrow_budget_exceeded",
+                "the job's escrow cannot cover this receipt",
+            ),
+            srct_compute::ComputeError::Overclaim => {
+                fail(StatusCode::BAD_REQUEST, "overclaim", e.to_string())
+            }
+            srct_compute::ComputeError::PriceMismatch => {
+                fail(StatusCode::CONFLICT, "price_mismatch", e.to_string())
+            }
+            srct_compute::ComputeError::BindingMismatch => {
+                fail(StatusCode::BAD_REQUEST, "binding_mismatch", e.to_string())
+            }
+            srct_compute::ComputeError::Expired => {
+                fail(StatusCode::CONFLICT, "receipt_expired", e.to_string())
+            }
+            srct_compute::ComputeError::Replay => fail(
+                StatusCode::CONFLICT,
+                "already_settled",
+                "this shard already settled",
+            ),
+            _ => fail(StatusCode::BAD_REQUEST, "invalid_receipt", e.to_string()),
+        };
+        let (payout, preauth_key) = if let Some(assignment) = sh.compute_assignments.get(&auth_id).cloned() {
+            // Push path: the receipt fulfils a planned assignment.
+            let payout = sh
+                .compute_escrow
+                .release(&signed_receipt, &assignment, height)
+                .map_err(map_settle_err)?;
+            sh.compute_ledger
+                .settle(&signed_receipt, &assignment, height)
+                .map_err(|e| {
+                    fail(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "internal",
+                        format!("ledger diverged from escrow: {e}"),
+                    )
+                })?;
+            if let Err(e) = sh
+                .compute_bonds
+                .record_settlement(&signed_receipt, &assignment)
+            {
+                return Err(fail(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "internal",
-                    format!("ledger diverged from escrow: {e}"),
-                )
-            })?;
-        // Reputation follows the money, never precedes it: only a settled
-        // receipt counts toward the provider's score.
-        if let Err(e) = sh
-            .compute_bonds
-            .record_settlement(&signed_receipt, &assignment)
-        {
-            return Err(fail(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal",
-                format!("bond book diverged from settlement: {e}"),
-            ));
-        }
+                    format!("bond book diverged from settlement: {e}"),
+                ));
+            }
+            (payout, assignment.hash())
+        } else {
+            // Pull path: the receipt fulfils a ticket claim. The claim must
+            // still be on the board — a pruned (expired, unsettled) claim
+            // settles nothing.
+            let claim = sh
+                .compute_claims
+                .all_claims()
+                .find(|c| c.hash() == auth_id)
+                .cloned()
+                .ok_or_else(|| {
+                    fail(
+                        StatusCode::NOT_FOUND,
+                        "assignment_required",
+                        "no requester-signed assignment or ticket claim for this receipt: POST /v1/compute/assign or claim a ticket first",
+                    )
+                })?;
+            let ticket = sh
+                .compute_claims
+                .ticket(&claim.claim.ticket)
+                .cloned()
+                .ok_or_else(|| {
+                    fail(
+                        StatusCode::NOT_FOUND,
+                        "unknown_ticket",
+                        "the claim's ticket is no longer on the board",
+                    )
+                })?;
+            let payout = sh
+                .compute_escrow
+                .release_for_claim(&signed_receipt, &ticket, &claim, height)
+                .map_err(map_settle_err)?;
+            sh.compute_ledger
+                .settle_claim(&signed_receipt, &ticket, &claim, height)
+                .map_err(|e| {
+                    fail(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "internal",
+                        format!("ledger diverged from escrow: {e}"),
+                    )
+                })?;
+            if let Err(e) = sh
+                .compute_bonds
+                .record_claim_settlement(&signed_receipt, &ticket, &claim)
+            {
+                return Err(fail(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal",
+                    format!("bond book diverged from settlement: {e}"),
+                ));
+            }
+            (payout, ticket.hash())
+        };
 
         let provider = address_to_hex(&signed_receipt.receipt.provider);
         let total_sat = signed_receipt.receipt.total_sat;
@@ -9002,6 +9383,13 @@ async fn compute_receipt_post(
             format!("settled {units_done} units ({total_sat} sat) for {provider}"),
         );
 
+        // Pre-authorized payout: a stored exit for this exact payout queues
+        // now, with no second signature. It fires only here — after a
+        // verified receipt settled — and exactly once: the preauth is
+        // consumed whether the queue accepts it or not, so settling twice
+        // cannot pay twice, and a redirected exit never queues at all.
+        let auto_queued = try_auto_preauth(sh, hash, &preauth_key, &payout);
+
         Ok(Json(json!({
             "status": "settled",
             "receipt_hash": hash_to_hex(&hash),
@@ -9013,6 +9401,7 @@ async fn compute_receipt_post(
                 "to": address_to_hex(&payout.to),
                 "amount_sat": payout.amount_sat,
             },
+            "auto_queued": auto_queued,
             "claim": format!("/v1/compute/payouts/{}/exit-template", hash_to_hex(&hash)),
         })))
     })?
@@ -9104,16 +9493,28 @@ async fn compute_assign_post(
             ));
         }
         sh.compute_assignments.insert(hash, signed.clone());
+        // Optional pre-signed payout exit: it must name exactly this
+        // assignment's requester, provider and total, or it is refused at
+        // store time. Verified exits queue automatically on settlement.
+        let mut preauth = false;
+        if let Some(hex) = &req.exit_tx_hex {
+            let bytes =
+                hex::decode(hex).map_err(|e| bad(format!("exit_tx_hex is not hex: {e}")))?;
+            decode_preauth_exit(&bytes, &a.requester, &a.provider, a.total_sat)?;
+            sh.compute_preauth.insert(hash, bytes);
+            preauth = true;
+        }
         audit_push(
             sh,
             "compute_assign",
             Some(hash),
             None,
             format!(
-                "assignment for {} units at {} sat to {}",
+                "assignment for {} units at {} sat to {}{}",
                 a.units,
                 a.total_sat,
-                address_to_hex(&a.provider)
+                address_to_hex(&a.provider),
+                if preauth { " (payout pre-authorized)" } else { "" },
             ),
         );
         Ok(Json(json!({
@@ -9124,6 +9525,7 @@ async fn compute_assign_post(
             "units": a.units,
             "total_sat": a.total_sat,
             "deadline": a.deadline,
+            "preauth": preauth,
         })))
     })?
 }
@@ -9150,6 +9552,217 @@ async fn compute_assignments_list(State(state): State<ApiState>) -> ApiResult {
         Ok(Json(json!({
             "count": list.len(),
             "assignments": list,
+        })))
+    })?
+}
+
+/// `POST /v1/compute/tickets` — post a requester-signed shard ticket to the
+/// open board.
+///
+/// A ticket is pull-model authorization: any capable provider may claim it,
+/// first valid claim wins. The node checks it against the job it names
+/// (same requester, shard total inside the job's ceilings, deadline inside
+/// the job window), because a requester's signature on numbers that
+/// contradict its own job is a mistake the node refuses to file. An
+/// optional pre-signed payout exit may ride along, but only on designated
+/// tickets — the destination must be known when the requester signs — and
+/// it queues automatically when a receipt settles against the winning claim.
+async fn compute_ticket_post(
+    State(state): State<ApiState>,
+    Json(req): Json<ComputeTicketReq>,
+) -> ApiResult {
+    let bytes = hex::decode(&req.ticket_hex).map_err(|e| bad(format!("ticket_hex is not hex: {e}")))?;
+    let signed = srct_compute::SignedTicket::decode(&bytes)
+        .map_err(|e| fail(StatusCode::BAD_REQUEST, "invalid_ticket", e.to_string()))?;
+    let exit_bytes = req
+        .exit_tx_hex
+        .map(|h| {
+            hex::decode(&h).map_err(|e| bad(format!("exit_tx_hex is not hex: {e}")))
+        })
+        .transpose()?;
+    with_shared(&state, |sh| {
+        let network = sh.chain.params().network_id.clone();
+        if signed.ticket.network_id != network {
+            return Err(fail(
+                StatusCode::BAD_REQUEST,
+                "wrong_network",
+                format!(
+                    "ticket network {} != node network {}",
+                    signed.ticket.network_id, network
+                ),
+            ));
+        }
+        let job = sh.compute_jobs.get(&signed.ticket.job).ok_or_else(|| {
+            fail(
+                StatusCode::BAD_REQUEST,
+                "unknown_job",
+                "ticket references unknown compute job",
+            )
+        })?;
+        let t = &signed.ticket;
+        if t.requester != job.job.requester {
+            return Err(fail(
+                StatusCode::BAD_REQUEST,
+                "ticket_requester_mismatch",
+                "the ticket's requester is not the job's requester",
+            ));
+        }
+        if t.total_sat > job.job.max_total_sat || t.unit_price_sat > job.job.max_unit_price_sat {
+            return Err(fail(
+                StatusCode::BAD_REQUEST,
+                "ticket_over_job_ceiling",
+                "ticket exceeds the job's price ceilings",
+            ));
+        }
+        let height = sh.chain.height();
+        if height > t.deadline || t.deadline > job.job.deadline {
+            return Err(fail(
+                StatusCode::BAD_REQUEST,
+                "ticket_deadline",
+                "ticket deadline is past or outside the job window",
+            ));
+        }
+        let hash = signed.hash();
+        // Pre-signed exits only ride designated tickets: the exit must name
+        // exactly this ticket's requester, designated provider and total, or
+        // it is refused at store time and never queued.
+        if let Some(bytes) = exit_bytes {
+            let designated = t.provider.ok_or_else(|| {
+                fail(
+                    StatusCode::BAD_REQUEST,
+                    "preauth_needs_designation",
+                    "a pre-signed exit needs a designated ticket: open tickets name no destination",
+                )
+            })?;
+            decode_preauth_exit(&bytes, &t.requester, &designated, t.total_sat)?;
+            sh.compute_preauth.insert(hash, bytes);
+        }
+        sh.compute_claims.post(&signed, height).map_err(|e| {
+            fail(
+                StatusCode::CONFLICT,
+                "ticket_rejected",
+                format!("ticket refused: {e}"),
+            )
+        })?;
+        sh.compute_claims.prune(height);
+        audit_push(
+            sh,
+            "compute_ticket",
+            Some(hash),
+            None,
+            format!(
+                "ticket for {} units at {} sat to {}",
+                t.units,
+                t.total_sat,
+                t.provider.map(|p| address_to_hex(&p)).unwrap_or_else(|| "open".into())
+            ),
+        );
+        Ok(Json(json!({
+            "status": "posted",
+            "ticket_hash": hash_to_hex(&hash),
+            "job_hash": hash_to_hex(&t.job),
+            "units": t.units,
+            "total_sat": t.total_sat,
+            "deadline": t.deadline,
+            "designated": t.provider.map(|p| address_to_hex(&p)),
+            "preauth": sh.compute_preauth.contains_key(&hash),
+        })))
+    })?
+}
+
+/// `GET /v1/compute/tickets/list` — the open board: unclaimed, unexpired
+/// tickets any capable provider may take.
+async fn compute_tickets_list(State(state): State<ApiState>) -> ApiResult {
+    with_shared(&state, |sh| {
+        let height = sh.chain.height();
+        let list: Vec<Value> = sh
+            .compute_claims
+            .open_tickets(height)
+            .map(|t| {
+                let ticket = &t.ticket;
+                json!({
+                    "ticket_hash": hash_to_hex(&t.hash()),
+                    "job_hash": hash_to_hex(&ticket.job),
+                    "requester": address_to_hex(&ticket.requester),
+                    "units": ticket.units,
+                    "unit_price_sat": ticket.unit_price_sat,
+                    "total_sat": ticket.total_sat,
+                    "min_ram_mib": ticket.min_ram_mib,
+                    "min_units_per_sec": ticket.min_units_per_sec,
+                    "deadline": ticket.deadline,
+                    "designated": ticket.provider.map(|p| address_to_hex(&p)),
+                })
+            })
+            .collect();
+        Ok(Json(json!({
+            "count": list.len(),
+            "tickets": list,
+        })))
+    })?
+}
+
+/// `POST /v1/compute/claims` — claim an open ticket: first valid claim wins.
+///
+/// The claim is provider-signed and checked against the ticket (same job
+/// shard, whole shard, designated provider when named, inside the window),
+/// then inserted atomically — a second claim for the same ticket is refused
+/// by name even if otherwise valid. Claims also respect the bond-based
+/// capacity: ticket total plus open exposure must fit, so a small bond
+/// takes small shards. Settle the receipt right after: there is no cooldown
+/// and no one-claim-at-a-time rule, so the next claim can land immediately.
+async fn compute_claim_post(
+    State(state): State<ApiState>,
+    Json(req): Json<ComputeClaimReq>,
+) -> ApiResult {
+    let bytes = hex::decode(&req.claim_hex).map_err(|e| bad(format!("claim_hex is not hex: {e}")))?;
+    let signed = srct_compute::SignedClaim::decode(&bytes)
+        .map_err(|e| fail(StatusCode::BAD_REQUEST, "invalid_claim", e.to_string()))?;
+    with_shared(&state, |sh| {
+        let network = sh.chain.params().network_id.clone();
+        if signed.claim.network_id != network {
+            return Err(fail(
+                StatusCode::BAD_REQUEST,
+                "wrong_network",
+                format!(
+                    "claim network {} != node network {}",
+                    signed.claim.network_id, network
+                ),
+            ));
+        }
+        let height = sh.chain.height();
+        let ticket = sh
+            .compute_claims
+            .ticket(&signed.claim.ticket)
+            .ok_or_else(|| not_found("unknown compute ticket"))?
+            .clone();
+        // Capacity before atomicity: the ticket total must fit the
+        // provider's remaining headroom, or the claim refuses.
+        check_compute_capacity(sh, &signed.claim.provider, ticket.ticket.total_sat, height)?;
+        let claim_id = sh.compute_claims.claim(&signed, height).map_err(|e| {
+            fail(
+                StatusCode::CONFLICT,
+                "claim_rejected",
+                format!("claim refused: {e}"),
+            )
+        })?;
+        audit_push(
+            sh,
+            "compute_claim",
+            Some(claim_id),
+            None,
+            format!(
+                "ticket {} claimed by {}",
+                hash_to_hex(&ticket.hash()),
+                address_to_hex(&signed.claim.provider)
+            ),
+        );
+        Ok(Json(json!({
+            "status": "claimed",
+            "claim_hash": hash_to_hex(&claim_id),
+            "ticket_hash": hash_to_hex(&ticket.hash()),
+            "provider": address_to_hex(&signed.claim.provider),
+            "units": signed.claim.units,
+            "total_sat": ticket.ticket.total_sat,
         })))
     })?
 }
@@ -9366,9 +9979,8 @@ async fn compute_payout_claim(
             .get(&id)
             .ok_or_else(|| not_found("unknown compute payout"))?
             .clone();
-        let txid = tx.txid();
-        let (exit_owner, exit_destination, exit_amount, exit_nonce) = match &tx.payload {
-            L2Payload::ExitQueue(e) => (e.owner, e.destination, e.amount_sat, e.nonce),
+        let (exit_owner, exit_destination, exit_amount) = match &tx.payload {
+            L2Payload::ExitQueue(e) => (e.owner, e.destination, e.amount_sat),
             _ => {
                 return Err(fail(
                     StatusCode::BAD_REQUEST,
@@ -9398,58 +10010,14 @@ async fn compute_payout_claim(
                 "the exit must pay exactly the settled payout",
             ));
         }
-        if let Some(bound) = sh.compute_payout_exit.get(&id) {
-            if bound.txid == txid {
-                return Ok(Json(json!({
-                    "receipt_hash": hash_to_hex(&id),
-                    "txid": hash512_to_hex(&txid),
-                    "duplicate": true,
-                })));
-            }
-            let stale = !sh.chain.exit_released(&bound.owner, bound.nonce)
-                && !sh
-                    .l2
-                    .pending_exits()
-                    .iter()
-                    .any(|w| w.owner == bound.owner && w.nonce == bound.nonce)
-                && !sh.l2_to_include.iter().any(|t| t.txid() == bound.txid);
-            if !stale {
-                return Err(fail(
-                    StatusCode::CONFLICT,
-                    "payout_claimed",
-                    "this payout's coin move is already bound to another exit",
-                ));
-            }
-            sh.compute_payout_exit.remove(&id);
+        let (txid, fresh) = bind_exit_to_payout(sh, id, tx)?;
+        if !fresh {
+            return Ok(Json(json!({
+                "receipt_hash": hash_to_hex(&id),
+                "txid": hash512_to_hex(&txid),
+                "duplicate": true,
+            })));
         }
-        // Same inclusion gate as every other L2 write: the exit must dry-run
-        // clean against this node's current state, or it is refused here
-        // rather than skipped in a block.
-        sh.l2
-            .check(&sh.chain, &tx, sh.chain.height() + 1)
-            .map_err(|e| {
-                fail(
-                    StatusCode::CONFLICT,
-                    "exit_rejected",
-                    format!("the bound exit fails admission: {e}"),
-                )
-            })?;
-        if sh.l2_to_include.len() >= MAX_L2_QUEUE {
-            return Err(fail(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "l2_queue_full",
-                "inclusion queue is full; retry shortly",
-            ));
-        }
-        sh.l2_to_include.push(tx);
-        sh.compute_payout_exit.insert(
-            id,
-            EscrowExitBinding {
-                txid,
-                owner: exit_owner,
-                nonce: exit_nonce,
-            },
-        );
         audit_push(
             sh,
             "compute_payout_claim",
@@ -9489,29 +10057,59 @@ async fn compute_challenge_open(
     let challenge = srct_compute::SignedChallenge::decode(&bytes)
         .map_err(|e| fail(StatusCode::BAD_REQUEST, "invalid_challenge", e.to_string()))?;
     with_shared(&state, |sh| {
-        let assignment = sh
-            .compute_assignments
-            .get(&challenge.challenge.assignment)
-            .ok_or_else(|| not_found("unknown compute assignment"))?
-            .clone();
-        if !sh.compute_ledger.is_settled(&assignment.hash()) {
-            return Err(fail(
-                StatusCode::CONFLICT,
-                "challenge_needs_settlement",
-                "challenges open against settled assignments only",
-            ));
-        }
-        let height = sh.chain.height();
-        sh.compute_challenges
-            .open(&challenge, &assignment, height)
-            .map_err(|e| match e {
-                srct_compute::ComputeError::Replay => fail(
+        let target = challenge.challenge.assignment;
+        // Push path (assignment) or pull path (ticket claim): the challenge
+        // opens against whichever settled authorization the id names.
+        if let Some(assignment) = sh.compute_assignments.get(&target).cloned() {
+            if !sh.compute_ledger.is_settled(&assignment.hash()) {
+                return Err(fail(
                     StatusCode::CONFLICT,
-                    "already_challenged",
-                    "this assignment already has a challenge",
-                ),
-                _ => fail(StatusCode::BAD_REQUEST, "invalid_challenge", e.to_string()),
-            })?;
+                    "challenge_needs_settlement",
+                    "challenges open against settled assignments only",
+                ));
+            }
+            let height = sh.chain.height();
+            sh.compute_challenges
+                .open(&challenge, &assignment, height)
+                .map_err(|e| match e {
+                    srct_compute::ComputeError::Replay => fail(
+                        StatusCode::CONFLICT,
+                        "already_challenged",
+                        "this assignment already has a challenge",
+                    ),
+                    _ => fail(StatusCode::BAD_REQUEST, "invalid_challenge", e.to_string()),
+                })?;
+        } else {
+            let claim = sh
+                .compute_claims
+                .all_claims()
+                .find(|c| c.hash() == target)
+                .cloned()
+                .ok_or_else(|| not_found("unknown compute assignment or claim"))?;
+            if !sh.compute_ledger.is_settled(&claim.hash()) {
+                return Err(fail(
+                    StatusCode::CONFLICT,
+                    "challenge_needs_settlement",
+                    "challenges open against settled claims only",
+                ));
+            }
+            let ticket = sh
+                .compute_claims
+                .ticket(&claim.claim.ticket)
+                .cloned()
+                .ok_or_else(|| not_found("the claim's ticket is no longer on the board"))?;
+            let height = sh.chain.height();
+            sh.compute_challenges
+                .open_for_claim(&challenge, &ticket, &claim, height)
+                .map_err(|e| match e {
+                    srct_compute::ComputeError::Replay => fail(
+                        StatusCode::CONFLICT,
+                        "already_challenged",
+                        "this claim already has a challenge",
+                    ),
+                    _ => fail(StatusCode::BAD_REQUEST, "invalid_challenge", e.to_string()),
+                })?;
+        }
         audit_push(
             sh,
             "compute_challenge_open",
@@ -9730,28 +10328,43 @@ async fn compute_bond_dispute(
     let dispute = srct_compute::SignedDispute::decode(&bytes)
         .map_err(|e| fail(StatusCode::BAD_REQUEST, "invalid_dispute", e.to_string()))?;
     with_shared(&state, |sh| {
-        let assignment = sh
-            .compute_assignments
-            .get(&dispute.dispute.assignment)
-            .ok_or_else(|| not_found("unknown compute assignment"))?
-            .clone();
         let height = sh.chain.height();
-        let remaining = sh
-            .compute_bonds
-            .slash(&dispute, &assignment, height)
-            .map_err(|e| match e {
-                srct_compute::ComputeError::AlreadySlashed => fail(
-                    StatusCode::CONFLICT,
-                    "already_slashed",
-                    "this dispute already executed",
-                ),
-                srct_compute::ComputeError::NotBonded => fail(
-                    StatusCode::CONFLICT,
-                    "not_bonded",
-                    "the provider holds no bond to slash",
-                ),
-                _ => fail(StatusCode::BAD_REQUEST, "invalid_dispute", e.to_string()),
-            })?;
+        let map_dispute_err = |e: srct_compute::ComputeError| match e {
+            srct_compute::ComputeError::AlreadySlashed => fail(
+                StatusCode::CONFLICT,
+                "already_slashed",
+                "this dispute already executed",
+            ),
+            srct_compute::ComputeError::NotBonded => fail(
+                StatusCode::CONFLICT,
+                "not_bonded",
+                "the provider holds no bond to slash",
+            ),
+            _ => fail(StatusCode::BAD_REQUEST, "invalid_dispute", e.to_string()),
+        };
+        let remaining =
+            if let Some(assignment) = sh.compute_assignments.get(&dispute.dispute.assignment).cloned() {
+                // Push path: dispute binds a planned assignment.
+                sh.compute_bonds
+                    .slash(&dispute, &assignment, height)
+                    .map_err(map_dispute_err)?
+            } else {
+                // Pull path: dispute binds a ticket claim.
+                let claim = sh
+                    .compute_claims
+                    .all_claims()
+                    .find(|c| c.hash() == dispute.dispute.assignment)
+                    .cloned()
+                    .ok_or_else(|| not_found("unknown compute assignment or claim"))?;
+                let ticket = sh
+                    .compute_claims
+                    .ticket(&claim.claim.ticket)
+                    .cloned()
+                    .ok_or_else(|| not_found("the claim's ticket is no longer on the board"))?;
+                sh.compute_bonds
+                    .slash_for_claim(&dispute, &ticket, &claim, height)
+                    .map_err(map_dispute_err)?
+            };
         audit_push(
             sh,
             "compute_bond_slash",
@@ -12005,6 +12618,9 @@ pub fn router(state: ApiState, cfg: &ApiConfig) -> Router {
             "/v1/compute/assignments/list",
             get(compute_assignments_list),
         )
+        .route("/v1/compute/tickets", post(compute_ticket_post))
+        .route("/v1/compute/tickets/list", get(compute_tickets_list))
+        .route("/v1/compute/claims", post(compute_claim_post))
         .route("/v1/compute/escrow/fund", post(compute_escrow_fund_post))
         .route(
             "/v1/compute/escrow/refund",

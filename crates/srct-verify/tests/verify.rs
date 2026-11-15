@@ -361,6 +361,7 @@ fn compute_evidence() -> (SignedAssignment, SignedReceipt) {
         8,
         20,
         50_000,
+        5_000,
         [7u8; 32],
     );
     let offer = srct_compute::market::SignedOffer::sign(
@@ -393,6 +394,8 @@ fn compute_evidence() -> (SignedAssignment, SignedReceipt) {
             max_total_sat: 100,
             class_mask: DeviceClass::Gpu.mask(),
             min_ram_mib: 512,
+            min_units_per_sec: 400,
+            min_bandwidth_kbps: 0,
             determinism: Determinism::Reproducible,
             required_kernel: [7u8; 32],
             min_verification: Verification::Receipt,
