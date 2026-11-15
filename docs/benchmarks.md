@@ -29,14 +29,16 @@ only expensive step and stays interactive for small statements.
 
 | Operation | Latency |
 |---|---|
-| DiLoCo release round (3 workers) | 6.4–8.5 ms/round |
 | CNNP ridge adapter fit (128 pairs) | 1.9–3.4 ms |
 | CNNP two-stage plan quote | 30 sat, 100 ms |
 | Workgraph royalty settlement | sub-ms (integer arithmetic, depth-capped) |
 | Intent attach + settle (TEE/ZK) | dominated by the proof checks above |
 
+(The DiLoCo release-round row was removed with the crate; historical
+numbers live in `docs/status.md`, not here.)
+
 ## What is not benchmarked yet
 
 Throughput under load, gossip propagation latency, journal replay at cap
-(4,096 entries), multi-round DiLoCo convergence at scale, and live-network
+(4,096 entries), and live-network
 latencies. Those need a running network, not a unit harness.

@@ -65,36 +65,14 @@ rules in code would have been the wrong order.
   pairs; a two-stage plan quotes at 30 sat and 100 ms. Settlement is an
   authorization only; no coin moves in this crate. See
   [`docs/cnnp.md`](cnnp.md).
-- **DiLoCo PoUW prototype (non-consensus, `srct-diloco`).** `cargo test -p
-  srct-diloco` passes 48 tests: 23 unit and 25 acceptance. The acceptance suite
-  trains a real 2-8-1 MLP for 24 rounds across three independently signed
-  workers (loss 1.0144 -> 0.2695, accuracy 17.2% -> 88.5%) and exercises forged
-  keys, tampered deltas, replay, wrong round/base/model, NaN/Inf and oversized
-  updates, a low-quality outlier excluded from aggregation and rewards, quorum
-  failure, deterministic checkpoints and strict wire decoding. Measured release
-  latency: 6.4-8.5 ms/round. A `TrainBackend` seam with fixed-vector
-  conformance wraps the CPU `f32` reference, a block-partitioned executor
-  (`Statistical`), a fixed-point Q16.16 integer backend (`BitExact` by
-  construction: byte-identical training runs, integer Padé activations,
-  MSE objective) and six staged hardware backends (CUDA, ROCm, TPU, NPU,
-  Apple silicon, photonic): the suite proves CPU and blocked pass the same
-  conformance, the fixed-point backend trains deterministically while
-  f32-parity conformance correctly refuses its dtype, a perturbed kernel fails,
-  a `Statistical` kernel can pass tolerance but is refused by the `BitExact`
-  consensus gate (which the fixed-point backend satisfies), an unavailable
-  device fails closed, and every emulated hardware backend passes plumbing
-  conformance while no hardware backend passes the consensus gate. A staged
-  consensus package pins the rest of the fork surface without activating it:
-  round anchors with exact wire refusal, PoUW minting sharing the issuance
-  schedule through the real mint gate (a full coinbase plus any PoUW mint is
-  refused; a yielded satoshi admits a PoUW satoshi), bonded eligibility with
-  a positive floor, challenge re-execution that catches fabricated deltas,
-  and quorum-gated minting — all behind `pouw_activation_height`, `0` (off)
-  on every shipped profile. Hash mining is untouched and remains the
-  only consensus mechanism. Real silicon execution plugs in behind each
-  backend's probe; contributors test on their hardware. The
-  required `TrainBackend` seam, determinism policy and conformance gates are
-  specified in [`docs/dual-mining.md`](dual-mining.md) §8.
+- **DiLoCo PoUW prototype removed.** `crates/srct-diloco` and
+  `docs/dual-mining.md` were deleted: training-based consensus is not on the
+  roadmap, and the prototype's `TrainBackend` seam no longer exists. The
+  historical record stands — the crate passed its 48 tests and its numbers
+  were real — but it is gone rather than staged. Useful AI work is proven
+  the other way: signed compute receipts, challenge re-execution and
+  slashing in the marketplace. The dormant `pouw_*` consensus params were
+  left untouched (removing them would be a consensus change).
 - **End-to-end agent messaging (non-consensus, `srct-agentnet`).** `cargo test
   -p srct-agentnet` passes 50 tests (2 unit, 48 acceptance): hybrid-wallet
   seal/open, recipient-key/address binding at seal time, wrong-recipient
@@ -2534,10 +2512,9 @@ economic-rule changes:
   `[EMULATED]` / `[INSTRUCTIONS]` / `[PLANNED]`); PoUW described as
   implemented-but-disabled, hardware backends as emulated, TFHE as a toy,
   ZKML folding as linear batching, prototype payouts as instructions.
-- `docs/dual-mining.md`: §1 table clarifies no AI training in consensus
-  mining; §7 records the implemented-but-unactivated consensus mechanism;
-  §8 records the shipped `TrainBackend` seam (actual capability fields);
-  milestone numbering fixed (was two §9 item 8s).
+- `docs/dual-mining.md`: deleted along with the DiLoCo crate (see the
+  DiLoCo removal entry above); the hash-mining design of record lives in
+  `docs/mining.md`.
 - `docs/compute-sharing.md`: fraud-slash ban corrected to the conditional
   rule (ban iff `settled − 10×timeouts − 100×slashes ≤ −100`); L1-job vs
   compute-pot escrow namespace disambiguated in README.
@@ -2567,3 +2544,47 @@ regression: `vwc_perf_probe` (`crates/srct-l2/src/vwc.rs`),
 `bench_fhe_ops` (`crates/srct-fhe/tests/fhe.rs`),
 `bench_tee_quote_verify` (`crates/srct-compute/tests/tee.rs`). The next full
 run must confirm the set is still exactly these four names.
+
+## Continuous compute marketplace 2026-11-16
+
+Uncommitted working tree (no consensus change; `state.bin` envelope 15 → 16,
+fail-closed migration; offer/job wire v1/v2 dual decode, no envelope bump
+for those):
+
+- **Capability matching** (`crates/srct-compute/src/device.rs`,
+  `market.rs`): offers carry self-declared `claimed_units_per_sec`, jobs
+  name `min_units_per_sec`/`min_bandwidth_kbps` floors; matching runs on
+  RAM, throughput, bandwidth and determinism. Device class is a display
+  label — a photonic mask matches a CPU offer when the floors pass.
+  `OFFER_VERSION` stays 1, `JOB_VERSION`/`PROFILE_VERSION` are 2 with
+  v1 fallback (zero floors). Hardware truth remains self-declared and
+  spot-checked (receipt `elapsed_ms`, challenge re-execution), never
+  attested.
+- **Bond 1,000 sat + capacity** (`bond.rs`): `MIN_BOND_SAT` 10,000 → 1,000;
+  slash math multiplies before dividing (the old `amount / 10_000 * bps`
+  truncated small-bond slashes to zero — fixed and covered by test).
+  Capacity = bond x 10 + dampened settled units x 100, enforced on offer
+  post and ticket claim; wash volume counts per counterparty at its integer
+  square root. Unbonded providers have zero capacity.
+- **Pull model** (`ticket.rs`, new): two-sig tickets (requester) + claims
+  (provider), first-claim-wins atomic insert, designated tickets, ticket
+  settle/release/challenge/slash paths mirroring the assignment paths,
+  expired-board pruning. Pre-signed payout exits attach to assignments and
+  designated tickets, re-verify at settle time, and queue automatically —
+  firing only after a verified receipt, exactly once, never redirected.
+- **Node** (`crates/srct-node/src/api.rs`): `/v1/compute/tickets`,
+  `/tickets/list`, `/claims` endpoints, capacity gate on offers, receipt
+  claim-branch, challenge/dispute claim paths, preauth store + auto-queue,
+  `state.bin` v16 with migration.
+- **Join UX** (`srct-worker compute-join|compute-claim-ticket|
+  compute-submit-receipt` + `templates/srct_node.py --auto-capability` and
+  the ticket cycle): measure RAM, benchmark throughput, stake, post, claim,
+  work, submit — keys never enter Python.
+- **DiLoCo removed**: crate, `dual-mining.md`, AGENTS/README/docs
+  references deleted; `srct-cnnp` dev-dep dropped; `pouw_*` consensus
+  params left untouched as dead config.
+- **Tests added**: capability matrix, ticket atomicity/designation/prune,
+  capacity math, wash-dampening comparison, small-bond slash amounts, v1
+  fallbacks, node `compute_pull` suite (many offers, zero-capacity refusal,
+  first-claim-wins, settle-then-claim-again, full preauth lifecycle against
+  real L2 funding).

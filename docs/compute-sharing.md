@@ -1,6 +1,6 @@
 # Decentralized compute sharing
 
-Status: **production money loop** with core in `crates/srct-compute` and endpoints in `crates/srct-node`. Heterogeneous devices advertise compute behind a signed bond, requesters shard work across them, and verified receipts settle completed units. Offers, jobs, assignments, receipts, payouts, escrow and bond books, and challenges persist in `state.bin` (envelope v15).
+Status: **production money loop** with core in `crates/srct-compute` and endpoints in `crates/srct-node`. Any device advertises capability (RAM, measured throughput, bandwidth, determinism) behind a signed bond, requesters shard work across devices, and verified receipts settle completed units — via planned assignments or the open ticket board. Offers, jobs, assignments, tickets, claims, receipts, payouts, preauth exits, escrow and bond books, and challenges persist in `state.bin` (envelope v16).
 
 ```bash
 cargo test -p srct-compute
@@ -25,10 +25,15 @@ be able to earn SRCT for spare compute without four separate protocols:
 and a settlement ledger. `srct-node` runs the full money loop over REST:
 
 - market: `POST /v1/compute/offers` & `GET /v1/compute/offers/list`
-  (list reports each provider's bond, score and bonded state)
+  (list reports each provider's bond, score, bonded state, capacity and open exposure;
+  posting is capacity-gated)
 - jobs: `POST /v1/compute/jobs` & `GET /v1/compute/jobs/list`
 - planning: `POST /v1/compute/plan`
-- authorization to pay: `POST /v1/compute/assign` & `GET /v1/compute/assignments/list`
+- authorization to pay (push): `POST /v1/compute/assign` (optional `exit_tx_hex`
+  pre-signed payout) & `GET /v1/compute/assignments/list`
+- authorization to pay (pull): `POST /v1/compute/tickets` (optional `exit_tx_hex`
+  on designated tickets), `GET /v1/compute/tickets/list` (open board),
+  `POST /v1/compute/claims` (first valid claim wins)
 - money in: `POST /v1/compute/escrow/fund`, money back: `POST /v1/compute/escrow/refund`
 - settlement: `POST /v1/compute/receipt` & `GET /v1/compute/receipts/list`
 - money out: `GET /v1/compute/payouts`,
@@ -41,14 +46,27 @@ and a settlement ledger. `srct-node` runs the full money loop over REST:
   `POST /v1/compute/bonds/dispute`, `GET /v1/compute/bonds/{provider}`
 
 The loop, end to end: the requester posts a job, funds its escrow, plans
-shards and signs one assignment per shard. The provider runs the work
+shards and signs one assignment per shard — or posts open tickets on the
+board and lets providers claim them. The provider runs the work
 (`templates/srct_node.py` ships built-in CPU inference and training workers,
 so a fresh box contributes real deterministic arithmetic out of the box) and
-posts a receipt. Settlement verifies the receipt against the assignment,
-releases exactly its total from the funded escrow, and records the exact
-payout. The requester signs an exit from the template; anyone submits the
+posts a receipt. Settlement verifies the receipt against the assignment or
+the winning claim, releases exactly its total from the funded escrow, and
+records the exact payout. A pre-signed exit attached to the assignment or
+designated ticket queues automatically on settlement — no second signature.
+Otherwise the requester signs an exit from the template; anyone submits the
 claim; consensus pays the provider when the exit releases — the same
-permissionless crank pattern as the L2 exit path.
+permissionless crank pattern as the L2 exit path. A pre-signed exit attached
+to the assignment (`exit_tx_hex` on assign) or designated ticket fires here
+instead: the node stored it at authorization time, re-verifies the exact
+binding at settle time, dry-runs L2 admission, and queues it with no second
+signature. It fires only after a verified receipt settles, exactly once
+(the preauth is consumed whether the queue accepts it or not — settling
+twice cannot pay twice), and never redirects (owner, destination and amount
+must match the payout to the satoshi). Anything else leaves the payout
+manual with the reason in the audit trail. Settling the receipt
+immediately frees the provider for the next claim: no cooldown, no
+one-offer-at-a-time rule.
 
 ### Dedicated Resource Modes and Consumer Dispatch
 
@@ -61,22 +79,30 @@ In `templates/srct_node.py`, participants operate under 100% dedicated allocatio
 
 ```
 DeviceProfile = version || class || determinism || ram_mib || cores ||
-                max_units_per_shard || bandwidth_kbps || kernel(32)
+                max_units_per_shard || bandwidth_kbps ||
+                claimed_units_per_sec || kernel(32)   // v2; v1 stops at bandwidth
 profile_hash = SHA256("srct/compute/device-profile/v1" || encode)
 ```
 
-- `class`: CPU, GPU, TPU, NPU, Apple silicon, photonic. A new class is a new
-  encoding value; an unknown byte is refused rather than coerced.
+- `class`: CPU, GPU, TPU, NPU, Apple silicon, photonic. **Display label
+  only.** Matching never consults it: a new hardware family joins without
+  any protocol change, and a job expresses "fast" as floors, not as a
+  class gate. An unknown byte is still refused rather than coerced.
 - `determinism`: `Statistical < Reproducible < BitExact`. A job requiring
   `BitExact` cannot be scheduled on a floating-point device.
+- `claimed_units_per_sec`: self-declared sustained throughput measured with
+  the canonical benchmark kernel (units per second). Spot-checked by receipt
+  `elapsed_ms` and challenge re-execution, never trusted outright. Version
+  1 profiles decode with 0, which satisfies only jobs that require none.
 - `max_units_per_shard` is a device-side cap, independent of the offer's
   per-job cap.
 - `kernel` is the declared kernel-set hash; zero means "any kernel". A job that
   names a kernel binds reproducibility to that exact hash.
 
-`DeviceRequirement` matching is fail-closed: an empty class mask matches nothing,
-too little RAM refuses, a weaker determinism class refuses and a different kernel
-refuses.
+`DeviceRequirement` matching is fail-closed on capabilities: too little RAM
+refuses, throughput below the floor refuses, bandwidth below the floor
+refuses, a weaker determinism class refuses and a different kernel refuses.
+The class mask rides the wire for compatibility and is ignored.
 
 ## 3. Signed offers
 
@@ -101,6 +127,7 @@ run a fragment below it. `privacy` says the provider accepts a sealed input, and
 ```
 ComputeJob = version || network || requester || service || units ||
              max_unit_price_sat || max_total_sat || class_mask || min_ram_mib ||
+             min_units_per_sec || min_bandwidth_kbps ||     // v2; v1 decodes both as 0
              determinism || required_kernel || min_verification || sealed_input ||
              input_commitment || deadline || nonce
 ```
@@ -145,6 +172,35 @@ plan: 30 units in 4 shards for 244 sat
 
 The phone participates because its shard cap is 4 units, not because the
 protocol has a phone-specific path.
+
+## 4b. Pull model: tickets and atomic claims
+
+Planning picks the provider; tickets let the provider pick the work. A
+requester posts a signed `ClaimTicket` per shard — job, shard index, units,
+price, exact total, capability floors, deadline, nonce, and optionally a
+designated provider — on the open board (`POST /v1/compute/tickets`,
+`GET /v1/compute/tickets/list`). Any capable provider claims one with a
+signed `ShardClaim` (`POST /v1/compute/claims`). The first valid claim wins:
+the node's `ClaimBook` inserts atomically and refuses every later claim for
+the same ticket by name, even a valid one.
+
+Two signatures authorize the payout, same as the push path: the requester
+signs the shard terms (ticket), the provider signs the take (claim).
+Settlement (`settle_claim`), escrow release (`release_for_claim`) and
+challenges (`open_for_claim`) mirror the assignment path check for check —
+binding, price, deadline, once-only — keyed by the claim hash instead of the
+assignment hash. Receipts for claims are built with
+`ComputeReceipt::for_claim`. Expired tickets prune with their claims: a
+claim past its ticket deadline can never settle, so dropping it loses
+nothing settleable.
+
+Designated tickets (`provider: Some`) name the winner up front. Only they
+can carry a pre-signed payout exit (the destination must be known when the
+requester signs); the node stores it and queues it automatically on
+settlement. Open tickets settle into the manual claim path with an
+auto-built exit template. Settling immediately frees the provider for the
+next claim: no cooldown, no one-at-a-time rule, and many live offers can
+coexist as long as they fit the provider's capacity.
 
 ## 5. Receipts and settlement
 
@@ -200,10 +256,13 @@ refunded once.
 `PayoutInstruction` and `RefundInstruction` are instructions only; this crate
 never holds or moves coin.
 
-## 6. Bonds and reputation
+## 6. Bonds, capacity and reputation
 
 Sybil resistance starts here: identity is still an ordinary SRCT address, but a
-capacity claim now costs stake and bad behaviour costs more.
+capacity claim now costs stake and bad behaviour costs more. A provider joins
+with one command — `templates/srct_node.py --auto-capability` measures the box
+(RAM + benchmarked throughput) and shells `srct-worker compute-join`, which
+stakes the bond and posts the offer. No manual hardware description.
 
 ```
 ProviderBond    = version || network || provider || amount_sat || registered_height || nonce
@@ -227,16 +286,25 @@ BondDispute     = version || network || requester || provider || assignment ||
 - **Reputation**: `score = settled_units - 10 * timeouts - 100 * slashes`,
   saturating. `record_settlement` counts a verified receipt's units;
   `record_timeout` counts an assignment that passed its deadline unclaimed.
+- **Minimum bond** is 1,000 sat (`MIN_BOND_SAT`): low enough that any
+  device joins, high enough to price bond spam. Small bonds still slash
+  meaningfully (NoShow 10% = 100 sat, fraud 50% = 500 sat — both non-dust)
+  and the −100 score penalty bans on a single fraud.
+- **Capacity** (`BondBook::capacity`): open exposure may not exceed
+  `bond × 10 + effective_units × 100`. Posting an offer and claiming a
+  ticket both check it, so a fresh 1,000-sat bond carries ~10,000 sat of
+  open work and only settled receipts raise the limit. Unbonded providers
+  have zero capacity: the first offer is refused, not filed.
+- **Wash-trade dampening** (`effective_units`): settled volume counts per
+  counterparty at its integer square root. Ten jobs with ten different
+  requesters earn ~3× the capacity of the same volume with one — including
+  yourself. Self-dealing buys sublinear headroom no matter the volume.
 - **Admission** (`BondBook::admit_offer`): an offer is schedulable only if it
   verifies, belongs to the book's network, stands behind a bond of at least
-  `MIN_BOND_SAT` (10,000 sat) registered before the current height, and its
-  provider's score is above `BAN_SCORE` (−100). A fraud slash subtracts
-  100 from the score (`score = settled_units − 10 × timeouts − 100 ×
-  slashes`), so it bans a provider whose settled volume does not cover the
-  penalty — a high-volume provider can survive one fraud event. Re-bonding
-  restores the stake and clears timeouts, not fraud slashes — and a
-  provider that times out ten assignments without settling any units is also
-  out until it settles work or re-bonds.
+  `MIN_BOND_SAT` (1,000 sat) registered before the current height, and its
+  provider's score is above `BAN_SCORE` (−100). The node additionally gates
+  posting and claiming on capacity (above), which is the live limit;
+  admission is the static floor.
 
 Honest limits: the book verifies *who* signed a dispute, not the evidence
 behind it (arbitration belongs to the escrow layer); slashes and bonds are
@@ -290,8 +358,9 @@ correct or useful — that is challenge re-execution / ZKML, still future.
   approved execution — neither proves the output is correct. `Challenge`
   re-execution catches a result that does not reproduce, by comparison, but it
   cannot prove semantic correctness and ZK proofs remain future work.
-- **Hardware truth.** RAM, cores, bandwidth, kernel hash and device class are
-  self-declared. They bound assignment, not reality.
+- **Hardware truth.** RAM, throughput, bandwidth, kernel hash and device class are
+  self-declared. They bound assignment, not reality; elapsed times and
+  re-execution are the spot-checks, attestation is not claimed.
 - **Sybil resistance at the stake layer.** Bonds and reputation gate admission,
   but a slash is only as real as the escrow or payment rail that executes it,
   and dispute evidence is unverified here.
@@ -303,11 +372,26 @@ correct or useful — that is challenge re-execution / ZKML, still future.
 
 ## 9. Verified behavior
 
-`cargo test -p srct-compute` passes 68 tests (5 unit, 63 acceptance):
+`cargo test -p srct-compute` unit + acceptance suites (device, market,
+escrow, settle, bond, challenge, ticket, TEE, journal, gossip):
 
-- profile hash binds class, RAM, caps and kernel; unknown encodings refused;
-- requirement matching refuses empty mask, low RAM, weak determinism and wrong
-  kernel;
+- capability matching runs on RAM, throughput, bandwidth and determinism;
+  class is a display label (a photonic mask still matches a CPU offer);
+  v1 wire decodes with zero throughput; v2 throughput validates;
+- a small phone takes a small job alone, and takes several 4-unit shards up to
+  its 8-unit per-job cap;
+- ineligible offers (RAM, throughput, bandwidth, determinism, kernel,
+  service, price, sealed input, verification, expired window) are never
+  scheduled;
+- two-sig tickets post, first claim wins, replays and wrong-provider claims
+  refuse, designated tickets enforce the named provider, expired boards
+  prune to nothing settleable, ticket escrow releases exactly and only
+  when funded;
+- bond floor is 1,000 sat; slash math multiplies before dividing so small
+  bonds slash for real (NoShow 100, fraud 500 on 1,000);
+- capacity starts at bond x 10, grows with dampened settled volume, and
+  wash volume with one counterparty earns strictly less than distributed
+  volume; v1 bond books still decode;
 - offer and job wire codecs round-trip, tampered offers fail their signature;
 - a 30-unit job splits across a GPU, a phone and a laptop deterministically,
   including with the offer list reversed;
@@ -376,13 +460,22 @@ correct or useful — that is challenge re-execution / ZKML, still future.
   over-release beyond the pot, duplicate assignments, late/misbound/overclaiming
   receipts and any release after a refund, then refunds the remainder exactly
   once after the deadline; funding wire codecs round-trip and refuse tampering;
+- claim-settlement and claim-slash mirror the assignment paths against the
+  ticket two-sig binding; challenge opens against settled claims;
+- pre-signed exits fire only after a verified receipt settles, queue exactly
+  once (second settlement is already_settled; the preauth is consumed on
+  first use), and refuse any owner/destination/amount redirect at store time;
 - one end-to-end test runs a bonded two-shard job from bond admission and
-  funding through settlement, challenge/slash, refund and journal replay.
+  funding through settlement, challenge/slash, refund and journal replay;
+- node pull-model tests cover many-offers-at-once, zero-capacity refusal,
+  first-claim-wins, settle-then-claim-again, and the full preauth
+  fire-once/no-redirect lifecycle against real L2 funding.
 
 ## 10. Next milestones
 
-1. GPU / Apple / NPU / TPU / photonic backends behind the `srct-diloco`
-   `TrainBackend` conformance suite; this crate only routes units.
+1. Capability profiles are self-declared and spot-checked (receipt
+    `elapsed_ms`, challenge re-execution); attested hardware measurement is
+    future work, not a claim. This crate routes units, nothing more.
 2. Challenge re-execution — **done** (`challenge::ChallengeBook` with
    independent re-runs, result comparison and `WrongResult` fraud disputes).
 3. Escrow integration — **done** (`escrow::EscrowBook`: fund once, release per

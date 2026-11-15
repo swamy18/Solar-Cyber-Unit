@@ -137,9 +137,11 @@ This is the "read this before you trust any number" section. We'd rather underse
 
 - **No outside audit — yet.** Every test, red-team attack, simulation and the Python reference implementation was written and run by the author. The counts are real (`scripts/test_count.sh` reproduces them) but self-reported. Treat them as hard work, not as a certificate.
 - **Nobody checking means nobody caught.** If nobody challenges a result before the window closes, it settles as-is — even a wrong one. The fraud path only bites when a challenger shows up. Running challengers is part of operating this network, not an optional hobby.
-- **Useful-work mining is staged, not live.** The mining puzzle looks brain-like but it's still hash work under the hood. The separate DiLoCo package really does train models with signed updates and cheater-filtering —
-but it doesn't drive consensus yet. It's switched on for `testnet` and off for `mainnet`, waiting for on-chain
-governance. Specialized hardware backends stay off where drivers are missing; CPU always works.
+- **Useful-work mining is not live.** The mining puzzle looks brain-like but it's still hash
+work under the hood. There is no training-based consensus on any profile:
+useful work is proven the other way — signed receipts, challenge
+re-execution and slashing in the compute marketplace. Specialized hardware
+backends stay off where drivers are missing; CPU always works.
 - **The compute marketplace settles first, pays through signed exits.** Settlement verifies the receipt against the requester's assignment and releases exactly its total from the funded escrow — work without authorization or funding settles nothing. The payout then moves through a requester-signed L2 exit (template → claim → crank), so the node never moves coins on anyone's behalf. The compute *crate* still only writes instructions; the node executes them strictly through signed exits. Where specialized hardware is missing, the built-in CPU workers run real deterministic arithmetic instead.
 - **Most service crates are prototypes with honest labels.** Training, cross-model adapters, cross-network intents, encrypted messaging, encrypted compute, zero-knowledge proofs, the unified verifier, the work graph — real, tested library code, but not consensus and not moving your coins. Intents hand payment instructions to the existing escrow layer (they verify no foreign chain). Adapters prove who fitted them, not that two models think alike.
 - **Scores, quotes and job boards live on each node, not on the chain.** Two honest nodes can disagree about a reputation score or a price. The money itself (UTXOs, bonds, Layer 2 accounts) can never disagree. So: run your own node, and treat anyone else's score as gossip until you verify it.
@@ -214,7 +216,7 @@ This is the "who may spend my money while I'm away" layer. It lives in one file 
 - **Pay-as-you-go streams.** `PaymentStream` is a subscription with a payer-signed rate per block, a window, a hard cap, a recipient, and the policy guarding non-human payers. Settlement rides the normal payment path with the stream id as the reference — no new transaction type to learn.
 - **A front door for apps.** `srct-mcp` wraps identity, payments, receipts and reputation in a keyless interface — including a **wallet guard** that checks budget and expiry *before* any key is touched, portable grant prove/verify, one-shot grant enforcement, and audit-chain verification.
 
-**Little helpers (`srct-worker`).** Small commands that talk to a node URL — no chain data on your machine: `verify-cert` (was that work really verified?), `grant` (mint a bounded grant), `claim` / `submit-result` (the two signing steps behind the templates), `pay` (x402 with a client-side budget), stream commands, `batch-quote`, and the `trial-*` family (one sponsored first task per agent, ever).
+**Little helpers (`srct-worker`).** Small commands that talk to a node URL — no chain data on your machine: `verify-cert` (was that work really verified?), `grant` (mint a bounded grant), `claim` / `submit-result` (the two signing steps behind the templates), `compute-join` (stake + offer in one command), `compute-claim-ticket` / `compute-submit-receipt` (the pull-model work loop), `pay` (x402 with a client-side budget), stream commands, `batch-quote`, and the `trial-*` family (one sponsored first task per agent, ever).
 
 **The trial faucet (operators only).** Trials stay off until a sponsor funds them — no sponsor, no money, every request refused:
 
@@ -238,7 +240,7 @@ The **service layer is each node's own notebook**: the payment book, receipt boo
 
 Three ways to mine, easiest first. Same blocks, same rewards — only the location of the grinding changes.
 
-Hash mining is the only consensus mechanism today. The DiLoCo training prototype in `crates/srct-diloco` genuinely trains models and scores contributions, but it's **not driving consensus** (on for `testnet`, off for `mainnet` pending governance). See [`docs/dual-mining.md`](docs/dual-mining.md) for measurements, the threat model, and the work still ahead.
+Hash mining is the only consensus mechanism. There is no training-based consensus to stage or activate: useful AI work is proven in the compute marketplace — signed receipts, challenge re-execution, slashing — and paid in SRCT. See [`docs/mining.md`](docs/mining.md).
 
 **Where do rewards go?** Every block pays its coinbase to one address: your node's wallet (in-node mining) or whatever `--miner` address you hand the standalone miner. Fresh coins are **immature** first — spendable after 100 blocks on mainnet, 10 on testnet/mini — then they're ordinary money. Peek with `srct-node balance --address <addr>` or `status`.
 
@@ -287,9 +289,9 @@ The `--miner` address doesn't need a wallet on the node — it's just where the 
 
 Run `templates/srct_node.py` and your box joins the compute marketplace. One rule: **all in, one mode**. Mining mode gives proof-of-work 100% of the CPU and ignores AI jobs entirely; AI compute mode gives the marketplace 100% of RAM and capacity and never mines. Half-and-half splits are refused on purpose — dedication keeps accounting honest.
 
-On the receiving end, jobs route themselves: inference-shaped work goes to the inference handler, training-shaped work goes to the training handler — and with no handlers given, built-in CPU workers run real deterministic arithmetic instead of refusing (a tiny MLP forward pass for inference, real gradient descent for training; explicit handlers and external programs via `CommandExecutor` still override them). Everything flows through the node's compute REST endpoints (offers, jobs, assign, escrow, receipts, payouts, challenges, bonds), so the whole market lives in the objects the node stores.
+On the receiving end, jobs route themselves: inference-shaped work goes to the inference handler, training-shaped work goes to the training handler — and with no handlers given, built-in CPU workers run real deterministic arithmetic instead of refusing (a tiny MLP forward pass for inference, real gradient descent for training; explicit handlers and external programs via `CommandExecutor` still override them). New providers join with one command — `python templates/srct_node.py --auto-capability` measures the box (RAM + a canonical benchmark) and shells `srct-worker compute-join`, which stakes the bond and posts the offer. No manual hardware description; matching runs on measured capabilities, never on the device class. Everything flows through the node's compute REST endpoints (offers, jobs, assign, tickets, claims, escrow, receipts, payouts, challenges, bonds), so the whole market lives in the objects the node stores.
 
-The marketplace dance, briefly: a provider posts a signed offer (capacity, price, hardware) and stakes a bond; the requester funds the job's escrow, plans the cheapest deterministic shards, and signs one assignment per shard — the authorization to pay. The worker claims it, runs it, and posts a receipt; settlement checks the signature, the assignment, the price, the deadline and the once-only rule, then releases exactly the receipt's total from the funded escrow and records the payout. A receipt with no signed assignment behind it, or no funded escrow in front of it, settles nothing. Then the requester signs an exit from the payout template, anyone submits the claim, and consensus pays the provider when the exit releases — the same permissionless crank pattern as withdrawals. Challenges, bond slashes and refunds ride alongside: re-run the work, compare bytes, slash the bond on mismatch, refund the unspent escrow after the deadline. Self-test: `python templates/srct_node.py --selftest`.
+The marketplace dance, briefly: a provider posts a signed offer (capacity, price, measured throughput) and stakes a bond — posting is capacity-gated, so a small bond means small open exposure, and only settled work raises the limit. The requester funds the job's escrow, then either signs one assignment per planned shard, or posts open tickets on the board for any capable provider to claim — first valid claim wins, no waiting, no one-claim-at-a-time rule, and settling immediately frees the next claim. The worker runs the shard and posts a receipt; settlement checks the signature, the assignment or winning claim, the price, the deadline and the once-only rule, then releases exactly the receipt's total from the funded escrow and records the payout. A receipt with no signed authorization behind it, or no funded escrow in front of it, settles nothing. A pre-signed exit attached to the assignment or designated ticket queues automatically on settlement — no second signature. Otherwise the requester signs an exit from the payout template, anyone submits the claim, and consensus pays the provider when the exit releases — the same permissionless crank pattern as withdrawals. Challenges, bond slashes and refunds ride alongside: re-run the work, compare bytes, slash the bond on mismatch, refund the unspent escrow after the deadline. Self-test: `python templates/srct_node.py --selftest`.
 
 How each kind of AI work is supported:
 
@@ -297,7 +299,7 @@ How each kind of AI work is supported:
 |---|---|---|
 | Answering queries (inference) | Marketplace → participant inference handler / external model runtimes | Integrated via node REST + receipts |
 | Training jobs | Marketplace → participant training handler | Integrated via node REST + receipts |
-| DiLoCo distributed training | `srct-diloco` prototype (real models, signed updates, cheater filtering) | Real tested code, **not consensus** |
+| One-command join | `templates/srct_node.py --auto-capability` + `srct-worker compute-join` | Measured profile, bonded, offer posted |
 
 ---
 
@@ -389,13 +391,13 @@ A "grid deployment" just means Smart Gate grants on every enforcing node, with h
 
 ## API index
 
-126 `/v1/` routes — here are the greatest hits; the full set lives in the router at `crates/srct-node/src/api.rs` (SPEC §19 wins if they ever disagree).
+129 `/v1/` routes — here are the greatest hits; the full set lives in the router at `crates/srct-node/src/api.rs` (SPEC §19 wins if they ever disagree).
 
 - **Node health:** `GET /v1/health`, `/v1/status`, `/v1/finality`, `/v1/fees`, `/v1/mempool`, `/v1/block/{hash}`, `/v1/block/latest`, `/v1/balance/{address}`, `/metrics`
 - **Money:** `GET /v1/conservation`, `POST /v1/l2/broadcast`, `GET /v1/l2/state`, `POST /v1/credit/open|repay|default|deposit|bond|mint`, `GET /v1/credit/*`, `GET /v1/exit/crankable`. Node-local `credit/open` needs both lender and borrower signatures; `credit/bond` and `credit/repay` need the named account's signature. These are separate from the consensus Layer 2 credit positions. `credit/deposit` is an unbacked local test/admin writer, not a real deposit — disabled on exposed binds.
 - **Escrow:** `POST /v1/escrow/open`, `GET /v1/escrow/{id}`, `POST /v1/escrow/{id}/release|settle` (release binds the delivered result; disputes freeze funds via `held_escrows`)
 - **Guard & policy:** `POST /v1/policy/decide`, `/v1/policies*`, `/v1/guard/grant|decide|authorize|revoke`, `POST /v1/delegation/link|verify`, `POST /v1/authorize`
-- **Compute market:** offers (`POST /v1/compute/offers`, list with live bond/score), jobs (`POST /v1/compute/jobs`, list), `POST /v1/compute/plan`, assignments (`POST /v1/compute/assign`, list), escrow (`POST /v1/compute/escrow/fund|refund`), settlement (`POST /v1/compute/receipt`, list), payouts (`GET /v1/compute/payouts`, exit-template, claim), challenges (open, second, status), bonds (register, withdraw, dispute, lookup)
+- **Compute market:** offers (`POST /v1/compute/offers`, list with live bond/score/capacity/exposure), jobs (`POST /v1/compute/jobs`, list), `POST /v1/compute/plan`, assignments (`POST /v1/compute/assign` with optional pre-signed exit, list), tickets (`POST /v1/compute/tickets` with optional pre-signed exit on designated tickets, open board list), claims (`POST /v1/compute/claims`), escrow (`POST /v1/compute/escrow/fund|refund`), settlement (`POST /v1/compute/receipt` with `auto_queued` flag, list), payouts (`GET /v1/compute/payouts`, exit-template, claim), challenges (open, second, status), bonds (register, withdraw, dispute, lookup)
 
 ---
 
@@ -783,8 +785,7 @@ cargo test -p srct-mcp                        # keyless wallet guard, portable p
 cargo test -p srct-node --test micro_safety   # batch quotes, streams, sponsor intents, session/risk/audit
 cargo test -p srct-node --test agent_economy  # passport, tiers, jobs, FX quotes, ramps, lending marketplace
 cargo test -p srct-agentnet                   # pairwise, double ratchet, sealed sender, groups, MLS-style epochs
-cargo test -p srct-compute                    # offers, sharding, TEE evidence, bonds, challenges, journal, escrow
-cargo test -p srct-diloco                     # DiLoCo rounds, fixed-point backend and hardware conformance
+cargo test -p srct-compute                    # tickets, claims, capability matching, capacity, bonds, challenges, escrow
 cargo test -p srct-cnnp                       # representation adapters, metering and evidence gates
 cargo test -p srct-intent                     # intent lifecycle, evidence, bonds and solver directory
 cargo test -p srct-fhe                        # encrypted sums and toy TFHE gates

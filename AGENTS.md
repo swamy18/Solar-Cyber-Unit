@@ -21,8 +21,6 @@ cargo test -p srct-core --lib
 cargo test -p srct-node --test api
 # Mining stack: solver/stratum/payouts/backends, template/submit roundtrips.
 cargo test -p srct-miner
-# DiLoCo proof-of-useful-work prototype (real training + adversarial rounds).
-cargo test -p srct-diloco
 # CNNP representation/adapter/discovery/metering core.
 cargo test -p srct-cnnp
 # Decentralized E2E agent messaging (envelopes, double ratchet, mailbox).

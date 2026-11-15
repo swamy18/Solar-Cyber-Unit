@@ -1,6 +1,8 @@
 [workspace]
 resolver = "2"
-members = ["crates/srct-core", "crates/srct-l2", "crates/srct-mcp", "crates/srct-miner", "crates/srct-net", "crates/srct-node", "crates/srct-store", "crates/srct-worker", "crates/srct-policy", "crates/srct-bench", "crates/srct-diloco", "crates/srct-cnnp", "crates/srct-intent", "crates/srct-agentnet", "crates/srct-compute", "crates/srct-fhe", "crates/srct-zkml", "crates/srct-workgraph", "crates/srct-verify"]
+members = ["crates/srct-core", "crates/srct-l2", "crates/srct-mcp", "crates/srct-miner", "crates/srct-net", "crates/srct-node", "crates/srct-store", "crates/srct-worker",     "crates/srct-policy",
+    "crates/srct-bench",
+    "crates/srct-cnnp", "crates/srct-intent", "crates/srct-agentnet", "crates/srct-compute", "crates/srct-fhe", "crates/srct-zkml", "crates/srct-workgraph", "crates/srct-verify"]
 
 [workspace.package]
 version = "0.1.0"
@@ -16,7 +18,6 @@ srct-core = { path = "crates/srct-core" }
 srct-l2 = { path = "crates/srct-l2" }
 srct-net = { path = "crates/srct-net" }
 srct-store = { path = "crates/srct-store" }
-srct-diloco = { path = "crates/srct-diloco" }
 srct-cnnp = { path = "crates/srct-cnnp" }
 srct-agentnet = { path = "crates/srct-agentnet" }
 srct-compute = { path = "crates/srct-compute" }
