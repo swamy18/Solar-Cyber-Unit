@@ -1170,15 +1170,68 @@ fn compute_marketplace_offer_job_plan_and_settle() {
     assert_eq!(plan_res["shards_count"], 1);
     assert_eq!(plan_res["total_sat"], 20_000); // 100 units * 200 sat
 
-    // 4. Provider executes and signs a receipt
+    // 4. Requester signs the assignment: the authorization to pay for
+    // the planned shard. Receipts settle only against a stored assignment.
     let plan = srct_compute::market::plan_assignments(&signed_job, &[signed_offer], 1, 0).unwrap();
     let signed_plan = plan.sign(&requester_wallet).unwrap();
     let assignment = &signed_plan.assignments[0];
+    let assignment_hex = hex::encode(assignment.encode());
+    let assignment_hash_hex = hex::encode(assignment.hash());
 
+    let (s, res) = post(
+        &node,
+        "/v1/compute/assign",
+        &json!({ "assignment_hex": assignment_hex }),
+    );
+    assert_eq!(s, 200, "assign failed: {res}");
+    assert_eq!(res["status"], "assigned");
+    assert_eq!(res["assignment_hash"], assignment_hash_hex);
+
+    // A duplicate assignment post is idempotent, not a second authorization.
+    let (s, res) = post(
+        &node,
+        "/v1/compute/assign",
+        &json!({ "assignment_hex": assignment_hex }),
+    );
+    assert_eq!(s, 200, "{res}");
+    assert_eq!(res["duplicate"], true);
+
+    // 5. Requester funds the job escrow: one funding per job, before any
+    // receipt can settle. Unfunded work settles nothing.
+    let funding = srct_compute::EscrowFunding {
+        version: srct_compute::ESCROW_VERSION,
+        network_id: NET.to_string(),
+        job: signed_job.hash(),
+        requester: requester_addr,
+        amount_sat: 25_000,
+        deadline: 9_000,
+        nonce: 7,
+    };
+    let signed_funding = srct_compute::SignedFunding::sign(funding, &requester_wallet).unwrap();
+    let (s, res) = post(
+        &node,
+        "/v1/compute/escrow/fund",
+        &json!({ "funding_hex": hex::encode(signed_funding.encode()) }),
+    );
+    assert_eq!(s, 200, "fund failed: {res}");
+    assert_eq!(res["funded_sat"], 25_000);
+
+    // A second funding for the same job is refused, not stacked.
+    let (s, res) = post(
+        &node,
+        "/v1/compute/escrow/fund",
+        &json!({ "funding_hex": hex::encode(signed_funding.encode()) }),
+    );
+    assert_eq!(s, 409, "{res}");
+    assert_eq!(res["error"], "already_funded");
+
+    // 6. Provider executes and signs a receipt: it settles against the
+    // assignment and releases exactly its total from the funded escrow.
     let receipt =
         srct_compute::ComputeReceipt::new(assignment, 100, [99u8; 32], 500, 0, 200).unwrap();
     let signed_receipt = srct_compute::SignedReceipt::sign(receipt, &provider_wallet).unwrap();
     let receipt_hex = hex::encode(signed_receipt.encode());
+    let receipt_hash_hex = hex::encode(signed_receipt.hash());
 
     let (s, settle_res) = post(
         &node,
@@ -1188,9 +1241,70 @@ fn compute_marketplace_offer_job_plan_and_settle() {
     assert_eq!(s, 200, "settle failed: {settle_res}");
     assert_eq!(settle_res["status"], "settled");
     assert_eq!(settle_res["total_sat"], 20_000);
+    assert_eq!(
+        settle_res["payout"]["from"],
+        address_to_hex(&requester_addr)
+    );
+    assert_eq!(settle_res["payout"]["to"], address_to_hex(&provider_addr));
+    assert_eq!(settle_res["payout"]["amount_sat"], 20_000);
 
-    // 5. Verify receipts list
+    // A duplicate receipt post is idempotent.
+    let (s, res) = post(
+        &node,
+        "/v1/compute/receipt",
+        &json!({ "receipt_hex": receipt_hex }),
+    );
+    assert_eq!(s, 200, "{res}");
+    assert_eq!(res["duplicate"], true);
+
+    // 7. Receipts and payouts list the settled work and the exact transfer.
     let (s, receipts_list) = get(&node, "/v1/compute/receipts/list");
     assert_eq!(s, 200);
     assert_eq!(receipts_list["count"], 1);
+
+    let (s, payouts) = get(&node, "/v1/compute/payouts");
+    assert_eq!(s, 200, "{payouts}");
+    assert_eq!(payouts["count"], 1);
+    assert_eq!(payouts["payouts"][0]["receipt_hash"], receipt_hash_hex);
+    assert_eq!(payouts["payouts"][0]["amount_sat"], 20_000);
+    assert_eq!(payouts["payouts"][0]["claimed"], false);
+
+    // 8. The exit template names exactly this payout for the requester to sign.
+    let (s, template) = get(
+        &node,
+        &format!("/v1/compute/payouts/{receipt_hash_hex}/exit-template"),
+    );
+    assert_eq!(s, 200, "{template}");
+    assert_eq!(template["owner"], address_to_hex(&requester_addr));
+    assert_eq!(template["destination"], address_to_hex(&provider_addr));
+    assert_eq!(template["amount_sat"], 20_000);
+    assert_eq!(template["suggested_nonce"], 1);
+
+    // 9. A claim naming the wrong amount is refused before any L2 check:
+    // the exit must pay exactly the settled payout.
+    let bad_payload = srct_core::l2::ExitQueuePayload::build(
+        &requester_wallet,
+        1,
+        1,
+        provider_addr,
+        srct_core::l2::MIN_EXIT_FEE_SAT,
+    )
+    .unwrap();
+    let bad_tx =
+        srct_core::l2::L2Transaction::new(srct_core::l2::L2Payload::ExitQueue(bad_payload));
+    let (s, body) = post(
+        &node,
+        &format!("/v1/compute/payouts/{receipt_hash_hex}/claim"),
+        &json!({ "l2_tx_hex": hex::encode(bad_tx.serialize()) }),
+    );
+    assert_eq!(s, 400, "{body}");
+    assert_eq!(body["error"], "claim_amount_mismatch");
+
+    // 10. A claim for a payout that does not exist is a 404, not a queue entry.
+    let (s, body) = post(
+        &node,
+        &format!("/v1/compute/payouts/{}/claim", "ab".repeat(32)),
+        &json!({ "l2_tx_hex": hex::encode(bad_tx.serialize()) }),
+    );
+    assert_eq!(s, 404, "{body}");
 }
