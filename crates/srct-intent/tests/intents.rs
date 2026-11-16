@@ -1231,4 +1231,3 @@ fn adapter_rail_executes_settlement_end_to_end() {
     );
     assert!(rail.execute_refund(&refund).is_err());
 }
-

@@ -9,8 +9,8 @@
 //! `aad` binds any additional envelope fields. Both are authenticated but
 //! not encrypted; the data key itself is the only secret in the output.
 
-use hpke::{Deserializable, Kem as KemTrait, Serializable};
 use hpke::{aead::ChaCha20Poly1305, kdf::HkdfSha256, kem::X25519HkdfSha256};
+use hpke::{Deserializable, Kem as KemTrait, Serializable};
 use zeroize::Zeroizing;
 
 use crate::ConfidError;
@@ -89,14 +89,13 @@ pub fn seal_to_enclave(
     let pk = <X25519HkdfSha256 as KemTrait>::PublicKey::from_bytes(recipient_pub)
         .map_err(|e| ConfidError::Crypto(format!("bad enclave pubkey: {e:?}")))?;
     let mut rng = rand::thread_rng();
-    let (encapped, mut sender) =
-        hpke::setup_sender::<ChaCha20Poly1305, HkdfSha256, X25519HkdfSha256, _>(
-            &hpke::OpModeS::Base,
-            &pk,
-            info,
-            &mut rng,
-        )
-        .map_err(|e| ConfidError::Crypto(format!("hpke setup failed: {e:?}")))?;
+    let (encapped, mut sender) = hpke::setup_sender::<
+        ChaCha20Poly1305,
+        HkdfSha256,
+        X25519HkdfSha256,
+        _,
+    >(&hpke::OpModeS::Base, &pk, info, &mut rng)
+    .map_err(|e| ConfidError::Crypto(format!("hpke setup failed: {e:?}")))?;
     let ct = sender
         .seal(key, aad)
         .map_err(|e| ConfidError::Crypto(format!("hpke seal failed: {e:?}")))?;
@@ -129,7 +128,9 @@ pub fn open_with_privkey(
         .open(&sealed.ct, aad)
         .map_err(|e| ConfidError::Crypto(format!("hpke open failed: {e:?}")))?;
     if pt.len() != 32 {
-        return Err(ConfidError::Crypto("hpke open returned wrong length".into()));
+        return Err(ConfidError::Crypto(
+            "hpke open returned wrong length".into(),
+        ));
     }
     let mut key = Zeroizing::new([0u8; 32]);
     key.copy_from_slice(&pt);

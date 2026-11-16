@@ -156,7 +156,9 @@ impl VendorEvidence {
         }
         let len = u32::from_le_bytes([bytes[2], bytes[3], bytes[4], bytes[5]]) as usize;
         if len != bytes.len() - 6 {
-            return Err(TeeError::Malformed("vendor evidence length mismatch".into()));
+            return Err(TeeError::Malformed(
+                "vendor evidence length mismatch".into(),
+            ));
         }
         let body = &bytes[6..];
         match bytes[1] {
@@ -325,7 +327,14 @@ impl TdxQuote {
         let u32le = |o: usize| u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
         let u64le = |o: usize| {
             u64::from_le_bytes([
-                b[o], b[o + 1], b[o + 2], b[o + 3], b[o + 4], b[o + 5], b[o + 6], b[o + 7],
+                b[o],
+                b[o + 1],
+                b[o + 2],
+                b[o + 3],
+                b[o + 4],
+                b[o + 5],
+                b[o + 6],
+                b[o + 7],
             ])
         };
         if u16le(L::VERSION_OFFSET) != L::QUOTE_VERSION_4 {
@@ -359,7 +368,9 @@ impl TdxQuote {
             return Err(malformed("auth data over cap"));
         }
         let mut cursor = L::FIXED_LEN;
-        let auth_end = cursor.checked_add(auth_len).ok_or_else(|| malformed("length overflow"))?;
+        let auth_end = cursor
+            .checked_add(auth_len)
+            .ok_or_else(|| malformed("length overflow"))?;
         if auth_end + 65 > b.len() {
             return Err(malformed("truncated auth data"));
         }
@@ -394,7 +405,9 @@ impl TdxQuote {
                 return Err(malformed("cert count out of range"));
             }
         }
-        let tail = b.get(chain_end..).ok_or_else(|| malformed("truncated pubkey trailer"))?;
+        let tail = b
+            .get(chain_end..)
+            .ok_or_else(|| malformed("truncated pubkey trailer"))?;
         if tail.len() != 65 || tail[0] != 0x04 {
             return Err(malformed("attestation key is not uncompressed P-256"));
         }
@@ -528,7 +541,14 @@ impl SnpReport {
         let u32le = |o: usize| u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
         let u64le = |o: usize| {
             u64::from_le_bytes([
-                b[o], b[o + 1], b[o + 2], b[o + 3], b[o + 4], b[o + 5], b[o + 6], b[o + 7],
+                b[o],
+                b[o + 1],
+                b[o + 2],
+                b[o + 3],
+                b[o + 4],
+                b[o + 5],
+                b[o + 6],
+                b[o + 7],
             ])
         };
         let version = u32le(L::VERSION_OFFSET);
@@ -633,8 +653,12 @@ impl NvidiaReport {
         if len > 65_536 {
             return Err(malformed("signing input over cap"));
         }
-        let input = bytes.get(5..5 + len).ok_or_else(|| malformed("truncated input"))?;
-        let sig = bytes.get(5 + len..5 + len + 64).ok_or_else(|| malformed("truncated sig"))?;
+        let input = bytes
+            .get(5..5 + len)
+            .ok_or_else(|| malformed("truncated input"))?;
+        let sig = bytes
+            .get(5 + len..5 + len + 64)
+            .ok_or_else(|| malformed("truncated sig"))?;
         if 5 + len + 64 != bytes.len() {
             return Err(malformed("trailing bytes"));
         }
@@ -829,7 +853,12 @@ impl VendorInputs {
 
 /// Verify a raw (r||s) or DER ECDSA signature of `msg` under an
 /// uncompressed SEC1 public key on `curve`.
-pub fn verify_sig(pubkey: &[u8], msg: &[u8], sig: &[u8], curve: ChainCurve) -> Result<(), TeeError> {
+pub fn verify_sig(
+    pubkey: &[u8],
+    msg: &[u8],
+    sig: &[u8],
+    curve: ChainCurve,
+) -> Result<(), TeeError> {
     if pubkey.len() != curve.pubkey_len() || pubkey[0] != 0x04 {
         return Err(TeeError::Malformed("key is not uncompressed SEC1".into()));
     }
@@ -838,13 +867,13 @@ pub fn verify_sig(pubkey: &[u8], msg: &[u8], sig: &[u8], curve: ChainCurve) -> R
             use p256::ecdsa::signature::Verifier as _;
             let key = VerifyingKey::from_sec1_bytes(pubkey)
                 .map_err(|e| TeeError::BadSignature(format!("bad p256 key: {e}")))?;
-    let signature = if sig.len() == 64 {
-        P256Signature::from_slice(&sig[..64])
-            .map_err(|e| TeeError::BadSignature(format!("bad raw sig: {e}")))?
-    } else {
-        P256Signature::from_der(sig)
-            .map_err(|e| TeeError::BadSignature(format!("bad der sig: {e}")))?
-    };
+            let signature = if sig.len() == 64 {
+                P256Signature::from_slice(&sig[..64])
+                    .map_err(|e| TeeError::BadSignature(format!("bad raw sig: {e}")))?
+            } else {
+                P256Signature::from_der(sig)
+                    .map_err(|e| TeeError::BadSignature(format!("bad der sig: {e}")))?
+            };
             key.verify(msg, &signature)
                 .map_err(|e| TeeError::BadSignature(format!("p256 verify failed: {e}")))
         }
@@ -852,13 +881,13 @@ pub fn verify_sig(pubkey: &[u8], msg: &[u8], sig: &[u8], curve: ChainCurve) -> R
             use p384::ecdsa::signature::Verifier as _;
             let key = p384::ecdsa::VerifyingKey::from_sec1_bytes(pubkey)
                 .map_err(|e| TeeError::BadSignature(format!("bad p384 key: {e}")))?;
-        let signature = if sig.len() == 96 {
-            p384::ecdsa::Signature::from_slice(&sig[..96])
-                .map_err(|e| TeeError::BadSignature(format!("bad raw sig: {e}")))?
-        } else {
-            p384::ecdsa::Signature::from_der(sig)
-                .map_err(|e| TeeError::BadSignature(format!("bad der sig: {e}")))?
-        };
+            let signature = if sig.len() == 96 {
+                p384::ecdsa::Signature::from_slice(&sig[..96])
+                    .map_err(|e| TeeError::BadSignature(format!("bad raw sig: {e}")))?
+            } else {
+                p384::ecdsa::Signature::from_der(sig)
+                    .map_err(|e| TeeError::BadSignature(format!("bad der sig: {e}")))?
+            };
             key.verify(msg, &signature)
                 .map_err(|e| TeeError::BadSignature(format!("p384 verify failed: {e}")))
         }
@@ -947,7 +976,11 @@ fn der_tlv(der: &[u8], off: usize) -> Result<(u8, usize, usize, usize), ()> {
         }
         let mut len = 0usize;
         for b in lb {
-            len = len.checked_mul(256).ok_or(())?.checked_add(*b as usize).ok_or(())?;
+            len = len
+                .checked_mul(256)
+                .ok_or(())?
+                .checked_add(*b as usize)
+                .ok_or(())?;
         }
         if len < 128 {
             return Err(());
@@ -964,9 +997,7 @@ pub fn canonical_spki_der(pubkey: &[u8], curve: ChainCurve) -> Result<Vec<u8>, T
         return Err(TeeError::Malformed("key is not uncompressed SEC1".into()));
     }
     // SEQUENCE { SEQUENCE { OID ecPublicKey, OID namedCurve }, BIT STRING }.
-    let mut alg_body = vec![
-        0x06, 0x07, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01,
-    ];
+    let mut alg_body = vec![0x06, 0x07, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01];
     alg_body.extend_from_slice(&match curve {
         ChainCurve::P256 => vec![0x06, 0x08, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07],
         // secp384r1 1.3.132.0.34.
@@ -1096,8 +1127,8 @@ pub fn verify_cert_chain(
     // Parse every cert first (fail-closed before any crypto).
     let mut certs = Vec::with_capacity(chain_der.len());
     for der in chain_der {
-        let (_, cert) = X509Certificate::from_der(der)
-            .map_err(|_| malformed("unparseable certificate"))?;
+        let (_, cert) =
+            X509Certificate::from_der(der).map_err(|_| malformed("unparseable certificate"))?;
         certs.push(cert);
     }
     // Walk leaf -> ... -> pinned root.
@@ -1135,7 +1166,9 @@ pub fn verify_cert_chain(
             break;
         }
         // Otherwise the next cert must exist and issue this one.
-        let next = certs.get(i + 1).ok_or_else(|| malformed("chain ends before a pinned root"))?;
+        let next = certs
+            .get(i + 1)
+            .ok_or_else(|| malformed("chain ends before a pinned root"))?;
         if tbs.issuer.as_raw() != next.tbs_certificate.subject.as_raw() {
             return Err(TeeError::Malformed("issuer/subject mismatch".into()));
         }
@@ -1168,7 +1201,9 @@ pub fn verify_tdx(evidence: &TdxQuote, inputs: &VendorInputs) -> Result<(), TeeE
     h.update(&evidence.qe_auth_data);
     let qe_binding: [u8; 32] = h.finalize().into();
     if evidence.qe_report[320..352] != qe_binding {
-        return Err(TeeError::BadSignature("qe report does not bind the attestation key".into()));
+        return Err(TeeError::BadSignature(
+            "qe report does not bind the attestation key".into(),
+        ));
     }
     // Chain to a pinned root; leaf key signs the QE report.
     let leaf_key = verify_cert_chain(
@@ -1178,7 +1213,12 @@ pub fn verify_tdx(evidence: &TdxQuote, inputs: &VendorInputs) -> Result<(), TeeE
         inputs.now_unix,
         ChainCurve::P256,
     )?;
-    verify_sig(&leaf_key, &evidence.qe_report, &evidence.qe_report_sig, ChainCurve::P256)?;
+    verify_sig(
+        &leaf_key,
+        &evidence.qe_report,
+        &evidence.qe_report_sig,
+        ChainCurve::P256,
+    )?;
     // Approved measurement only.
     if !inputs.measurement_ok(&VendorEvidence::Tdx(evidence.clone())) {
         return Err(TeeError::MeasurementMismatch);
@@ -1219,7 +1259,12 @@ pub fn verify_snp(evidence: &SnpReport, inputs: &VendorInputs) -> Result<(), Tee
     // The simulator envelope carries the 96-byte P-384 signature (r||s)
     // in the first 96 bytes of the 512-byte slot; the hardware gating run
     // confirms placement against real VCEK-signed reports.
-    verify_sig(&leaf_key, &evidence.abi_bytes(), &evidence.signature[..96], ChainCurve::P384)?;
+    verify_sig(
+        &leaf_key,
+        &evidence.abi_bytes(),
+        &evidence.signature[..96],
+        ChainCurve::P384,
+    )?;
     if !inputs.measurement_ok(&VendorEvidence::Snp(evidence.clone())) {
         return Err(TeeError::MeasurementMismatch);
     }

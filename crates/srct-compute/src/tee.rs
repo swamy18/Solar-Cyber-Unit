@@ -121,7 +121,9 @@ impl std::fmt::Display for TeeError {
             TeeError::DebugForbidden => write!(f, "guest ran with debugging enabled"),
             TeeError::TcbTooOld => write!(f, "evidence TCB is below the SLA minimum"),
             TeeError::BadReportData => write!(f, "report_data does not bind the session key"),
-            TeeError::SoftwareOnMainnet => write!(f, "simulator evidence is never accepted on mainnet"),
+            TeeError::SoftwareOnMainnet => {
+                write!(f, "simulator evidence is never accepted on mainnet")
+            }
             TeeError::UnsupportedCurve => write!(f, "evidence needs an unapproved curve"),
             TeeError::UnknownVendorFormat => write!(f, "unknown vendor evidence"),
             TeeError::RevokedVendorCert => write!(f, "vendor certificate was revoked"),
@@ -288,7 +290,9 @@ impl TeeSla {
             tcb.copy_from_slice(&r.fixed::<16>().map_err(malformed)?);
             let debug_byte = r.u8().map_err(malformed)?;
             if debug_byte > 1 {
-                return Err(TeeError::Malformed("tee sla debug flag is not a bit".into()));
+                return Err(TeeError::Malformed(
+                    "tee sla debug flag is not a bit".into(),
+                ));
             }
             let measurement: Hash = r.fixed().map_err(malformed)?;
             (tcb, debug_byte == 1, measurement)
@@ -365,7 +369,9 @@ impl TeeQuote {
             return Err(TeeError::Malformed("tee quote nonce is zero".into()));
         }
         if self.version == TEE_VERSION && self.vendor.is_none() {
-            return Err(TeeError::Malformed("v2 quote names no vendor evidence".into()));
+            return Err(TeeError::Malformed(
+                "v2 quote names no vendor evidence".into(),
+            ));
         }
         Ok(())
     }
@@ -427,7 +433,9 @@ impl TeeQuote {
         let (debug, tcb_svn, report_data, vendor) = if version == TEE_VERSION {
             let debug_byte = r.u8().map_err(malformed)?;
             if debug_byte > 1 {
-                return Err(TeeError::Malformed("tee quote debug flag is not a bit".into()));
+                return Err(TeeError::Malformed(
+                    "tee quote debug flag is not a bit".into(),
+                ));
             }
             let tcb_svn: [u8; 16] = r.fixed().map_err(malformed)?;
             let binding: [u8; 32] = r.fixed().map_err(malformed)?;
@@ -565,17 +573,38 @@ impl StoredAttestation {
 
     pub fn decode(bytes: &[u8]) -> Result<Self, TeeError> {
         let mut r = srct_core::ser::Reader::new(bytes);
-        let quote_hash = r.fixed().map_err(|e| TeeError::Malformed(format!("quote_hash: {e}")))?;
-        let provider = r.fixed().map_err(|e| TeeError::Malformed(format!("provider: {e}")))?;
-        let len = r.u32le().map_err(|e| TeeError::Malformed(format!("quote_bytes len: {e}")))? as usize;
+        let quote_hash = r
+            .fixed()
+            .map_err(|e| TeeError::Malformed(format!("quote_hash: {e}")))?;
+        let provider = r
+            .fixed()
+            .map_err(|e| TeeError::Malformed(format!("provider: {e}")))?;
+        let len = r
+            .u32le()
+            .map_err(|e| TeeError::Malformed(format!("quote_bytes len: {e}")))?
+            as usize;
         if len > 64 * 1024 {
             return Err(TeeError::Malformed("quote bytes too large".into()));
         }
-        let quote_bytes = r.fixed_slice(len).map_err(|e| TeeError::Malformed(format!("quote_bytes: {e}")))?.to_vec();
-        let registered_height = r.u64le().map_err(|e| TeeError::Malformed(format!("registered_height: {e}")))?;
-        let expires_height = r.u64le().map_err(|e| TeeError::Malformed(format!("expires_height: {e}")))?;
-        r.expect_end().map_err(|e| TeeError::Malformed(format!("trailing: {e}")))?;
-        Ok(StoredAttestation { quote_hash, provider, quote_bytes, registered_height, expires_height })
+        let quote_bytes = r
+            .fixed_slice(len)
+            .map_err(|e| TeeError::Malformed(format!("quote_bytes: {e}")))?
+            .to_vec();
+        let registered_height = r
+            .u64le()
+            .map_err(|e| TeeError::Malformed(format!("registered_height: {e}")))?;
+        let expires_height = r
+            .u64le()
+            .map_err(|e| TeeError::Malformed(format!("expires_height: {e}")))?;
+        r.expect_end()
+            .map_err(|e| TeeError::Malformed(format!("trailing: {e}")))?;
+        Ok(StoredAttestation {
+            quote_hash,
+            provider,
+            quote_bytes,
+            registered_height,
+            expires_height,
+        })
     }
 }
 
@@ -623,9 +652,18 @@ impl TeeVerifier {
         current_height: u64,
     ) -> Result<Hash, TeeError> {
         if signed.quote.version != TEE_VERSION {
-            return Err(TeeError::Malformed("verify_v2 needs a version 2 quote".into()));
+            return Err(TeeError::Malformed(
+                "verify_v2 needs a version 2 quote".into(),
+            ));
         }
-        self.verify_inner(sla, signed, roots, Some(vendor), presented_pubkey, current_height)
+        self.verify_inner(
+            sla,
+            signed,
+            roots,
+            Some(vendor),
+            presented_pubkey,
+            current_height,
+        )
     }
 
     fn verify_inner(
@@ -688,9 +726,8 @@ impl TeeVerifier {
         vendor: Option<&crate::vendor::VendorInputs>,
         presented_pubkey: &[u8],
     ) -> Result<(), TeeError> {
-        let inputs = vendor.ok_or_else(|| {
-            TeeError::Malformed("version 2 quote needs vendor inputs".into())
-        })?;
+        let inputs = vendor
+            .ok_or_else(|| TeeError::Malformed("version 2 quote needs vendor inputs".into()))?;
         let evidence = quote.vendor.as_ref().ok_or_else(|| {
             TeeError::Malformed("version 2 quote names no vendor evidence".into())
         })?;

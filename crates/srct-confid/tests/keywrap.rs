@@ -20,7 +20,8 @@ const PKR_HEX: &str = "4310ee97d88cc1f088a5576c77ab0cf5c3ac797f3d95139c6c84b5429
 // enc (ephemeral public share).
 const ENC_HEX: &str = "1afa08d3dec047a643885163f1180476fa7ddb54c6a8029ea33f95796bf2ac4a";
 const AAD_HEX: &str = "436f756e742d30";
-const CT_HEX: &str = "1c5250d8034ec2b784ba2cfd69dbdb8af406cfe3ff938e131f0def8c8b60b4db21993c62ce81883d2dd1b51a28";
+const CT_HEX: &str =
+    "1c5250d8034ec2b784ba2cfd69dbdb8af406cfe3ff938e131f0def8c8b60b4db21993c62ce81883d2dd1b51a28";
 const PT_HEX: &str = "4265617574792069732074727574682c20747275746820626561757479";
 
 fn hex(s: &str) -> Vec<u8> {
@@ -40,7 +41,7 @@ fn rfc9180_base_vector_opens() {
     // / HKDF-SHA256 / ChaCha20Poly1305. The receiver side is fully
     // deterministic: given skRm + enc + info + aad, open() must yield the
     // published pt. This pins our exact ciphersuite to the RFC.
-    use hpke::{Deserializable};
+    use hpke::Deserializable;
     type Kem = hpke::kem::X25519HkdfSha256;
     type Kdf = hpke::kdf::HkdfSha256;
     type Aead = hpke::aead::ChaCha20Poly1305;

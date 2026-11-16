@@ -61,8 +61,8 @@ pub mod bond;
 pub mod challenge;
 pub mod device;
 pub mod escrow;
-pub mod guest;
 pub mod gossip;
+pub mod guest;
 pub mod inference;
 pub mod ledger;
 pub mod market;
@@ -83,21 +83,27 @@ pub use challenge::{
     Challenge, ChallengeBook, ChallengeVerdict, SignedChallenge, CHALLENGE_VERSION,
 };
 pub use device::{
-    BackendCapabilities, BackendRegistry, ComputeBackend, CpuBackend, Determinism, DeviceClass,
-    DeviceProfile, DeviceRequirement, LoopbackBackend, GENERIC_BACKEND, MAX_BACKEND_ID_LEN,
-    legacy_backend,
+    legacy_backend, BackendCapabilities, BackendRegistry, ComputeBackend, CpuBackend, Determinism,
+    DeviceClass, DeviceProfile, DeviceRequirement, LoopbackBackend, GENERIC_BACKEND,
+    MAX_BACKEND_ID_LEN,
 };
 pub use escrow::{
     EscrowAccount, EscrowBook, EscrowFunding, RefundInstruction, SignedFunding, ESCROW_VERSION,
 };
 pub use gossip::{
     decode_batch, decode_ticket_batch, encode_batch, encode_ticket_batch, GossipSet,
-    GOSSIP_BATCH_VERSION, MAX_BATCH_BYTES, MAX_GOSSIP_OFFERS, TicketGossipSet,
-    MAX_GOSSIP_TICKETS,
+    TicketGossipSet, GOSSIP_BATCH_VERSION, MAX_BATCH_BYTES, MAX_GOSSIP_OFFERS, MAX_GOSSIP_TICKETS,
+};
+pub use guest::{
+    attest_quote, GuestSession, SessionEvent, SessionState, UsageRecord as GuestUsageRecord,
+};
+pub use inference::{
+    open_request, open_response, seal_request, seal_response, GuestInput, GuestOutput,
+    InferenceRequest, InferenceResponse,
 };
 pub use ledger::{
-    ComputeUsageLedger, LedgerEntry, SliceWindow, UsageRecord, LEDGER_VERSION, SLICE_BLOCKS_MAINNET,
-    SLICE_BLOCKS_TESTNET_MINI, SLICE_UNITS, slice_blocks, slice_index, slice_window,
+    slice_blocks, slice_index, slice_window, ComputeUsageLedger, LedgerEntry, SliceWindow,
+    UsageRecord, LEDGER_VERSION, SLICE_BLOCKS_MAINNET, SLICE_BLOCKS_TESTNET_MINI, SLICE_UNITS,
 };
 pub use market::{
     plan_assignments, Assignment, ComputeJob, ComputeOffer, Plan, SignedAssignment, SignedJob,
@@ -107,6 +113,7 @@ pub use market::{
 pub use settle::{
     ComputeLedger, ComputeReceipt, PayoutInstruction, SettlementStatus, SignedReceipt,
 };
+pub use shield::{open, seal, SealedShield, ShieldBundle, ShieldChunk, SHIELD_VERSION};
 pub use store::{
     EntryKind, FlowJournal, JournalEntry, Replayed, JOURNAL_VERSION, MAX_ENTRY_BYTES,
     MAX_JOURNAL_ENTRIES,
@@ -115,28 +122,18 @@ pub use tee::{
     AttestationRoots, SignedTeeQuote, StoredAttestation, TeeError, TeeQuote, TeeSla, TeeType,
     TeeVerifier, TEE_VERSION, TEE_VERSION_V1,
 };
-pub use vendor::{
-    expected_report_binding, verify_cert_chain, verify_nvidia, verify_p256_sig, verify_sig,
-    verify_snp, verify_tdx, ChainCurve, NvidiaReport, SnpReport, TcbPolicy, TdxQuote,
-    VendorEvidence, VendorFamily, VendorInputs, VendorRoots, VENDOR_EVIDENCE_VERSION,
-};
 pub use ticket::{
     ClaimBook, ClaimTicket, ShardClaim, SignedClaim, SignedTicket, CLAIM_VERSION, MAX_TICKETS,
     TICKET_VERSION,
 };
 pub use training::{
-    EncryptedCheckpoint, ResumeToken, TrainingShard, seal_checkpoint, open_checkpoint,
-    seal_resume_token, open_resume_token, split_into_shards,
+    open_checkpoint, open_resume_token, seal_checkpoint, seal_resume_token, split_into_shards,
+    EncryptedCheckpoint, ResumeToken, TrainingShard,
 };
-pub use shield::{
-    ShieldBundle, SealedShield, ShieldChunk, seal, open, SHIELD_VERSION,
-};
-pub use guest::{
-    GuestSession, SessionState, SessionEvent, UsageRecord as GuestUsageRecord, attest_quote,
-};
-pub use inference::{
-    InferenceRequest, InferenceResponse, seal_request, open_request,
-    seal_response, open_response, GuestInput, GuestOutput,
+pub use vendor::{
+    expected_report_binding, verify_cert_chain, verify_nvidia, verify_p256_sig, verify_sig,
+    verify_snp, verify_tdx, ChainCurve, NvidiaReport, SnpReport, TcbPolicy, TdxQuote,
+    VendorEvidence, VendorFamily, VendorInputs, VendorRoots, VENDOR_EVIDENCE_VERSION,
 };
 
 /// Why a compute-sharing operation was refused.

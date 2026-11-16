@@ -275,20 +275,26 @@ pub fn decode_batch(bytes: &[u8]) -> Result<Vec<SignedOffer>, ComputeError> {
 pub fn encode_ticket_batch(tickets: &[&SignedTicket]) -> Result<Vec<u8>, ComputeError> {
     use srct_core::ser::Writer;
     if tickets.len() > MAX_GOSSIP_TICKETS {
-        return Err(ComputeError::Malformed("ticket gossip batch is over cap".into()));
+        return Err(ComputeError::Malformed(
+            "ticket gossip batch is over cap".into(),
+        ));
     }
     let mut w = Writer::with_capacity(64 + tickets.len() * 256);
     w.u8(GOSSIP_BATCH_VERSION).u32le(tickets.len() as u32);
     for ticket in tickets {
         let bytes = ticket.encode();
         if bytes.len() > MAX_BATCH_BYTES {
-            return Err(ComputeError::Malformed("ticket gossip ticket is over cap".into()));
+            return Err(ComputeError::Malformed(
+                "ticket gossip ticket is over cap".into(),
+            ));
         }
         w.u32le(bytes.len() as u32).raw(&bytes);
     }
     let out = w.into_vec();
     if out.len() > MAX_BATCH_BYTES {
-        return Err(ComputeError::Malformed("ticket gossip batch is over cap".into()));
+        return Err(ComputeError::Malformed(
+            "ticket gossip batch is over cap".into(),
+        ));
     }
     Ok(out)
 }
@@ -297,7 +303,9 @@ pub fn encode_ticket_batch(tickets: &[&SignedTicket]) -> Result<Vec<u8>, Compute
 pub fn decode_ticket_batch(bytes: &[u8]) -> Result<Vec<SignedTicket>, ComputeError> {
     use srct_core::ser::Reader;
     if bytes.len() > MAX_BATCH_BYTES {
-        return Err(ComputeError::Malformed("ticket gossip batch is over cap".into()));
+        return Err(ComputeError::Malformed(
+            "ticket gossip batch is over cap".into(),
+        ));
     }
     let mut r = Reader::new(bytes);
     let bad = |detail: &str| ComputeError::Malformed(format!("ticket gossip batch {detail}"));
@@ -314,7 +322,9 @@ pub fn decode_ticket_batch(bytes: &[u8]) -> Result<Vec<SignedTicket>, ComputeErr
         if len == 0 || len > MAX_BATCH_BYTES {
             return Err(bad("ticket is over cap"));
         }
-        let blob = r.fixed_slice(len).map_err(|_| bad("ticket bytes are missing"))?;
+        let blob = r
+            .fixed_slice(len)
+            .map_err(|_| bad("ticket bytes are missing"))?;
         tickets.push(SignedTicket::decode(blob)?);
     }
     r.expect_end().map_err(|_| bad("has trailing bytes"))?;

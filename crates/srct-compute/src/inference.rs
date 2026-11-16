@@ -6,13 +6,13 @@
 //! response back under the same session key. Both sides are bound to the
 //! attestation output hash so a replaced guest cannot decrypt.
 
-use chacha20poly1305::{XChaCha20Poly1305, KeyInit, Key};
 use chacha20poly1305::aead::{Aead, Payload};
-use generic_array::{GenericArray, typenum::U24};
+use chacha20poly1305::{Key, KeyInit, XChaCha20Poly1305};
+use generic_array::{typenum::U24, GenericArray};
 use zeroize::Zeroizing;
 
-use srct_core::hash::{Hash, sha256_dom};
 use crate::ComputeError;
+use srct_core::hash::{sha256_dom, Hash};
 
 const DOM_INFERENCE: &[u8] = b"srct/inference/v1";
 const DOM_REQ: &[u8] = b"srct/inference/request/v1";
@@ -53,7 +53,14 @@ pub fn seal_request(
     let nonce_input = sha256_dom(DOM_REQ, &[&session_id, input]);
     nonce.copy_from_slice(&nonce_input[..24]);
     let nonce_n = GenericArray::<u8, U24>::from_slice(&nonce);
-    let ct = cipher.encrypt(nonce_n, Payload { msg: input, aad: &[] })
+    let ct = cipher
+        .encrypt(
+            nonce_n,
+            Payload {
+                msg: input,
+                aad: &[],
+            },
+        )
         .map_err(|e| ComputeError::Malformed(format!("request seal failed: {e}")))?;
     Ok(InferenceRequest {
         session_id,
@@ -64,13 +71,17 @@ pub fn seal_request(
 }
 
 /// Open an inference request inside the enclave. Returns the plaintext input.
-pub fn open_request(
-    key: &[u8; 32],
-    req: &InferenceRequest,
-) -> Result<Vec<u8>, ComputeError> {
+pub fn open_request(key: &[u8; 32], req: &InferenceRequest) -> Result<Vec<u8>, ComputeError> {
     let cipher = XChaCha20Poly1305::new(Key::from_slice(key));
     let req_nonce = GenericArray::<u8, U24>::from_slice(&req.nonce);
-    let pt = cipher.decrypt(req_nonce, Payload { msg: &req.ciphertext, aad: &[] })
+    let pt = cipher
+        .decrypt(
+            req_nonce,
+            Payload {
+                msg: &req.ciphertext,
+                aad: &[],
+            },
+        )
         .map_err(|_| ComputeError::BadSignature("inference request unseal failed".into()))?;
     Ok(pt)
 }
@@ -86,7 +97,14 @@ pub fn seal_response(
     let nonce_input = sha256_dom(DOM_RESP, &[&session_id, output]);
     nonce.copy_from_slice(&nonce_input[..24]);
     let nonce_n = GenericArray::<u8, U24>::from_slice(&nonce);
-    let ct = cipher.encrypt(nonce_n, Payload { msg: output, aad: &[] })
+    let ct = cipher
+        .encrypt(
+            nonce_n,
+            Payload {
+                msg: output,
+                aad: &[],
+            },
+        )
         .map_err(|e| ComputeError::Malformed(format!("response seal failed: {e}")))?;
     Ok(InferenceResponse {
         session_id,
@@ -97,13 +115,17 @@ pub fn seal_response(
 }
 
 /// Open an inference response outside the enclave. Returns the plaintext output.
-pub fn open_response(
-    key: &[u8; 32],
-    resp: &InferenceResponse,
-) -> Result<Vec<u8>, ComputeError> {
+pub fn open_response(key: &[u8; 32], resp: &InferenceResponse) -> Result<Vec<u8>, ComputeError> {
     let cipher = XChaCha20Poly1305::new(Key::from_slice(key));
     let resp_nonce = GenericArray::<u8, U24>::from_slice(&resp.nonce);
-    let pt = cipher.decrypt(resp_nonce, Payload { msg: &resp.ciphertext, aad: &[] })
+    let pt = cipher
+        .decrypt(
+            resp_nonce,
+            Payload {
+                msg: &resp.ciphertext,
+                aad: &[],
+            },
+        )
         .map_err(|_| ComputeError::BadSignature("inference response unseal failed".into()))?;
     Ok(pt)
 }
@@ -116,7 +138,9 @@ pub struct GuestInput {
 
 impl GuestInput {
     pub fn new(tensor: Vec<f32>) -> Self {
-        Self { tensor: Zeroizing::new(tensor) }
+        Self {
+            tensor: Zeroizing::new(tensor),
+        }
     }
 }
 
@@ -128,7 +152,9 @@ pub struct GuestOutput {
 
 impl GuestOutput {
     pub fn new(tensor: Vec<f32>) -> Self {
-        Self { tensor: Zeroizing::new(tensor) }
+        Self {
+            tensor: Zeroizing::new(tensor),
+        }
     }
 }
 

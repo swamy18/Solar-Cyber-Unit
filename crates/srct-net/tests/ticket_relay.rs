@@ -13,9 +13,11 @@ use std::net::{SocketAddr, TcpListener};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use srct_compute::ticket::{ClaimTicket, ShardClaim, SignedClaim, SignedTicket, CLAIM_VERSION, TICKET_VERSION};
-use srct_compute::{ClaimBook, ComputeError, Determinism};
 use srct_compute::market::Verification;
+use srct_compute::ticket::{
+    ClaimTicket, ShardClaim, SignedClaim, SignedTicket, CLAIM_VERSION, TICKET_VERSION,
+};
+use srct_compute::{ClaimBook, ComputeError, Determinism};
 use srct_core::chain::Chain;
 use srct_core::mempool::Mempool;
 use srct_core::params::NetworkParams;

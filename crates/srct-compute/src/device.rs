@@ -312,14 +312,11 @@ impl DeviceProfile {
             0
         };
         let backend = if version >= PROFILE_VERSION {
-            let len = r
-                .u16le()
-                .map_err(|e| ComputeError::Malformed(e.to_string()))?
-                as usize;
+            let len =
+                r.u16le()
+                    .map_err(|e| ComputeError::Malformed(e.to_string()))? as usize;
             if len > MAX_BACKEND_ID_LEN {
-                return Err(ComputeError::Malformed(
-                    "device backend id over cap".into(),
-                ));
+                return Err(ComputeError::Malformed("device backend id over cap".into()));
             }
             let raw = r
                 .fixed_slice(len)
@@ -674,7 +671,10 @@ mod tests {
         let mut unknown = profile(DeviceClass::Cpu, 2_048, 8, [0u8; 32]);
         unknown = unknown.with_backend("mobile/snapdragon-x");
         let decoded_unknown = DeviceProfile::decode(&unknown.encode()).unwrap();
-        assert_eq!(decoded_unknown.backend_id_or_legacy(), "mobile/snapdragon-x");
+        assert_eq!(
+            decoded_unknown.backend_id_or_legacy(),
+            "mobile/snapdragon-x"
+        );
         assert!(decoded_unknown.meets(&req()));
         assert!(!decoded_unknown.meets(&DeviceRequirement {
             min_ram_mib: 4_096,
@@ -699,8 +699,8 @@ mod tests {
         let mut bad_len = profile(DeviceClass::Cpu, 2_048, 8, [0u8; 32]);
         bad_len = bad_len.with_backend("x".repeat(MAX_BACKEND_ID_LEN + 1));
         assert!(bad_len.validate().is_err());
-        let bad_chars = profile(DeviceClass::Cpu, 2_048, 8, [0u8; 32])
-            .with_backend("cpu; rm -rf /");
+        let bad_chars =
+            profile(DeviceClass::Cpu, 2_048, 8, [0u8; 32]).with_backend("cpu; rm -rf /");
         assert!(bad_chars.validate().is_err());
         let mut bad_utf8 = profile(DeviceClass::Cpu, 2_048, 8, [0u8; 32]);
         bad_utf8.version = PROFILE_VERSION;

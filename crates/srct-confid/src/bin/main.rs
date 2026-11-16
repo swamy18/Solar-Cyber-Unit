@@ -41,7 +41,9 @@ fn main() -> std::process::ExitCode {
 }
 
 fn run(args: &[String]) -> Result<i32, ConfidError> {
-    let cmd = args.first().ok_or_else(|| ConfidError::Malformed(usage()))?;
+    let cmd = args
+        .first()
+        .ok_or_else(|| ConfidError::Malformed(usage()))?;
     match cmd.as_str() {
         "--help" | "help" => {
             println!("{}", usage());
@@ -288,7 +290,11 @@ fn cmd_release(args: &[String]) -> Result<i32, ConfidError> {
         Some("data") => srct_confid::KeyPurpose::Data,
         Some("result") => srct_confid::KeyPurpose::Result,
         Some("checkpoint") => srct_confid::KeyPurpose::Checkpoint,
-        _ => return Err(ConfidError::Malformed("purpose must be data|result|checkpoint".into())),
+        _ => {
+            return Err(ConfidError::Malformed(
+                "purpose must be data|result|checkpoint".into(),
+            ))
+        }
     };
     let aad_hex: &str = match get("aad_hex") {
         Ok(v) => v.as_str().unwrap_or(""),
@@ -323,11 +329,17 @@ fn cmd_release(args: &[String]) -> Result<i32, ConfidError> {
             Some("tdx") => srct_compute::tee::TeeType::Tdx,
             Some("sevsnp") => srct_compute::tee::TeeType::SevSnp,
             Some("nvidia-cc") => srct_compute::tee::TeeType::NvidiaCc,
-            _ => return Err(ConfidError::Malformed("attester tee must be software|tdx|sevsnp|nvidia-cc".into())),
+            _ => {
+                return Err(ConfidError::Malformed(
+                    "attester tee must be software|tdx|sevsnp|nvidia-cc".into(),
+                ))
+            }
         };
         let pk = hex_decode(pk_hex, "attester pubkey")?;
         if pk.len() != 20 {
-            return Err(ConfidError::Malformed("attester pubkey must be 20 bytes".into()));
+            return Err(ConfidError::Malformed(
+                "attester pubkey must be 20 bytes".into(),
+            ));
         }
         let mut addr = [0u8; 20];
         addr.copy_from_slice(&pk);
@@ -342,7 +354,9 @@ fn cmd_release(args: &[String]) -> Result<i32, ConfidError> {
     };
     let approved = str_hex("approved_measurement_hex", "approved measurement")?;
     if approved.len() != 32 {
-        return Err(ConfidError::Malformed("approved measurement must be 32 bytes".into()));
+        return Err(ConfidError::Malformed(
+            "approved measurement must be 32 bytes".into(),
+        ));
     }
     let mut approved_measurement = [0u8; 32];
     approved_measurement.copy_from_slice(&approved);
@@ -354,11 +368,16 @@ fn cmd_release(args: &[String]) -> Result<i32, ConfidError> {
         }
         min_tcb.copy_from_slice(&raw);
     }
-    let allow_debug = v.get("allow_debug").and_then(|x| x.as_bool()).unwrap_or(false);
+    let allow_debug = v
+        .get("allow_debug")
+        .and_then(|x| x.as_bool())
+        .unwrap_or(false);
     let presented = str_hex("presented_pubkey_hex", "presented pubkey")?;
     let enclave_raw = hex_decode(enclave_hex, "enclave pubkey")?;
     if enclave_raw.len() != 32 {
-        return Err(ConfidError::Malformed("enclave pubkey must be 32 bytes".into()));
+        return Err(ConfidError::Malformed(
+            "enclave pubkey must be 32 bytes".into(),
+        ));
     }
     let mut enclave_pubkey = [0u8; 32];
     enclave_pubkey.copy_from_slice(&enclave_raw);
@@ -374,7 +393,9 @@ fn cmd_release(args: &[String]) -> Result<i32, ConfidError> {
                 "nvidia signing key",
             )?;
             if raw.len() != 65 || raw[0] != 0x04 {
-                return Err(ConfidError::Malformed("nvidia key must be uncompressed P-256".into()));
+                return Err(ConfidError::Malformed(
+                    "nvidia key must be uncompressed P-256".into(),
+                ));
             }
             let mut k = [0u8; 65];
             k.copy_from_slice(&raw);

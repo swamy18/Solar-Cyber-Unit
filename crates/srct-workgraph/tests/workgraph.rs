@@ -438,7 +438,9 @@ fn tee_setup() -> (
     srct_verify::TeeSla,
     srct_verify::SignedTeeQuote,
 ) {
-    use srct_verify::{AttestationRoots, SignedTeeQuote, TeeQuote, TeeSla, TeeType, TEE_VERSION_V1};
+    use srct_verify::{
+        AttestationRoots, SignedTeeQuote, TeeQuote, TeeSla, TeeType, TEE_VERSION_V1,
+    };
     let provider = wallet(21);
     let attester = wallet(22);
     let sla = TeeSla {

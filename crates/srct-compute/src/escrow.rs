@@ -375,7 +375,9 @@ impl EscrowBook {
         }
         let n_scheduled = r.u32le().map_err(malformed)? as usize;
         if n_scheduled > MAX_ESCROW_ACCOUNTS {
-            return Err(ComputeError::Malformed("escrow scheduled entries over cap".into()));
+            return Err(ComputeError::Malformed(
+                "escrow scheduled entries over cap".into(),
+            ));
         }
         let mut scheduled = BTreeMap::new();
         for _ in 0..n_scheduled {
@@ -394,29 +396,39 @@ impl EscrowBook {
                 )
                 .is_some()
             {
-                return Err(ComputeError::Malformed("duplicate escrow scheduled entry".into()));
+                return Err(ComputeError::Malformed(
+                    "duplicate escrow scheduled entry".into(),
+                ));
             }
         }
         let n_paid = r.u32le().map_err(malformed)? as usize;
         if n_paid > MAX_ESCROW_ACCOUNTS {
-            return Err(ComputeError::Malformed("escrow paid entries over cap".into()));
+            return Err(ComputeError::Malformed(
+                "escrow paid entries over cap".into(),
+            ));
         }
         let mut paid = BTreeSet::new();
         for _ in 0..n_paid {
             let h: Hash = r.fixed().map_err(malformed)?;
             if !paid.insert(h) {
-                return Err(ComputeError::Malformed("duplicate escrow paid entry".into()));
+                return Err(ComputeError::Malformed(
+                    "duplicate escrow paid entry".into(),
+                ));
             }
         }
         let n_held = r.u32le().map_err(malformed)? as usize;
         if n_held > MAX_ESCROW_ACCOUNTS {
-            return Err(ComputeError::Malformed("escrow held entries over cap".into()));
+            return Err(ComputeError::Malformed(
+                "escrow held entries over cap".into(),
+            ));
         }
         let mut held = BTreeSet::new();
         for _ in 0..n_held {
             let h: Hash = r.fixed().map_err(malformed)?;
             if !held.insert(h) {
-                return Err(ComputeError::Malformed("duplicate escrow held entry".into()));
+                return Err(ComputeError::Malformed(
+                    "duplicate escrow held entry".into(),
+                ));
             }
         }
         r.expect_end().map_err(malformed)?;
@@ -801,7 +813,9 @@ impl EscrowBook {
     /// Returns `true` when the payout was found and held.
     pub fn hold(&mut self, assignment: &Hash) -> bool {
         if let Some(sp) = self.scheduled.get(assignment) {
-            if sp.payable_at == 0 || self.paid.contains(assignment) || self.held.contains(assignment)
+            if sp.payable_at == 0
+                || self.paid.contains(assignment)
+                || self.held.contains(assignment)
             {
                 return false;
             }

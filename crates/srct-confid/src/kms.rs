@@ -61,7 +61,13 @@ struct KeystoreFile {
 pub trait KmsAdapter {
     /// Store (or rotate: overwrite) the 32-byte key under `id` with a TTL
     /// in seconds measured from `now_unix`.
-    fn store(&mut self, id: &str, key: &[u8; 32], ttl_secs: u64, now_unix: u64) -> Result<(), ConfidError>;
+    fn store(
+        &mut self,
+        id: &str,
+        key: &[u8; 32],
+        ttl_secs: u64,
+        now_unix: u64,
+    ) -> Result<(), ConfidError>;
     /// Load the key, enforcing expiry and revocation. Returns a zeroizing
     /// buffer: the key wipes itself when the caller is done with it.
     fn load(&self, id: &str, now_unix: u64) -> Result<Zeroizing<[u8; 32]>, ConfidError>;
@@ -161,13 +167,21 @@ fn check_id(id: &str) -> Result<(), ConfidError> {
         .bytes()
         .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
     {
-        return Err(ConfidError::Malformed("key id has illegal characters".into()));
+        return Err(ConfidError::Malformed(
+            "key id has illegal characters".into(),
+        ));
     }
     Ok(())
 }
 
 impl KmsAdapter for LocalKeystore {
-    fn store(&mut self, id: &str, key: &[u8; 32], ttl_secs: u64, now_unix: u64) -> Result<(), ConfidError> {
+    fn store(
+        &mut self,
+        id: &str,
+        key: &[u8; 32],
+        ttl_secs: u64,
+        now_unix: u64,
+    ) -> Result<(), ConfidError> {
         check_id(id)?;
         self.file.keys.insert(
             id.to_string(),
@@ -260,7 +274,9 @@ fn decrypt(passphrase: &str, blob: &[u8]) -> Result<Zeroizing<Vec<u8>>, ConfidEr
     }
     let (prefix, rest) = blob.split_at(MAGIC.len());
     if prefix != MAGIC {
-        return Err(ConfidError::Malformed("keystore file has an unknown format".into()));
+        return Err(ConfidError::Malformed(
+            "keystore file has an unknown format".into(),
+        ));
     }
     let (salt, rest) = rest.split_at(SALT_LEN);
     let (nonce, ct) = rest.split_at(NONCE_LEN);
@@ -272,7 +288,9 @@ fn decrypt(passphrase: &str, blob: &[u8]) -> Result<Zeroizing<Vec<u8>>, ConfidEr
     cipher
         .decrypt(&Nonce::from(nonce_bytes), ct)
         .map(Zeroizing::new)
-        .map_err(|_| ConfidError::Crypto("wrong passphrase, or the keystore file was modified".into()))
+        .map_err(|_| {
+            ConfidError::Crypto("wrong passphrase, or the keystore file was modified".into())
+        })
 }
 
 /// Write bytes to `path` so no other account can read them and no crash
@@ -324,9 +342,16 @@ impl VaultKms {
 }
 
 impl KmsAdapter for VaultKms {
-    fn store(&mut self, _id: &str, _key: &[u8; 32], _ttl_secs: u64, _now_unix: u64) -> Result<(), ConfidError> {
+    fn store(
+        &mut self,
+        _id: &str,
+        _key: &[u8; 32],
+        _ttl_secs: u64,
+        _now_unix: u64,
+    ) -> Result<(), ConfidError> {
         Err(ConfidError::NotConfigured(
-            "VaultKms is a documented stub: implement KmsAdapter over a Vault client to enable it".into(),
+            "VaultKms is a documented stub: implement KmsAdapter over a Vault client to enable it"
+                .into(),
         ))
     }
     fn load(&self, id: &str, _now_unix: u64) -> Result<Zeroizing<[u8; 32]>, ConfidError> {
@@ -336,7 +361,8 @@ impl KmsAdapter for VaultKms {
     }
     fn revoke(&mut self, _id: &str) -> Result<bool, ConfidError> {
         Err(ConfidError::NotConfigured(
-            "VaultKms is a documented stub: implement KmsAdapter over a Vault client to enable it".into(),
+            "VaultKms is a documented stub: implement KmsAdapter over a Vault client to enable it"
+                .into(),
         ))
     }
     fn ids(&self) -> Vec<String> {
@@ -360,7 +386,13 @@ impl CloudKms {
 }
 
 impl KmsAdapter for CloudKms {
-    fn store(&mut self, _id: &str, _key: &[u8; 32], _ttl_secs: u64, _now_unix: u64) -> Result<(), ConfidError> {
+    fn store(
+        &mut self,
+        _id: &str,
+        _key: &[u8; 32],
+        _ttl_secs: u64,
+        _now_unix: u64,
+    ) -> Result<(), ConfidError> {
         Err(ConfidError::NotConfigured(
             "CloudKms is a documented stub: implement KmsAdapter over a cloud KMS client to enable it".into(),
         ))

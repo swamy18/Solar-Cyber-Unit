@@ -5,13 +5,13 @@
 //! attested enclave. Checkpoints are encrypted under per-slice session keys
 //! and can be resumed from any verified checkpoint height.
 
-use chacha20poly1305::{XChaCha20Poly1305, KeyInit, Key};
 use chacha20poly1305::aead::{Aead, Payload};
-use generic_array::{GenericArray, typenum::U24};
+use chacha20poly1305::{Key, KeyInit, XChaCha20Poly1305};
+use generic_array::{typenum::U24, GenericArray};
 use hex::FromHex as _;
 
-use srct_core::hash::{Hash, sha256_dom};
 use crate::ComputeError;
+use srct_core::hash::{sha256_dom, Hash};
 
 const DOM_CHECKPOINT: &[u8] = b"srct/training/checkpoint/v1";
 const DOM_RESUME: &[u8] = b"srct/training/resume/v1";
@@ -52,10 +52,20 @@ pub fn seal_checkpoint(
 ) -> Result<EncryptedCheckpoint, ComputeError> {
     let cipher = XChaCha20Poly1305::new(Key::from_slice(key));
     let mut nonce = [0u8; 24];
-    let nonce_input = sha256_dom(DOM_CHECKPOINT, &[&shard_id, &height.to_le_bytes(), plaintext]);
+    let nonce_input = sha256_dom(
+        DOM_CHECKPOINT,
+        &[&shard_id, &height.to_le_bytes(), plaintext],
+    );
     nonce.copy_from_slice(&nonce_input[..24]);
     let nonce_n = GenericArray::<u8, U24>::from_slice(&nonce);
-    let ct = cipher.encrypt(nonce_n, Payload { msg: plaintext, aad: &[] })
+    let ct = cipher
+        .encrypt(
+            nonce_n,
+            Payload {
+                msg: plaintext,
+                aad: &[],
+            },
+        )
         .map_err(|e| ComputeError::Malformed(format!("checkpoint seal failed: {e}")))?;
     Ok(EncryptedCheckpoint {
         shard_id,
@@ -67,17 +77,23 @@ pub fn seal_checkpoint(
 }
 
 /// Open an encrypted checkpoint, returning the plaintext.
-pub fn open_checkpoint(
-    key: &[u8; 32],
-    cp: &EncryptedCheckpoint,
-) -> Result<Vec<u8>, ComputeError> {
+pub fn open_checkpoint(key: &[u8; 32], cp: &EncryptedCheckpoint) -> Result<Vec<u8>, ComputeError> {
     let cipher = XChaCha20Poly1305::new(Key::from_slice(key));
     let cp_nonce = GenericArray::<u8, U24>::from_slice(&cp.nonce);
-    let pt = cipher.decrypt(cp_nonce, Payload { msg: &cp.ciphertext, aad: &[] })
+    let pt = cipher
+        .decrypt(
+            cp_nonce,
+            Payload {
+                msg: &cp.ciphertext,
+                aad: &[],
+            },
+        )
         .map_err(|_| ComputeError::BadSignature("checkpoint unseal failed".into()))?;
     // Verify plaintext hash matches (integrity even if decryption succeeded).
     if sha256_dom(DOM_CHECKPOINT, &[&pt]) != cp.plaintext_hash {
-        return Err(ComputeError::BadSignature("checkpoint plaintext hash mismatch".into()));
+        return Err(ComputeError::BadSignature(
+            "checkpoint plaintext hash mismatch".into(),
+        ));
     }
     Ok(pt)
 }
@@ -103,7 +119,14 @@ pub fn seal_resume_token(
     nonce.copy_from_slice(&nonce_input[..24]);
     let payload = format!("resume:{}:{}", hex::encode(shard_id), checkpoint_height);
     let nonce_n = GenericArray::<u8, U24>::from_slice(&nonce);
-    let ct = cipher.encrypt(nonce_n, Payload { msg: payload.as_bytes(), aad: &[] })
+    let ct = cipher
+        .encrypt(
+            nonce_n,
+            Payload {
+                msg: payload.as_bytes(),
+                aad: &[],
+            },
+        )
         .map_err(|e| ComputeError::Malformed(format!("resume token seal failed: {e}")))?;
     Ok(ResumeToken {
         shard_id,
@@ -114,22 +137,28 @@ pub fn seal_resume_token(
 }
 
 /// Open a resume token.
-pub fn open_resume_token(
-    key: &[u8; 32],
-    token: &ResumeToken,
-) -> Result<(Hash, u64), ComputeError> {
+pub fn open_resume_token(key: &[u8; 32], token: &ResumeToken) -> Result<(Hash, u64), ComputeError> {
     let cipher = XChaCha20Poly1305::new(Key::from_slice(key));
     let token_nonce = GenericArray::<u8, U24>::from_slice(&token.nonce);
-    let pt = cipher.decrypt(token_nonce, Payload { msg: &token.ciphertext, aad: &[] })
+    let pt = cipher
+        .decrypt(
+            token_nonce,
+            Payload {
+                msg: &token.ciphertext,
+                aad: &[],
+            },
+        )
         .map_err(|_| ComputeError::BadSignature("resume token unseal failed".into()))?;
-    let text = String::from_utf8(pt).map_err(|e| ComputeError::Malformed(format!("resume token not utf-8: {e}")))?;
+    let text = String::from_utf8(pt)
+        .map_err(|e| ComputeError::Malformed(format!("resume token not utf-8: {e}")))?;
     let parts: Vec<&str> = text.splitn(3, ':').collect();
     if parts.len() != 3 || parts[0] != "resume" {
         return Err(ComputeError::Malformed("resume token malformed".into()));
     }
     let shard_id = Hash::from_hex(parts[1])
         .map_err(|e| ComputeError::Malformed(format!("resume token bad shard id: {e}")))?;
-    let height = parts[2].parse::<u64>()
+    let height = parts[2]
+        .parse::<u64>()
         .map_err(|e| ComputeError::Malformed(format!("resume token bad height: {e}")))?;
     Ok((shard_id, height))
 }
@@ -140,10 +169,14 @@ pub fn split_into_shards(
     total_samples: u64,
 ) -> Result<Vec<TrainingShard>, ComputeError> {
     if num_gpus == 0 {
-        return Err(ComputeError::Malformed("training needs at least one GPU".into()));
+        return Err(ComputeError::Malformed(
+            "training needs at least one GPU".into(),
+        ));
     }
     if total_samples == 0 {
-        return Err(ComputeError::Malformed("training needs at least one sample".into()));
+        return Err(ComputeError::Malformed(
+            "training needs at least one sample".into(),
+        ));
     }
     let mut shards = Vec::with_capacity(num_gpus as usize);
     let samples_per_gpu = total_samples / num_gpus as u64;

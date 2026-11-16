@@ -55,11 +55,20 @@ fn ttl_expiry_and_revocation_enforced() {
     let mut ks = LocalKeystore::open(&path, PASS).unwrap();
     ks.store("short", &[0xCDu8; 32], 10, NOW).unwrap();
     assert!(ks.load("short", NOW + 9).is_ok());
-    assert_eq!(ks.load("short", NOW + 11), Err(ConfidError::Expired("short".into())));
+    assert_eq!(
+        ks.load("short", NOW + 11),
+        Err(ConfidError::Expired("short".into()))
+    );
     assert!(ks.revoke("short").unwrap());
-    assert_eq!(ks.load("short", NOW), Err(ConfidError::Revoked("short".into())));
+    assert_eq!(
+        ks.load("short", NOW),
+        Err(ConfidError::Revoked("short".into()))
+    );
     assert!(!ks.revoke("nope").unwrap());
-    assert!(matches!(ks.load("nope", NOW), Err(ConfidError::UnknownKey(_))));
+    assert!(matches!(
+        ks.load("nope", NOW),
+        Err(ConfidError::UnknownKey(_))
+    ));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -79,12 +88,18 @@ fn every_store_rewrites_ciphertext_and_leaves_no_temp() {
     {
         use std::os::unix::fs::PermissionsExt;
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o600, "keystore must not be group/world readable");
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "keystore must not be group/world readable"
+        );
     }
     // Bad key ids refused before touching disk.
     assert!(ks.store("", &[0u8; 32], u64::MAX, NOW).is_err());
     assert!(ks.store("../escape", &[0u8; 32], u64::MAX, NOW).is_err());
-    assert!(ks.store(&"k".repeat(200), &[0u8; 32], u64::MAX, NOW).is_err());
+    assert!(ks
+        .store(&"k".repeat(200), &[0u8; 32], u64::MAX, NOW)
+        .is_err());
     let _ = std::fs::remove_dir_all(&dir);
 }
 

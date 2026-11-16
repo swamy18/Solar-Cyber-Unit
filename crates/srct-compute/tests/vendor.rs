@@ -16,8 +16,8 @@ use srct_compute::tee::{
     TEE_VERSION, TEE_VERSION_V1,
 };
 use srct_compute::vendor::{
-    verify_cert_chain, verify_nvidia, verify_snp, verify_tdx, ChainCurve, NvidiaReport,
-    SnpReport, TcbPolicy, TdxQuote, VendorEvidence, VendorInputs, VendorRoots,
+    verify_cert_chain, verify_nvidia, verify_snp, verify_tdx, ChainCurve, NvidiaReport, SnpReport,
+    TcbPolicy, TdxQuote, VendorEvidence, VendorInputs, VendorRoots,
 };
 use srct_core::wallet::Wallet;
 
@@ -134,12 +134,7 @@ fn make_cert(
     sig_bitstring.extend_from_slice(&sig_der);
     tlv(
         0x30,
-        &[
-            tbs,
-            tlv(0x30, OID_ECDSA_SHA256),
-            tlv(0x03, &sig_bitstring),
-        ]
-        .concat(),
+        &[tbs, tlv(0x30, OID_ECDSA_SHA256), tlv(0x03, &sig_bitstring)].concat(),
     )
 }
 
@@ -207,12 +202,7 @@ fn make_cert_p384(
     sig_bitstring.extend_from_slice(&sig_der);
     tlv(
         0x30,
-        &[
-            tbs,
-            tlv(0x30, OID_ECDSA_SHA384),
-            tlv(0x03, &sig_bitstring),
-        ]
-        .concat(),
+        &[tbs, tlv(0x30, OID_ECDSA_SHA384), tlv(0x03, &sig_bitstring)].concat(),
     )
 }
 
@@ -228,8 +218,24 @@ type PckChain = (Vec<u8>, Vec<u8>, [u8; 32], [u8; 65], [u8; 65]);
 fn pck_chain() -> PckChain {
     let (root_sk, root_pk) = p256_keypair(0xA1);
     let (leaf_sk, leaf_pk) = p256_keypair(0xB2);
-    let root_der = make_cert(1, "sim-root", "sim-root", &root_pk, "230101000000Z", "350101000000Z", &root_sk);
-    let leaf_der = make_cert(2, "sim-root", "sim-pck-leaf", &leaf_pk, "230101000000Z", "350101000000Z", &root_sk);
+    let root_der = make_cert(
+        1,
+        "sim-root",
+        "sim-root",
+        &root_pk,
+        "230101000000Z",
+        "350101000000Z",
+        &root_sk,
+    );
+    let leaf_der = make_cert(
+        2,
+        "sim-root",
+        "sim-pck-leaf",
+        &leaf_pk,
+        "230101000000Z",
+        "350101000000Z",
+        &root_sk,
+    );
     let mut h = Sha256::new();
     h.update(canonical_spki(&root_pk));
     let pin: [u8; 32] = h.finalize().into();
@@ -265,7 +271,8 @@ fn roots_with(pin: [u8; 32]) -> VendorRoots {
 #[test]
 fn chain_verifies_against_pinned_root() {
     let (leaf_der, root_der, pin, leaf_pk, _root_pk) = pck_chain();
-    let leaf_key = verify_cert_chain(&[leaf_der, root_der], &[pin], &[], NOW, ChainCurve::P256).unwrap();
+    let leaf_key =
+        verify_cert_chain(&[leaf_der, root_der], &[pin], &[], NOW, ChainCurve::P256).unwrap();
     assert_eq!(leaf_key, leaf_pk.to_vec());
 }
 
@@ -274,12 +281,24 @@ fn chain_refuses_wrong_pin_expired_revoked_and_tampered() {
     let (leaf_der, root_der, pin, _leaf_pk, _root_pk) = pck_chain();
     // Unknown pin.
     assert!(matches!(
-        verify_cert_chain(&[leaf_der.clone(), root_der.clone()], &[[9u8; 32]], &[], NOW, ChainCurve::P256),
+        verify_cert_chain(
+            &[leaf_der.clone(), root_der.clone()],
+            &[[9u8; 32]],
+            &[],
+            NOW,
+            ChainCurve::P256
+        ),
         Err(srct_compute::tee::TeeError::Malformed(_))
     ));
     // Expired (after not_after 2035).
     assert_eq!(
-        verify_cert_chain(&[leaf_der.clone(), root_der.clone()], &[pin], &[], 4_102_444_800, ChainCurve::P256),
+        verify_cert_chain(
+            &[leaf_der.clone(), root_der.clone()],
+            &[pin],
+            &[],
+            4_102_444_800,
+            ChainCurve::P256
+        ),
         Err(srct_compute::tee::TeeError::Expired)
     );
     // Revoked leaf serial (leaf serial is 2).
@@ -297,7 +316,9 @@ fn chain_refuses_wrong_pin_expired_revoked_and_tampered() {
     let mut bad = leaf_der.clone();
     let last = bad.len() - 1;
     bad[last] ^= 0x01;
-    assert!(verify_cert_chain(&[bad, root_der.clone()], &[pin], &[], NOW, ChainCurve::P256).is_err());
+    assert!(
+        verify_cert_chain(&[bad, root_der.clone()], &[pin], &[], NOW, ChainCurve::P256).is_err()
+    );
     // Empty chain and oversized blob.
     assert!(verify_cert_chain(&[], &[pin], &[], NOW, ChainCurve::P256).is_err());
     assert!(verify_cert_chain(&[vec![0u8; 9_000]], &[pin], &[], NOW, ChainCurve::P256).is_err());
@@ -330,8 +351,24 @@ type SimTdxEvidence = (TdxQuote, [u8; 65], Vec<u8>, Vec<u8>, [u8; 32], [u8; 65])
 fn sim_tdx(nonce: u64) -> SimTdxEvidence {
     let (root_sk, _root_pk) = p256_keypair(0xA1);
     let (leaf_sk, leaf_pk) = p256_keypair(0xB2);
-    let root_der = make_cert(1, "sim-root", "sim-root", &_root_pk_of(0xA1), "230101000000Z", "350101000000Z", &root_sk);
-    let leaf_der = make_cert(2, "sim-root", "sim-pck-leaf", &leaf_pk, "230101000000Z", "350101000000Z", &root_sk);
+    let root_der = make_cert(
+        1,
+        "sim-root",
+        "sim-root",
+        &_root_pk_of(0xA1),
+        "230101000000Z",
+        "350101000000Z",
+        &root_sk,
+    );
+    let leaf_der = make_cert(
+        2,
+        "sim-root",
+        "sim-pck-leaf",
+        &leaf_pk,
+        "230101000000Z",
+        "350101000000Z",
+        &root_sk,
+    );
     let (_att_sk, att_pub) = p256_keypair(0xC3);
     let (eph_sk, eph_pub) = p256_keypair(0xD4);
     let qe_auth_data = b"sim-qe-auth".to_vec();
@@ -379,14 +416,26 @@ fn sim_tdx(nonce: u64) -> SimTdxEvidence {
     let mut pin_h = Sha256::new();
     pin_h.update(canonical_spki(&_root_pk_of(0xA1)));
     let pin: [u8; 32] = pin_h.finalize().into();
-    (q, att_pub, eph_pub.to_vec(), nonce.to_le_bytes().to_vec(), pin, _root_pk_of(0xA1))
+    (
+        q,
+        att_pub,
+        eph_pub.to_vec(),
+        nonce.to_le_bytes().to_vec(),
+        pin,
+        _root_pk_of(0xA1),
+    )
 }
 
 fn _root_pk_of(seed: u8) -> [u8; 65] {
     p256_keypair(seed).1
 }
 
-fn sim_inputs(measurement: [u8; 32], presented: Vec<u8>, nonce: u64, roots: VendorRoots) -> VendorInputs {
+fn sim_inputs(
+    measurement: [u8; 32],
+    presented: Vec<u8>,
+    nonce: u64,
+    roots: VendorRoots,
+) -> VendorInputs {
     VendorInputs {
         now_unix: NOW,
         presented_pubkey: presented,
@@ -432,12 +481,7 @@ fn tdx_roundtrip_and_full_verify_ok() {
     let encoded = VendorEvidence::Tdx(q.clone()).encode();
     let back = VendorEvidence::decode(&encoded).unwrap();
     assert_eq!(back, VendorEvidence::Tdx(q.clone()));
-    let inputs = sim_inputs(
-        tdx_measurement_id(&q),
-        eph_pub,
-        nonce,
-        roots_with(pin),
-    );
+    let inputs = sim_inputs(tdx_measurement_id(&q), eph_pub, nonce, roots_with(pin));
     verify_tdx(&q, &inputs).unwrap();
 }
 
@@ -448,12 +492,18 @@ fn tdx_negatives_each_fail_closed() {
     let (mut q, _, eph_pub, _, pin, _) = sim_tdx(nonce);
     q.td_attributes = 1;
     let inputs = sim_inputs(tdx_measurement_id(&q), eph_pub, nonce, roots_with(pin));
-    assert_eq!(verify_tdx(&q, &inputs), Err(srct_compute::tee::TeeError::DebugForbidden));
+    assert_eq!(
+        verify_tdx(&q, &inputs),
+        Err(srct_compute::tee::TeeError::DebugForbidden)
+    );
     // TCB too old.
     let (q, _, eph_pub, _, pin, _) = sim_tdx(nonce);
     let mut old_inputs = sim_inputs(tdx_measurement_id(&q), eph_pub, nonce, roots_with(pin));
     old_inputs.tcb.min_tdx_svn = [0xFFu8; 16];
-    assert_eq!(verify_tdx(&q, &old_inputs), Err(srct_compute::tee::TeeError::TcbTooOld));
+    assert_eq!(
+        verify_tdx(&q, &old_inputs),
+        Err(srct_compute::tee::TeeError::TcbTooOld)
+    );
     // Wrong measurement.
     let (q, _, eph_pub, _, pin, _) = sim_tdx(nonce);
     let inputs = sim_inputs([9u8; 32], eph_pub, nonce, roots_with(pin));
@@ -472,8 +522,16 @@ fn tdx_negatives_each_fail_closed() {
     // Wrong session binding (report_data does not bind presented key).
     let (mut q, _, _, _, pin, _) = sim_tdx(nonce);
     q.report_data[0] ^= 0x01;
-    let inputs = sim_inputs(tdx_measurement_id(&q), vec![0x04u8; 65], nonce, roots_with(pin));
-    assert_eq!(verify_tdx(&q, &inputs), Err(srct_compute::tee::TeeError::BadReportData));
+    let inputs = sim_inputs(
+        tdx_measurement_id(&q),
+        vec![0x04u8; 65],
+        nonce,
+        roots_with(pin),
+    );
+    assert_eq!(
+        verify_tdx(&q, &inputs),
+        Err(srct_compute::tee::TeeError::BadReportData)
+    );
     // Tampered wire bytes refuse at decode.
     let (q, _, _, _, _, _) = sim_tdx(nonce);
     let bytes = VendorEvidence::Tdx(q).encode();
@@ -502,10 +560,22 @@ fn sim_snp_with_policy(nonce: u64, policy: u64) -> (SnpReport, Vec<u8>, Vec<Vec<
     let (root_sk, root_pk) = p384_keypair(0xA1);
     let (leaf_sk, leaf_pk) = p384_keypair(0xB2);
     let root_der = make_cert_p384(
-        1, "sim-amd-ark", "sim-amd-ark", &root_pk, "230101000000Z", "350101000000Z", &root_sk,
+        1,
+        "sim-amd-ark",
+        "sim-amd-ark",
+        &root_pk,
+        "230101000000Z",
+        "350101000000Z",
+        &root_sk,
     );
     let leaf_der = make_cert_p384(
-        2, "sim-amd-ark", "sim-vcek", &leaf_pk, "230101000000Z", "350101000000Z", &root_sk,
+        2,
+        "sim-amd-ark",
+        "sim-vcek",
+        &leaf_pk,
+        "230101000000Z",
+        "350101000000Z",
+        &root_sk,
     );
     let mut pin_h = Sha256::new();
     pin_h.update(canonical_spki384(&root_pk));
@@ -571,16 +641,28 @@ fn snp_full_verify_with_p384_chain() {
     // TCB minimum enforced.
     let mut inputs_old = inputs.clone();
     inputs_old.tcb.min_snp_tcb = [0xFFu8; 16];
-    assert_eq!(verify_snp(&r, &inputs_old), Err(srct_compute::tee::TeeError::TcbTooOld));
+    assert_eq!(
+        verify_snp(&r, &inputs_old),
+        Err(srct_compute::tee::TeeError::TcbTooOld)
+    );
     // Wrong measurement refuses.
-    let inputs_bad_m = VendorInputs { approved_measurement: [9u8; 32], ..inputs.clone() };
+    let inputs_bad_m = VendorInputs {
+        approved_measurement: [9u8; 32],
+        ..inputs.clone()
+    };
     assert_eq!(
         verify_snp(&r, &inputs_bad_m),
         Err(srct_compute::tee::TeeError::MeasurementMismatch)
     );
     // Wrong session binding refuses.
-    let inputs_bad_b = VendorInputs { presented_pubkey: vec![0x04u8; 65], ..inputs.clone() };
-    assert_eq!(verify_snp(&r, &inputs_bad_b), Err(srct_compute::tee::TeeError::BadReportData));
+    let inputs_bad_b = VendorInputs {
+        presented_pubkey: vec![0x04u8; 65],
+        ..inputs.clone()
+    };
+    assert_eq!(
+        verify_snp(&r, &inputs_bad_b),
+        Err(srct_compute::tee::TeeError::BadReportData)
+    );
     // Tampered report signature refuses.
     let mut bad_sig = r.clone();
     bad_sig.signature[10] ^= 0x01;
@@ -650,8 +732,8 @@ fn sim_jwt(payload_extra: Option<serde_json::Value>, nonce: u64) -> (Vec<u8>, [u
             payload[k] = v.clone();
         }
     }
-    let payload_b64 =
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap());
+    let payload_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(serde_json::to_vec(&payload).unwrap());
     let input = format!("{header_b64}.{payload_b64}");
     let sig: P256Sig = sk.sign(input.as_bytes());
     let mut sig64 = [0u8; 64];
@@ -666,13 +748,21 @@ fn nvidia_roundtrip_and_full_verify_ok() {
     let r = NvidiaReport::from_signing_input(&input, sig).unwrap();
     let (eph_sk, eph_pub) = p256_keypair(0xE5);
     let _ = eph_sk;
-    let mut inputs = sim_inputs(r.measurement_id(), eph_pub.to_vec(), nonce, roots_with([0u8; 32]));
+    let mut inputs = sim_inputs(
+        r.measurement_id(),
+        eph_pub.to_vec(),
+        nonce,
+        roots_with([0u8; 32]),
+    );
     inputs.nvidia_signing_key = None;
     assert!(verify_nvidia(&r, &inputs, &pk).is_ok());
     assert_eq!(r.fw_version, 3);
     // Encode/decode roundtrip preserves the parsed report.
     let bytes = VendorEvidence::Nvidia(r.clone()).encode();
-    assert_eq!(VendorEvidence::decode(&bytes).unwrap(), VendorEvidence::Nvidia(r));
+    assert_eq!(
+        VendorEvidence::decode(&bytes).unwrap(),
+        VendorEvidence::Nvidia(r)
+    );
 }
 
 #[test]
@@ -682,7 +772,12 @@ fn nvidia_negatives_each_fail_closed() {
     let r = NvidiaReport::from_signing_input(&input, sig).unwrap();
     let (eph_sk, eph_pub) = p256_keypair(0xE5);
     let _ = eph_sk;
-    let base = sim_inputs(r.measurement_id(), eph_pub.to_vec(), nonce, roots_with([0u8; 32]));
+    let base = sim_inputs(
+        r.measurement_id(),
+        eph_pub.to_vec(),
+        nonce,
+        roots_with([0u8; 32]),
+    );
     // Wrong signing key (a genuinely different key, not just a different nonce).
     let other = p256_keypair(0x77).1;
     assert!(matches!(
@@ -698,23 +793,32 @@ fn nvidia_negatives_each_fail_closed() {
     // Stale expiry.
     let (input_old, sig_old, _) = sim_jwt(Some(serde_json::json!({"exp": NOW - 1})), nonce);
     let r_old = NvidiaReport::from_signing_input(&input_old, sig_old).unwrap();
-    assert_eq!(verify_nvidia(&r_old, &base, &pk), Err(srct_compute::tee::TeeError::Expired));
+    assert_eq!(
+        verify_nvidia(&r_old, &base, &pk),
+        Err(srct_compute::tee::TeeError::Expired)
+    );
     // Wrong measurement.
-    let base_bad_m = VendorInputs { approved_measurement: [9u8; 32], ..base.clone() };
+    let base_bad_m = VendorInputs {
+        approved_measurement: [9u8; 32],
+        ..base.clone()
+    };
     assert_eq!(
         verify_nvidia(&r, &base_bad_m, &pk),
         Err(srct_compute::tee::TeeError::MeasurementMismatch)
     );
     // Wrong session binding.
-    let base_bad_b = VendorInputs { presented_pubkey: vec![0x04u8; 65], ..base.clone() };
+    let base_bad_b = VendorInputs {
+        presented_pubkey: vec![0x04u8; 65],
+        ..base.clone()
+    };
     assert_eq!(
         verify_nvidia(&r, &base_bad_b, &pk),
         Err(srct_compute::tee::TeeError::BadReportData)
     );
     // Non-ES256 header and truncated envelopes refuse at parse.
     use base64::Engine as _;
-    let bad_header = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .encode(r#"{"alg":"RS256","typ":"JWT"}"#);
+    let bad_header =
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(r#"{"alg":"RS256","typ":"JWT"}"#);
     let parts: Vec<&str> = std::str::from_utf8(&input).unwrap().split('.').collect();
     let forged = format!("{}.{}", bad_header, parts[1]);
     assert!(NvidiaReport::from_signing_input(forged.as_bytes(), sig).is_err());
@@ -777,14 +881,20 @@ fn v2_full_verify_ok_and_key_release_gate() {
     let (q, _, eph_pub, _, pin, _) = sim_tdx(nonce);
     let measurement = VendorEvidence::Tdx(q.clone()).measurement_id();
     let sla = sim_sla_v2(provider.address().unwrap(), measurement);
-    let signed =
-        SignedTeeQuote::sign(sim_quote_v2(&sla, q, [25u8; 32]), &att).unwrap();
+    let signed = SignedTeeQuote::sign(sim_quote_v2(&sla, q, [25u8; 32]), &att).unwrap();
     let mut roots = AttestationRoots::new();
     roots.add_root(att.address().unwrap(), TeeType::Tdx);
     let inputs = sim_inputs(measurement, eph_pub, nonce, roots_with(pin));
     // The broker rule, pinned here: the data key is released only on Ok.
     let mut verifier = TeeVerifier::new();
-    let released = verifier.verify_v2(&sla, &signed, &roots, &inputs, &inputs.presented_pubkey.clone(), 100);
+    let released = verifier.verify_v2(
+        &sla,
+        &signed,
+        &roots,
+        &inputs,
+        &inputs.presented_pubkey.clone(),
+        100,
+    );
     assert_eq!(released, Ok([25u8; 32]));
 }
 
@@ -796,8 +906,7 @@ fn v2_report_data_mismatch_never_releases() {
     let (q, _, _, _, pin, _) = sim_tdx(nonce);
     let measurement = VendorEvidence::Tdx(q.clone()).measurement_id();
     let sla = sim_sla_v2(provider.address().unwrap(), measurement);
-    let signed =
-        SignedTeeQuote::sign(sim_quote_v2(&sla, q, [25u8; 32]), &att).unwrap();
+    let signed = SignedTeeQuote::sign(sim_quote_v2(&sla, q, [25u8; 32]), &att).unwrap();
     let mut roots = AttestationRoots::new();
     roots.add_root(att.address().unwrap(), TeeType::Tdx);
     // Wrong presented key: both the evidence check and the quote-header
@@ -822,14 +931,20 @@ fn v2_debug_needs_explicit_opt_in() {
     let mut quote_dbg = sim_quote_v2(&sla, q, [25u8; 32]);
     // Honest attester mirrors the guest state in the quote header.
     quote_dbg.debug = true;
-    let signed =
-        SignedTeeQuote::sign(quote_dbg, &att).unwrap();
+    let signed = SignedTeeQuote::sign(quote_dbg, &att).unwrap();
     let mut roots = AttestationRoots::new();
     roots.add_root(att.address().unwrap(), TeeType::Tdx);
     let inputs = sim_inputs(measurement, eph_pub, nonce, roots_with(pin));
     let mut verifier = TeeVerifier::new();
     assert_eq!(
-        verifier.verify_v2(&sla, &signed, &roots, &inputs, &inputs.presented_pubkey.clone(), 100),
+        verifier.verify_v2(
+            &sla,
+            &signed,
+            &roots,
+            &inputs,
+            &inputs.presented_pubkey.clone(),
+            100
+        ),
         Err(TeeError::DebugForbidden)
     );
     // A quote that claims non-debug for a debug guest is a lying attester,
@@ -872,7 +987,14 @@ fn v2_debug_needs_explicit_opt_in() {
     let inputs2 = sim_inputs(measurement2, eph2, nonce, roots_with(pin));
     let mut verifier2 = TeeVerifier::new();
     assert_eq!(
-        verifier2.verify_v2(&sla_opt2, &signed2, &roots, &inputs2, &inputs2.presented_pubkey.clone(), 100),
+        verifier2.verify_v2(
+            &sla_opt2,
+            &signed2,
+            &roots,
+            &inputs2,
+            &inputs2.presented_pubkey.clone(),
+            100
+        ),
         Ok([25u8; 32])
     );
 }
@@ -885,8 +1007,7 @@ fn v2_without_vendor_context_is_refused() {
     let (q, _, _, _, _, _) = sim_tdx(nonce);
     let measurement = VendorEvidence::Tdx(q.clone()).measurement_id();
     let sla = sim_sla_v2(provider.address().unwrap(), measurement);
-    let signed =
-        SignedTeeQuote::sign(sim_quote_v2(&sla, q, [25u8; 32]), &att).unwrap();
+    let signed = SignedTeeQuote::sign(sim_quote_v2(&sla, q, [25u8; 32]), &att).unwrap();
     let mut roots = AttestationRoots::new();
     roots.add_root(att.address().unwrap(), TeeType::Tdx);
     // Plain verify() has no vendor context: fail closed, never verify.
@@ -959,7 +1080,14 @@ fn software_on_mainnet_is_always_refused() {
     let inputs = sim_inputs(measurement, eph_pub, nonce, roots_with(pin));
     let mut verifier2 = TeeVerifier::new();
     assert_eq!(
-        verifier2.verify_v2(&sla_v2, &signed_v2, &roots, &inputs, &inputs.presented_pubkey.clone(), 100),
+        verifier2.verify_v2(
+            &sla_v2,
+            &signed_v2,
+            &roots,
+            &inputs,
+            &inputs.presented_pubkey.clone(),
+            100
+        ),
         Err(TeeError::SoftwareOnMainnet)
     );
 }
@@ -1005,10 +1133,12 @@ fn v1_wire_still_decodes_and_verifies() {
     };
     let back = TeeQuote::decode(&quote.encode()).unwrap();
     assert_eq!(back, quote);
-    let back_sla = TeeSla::decode(&{
-        // v1 SLA encoding omits the confidential fields.
-        vec![TEE_VERSION_V1]
-    }[..])
+    let back_sla = TeeSla::decode(
+        &{
+            // v1 SLA encoding omits the confidential fields.
+            vec![TEE_VERSION_V1]
+        }[..],
+    )
     .unwrap_err();
     let _ = back_sla;
     let signed = SignedTeeQuote::sign(quote, &att).unwrap();

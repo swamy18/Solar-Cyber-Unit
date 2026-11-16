@@ -877,7 +877,10 @@ pub fn plan_assignments(
     // ordered by price so the cheapest offer is drawn from first.
     let mut by_provider: BTreeMap<Address, Vec<&SignedOffer>> = BTreeMap::new();
     for offer in &candidates {
-        by_provider.entry(offer.offer.provider).or_default().push(offer);
+        by_provider
+            .entry(offer.offer.provider)
+            .or_default()
+            .push(offer);
     }
     for offer_list in by_provider.values_mut() {
         offer_list.sort_by_key(|o| (o.offer.unit_price_sat, o.hash()));
@@ -951,16 +954,14 @@ pub fn plan_assignments(
 
     // Process providers in price order for a deterministic shard layout.
     let mut provider_order: Vec<Address> = by_provider.keys().cloned().collect();
-    provider_order.sort_by_key(|p| {
-        (
-            by_provider[p][0].offer.unit_price_sat,
-            *p,
-        )
-    });
+    provider_order.sort_by_key(|p| (by_provider[p][0].offer.unit_price_sat, *p));
 
     // Try to place `units` units from providers in `order`, drawing from each
     // offer's remaining capacity. Returns the number of units placed.
-    let mut place_units = |units: u32, order: &[Address], taken: &mut BTreeMap<Hash, u32>| -> Result<u32, ComputeError> {
+    let mut place_units = |units: u32,
+                           order: &[Address],
+                           taken: &mut BTreeMap<Hash, u32>|
+     -> Result<u32, ComputeError> {
         let mut left = units;
         for provider in order {
             if left == 0 {
@@ -992,7 +993,9 @@ pub fn plan_assignments(
                     }
                     let cost = (take as u64)
                         .checked_mul(offer.offer.unit_price_sat)
-                        .ok_or_else(|| ComputeError::Malformed("assignment total overflows".into()))?;
+                        .ok_or_else(|| {
+                            ComputeError::Malformed("assignment total overflows".into())
+                        })?;
                     let new_total = total_sat
                         .checked_add(cost)
                         .ok_or_else(|| ComputeError::Malformed("plan total overflows".into()))?;

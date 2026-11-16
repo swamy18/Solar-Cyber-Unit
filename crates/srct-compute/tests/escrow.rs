@@ -402,11 +402,26 @@ fn funding_wire_roundtrip_and_tamper_refusal() {
 
 #[test]
 fn default_payout_delay_matches_network_profile() {
-    assert_eq!(srct_compute::escrow::default_payout_delay_blocks("srct/mainnet"), 2);
-    assert_eq!(srct_compute::escrow::default_payout_delay_blocks("srct/testnet"), 180);
-    assert_eq!(srct_compute::escrow::default_payout_delay_blocks("srct/mini"), 180);
-    assert_eq!(srct_compute::escrow::default_payout_delay_blocks("srct/regtest"), 0);
-    assert_eq!(srct_compute::escrow::default_payout_delay_blocks("unknown"), 0);
+    assert_eq!(
+        srct_compute::escrow::default_payout_delay_blocks("srct/mainnet"),
+        2
+    );
+    assert_eq!(
+        srct_compute::escrow::default_payout_delay_blocks("srct/testnet"),
+        180
+    );
+    assert_eq!(
+        srct_compute::escrow::default_payout_delay_blocks("srct/mini"),
+        180
+    );
+    assert_eq!(
+        srct_compute::escrow::default_payout_delay_blocks("srct/regtest"),
+        0
+    );
+    assert_eq!(
+        srct_compute::escrow::default_payout_delay_blocks("unknown"),
+        0
+    );
 }
 
 #[test]
@@ -418,9 +433,11 @@ fn scheduled_payout_not_payable_before_delay() {
     let assignment = &plan.assignments[0];
     let receipt = receipt(assignment, &provider, 5, 20, 1);
     let mut book = EscrowBook::new(NET);
-    book.fund(&funding(&requester, job.hash(), 100, 100, 1), 10).unwrap();
+    book.fund(&funding(&requester, job.hash(), 100, 100, 1), 10)
+        .unwrap();
     // payable_at = 20 + 10 = 30
-    book.release_scheduled(&receipt, assignment, 20, 10).unwrap();
+    book.release_scheduled(&receipt, assignment, 20, 10)
+        .unwrap();
 
     assert!(book.due_payouts(19).is_empty());
     assert!(book.due_payouts(20).is_empty());
@@ -442,9 +459,11 @@ fn disputed_slice_held_never_pays() {
     let assignment = &plan.assignments[0];
     let receipt = receipt(assignment, &provider, 5, 20, 1);
     let mut book = EscrowBook::new(NET);
-    book.fund(&funding(&requester, job.hash(), 100, 100, 1), 10).unwrap();
+    book.fund(&funding(&requester, job.hash(), 100, 100, 1), 10)
+        .unwrap();
     // payable_at = 20 + 10 = 30
-    book.release_scheduled(&receipt, assignment, 20, 10).unwrap();
+    book.release_scheduled(&receipt, assignment, 20, 10)
+        .unwrap();
 
     // Dispute during the delay window (height 25 < 30)
     assert!(book.hold(&assignment.hash()));
@@ -471,10 +490,12 @@ fn unused_escrow_refunded_with_scheduled_payouts() {
     let assignment = &plan.assignments[0];
     let receipt = receipt(assignment, &provider, 5, 20, 1);
     let mut book = EscrowBook::new(NET);
-    book.fund(&funding(&requester, job.hash(), 100, 100, 1), 10).unwrap();
+    book.fund(&funding(&requester, job.hash(), 100, 100, 1), 10)
+        .unwrap();
 
     // Release 35 sat with delay (payable_at = 30)
-    book.release_scheduled(&receipt, assignment, 20, 10).unwrap();
+    book.release_scheduled(&receipt, assignment, 20, 10)
+        .unwrap();
     assert_eq!(book.remaining_sat(&job.hash()), 65);
 
     // Refund after the deadline: 65 unused (35 is committed/scheduled)
@@ -491,7 +512,8 @@ fn scheduled_payout_immediate_when_delay_zero() {
     let assignment = &plan.assignments[0];
     let receipt = receipt(assignment, &provider, 5, 20, 1);
     let mut book = EscrowBook::new(NET);
-    book.fund(&funding(&requester, job.hash(), 100, 100, 1), 10).unwrap();
+    book.fund(&funding(&requester, job.hash(), 100, 100, 1), 10)
+        .unwrap();
 
     // delay = 0 means payable_at = 0 (immediate)
     let payout = book.release_scheduled(&receipt, assignment, 20, 0).unwrap();

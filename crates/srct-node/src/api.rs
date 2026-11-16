@@ -1723,8 +1723,8 @@ impl SharedNode {
             compute_receipts,
             compute_payouts,
             compute_payout_exit,
-                compute_escrow,
-                compute_bonds,
+            compute_escrow,
+            compute_bonds,
             compute_challenges,
             revoke_broadcast,
             compute_claims,
@@ -2072,8 +2072,19 @@ impl SharedNode {
                 };
                 r.expect_end().map_err(|e| format!("state envelope: {e}"))?;
                 (
-                    co, cj, ca, cr, cp, ce, escrow, compute_usage_ledger, bonds, challenges, rb,
-                    claims, preauth,
+                    co,
+                    cj,
+                    ca,
+                    cr,
+                    cp,
+                    ce,
+                    escrow,
+                    compute_usage_ledger,
+                    bonds,
+                    challenges,
+                    rb,
+                    claims,
+                    preauth,
                 )
             } else if version == 14 {
                 let co = decode_section(&mut r, "compute_offers", |sr| {
@@ -9532,13 +9543,7 @@ async fn compute_receipt_post(
             );
             let payout = sh
                 .compute_escrow
-                .release_for_claim_scheduled(
-                    &signed_receipt,
-                    &ticket,
-                    &claim,
-                    height,
-                    delay,
-                )
+                .release_for_claim_scheduled(&signed_receipt, &ticket, &claim, height, delay)
                 .map_err(map_settle_err)?;
             sh.compute_ledger
                 .settle_claim(&signed_receipt, &ticket, &claim, height)
@@ -9605,11 +9610,7 @@ async fn compute_receipt_post(
         };
         let consumer = if let Some(assignment) = sh.compute_assignments.get(&auth_id) {
             assignment.assignment.requester
-        } else if let Some(claim) = sh
-            .compute_claims
-            .all_claims()
-            .find(|c| c.hash() == auth_id)
-        {
+        } else if let Some(claim) = sh.compute_claims.all_claims().find(|c| c.hash() == auth_id) {
             sh.compute_claims
                 .ticket(&claim.claim.ticket)
                 .map(|t| t.ticket.requester)
@@ -10748,16 +10749,16 @@ async fn compute_attest_submit(
     State(state): State<ApiState>,
     Json(req): Json<ComputeAttestSubmitReq>,
 ) -> ApiResult {
-    let bytes = hex::decode(&req.quote_hex)
-        .map_err(|e| bad(format!("quote_hex is not hex: {e}")))?;
+    let bytes =
+        hex::decode(&req.quote_hex).map_err(|e| bad(format!("quote_hex is not hex: {e}")))?;
     let signed = srct_compute::SignedTeeQuote::decode(&bytes)
         .map_err(|e| fail(StatusCode::BAD_REQUEST, "invalid_quote", e.to_string()))?;
     with_shared(&state, |sh| {
         let height = sh.chain.height();
         let quote_hash = srct_core::hash::sha256_dom(b"srct/compute/tee/quote/v1", &[&bytes]);
-        let provider = signed.attester().map_err(|e| {
-            fail(StatusCode::BAD_REQUEST, "bad_attester", e.to_string())
-        })?;
+        let provider = signed
+            .attester()
+            .map_err(|e| fail(StatusCode::BAD_REQUEST, "bad_attester", e.to_string()))?;
         // Default max age of 256 heights (~2-3 days on mainnet).
         let max_age: u64 = 256;
         let expires = height.saturating_add(max_age);
@@ -10774,7 +10775,11 @@ async fn compute_attest_submit(
             "compute_attestation",
             Some(quote_hash),
             None,
-            format!("provider {} registered tee quote, expires at {}", address_to_hex(&provider), expires),
+            format!(
+                "provider {} registered tee quote, expires at {}",
+                address_to_hex(&provider),
+                expires
+            ),
         );
         Ok(Json(json!({
             "status": "registered",

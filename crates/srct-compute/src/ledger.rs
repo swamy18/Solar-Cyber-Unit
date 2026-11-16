@@ -117,16 +117,12 @@ impl UsageRecord {
             end_height: r.u64le().map_err(malformed)?,
             consumer_sig: {
                 let mut s = [0u8; 64];
-                s.copy_from_slice(
-                    r.fixed_slice(64).map_err(malformed)?,
-                );
+                s.copy_from_slice(r.fixed_slice(64).map_err(malformed)?);
                 s
             },
             provider_sig: {
                 let mut s = [0u8; 64];
-                s.copy_from_slice(
-                    r.fixed_slice(64).map_err(malformed)?,
-                );
+                s.copy_from_slice(r.fixed_slice(64).map_err(malformed)?);
                 s
             },
         };
@@ -138,13 +134,19 @@ impl UsageRecord {
             )));
         }
         if record.ticket == [0u8; 32] {
-            return Err(ComputeError::Malformed("usage record names no ticket".into()));
+            return Err(ComputeError::Malformed(
+                "usage record names no ticket".into(),
+            ));
         }
         if record.provider == [0u8; 20] {
-            return Err(ComputeError::Malformed("usage record names no provider".into()));
+            return Err(ComputeError::Malformed(
+                "usage record names no provider".into(),
+            ));
         }
         if record.units == 0 {
-            return Err(ComputeError::Malformed("usage record has zero units".into()));
+            return Err(ComputeError::Malformed(
+                "usage record has zero units".into(),
+            ));
         }
         if record.end_height < record.start_height {
             return Err(ComputeError::Malformed(
@@ -210,7 +212,9 @@ impl ComputeUsageLedger {
         consumer: Address,
     ) -> Result<SliceWindow, ComputeError> {
         if record.units == 0 {
-            return Err(ComputeError::Malformed("usage record has zero units".into()));
+            return Err(ComputeError::Malformed(
+                "usage record has zero units".into(),
+            ));
         }
         if record.end_height < record.start_height {
             return Err(ComputeError::Malformed(
@@ -227,10 +231,7 @@ impl ComputeUsageLedger {
             .entry(record.end_height)
             .or_default()
             .push((record.clone(), consumer));
-        *self
-            .provider_totals
-            .entry(record.provider)
-            .or_insert(0) += record.units;
+        *self.provider_totals.entry(record.provider).or_insert(0) += record.units;
         self.ticket_heights
             .entry(record.ticket)
             .or_default()
@@ -325,9 +326,7 @@ impl ComputeUsageLedger {
                 if n > MAX_ENTRY_BYTES {
                     return Err(ComputeError::Malformed("usage record over cap".into()));
                 }
-                let rec_bytes = r
-                    .fixed_slice(n)
-                    .map_err(malformed)?;
+                let rec_bytes = r.fixed_slice(n).map_err(malformed)?;
                 // rec_bytes = usage_record_bytes || consumer_address(20)
                 if rec_bytes.len() < 20 {
                     return Err(ComputeError::Malformed("usage record too short".into()));
@@ -363,13 +362,17 @@ impl ComputeUsageLedger {
             let ticket: Hash = r.fixed().map_err(malformed)?;
             let n_heights = r.u32le().map_err(malformed)? as usize;
             if n_heights > 10_000 {
-                return Err(ComputeError::Malformed("ledger ticket heights over cap".into()));
+                return Err(ComputeError::Malformed(
+                    "ledger ticket heights over cap".into(),
+                ));
             }
             let mut heights = BTreeSet::new();
             for _ in 0..n_heights {
                 let h = r.u64le().map_err(malformed)?;
                 if !heights.insert(h) {
-                    return Err(ComputeError::Malformed("duplicate ledger ticket height".into()));
+                    return Err(ComputeError::Malformed(
+                        "duplicate ledger ticket height".into(),
+                    ));
                 }
             }
             if ticket_heights.insert(ticket, heights).is_some() {
@@ -465,16 +468,10 @@ mod tests {
         let mut ledger = ComputeUsageLedger::new();
         let ticket = [2u8; 32];
         ledger
-            .record(
-                &record(1, ticket, 100, 0, 9),
-                Address::default(),
-            )
+            .record(&record(1, ticket, 100, 0, 9), Address::default())
             .unwrap();
         ledger
-            .record(
-                &record(2, ticket, 200, 10, 19),
-                Address::default(),
-            )
+            .record(&record(2, ticket, 200, 10, 19), Address::default())
             .unwrap();
 
         let bytes = ledger.encode();

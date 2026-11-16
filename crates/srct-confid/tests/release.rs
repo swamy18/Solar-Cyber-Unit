@@ -3,9 +3,7 @@
 //! paths are covered in `srct-compute`'s own vendor suite; the gate logic
 //! is family-independent.
 
-use srct_compute::tee::{
-    AttestationRoots, SignedTeeQuote, TeeQuote, TeeSla, TeeType, TEE_VERSION,
-};
+use srct_compute::tee::{AttestationRoots, SignedTeeQuote, TeeQuote, TeeSla, TeeType, TEE_VERSION};
 use srct_compute::vendor::{
     expected_report_binding, NvidiaReport, TcbPolicy, VendorEvidence, VendorInputs, VendorRoots,
 };
@@ -51,8 +49,8 @@ fn sim_nvidia(enclave_pub: &[u8; 32], nonce: u64) -> (NvidiaReport, [u8; 65]) {
     });
     let header_b64 =
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(r#"{"alg":"ES256","typ":"JWT"}"#);
-    let payload_b64 =
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap());
+    let payload_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(serde_json::to_vec(&payload).unwrap());
     let input = format!("{header_b64}.{payload_b64}");
     let sig: p256::ecdsa::Signature = sk.sign(input.as_bytes());
     let mut sig64 = [0u8; 64];
@@ -213,7 +211,15 @@ fn release_never_happens_on_failed_attestation() {
         presented_pubkey: &inputs.presented_pubkey,
         current_height: 100,
     };
-    let refused = release_data_key(&ks, "job-1", &eph_pub, srct_confid::KeyPurpose::Data, b"t", NOW, &bad_policy);
+    let refused = release_data_key(
+        &ks,
+        "job-1",
+        &eph_pub,
+        srct_confid::KeyPurpose::Data,
+        b"t",
+        NOW,
+        &bad_policy,
+    );
     assert!(matches!(refused, Err(ConfidError::AttestationFailed(_))));
     // A permissive vendor-inputs measurement cannot widen the consumer's
     // SLA: the SLA stays authoritative and the release still fails.
@@ -228,7 +234,15 @@ fn release_never_happens_on_failed_attestation() {
         current_height: 100,
     };
     assert!(matches!(
-        release_data_key(&ks, "job-1", &eph_pub, srct_confid::KeyPurpose::Data, b"t", NOW, &loose_policy),
+        release_data_key(
+            &ks,
+            "job-1",
+            &eph_pub,
+            srct_confid::KeyPurpose::Data,
+            b"t",
+            NOW,
+            &loose_policy
+        ),
         Err(ConfidError::AttestationFailed(_))
     ));
     let _ = std::fs::remove_dir_all(&dir);
@@ -253,17 +267,39 @@ fn release_refuses_missing_expired_revoked_keys() {
         current_height: 100,
     };
     let call = |id: &str, now: u64| {
-        release_data_key(&ks, id, &eph_pub, srct_confid::KeyPurpose::Data, b"t", now, &policy)
+        release_data_key(
+            &ks,
+            id,
+            &eph_pub,
+            srct_confid::KeyPurpose::Data,
+            b"t",
+            now,
+            &policy,
+        )
     };
     // Unknown key.
     assert!(matches!(call("nope", NOW), Err(ConfidError::UnknownKey(_))));
     // Revoked key.
-    assert!(matches!(call("ephemeral", NOW), Err(ConfidError::Revoked(_))));
+    assert!(matches!(
+        call("ephemeral", NOW),
+        Err(ConfidError::Revoked(_))
+    ));
     // Expired key (TTL 10, now far past creation).
-    assert!(matches!(call("short", NOW + 11), Err(ConfidError::Expired(_))));
+    assert!(matches!(
+        call("short", NOW + 11),
+        Err(ConfidError::Expired(_))
+    ));
     // Presented key must match the release target.
     assert!(matches!(
-        release_data_key(&ks, "short", &[0u8; 32], srct_confid::KeyPurpose::Data, b"t", NOW, &policy),
+        release_data_key(
+            &ks,
+            "short",
+            &[0u8; 32],
+            srct_confid::KeyPurpose::Data,
+            b"t",
+            NOW,
+            &policy
+        ),
         Err(ConfidError::AttestationFailed(_))
     ));
     let _ = std::fs::remove_dir_all(&dir);

@@ -11,15 +11,15 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use chacha20poly1305::{XChaCha20Poly1305, KeyInit, Key};
 use chacha20poly1305::aead::{Aead, Payload};
+use chacha20poly1305::{Key, KeyInit, XChaCha20Poly1305};
+use generic_array::{typenum::U24, GenericArray};
 use zeroize::Zeroizing;
-use generic_array::{GenericArray, typenum::U24};
 
-use srct_core::hash::{Hash, sha256_dom};
-use crate::tee::{TeeSla, SignedTeeQuote, TeeVerifier, TeeError, AttestationRoots, TeeType};
+use crate::tee::{AttestationRoots, SignedTeeQuote, TeeError, TeeSla, TeeType, TeeVerifier};
 use crate::vendor::VendorInputs;
 use crate::ComputeError;
+use srct_core::hash::{sha256_dom, Hash};
 
 const DOM_SESSION: &[u8] = b"srct/guest/session/v1";
 const DOM_USAGE: &[u8] = b"srct/guest/usage/v1";
@@ -111,7 +111,9 @@ impl GuestSession {
         height: u64,
     ) -> Result<(), TeeError> {
         if self.state != SessionState::Attesting {
-            return Err(TeeError::Malformed("key release only in Attesting state".into()));
+            return Err(TeeError::Malformed(
+                "key release only in Attesting state".into(),
+            ));
         }
         self.sealed_key = Some(sealed);
         self.data_key = Some(Zeroizing::new(data_key));
@@ -128,7 +130,9 @@ impl GuestSession {
     /// key and input are now resident in guest memory.
     pub fn start_run(&mut self, input: Vec<u8>, height: u64) -> Result<(), TeeError> {
         if self.state != SessionState::KeyReleased {
-            return Err(TeeError::Malformed("start_run only in KeyReleased state".into()));
+            return Err(TeeError::Malformed(
+                "start_run only in KeyReleased state".into(),
+            ));
         }
         let input_zero = Zeroizing::new(input);
         self.input = Some(input_zero);
@@ -145,16 +149,28 @@ impl GuestSession {
     /// Running → Sealed. The output is AEAD-sealed under the data key.
     pub fn seal_output(&mut self, output: &[u8], height: u64) -> Result<Vec<u8>, TeeError> {
         if self.state != SessionState::Running {
-            return Err(TeeError::Malformed("seal_output only in Running state".into()));
+            return Err(TeeError::Malformed(
+                "seal_output only in Running state".into(),
+            ));
         }
-        let data_key = self.data_key.as_ref().ok_or(TeeError::Malformed("no data key in guest".into()))?;
+        let data_key = self
+            .data_key
+            .as_ref()
+            .ok_or(TeeError::Malformed("no data key in guest".into()))?;
         let cipher = XChaCha20Poly1305::new(Key::from_slice(data_key.as_ref()));
         let mut nonce = [0u8; 24];
         // Use deterministic nonce derived from session + output for auditability.
         let nonce_input = sha256_dom(DOM_SESSION, &[&self.session_id, output]);
         nonce.copy_from_slice(&nonce_input[..24]);
         let nonce_n = GenericArray::<u8, U24>::from_slice(&nonce);
-        let ct = cipher.encrypt(nonce_n, Payload { msg: output, aad: &[] })
+        let ct = cipher
+            .encrypt(
+                nonce_n,
+                Payload {
+                    msg: output,
+                    aad: &[],
+                },
+            )
             .map_err(|e| TeeError::Malformed(format!("output seal failed: {e}")))?;
         let mut sealed_out = nonce.to_vec();
         sealed_out.extend_from_slice(&ct);
@@ -229,13 +245,31 @@ impl UsageRecord {
 
     pub fn decode(bytes: &[u8]) -> Result<Self, ComputeError> {
         let mut r = srct_core::ser::Reader::new(bytes);
-        let session_id = r.fixed().map_err(|e| ComputeError::Malformed(format!("session_id: {e}")))?;
-        let output_hash = r.fixed().map_err(|e| ComputeError::Malformed(format!("output_hash: {e}")))?;
-        let units = r.u32le().map_err(|e| ComputeError::Malformed(format!("units: {e}")))?;
-        let slice_height = r.u64le().map_err(|e| ComputeError::Malformed(format!("slice_height: {e}")))?;
-        let sealed = r.u8().map_err(|e| ComputeError::Malformed(format!("sealed: {e}")))? != 0;
-        r.expect_end().map_err(|e| ComputeError::Malformed(format!("trailing: {e}")))?;
-        Ok(UsageRecord { session_id, output_hash, units, slice_height, sealed })
+        let session_id = r
+            .fixed()
+            .map_err(|e| ComputeError::Malformed(format!("session_id: {e}")))?;
+        let output_hash = r
+            .fixed()
+            .map_err(|e| ComputeError::Malformed(format!("output_hash: {e}")))?;
+        let units = r
+            .u32le()
+            .map_err(|e| ComputeError::Malformed(format!("units: {e}")))?;
+        let slice_height = r
+            .u64le()
+            .map_err(|e| ComputeError::Malformed(format!("slice_height: {e}")))?;
+        let sealed = r
+            .u8()
+            .map_err(|e| ComputeError::Malformed(format!("sealed: {e}")))?
+            != 0;
+        r.expect_end()
+            .map_err(|e| ComputeError::Malformed(format!("trailing: {e}")))?;
+        Ok(UsageRecord {
+            session_id,
+            output_hash,
+            units,
+            slice_height,
+            sealed,
+        })
     }
 }
 
@@ -255,7 +289,8 @@ pub fn attest_quote(
 }
 
 fn now_unix() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
 }
@@ -285,7 +320,10 @@ mod tests {
         assert_eq!(session.state, SessionState::Attesting);
 
         // Release key
-        let sealed = SealedKey { encapped: [1u8; 32], ct: vec![2u8; 48] };
+        let sealed = SealedKey {
+            encapped: [1u8; 32],
+            ct: vec![2u8; 48],
+        };
         session.release_key(sealed.clone(), [3u8; 32], 11).unwrap();
         assert_eq!(session.state, SessionState::KeyReleased);
 
@@ -344,7 +382,10 @@ mod tests {
             measurement: [7u8; 32],
         };
         let mut session = GuestSession::new([9u8; 32], TeeType::Tdx, sla, 10);
-        let sealed = SealedKey { encapped: [1u8; 32], ct: vec![2u8; 48] };
+        let sealed = SealedKey {
+            encapped: [1u8; 32],
+            ct: vec![2u8; 48],
+        };
         session.release_key(sealed.clone(), [3u8; 32], 11).unwrap();
         assert!(session.release_key(sealed, [3u8; 32], 12).is_err());
     }

@@ -13,13 +13,13 @@
 //! is sealed under a separate wrapping key, so the bundle is confidential
 //! end-to-end: neither the manifest nor any chunk leaks without the key.
 
-use chacha20poly1305::{XChaCha20Poly1305, KeyInit, Key};
 use chacha20poly1305::aead::{Aead, Payload};
-use rand::{RngCore, thread_rng};
-use generic_array::{GenericArray, typenum::U24};
+use chacha20poly1305::{Key, KeyInit, XChaCha20Poly1305};
+use generic_array::{typenum::U24, GenericArray};
+use rand::{thread_rng, RngCore};
 
-use srct_core::hash::{Hash, sha256_dom};
 use crate::ComputeError;
+use srct_core::hash::{sha256_dom, Hash};
 
 /// Shield bundle envelope version.
 pub const SHIELD_VERSION: u8 = 1;
@@ -82,9 +82,18 @@ pub struct SealedShield {
 
 /// Seal a plaintext payload into a shield bundle. `data_key` is the
 /// per-bundle XChaCha20-Poly1305 key (32 bytes).
-pub fn seal(data_key: &[u8; KEY_LEN], payload: &[u8], job_id: Hash, ticket_id: Hash, measurement: Hash, created_height: u64) -> Result<SealedShield, ComputeError> {
+pub fn seal(
+    data_key: &[u8; KEY_LEN],
+    payload: &[u8],
+    job_id: Hash,
+    ticket_id: Hash,
+    measurement: Hash,
+    created_height: u64,
+) -> Result<SealedShield, ComputeError> {
     if data_key.len() != KEY_LEN {
-        return Err(ComputeError::Malformed("shield data key must be 32 bytes".into()));
+        return Err(ComputeError::Malformed(
+            "shield data key must be 32 bytes".into(),
+        ));
     }
     let key = Key::from_slice(data_key);
     let cipher = XChaCha20Poly1305::new(key);
@@ -99,9 +108,20 @@ pub fn seal(data_key: &[u8; KEY_LEN], payload: &[u8], job_id: Hash, ticket_id: H
         let mut nonce = [0u8; NONCE_LEN];
         thread_rng().fill_bytes(&mut nonce);
         let nonce_n = GenericArray::<u8, U24>::from_slice(&nonce);
-        let ct = cipher.encrypt(nonce_n, Payload { msg: plain, aad: &[] })
+        let ct = cipher
+            .encrypt(
+                nonce_n,
+                Payload {
+                    msg: plain,
+                    aad: &[],
+                },
+            )
             .map_err(|e| ComputeError::Malformed(format!("chunk {index} seal failed: {e}")))?;
-        chunks.push(ShieldChunk { index, ciphertext: ct, nonce });
+        chunks.push(ShieldChunk {
+            index,
+            ciphertext: ct,
+            nonce,
+        });
         offset = end;
         index += 1;
         if index > MAX_CHUNKS as u32 {
@@ -138,12 +158,22 @@ pub fn seal(data_key: &[u8; KEY_LEN], payload: &[u8], job_id: Hash, ticket_id: H
     thread_rng().fill_bytes(&mut wrap_nonce);
     let manifest_bytes = manifest.encode();
     let wrap_nonce_arr = GenericArray::<u8, U24>::from_slice(&wrap_nonce);
-    let manifest_ct_body = wrap_cipher.encrypt(wrap_nonce_arr, Payload { msg: &manifest_bytes, aad: &[] })
+    let manifest_ct_body = wrap_cipher
+        .encrypt(
+            wrap_nonce_arr,
+            Payload {
+                msg: &manifest_bytes,
+                aad: &[],
+            },
+        )
         .map_err(|e| ComputeError::Malformed(format!("manifest seal failed: {e}")))?;
     let mut manifest_ct = wrap_nonce.to_vec();
     manifest_ct.extend_from_slice(&manifest_ct_body);
 
-    Ok(SealedShield { manifest_ct, chunks })
+    Ok(SealedShield {
+        manifest_ct,
+        chunks,
+    })
 }
 
 /// Open a sealed shield bundle, returning the plaintext payload.
@@ -151,7 +181,9 @@ pub fn seal(data_key: &[u8; KEY_LEN], payload: &[u8], job_id: Hash, ticket_id: H
 /// tampering, wrong key, or bad chunk refuses.
 pub fn open(data_key: &[u8; KEY_LEN], sealed: &SealedShield) -> Result<Vec<u8>, ComputeError> {
     if data_key.len() != KEY_LEN {
-        return Err(ComputeError::Malformed("shield data key must be 32 bytes".into()));
+        return Err(ComputeError::Malformed(
+            "shield data key must be 32 bytes".into(),
+        ));
     }
     let key = Key::from_slice(data_key);
     let cipher = XChaCha20Poly1305::new(key);
@@ -162,12 +194,23 @@ pub fn open(data_key: &[u8; KEY_LEN], sealed: &SealedShield) -> Result<Vec<u8>, 
     // The wrap nonce is the first 24 bytes of manifest_ct? No — we need to
     // store it. We prepend it: manifest_ct = nonce(24) || ciphertext.
     if sealed.manifest_ct.len() < NONCE_LEN + 16 {
-        return Err(ComputeError::Malformed("manifest ciphertext too short".into()));
+        return Err(ComputeError::Malformed(
+            "manifest ciphertext too short".into(),
+        ));
     }
     let (wrap_nonce, wrap_body) = sealed.manifest_ct.split_at(NONCE_LEN);
     let wrap_nonce_arr = GenericArray::<u8, U24>::from_slice(wrap_nonce);
-    let manifest_bytes = wrap_cipher.decrypt(wrap_nonce_arr, Payload { msg: wrap_body, aad: &[] })
-        .map_err(|_| ComputeError::BadSignature("manifest unseal failed: wrong key or tampered".into()))?;
+    let manifest_bytes = wrap_cipher
+        .decrypt(
+            wrap_nonce_arr,
+            Payload {
+                msg: wrap_body,
+                aad: &[],
+            },
+        )
+        .map_err(|_| {
+            ComputeError::BadSignature("manifest unseal failed: wrong key or tampered".into())
+        })?;
     let manifest = ShieldBundle::decode(&manifest_bytes)
         .map_err(|e| ComputeError::Malformed(format!("manifest decode failed: {e}")))?;
 
@@ -179,21 +222,41 @@ pub fn open(data_key: &[u8; KEY_LEN], sealed: &SealedShield) -> Result<Vec<u8>, 
     // Verify Merkle root over chunk ciphertexts.
     let root = merkle_root(&sealed.chunks);
     if root != manifest_merkle_root(&manifest)? {
-        return Err(ComputeError::BadSignature("Merkle root mismatch: chunk tampering".into()));
+        return Err(ComputeError::BadSignature(
+            "Merkle root mismatch: chunk tampering".into(),
+        ));
     }
 
     // Decrypt each chunk in order, reconstruct plaintext.
     let mut plaintext = Vec::with_capacity(manifest.total_size as usize);
     for (i, chunk) in sealed.chunks.iter().enumerate() {
         if chunk.index as usize != i {
-            return Err(ComputeError::Malformed(format!("chunk {} out of order", chunk.index)));
+            return Err(ComputeError::Malformed(format!(
+                "chunk {} out of order",
+                chunk.index
+            )));
         }
         if chunk.ciphertext.len() < 16 {
-            return Err(ComputeError::Malformed(format!("chunk {} ciphertext too short", chunk.index)));
+            return Err(ComputeError::Malformed(format!(
+                "chunk {} ciphertext too short",
+                chunk.index
+            )));
         }
         let chunk_nonce = GenericArray::<u8, U24>::from_slice(&chunk.nonce);
-        let pt = cipher.decrypt(chunk_nonce, Payload { msg: &chunk.ciphertext, aad: &[] })
-            .map_err(|_| ComputeError::BadSignature(format!("chunk {} unseal failed: wrong key or tampered", chunk.index)))?;
+        let pt = cipher
+            .decrypt(
+                chunk_nonce,
+                Payload {
+                    msg: &chunk.ciphertext,
+                    aad: &[],
+                },
+            )
+            .map_err(|_| {
+                ComputeError::BadSignature(format!(
+                    "chunk {} unseal failed: wrong key or tampered",
+                    chunk.index
+                ))
+            })?;
         plaintext.extend_from_slice(&pt);
     }
 
@@ -208,9 +271,10 @@ fn merkle_root(chunks: &[ShieldChunk]) -> Hash {
     if chunks.is_empty() {
         return sha256_dom(DOM_LEAF, &[&[]]);
     }
-    let mut level: Vec<Hash> = chunks.iter().map(|c| {
-        sha256_dom(DOM_LEAF, &[&c.ciphertext])
-    }).collect();
+    let mut level: Vec<Hash> = chunks
+        .iter()
+        .map(|c| sha256_dom(DOM_LEAF, &[&c.ciphertext]))
+        .collect();
     while level.len() > 1 {
         let mut next: Vec<Hash> = Vec::with_capacity(level.len().div_ceil(2));
         for pair in level.chunks(2) {
@@ -237,7 +301,10 @@ fn merkle_root_chunks(chunks: &[ShieldChunk]) -> Hash {
     if chunks.is_empty() {
         return sha256_dom(DOM_LEAF, &[&[]]);
     }
-    let mut level: Vec<Hash> = chunks.iter().map(|c| sha256_dom(DOM_LEAF, &[&c.ciphertext])).collect();
+    let mut level: Vec<Hash> = chunks
+        .iter()
+        .map(|c| sha256_dom(DOM_LEAF, &[&c.ciphertext]))
+        .collect();
     while level.len() > 1 {
         let mut next: Vec<Hash> = Vec::with_capacity(level.len().div_ceil(2));
         for pair in level.chunks(2) {
@@ -278,41 +345,91 @@ impl ShieldBundle {
     /// Strict inverse of [`encode`].
     pub fn decode(bytes: &[u8]) -> Result<Self, ComputeError> {
         let mut r = srct_core::ser::Reader::new(bytes);
-        let version = r.u8().map_err(|e| ComputeError::Malformed(format!("version: {e}")))?;
+        let version = r
+            .u8()
+            .map_err(|e| ComputeError::Malformed(format!("version: {e}")))?;
         if version != SHIELD_VERSION {
-            return Err(ComputeError::Malformed(format!("unsupported shield version {version}")));
+            return Err(ComputeError::Malformed(format!(
+                "unsupported shield version {version}"
+            )));
         }
-        let job_id = r.fixed().map_err(|e| ComputeError::Malformed(format!("job_id: {e}")))?;
-        let ticket_id = r.fixed().map_err(|e| ComputeError::Malformed(format!("ticket_id: {e}")))?;
-        let measurement = r.fixed().map_err(|e| ComputeError::Malformed(format!("measurement: {e}")))?;
-        let chunk_count = r.u32le().map_err(|e| ComputeError::Malformed(format!("chunk_count: {e}")))? as usize;
+        let job_id = r
+            .fixed()
+            .map_err(|e| ComputeError::Malformed(format!("job_id: {e}")))?;
+        let ticket_id = r
+            .fixed()
+            .map_err(|e| ComputeError::Malformed(format!("ticket_id: {e}")))?;
+        let measurement = r
+            .fixed()
+            .map_err(|e| ComputeError::Malformed(format!("measurement: {e}")))?;
+        let chunk_count = r
+            .u32le()
+            .map_err(|e| ComputeError::Malformed(format!("chunk_count: {e}")))?
+            as usize;
         if chunk_count > MAX_CHUNKS {
             return Err(ComputeError::Malformed("too many chunks".into()));
         }
-        let total_size = r.u64le().map_err(|e| ComputeError::Malformed(format!("total_size: {e}")))?;
-        let created_height = r.u64le().map_err(|e| ComputeError::Malformed(format!("created_height: {e}")))?;
-        let manifest_nonce = r.fixed::<NONCE_LEN>().map_err(|e| ComputeError::Malformed(format!("manifest_nonce: {e}")))?;
+        let total_size = r
+            .u64le()
+            .map_err(|e| ComputeError::Malformed(format!("total_size: {e}")))?;
+        let created_height = r
+            .u64le()
+            .map_err(|e| ComputeError::Malformed(format!("created_height: {e}")))?;
+        let manifest_nonce = r
+            .fixed::<NONCE_LEN>()
+            .map_err(|e| ComputeError::Malformed(format!("manifest_nonce: {e}")))?;
 
-        let chunk_count2 = r.u32le().map_err(|e| ComputeError::Malformed(format!("chunk_count2: {e}")))? as usize;
+        let chunk_count2 = r
+            .u32le()
+            .map_err(|e| ComputeError::Malformed(format!("chunk_count2: {e}")))?
+            as usize;
         if chunk_count2 != chunk_count {
-            return Err(ComputeError::Malformed("chunk count mismatch in manifest".into()));
+            return Err(ComputeError::Malformed(
+                "chunk count mismatch in manifest".into(),
+            ));
         }
         let mut chunks = Vec::with_capacity(chunk_count);
         for i in 0..chunk_count {
-            let index = r.u32le().map_err(|e| ComputeError::Malformed(format!("chunk {i} index: {e}")))?;
+            let index = r
+                .u32le()
+                .map_err(|e| ComputeError::Malformed(format!("chunk {i} index: {e}")))?;
             if index != i as u32 {
-                return Err(ComputeError::Malformed(format!("chunk {i} index {index} out of order")));
+                return Err(ComputeError::Malformed(format!(
+                    "chunk {i} index {index} out of order"
+                )));
             }
-            let nonce = r.fixed::<NONCE_LEN>().map_err(|e| ComputeError::Malformed(format!("chunk {i} nonce: {e}")))?;
-            let ct_len = r.u32le().map_err(|e| ComputeError::Malformed(format!("chunk {i} ct_len: {e}")))? as usize;
+            let nonce = r
+                .fixed::<NONCE_LEN>()
+                .map_err(|e| ComputeError::Malformed(format!("chunk {i} nonce: {e}")))?;
+            let ct_len = r
+                .u32le()
+                .map_err(|e| ComputeError::Malformed(format!("chunk {i} ct_len: {e}")))?
+                as usize;
             if ct_len > MAX_CHUNK_BYTES + 16 {
                 return Err(ComputeError::Malformed(format!("chunk {i} too large")));
             }
-            let ciphertext = r.fixed_slice(ct_len).map_err(|e| ComputeError::Malformed(format!("chunk {i} ct: {e}")))?.to_vec();
-            chunks.push(ShieldChunk { index, ciphertext, nonce });
+            let ciphertext = r
+                .fixed_slice(ct_len)
+                .map_err(|e| ComputeError::Malformed(format!("chunk {i} ct: {e}")))?
+                .to_vec();
+            chunks.push(ShieldChunk {
+                index,
+                ciphertext,
+                nonce,
+            });
         }
-        r.expect_end().map_err(|e| ComputeError::Malformed(format!("trailing bytes: {e}")))?;
-        Ok(ShieldBundle { version, job_id, ticket_id, measurement, chunks, total_size, created_height, manifest_nonce })
+        r.expect_end()
+            .map_err(|e| ComputeError::Malformed(format!("trailing bytes: {e}")))?;
+        Ok(ShieldBundle {
+            version,
+            job_id,
+            ticket_id,
+            measurement,
+            chunks,
+            total_size,
+            created_height,
+            manifest_nonce,
+        })
     }
 }
 
@@ -372,7 +489,11 @@ mod tests {
             job_id: [1u8; 32],
             ticket_id: [2u8; 32],
             measurement: [3u8; 32],
-            chunks: vec![ShieldChunk { index: 0, ciphertext: vec![1,2,3], nonce: [4u8; NONCE_LEN] }],
+            chunks: vec![ShieldChunk {
+                index: 0,
+                ciphertext: vec![1, 2, 3],
+                nonce: [4u8; NONCE_LEN],
+            }],
             total_size: 3,
             created_height: 999,
             manifest_nonce: [5u8; NONCE_LEN],
@@ -385,8 +506,16 @@ mod tests {
     #[test]
     fn merkle_root_stable() {
         let chunks = vec![
-            ShieldChunk { index: 0, ciphertext: vec![1u8], nonce: [0u8; NONCE_LEN] },
-            ShieldChunk { index: 1, ciphertext: vec![2u8], nonce: [0u8; NONCE_LEN] },
+            ShieldChunk {
+                index: 0,
+                ciphertext: vec![1u8],
+                nonce: [0u8; NONCE_LEN],
+            },
+            ShieldChunk {
+                index: 1,
+                ciphertext: vec![2u8],
+                nonce: [0u8; NONCE_LEN],
+            },
         ];
         let r1 = merkle_root(&chunks);
         let r2 = merkle_root(&chunks);

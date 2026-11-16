@@ -646,11 +646,7 @@ impl P2pNode {
     /// reason `Chain` is: the mempool is validated against chain state, so all of
     /// it has to be in the same hands to be consistent, and only the chain thread
     /// mutates any of it. See [`NodeState`].
-    pub fn poll_events(
-        &self,
-        mut state: NodeState<'_>,
-        now_ms: Option<u64>,
-    ) -> usize {
+    pub fn poll_events(&self, mut state: NodeState<'_>, now_ms: Option<u64>) -> usize {
         let mut count = 0;
 
         // Peers stopped since the last call are released here rather than waiting
