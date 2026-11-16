@@ -5,7 +5,7 @@
 //! (never accept) on malformed input.
 
 use libfuzzer_sys::fuzz_target;
-use srct_compute::vendor::{split_cert_der, verify_cert_chain};
+use srct_compute::vendor::{split_cert_der, verify_cert_chain, ChainCurve};
 
 fuzz_target!(|data: &[u8]| {
     if data.len() < 66 {
@@ -32,5 +32,5 @@ fuzz_target!(|data: &[u8]| {
         let _ = split_cert_der(chain_blob);
         return;
     }
-    let _ = verify_cert_chain(&chain, &[pin], &[], 1_700_000_000);
+    let _ = verify_cert_chain(&chain, &[pin], &[], 1_700_000_000, ChainCurve::P256);
 });
