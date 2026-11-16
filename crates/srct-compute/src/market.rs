@@ -27,6 +27,7 @@
 //!   exceeds the job's total budget is refused, never truncated.
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 
 use srct_core::agent::MAX_NETWORK_ID_LEN;
 use srct_core::hash::{sha256_dom, Address, Hash};
@@ -43,7 +44,7 @@ use crate::ComputeError;
 pub const OFFER_VERSION: u8 = 1;
 /// Job wire version 2 appends throughput and bandwidth floors. Version 1
 /// jobs still decode, with both floors 0 (require nothing).
-pub const JOB_VERSION: u8 = 2;
+pub const JOB_VERSION: u8 = 3;
 pub const ASSIGNMENT_VERSION: u8 = 1;
 /// Longest accepted service tag.
 pub const MAX_SERVICE_LEN: usize = 64;
@@ -307,6 +308,10 @@ pub struct ComputeJob {
     pub min_verification: Verification,
     /// Require a provider that accepts sealed inputs.
     pub sealed_input: bool,
+    /// Confidential tier: only providers with a valid, fresh attestation
+    /// matching this job's SLA may plan/claim it. Version 3+ carries the
+    /// flag on the wire; v1/v2 jobs decode as non-confidential.
+    pub confidential: bool,
     /// Commitment to the input data. The payload moves off-protocol.
     pub input: Hash,
     pub deadline: u64,
@@ -351,7 +356,6 @@ impl ComputeJob {
         }
         Ok(())
     }
-
     pub fn requirement(&self) -> DeviceRequirement {
         DeviceRequirement {
             // Kept on the wire for compatibility; matching ignores it.
@@ -386,6 +390,9 @@ impl ComputeJob {
             .fixed(&self.input)
             .u64le(self.deadline)
             .u64le(self.nonce);
+        if self.version == JOB_VERSION {
+            w.u8(self.confidential as u8);
+        }
         w.into_vec()
     }
 
@@ -451,6 +458,17 @@ impl ComputeJob {
             input: r.fixed().map_err(malformed)?,
             deadline: r.u64le().map_err(malformed)?,
             nonce: r.u64le().map_err(malformed)?,
+            // Version 3 appends the confidentiality flag; v1/v2 jobs decode as
+            // non-confidential.
+            confidential: if version == JOB_VERSION {
+                let flag = r.u8().map_err(malformed)?;
+                if flag > 1 {
+                    return Err(ComputeError::Malformed("job confidential flag".into()));
+                }
+                flag == 1
+            } else {
+                false
+            },
         };
         r.expect_end().map_err(malformed)?;
         job.validate()?;
@@ -813,6 +831,7 @@ pub fn plan_assignments(
     offers: &[SignedOffer],
     height: u64,
     attempt: u16,
+    attested: Option<&BTreeSet<Address>>,
 ) -> Result<Plan, ComputeError> {
     job.verify()?;
     if attempt > MAX_ATTEMPTS {
@@ -822,6 +841,18 @@ pub fn plan_assignments(
         return Err(ComputeError::Expired);
     }
     let requirement = job.job.requirement();
+
+    // Confidential jobs require attestation evidence; without it the plan is
+    // refused fail-closed. With evidence, only attested providers are eligible.
+    let attested_set = if job.job.confidential {
+        match attested {
+            Some(set) => set,
+            None => return Err(ComputeError::AttestationRequired),
+        }
+    } else {
+        // Non-confidential jobs ignore attestation entirely.
+        &BTreeSet::new()
+    };
 
     let candidates: Vec<&SignedOffer> = offers
         .iter()
@@ -835,6 +866,7 @@ pub fn plan_assignments(
                 && offer.offer.verification >= job.job.min_verification
                 && (!job.job.sealed_input || offer.offer.privacy)
                 && offer.offer.profile.meets(&requirement)
+                && (attested_set.is_empty() || attested_set.contains(&offer.offer.provider))
         })
         .collect();
     if candidates.is_empty() {

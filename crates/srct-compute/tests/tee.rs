@@ -3,7 +3,8 @@
 //! and replay protection.
 
 use srct_compute::tee::{
-    AttestationRoots, SignedTeeQuote, TeeError, TeeQuote, TeeSla, TeeType, TeeVerifier, TEE_VERSION,
+    AttestationRoots, SignedTeeQuote, TeeError, TeeQuote, TeeSla, TeeType, TeeVerifier,
+    TEE_VERSION_V1,
 };
 use srct_core::hash::Hash;
 use srct_core::wallet::Wallet;
@@ -28,7 +29,7 @@ fn setup() -> (Wallet, Wallet, Wallet, TeeSla, AttestationRoots) {
     let stranger = wallet(9);
     let (workload, model, runtime, config, input, _output) = hashes();
     let sla = TeeSla {
-        version: TEE_VERSION,
+        version: TEE_VERSION_V1,
         network_id: NET.into(),
         provider: provider.address().unwrap(),
         workload,
@@ -38,6 +39,9 @@ fn setup() -> (Wallet, Wallet, Wallet, TeeSla, AttestationRoots) {
         input_hash: input,
         tee: TeeType::SevSnp,
         max_age_heights: MAX_AGE,
+        min_tcb_svn: [0u8; 16],
+        allow_debug: false,
+        measurement: [0u8; 32],
     };
     let mut roots = AttestationRoots::new();
     roots.add_root(attester.address().unwrap(), TeeType::SevSnp);
@@ -46,7 +50,7 @@ fn setup() -> (Wallet, Wallet, Wallet, TeeSla, AttestationRoots) {
 
 fn quote_for(sla: &TeeSla, height: u64, nonce: u64, output: Hash) -> TeeQuote {
     TeeQuote {
-        version: TEE_VERSION,
+        version: TEE_VERSION_V1,
         network_id: sla.network_id.clone(),
         provider: sla.provider,
         tee: sla.tee,
@@ -58,6 +62,10 @@ fn quote_for(sla: &TeeSla, height: u64, nonce: u64, output: Hash) -> TeeQuote {
         output_hash: output,
         height,
         nonce,
+        debug: false,
+        tcb_svn: [0u8; 16],
+        report_data: [0u8; 32],
+        vendor: None,
     }
 }
 

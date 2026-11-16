@@ -438,11 +438,11 @@ fn tee_setup() -> (
     srct_verify::TeeSla,
     srct_verify::SignedTeeQuote,
 ) {
-    use srct_verify::{AttestationRoots, SignedTeeQuote, TeeQuote, TeeSla, TeeType, TEE_VERSION};
+    use srct_verify::{AttestationRoots, SignedTeeQuote, TeeQuote, TeeSla, TeeType, TEE_VERSION_V1};
     let provider = wallet(21);
     let attester = wallet(22);
     let sla = TeeSla {
-        version: TEE_VERSION,
+        version: TEE_VERSION_V1,
         network_id: NET.into(),
         provider: provider.address().unwrap(),
         workload: [11u8; 32],
@@ -452,9 +452,12 @@ fn tee_setup() -> (
         input_hash: [24u8; 32],
         tee: TeeType::SevSnp,
         max_age_heights: 10,
+        min_tcb_svn: [0u8; 16],
+        allow_debug: false,
+        measurement: [0u8; 32],
     };
     let quote = TeeQuote {
-        version: TEE_VERSION,
+        version: TEE_VERSION_V1,
         network_id: NET.into(),
         provider: provider.address().unwrap(),
         tee: TeeType::SevSnp,
@@ -466,6 +469,10 @@ fn tee_setup() -> (
         output_hash: [25u8; 32],
         height: 50,
         nonce: 1,
+        debug: false,
+        tcb_svn: [0u8; 16],
+        report_data: [0u8; 32],
+        vendor: None,
     };
     let signed = SignedTeeQuote::sign(quote, &attester).unwrap();
     let mut roots = AttestationRoots::new();

@@ -1,5 +1,9 @@
 //! Decentralized compute sharing for heterogeneous devices (non-consensus).
 //!
+//! `generic-array` 0.14 is deprecated but required by `chacha20poly1305` 0.10
+//! for AEAD nonce construction. Allow deprecated here.
+#![allow(deprecated)]
+
 //! A device advertises what it can run and at what unit price, a requester
 //! describes the work it needs, the scheduler splits that work into shards that
 //! fit each device, and a provider's signed receipt settles exactly the units
@@ -57,13 +61,18 @@ pub mod bond;
 pub mod challenge;
 pub mod device;
 pub mod escrow;
+pub mod guest;
 pub mod gossip;
+pub mod inference;
 pub mod ledger;
 pub mod market;
 pub mod settle;
+pub mod shield;
 pub mod store;
 pub mod tee;
 pub mod ticket;
+pub mod training;
+pub mod vendor;
 
 pub use bond::{
     BondBook, BondDispute, BondWithdrawal, DisputeReason, ProviderBond, Reputation, SignedBond,
@@ -103,11 +112,31 @@ pub use store::{
     MAX_JOURNAL_ENTRIES,
 };
 pub use tee::{
-    AttestationRoots, SignedTeeQuote, TeeError, TeeQuote, TeeSla, TeeType, TeeVerifier, TEE_VERSION,
+    AttestationRoots, SignedTeeQuote, StoredAttestation, TeeError, TeeQuote, TeeSla, TeeType,
+    TeeVerifier, TEE_VERSION, TEE_VERSION_V1,
+};
+pub use vendor::{
+    expected_report_binding, verify_cert_chain, verify_nvidia, verify_p256_sig, verify_sig,
+    verify_snp, verify_tdx, ChainCurve, NvidiaReport, SnpReport, TcbPolicy, TdxQuote,
+    VendorEvidence, VendorFamily, VendorInputs, VendorRoots, VENDOR_EVIDENCE_VERSION,
 };
 pub use ticket::{
     ClaimBook, ClaimTicket, ShardClaim, SignedClaim, SignedTicket, CLAIM_VERSION, MAX_TICKETS,
     TICKET_VERSION,
+};
+pub use training::{
+    EncryptedCheckpoint, ResumeToken, TrainingShard, seal_checkpoint, open_checkpoint,
+    seal_resume_token, open_resume_token, split_into_shards,
+};
+pub use shield::{
+    ShieldBundle, SealedShield, ShieldChunk, seal, open, SHIELD_VERSION,
+};
+pub use guest::{
+    GuestSession, SessionState, SessionEvent, UsageRecord as GuestUsageRecord, attest_quote,
+};
+pub use inference::{
+    InferenceRequest, InferenceResponse, seal_request, open_request,
+    seal_response, open_response, GuestInput, GuestOutput,
 };
 
 /// Why a compute-sharing operation was refused.
@@ -171,6 +200,10 @@ pub enum ComputeError {
     AlreadyClaimed,
     /// This ticket names a designated provider and the claim is from another.
     DesignatedProvider,
+    /// A confidential job requires provider attestation but none was supplied.
+    AttestationRequired,
+    /// The provider has no valid fresh attestation on file for this job.
+    ProviderNotAttested,
 }
 
 impl std::fmt::Display for ComputeError {
@@ -206,6 +239,12 @@ impl std::fmt::Display for ComputeError {
             ComputeError::AlreadyClaimed => write!(f, "ticket was already claimed"),
             ComputeError::DesignatedProvider => {
                 write!(f, "ticket names a different designated provider")
+            }
+            ComputeError::AttestationRequired => {
+                write!(f, "confidential job requires provider attestation evidence")
+            }
+            ComputeError::ProviderNotAttested => {
+                write!(f, "provider has no valid fresh attestation on file")
             }
         }
     }

@@ -7,7 +7,7 @@ use srct_cnnp::{
     required_evidence, Capability, ModelSpace, Privacy, SignedCapability, StageError, StageGate,
     Verification,
 };
-use srct_compute::tee::{SignedTeeQuote, TeeQuote, TeeSla, TeeType, TEE_VERSION};
+use srct_compute::tee::{SignedTeeQuote, TeeQuote, TeeSla, TeeType, TEE_VERSION_V1};
 use srct_core::wallet::Wallet;
 use srct_fhe::{
     eval, FheKeys, FheReceipt, FheTask, SignedFheReceipt, SignedFheTask, WeightedSum, FHE_VERSION,
@@ -66,7 +66,7 @@ fn roots_for(attester: &Wallet, tee: TeeType) -> AttestationRoots {
 
 fn tee_evidence(provider: &Wallet, attester: &Wallet) -> (TeeSla, SignedTeeQuote) {
     let sla = TeeSla {
-        version: TEE_VERSION,
+        version: TEE_VERSION_V1,
         network_id: "srct/testnet".into(),
         provider: provider.address().unwrap(),
         workload: [11u8; 32],
@@ -76,10 +76,13 @@ fn tee_evidence(provider: &Wallet, attester: &Wallet) -> (TeeSla, SignedTeeQuote
         input_hash: [24u8; 32],
         tee: TeeType::SevSnp,
         max_age_heights: 10,
+        min_tcb_svn: [0u8; 16],
+        allow_debug: false,
+        measurement: [0u8; 32],
     };
     let quote = SignedTeeQuote::sign(
         TeeQuote {
-            version: TEE_VERSION,
+            version: TEE_VERSION_V1,
             network_id: sla.network_id.clone(),
             provider: sla.provider,
             tee: sla.tee,
@@ -91,6 +94,10 @@ fn tee_evidence(provider: &Wallet, attester: &Wallet) -> (TeeSla, SignedTeeQuote
             output_hash: [25u8; 32],
             height: HEIGHT,
             nonce: 1,
+            debug: false,
+            tcb_svn: [0u8; 16],
+            report_data: [0u8; 32],
+            vendor: None,
         },
         attester,
     )

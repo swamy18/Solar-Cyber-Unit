@@ -1,8 +1,8 @@
 [workspace]
 resolver = "2"
-members = ["crates/srct-core", "crates/srct-l2", "crates/srct-mcp", "crates/srct-miner", "crates/srct-net", "crates/srct-node", "crates/srct-store", "crates/srct-worker",     "crates/srct-policy",
+members = ["crates/srct-core", "crates/srct-l2", "crates/srct-mcp", "crates/srct-miner", "crates/srct-net", "crates/srct-node", "crates/srct-store", "crates/srct-worker", "crates/srct-policy",
     "crates/srct-bench",
-    "crates/srct-cnnp", "crates/srct-intent", "crates/srct-agentnet", "crates/srct-compute", "crates/srct-fhe", "crates/srct-zkml", "crates/srct-workgraph", "crates/srct-verify"]
+    "crates/srct-cnnp", "crates/srct-intent", "crates/srct-agentnet", "crates/srct-compute", "crates/srct-fhe", "crates/srct-zkml", "crates/srct-workgraph", "crates/srct-verify", "crates/srct-confid"]
 
 [workspace.package]
 version = "0.1.0"
@@ -23,6 +23,7 @@ srct-agentnet = { path = "crates/srct-agentnet" }
 srct-compute = { path = "crates/srct-compute" }
 srct-fhe = { path = "crates/srct-fhe" }
 srct-zkml = { path = "crates/srct-zkml" }
+srct-confid = { path = "crates/srct-confid" }
 srct-verify = { path = "crates/srct-verify" }
 sha2 = "0.10"
 k256 = { version = "0.13", features = ["ecdsa", "schnorr", "arithmetic", "ecdh"] }
@@ -38,7 +39,20 @@ chacha20poly1305 = "0.10"
 # Zeroizing in-memory key material (srct-node wallet_store) so decrypted keys and
 # derived symmetric keys do not linger in freed memory.
 zeroize = "1"
+generic-array = "0.14"
+typenum = "1.15"
 hkdf = "0.12"
+# Confidential-tier vendor attestation (srct-compute only; never srct-core):
+# P-256 ECDSA for PCK/VCEK chains and NVIDIA JWTs, X.509 parsing for the
+# certificate chains, base64 for the NVIDIA JWT envelope.
+# HPKE RFC 9180 (consumer-side key release only; pinned exact version).
+# Suite is fixed in code to DHKEM(X25519, HKDF-SHA256) / HKDF-SHA256 /
+# ChaCha20Poly1305 — no other ciphersuite is instantiated anywhere.
+hpke = "=0.12.0"
+p256 = { version = "0.13", features = ["ecdsa"] }
+p384 = { version = "0.13", features = ["ecdsa"] }
+x509-parser = "0.18"
+base64 = "0.22"
 
 [profile.release]
 opt-level = 3

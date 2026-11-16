@@ -29,6 +29,9 @@ path = "../crates/srct-net"
 [dependencies.srct-compute]
 path = "../crates/srct-compute"
 
+[dependencies.srct-confid]
+path = "../crates/srct-confid"
+
 [dependencies.srct-worker]
 path = "../crates/srct-worker"
 
@@ -160,6 +163,55 @@ bench = false
 [[bin]]
 name = "compute_state_decode"
 path = "fuzz_targets/compute_state_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tdx_quote_parse"
+path = "fuzz_targets/tdx_quote_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "snp_report_parse"
+path = "fuzz_targets/snp_report_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "nvidia_report_parse"
+path = "fuzz_targets/nvidia_report_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "vendor_chain_parse"
+path = "fuzz_targets/vendor_chain_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "confid_keystore_parse"
+path = "fuzz_targets/confid_keystore_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "confid_sealed_open"
+path = "fuzz_targets/confid_sealed_open.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "shield_bundle_parse"
+path = "fuzz_targets/shield_bundle_parse.rs"
 test = false
 doc = false
 bench = false

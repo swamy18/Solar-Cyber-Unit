@@ -103,6 +103,7 @@ fn signed_job(
         input: [3u8; 32],
         deadline,
         nonce: 1,
+        confidential: false,
     };
     SignedJob::sign(job, requester).unwrap()
 }
@@ -194,7 +195,7 @@ fn a_job_is_split_across_heterogeneous_devices() {
         false,
         100,
     );
-    let plan = plan_assignments(&job, &offers, 10, 1).unwrap();
+    let plan = plan_assignments(&job, &offers, 10, 1, None).unwrap();
 
     // Max-min fair across provider identities: each of the 3 providers gets an
     // equal share (10 units) first, capped by capacity. The phone caps at 8,
@@ -250,7 +251,7 @@ fn a_job_is_split_across_heterogeneous_devices() {
 
     // The same offers in a different order produce the same plan.
     let reversed: Vec<SignedOffer> = offers.into_iter().rev().collect();
-    let again = plan_assignments(&job, &reversed, 10, 1).unwrap();
+    let again = plan_assignments(&job, &reversed, 10, 1, None).unwrap();
     assert_eq!(plan.units(), again.units());
     assert_eq!(plan.total_sat, again.total_sat);
     assert_eq!(plan.assignments.len(), again.assignments.len());
@@ -283,7 +284,7 @@ fn a_small_phone_can_take_a_small_job_alone() {
         false,
         100,
     );
-    let plan = plan_assignments(&job, &phone_only, 10, 1).unwrap();
+    let plan = plan_assignments(&job, &phone_only, 10, 1, None).unwrap();
     assert_eq!(plan.assignments.len(), 1);
     assert_eq!(plan.assignments[0].provider, phone.address().unwrap());
     assert_eq!(plan.assignments[0].units, 4);
@@ -326,7 +327,7 @@ fn a_small_device_can_take_several_shards_up_to_its_cap() {
         false,
         100,
     );
-    let plan = plan_assignments(&job, &offers, 10, 1).unwrap();
+    let plan = plan_assignments(&job, &offers, 10, 1, None).unwrap();
     assert_eq!(plan.assignments.len(), 2);
     assert_eq!(plan.units(), 8);
     assert!(plan
@@ -440,7 +441,7 @@ fn ineligible_offers_are_never_scheduled() {
             10
         };
         let job = SignedJob::sign(job, &requester).unwrap();
-        let err = plan_assignments(&job, &candidate, height, 1).unwrap_err();
+        let err = plan_assignments(&job, &candidate, height, 1, None).unwrap_err();
         assert!(
             matches!(err, ComputeError::NoEligibleOffer | ComputeError::Expired),
             "{name}: got {err:?}"
@@ -454,7 +455,7 @@ fn ineligible_offers_are_never_scheduled() {
         ..base.job.clone()
     };
     let photonic = SignedJob::sign(photonic, &requester).unwrap();
-    let plan = plan_assignments(&photonic, &[offers[0].clone()], 10, 1).unwrap();
+    let plan = plan_assignments(&photonic, &[offers[0].clone()], 10, 1, None).unwrap();
     assert_eq!(plan.units(), 4);
 }
 
@@ -497,7 +498,7 @@ fn capacity_budget_and_minimum_shard_are_enforced() {
         100,
     );
     assert_eq!(
-        plan_assignments(&too_much, &one, 10, 1).unwrap_err(),
+        plan_assignments(&too_much, &one, 10, 1, None).unwrap_err(),
         ComputeError::InsufficientCapacity
     );
 
@@ -516,7 +517,7 @@ fn capacity_budget_and_minimum_shard_are_enforced() {
         100,
     );
     assert_eq!(
-        plan_assignments(&below_min, &one, 10, 1).unwrap_err(),
+        plan_assignments(&below_min, &one, 10, 1, None).unwrap_err(),
         ComputeError::InsufficientCapacity
     );
 
@@ -535,7 +536,7 @@ fn capacity_budget_and_minimum_shard_are_enforced() {
         100,
     );
     assert_eq!(
-        plan_assignments(&over_budget, &one, 10, 1).unwrap_err(),
+        plan_assignments(&over_budget, &one, 10, 1, None).unwrap_err(),
         ComputeError::BudgetExceeded
     );
 }
@@ -557,7 +558,7 @@ fn only_the_requester_can_authorize_a_plan() {
         false,
         100,
     );
-    let plan = plan_assignments(&job, &offers, 10, 1).unwrap();
+    let plan = plan_assignments(&job, &offers, 10, 1, None).unwrap();
     let signed = plan.sign(&requester).unwrap();
     signed.verify().unwrap();
     assert_eq!(signed.units(), 4);
@@ -591,7 +592,7 @@ fn a_receipt_settles_exactly_once() {
         false,
         100,
     );
-    let plan = plan_assignments(&job, &offers, 10, 1).unwrap();
+    let plan = plan_assignments(&job, &offers, 10, 1, None).unwrap();
     let signed = plan.sign(&requester).unwrap();
     let assignment = signed.assignments[0].clone();
     assert_eq!(
@@ -637,7 +638,7 @@ fn overclaim_price_mismatch_and_wrong_binding_are_refused() {
         false,
         100,
     );
-    let plan = plan_assignments(&job, &offers, 10, 1).unwrap();
+    let plan = plan_assignments(&job, &offers, 10, 1, None).unwrap();
     let signed = plan.sign(&requester).unwrap();
     let assignment = signed.assignments[0].clone();
 
@@ -704,7 +705,7 @@ fn late_receipts_and_expiry_are_refused() {
         false,
         50,
     );
-    let plan = plan_assignments(&job, &offers, 10, 1).unwrap();
+    let plan = plan_assignments(&job, &offers, 10, 1, None).unwrap();
     let signed = plan.sign(&requester).unwrap();
     let assignment = signed.assignments[0].clone();
     let receipt = ComputeReceipt::new(&assignment, 5, [4u8; 32], 1, 20, 1).unwrap();
@@ -751,11 +752,11 @@ fn attempt_deadline_and_wire_codecs_are_bounded() {
         50,
     );
     assert_eq!(
-        plan_assignments(&job, &offers, 10, MAX_ATTEMPTS + 1).unwrap_err(),
+        plan_assignments(&job, &offers, 10, MAX_ATTEMPTS + 1, None).unwrap_err(),
         ComputeError::TooManyAttempts
     );
     assert_eq!(
-        plan_assignments(&job, &offers, 51, 1).unwrap_err(),
+        plan_assignments(&job, &offers, 51, 1, None).unwrap_err(),
         ComputeError::Expired
     );
 
@@ -772,7 +773,7 @@ fn attempt_deadline_and_wire_codecs_are_bounded() {
         Err(ComputeError::BadSignature(_))
     ));
 
-    let plan = plan_assignments(&job, &offers, 10, 1).unwrap();
+    let plan = plan_assignments(&job, &offers, 10, 1, None).unwrap();
     let signed = plan.sign(&requester).unwrap();
     let assignment_wire = signed.assignments[0].assignment.encode();
     assert_eq!(
@@ -828,7 +829,7 @@ fn fair_allocation_large_and_small_provider_both_get_shares() {
         false,
         100,
     );
-    let plan = plan_assignments(&job, &offers, 10, 1).unwrap();
+    let plan = plan_assignments(&job, &offers, 10, 1, None).unwrap();
     assert_eq!(plan.units(), 100);
     // Equal share is 50 each; the small provider caps at 10, so its overflow is
     // redistributed to the large provider. Both still receive a share.
@@ -899,7 +900,7 @@ fn fair_allocation_is_per_identity_not_per_machine() {
         false,
         100,
     );
-    let plan = plan_assignments(&job, &offers, 10, 1).unwrap();
+    let plan = plan_assignments(&job, &offers, 10, 1, None).unwrap();
     assert_eq!(plan.units(), 100);
     let many_units: u32 = plan
         .assignments
@@ -964,7 +965,7 @@ fn fair_allocation_capped_overflow_is_redistributed() {
         false,
         100,
     );
-    let plan = plan_assignments(&job, &offers, 10, 1).unwrap();
+    let plan = plan_assignments(&job, &offers, 10, 1, None).unwrap();
     assert_eq!(plan.units(), 100);
     let capped_units: u32 = plan
         .assignments
@@ -999,11 +1000,11 @@ fn fair_allocation_is_deterministic_under_reordered_input() {
         false,
         100,
     );
-    let baseline = plan_assignments(&job, &offers, 10, 1).unwrap();
+    let baseline = plan_assignments(&job, &offers, 10, 1, None).unwrap();
     // Every permutation must yield the identical plan.
     let mut permuted = offers.clone();
     permuted.reverse();
-    let rev = plan_assignments(&job, &permuted, 10, 1).unwrap();
+    let rev = plan_assignments(&job, &permuted, 10, 1, None).unwrap();
     assert_eq!(baseline.assignments.len(), rev.assignments.len());
     for (a, b) in baseline.assignments.iter().zip(rev.assignments.iter()) {
         assert_eq!(a.provider, b.provider);
@@ -1014,7 +1015,7 @@ fn fair_allocation_is_deterministic_under_reordered_input() {
     // A third distinct ordering as well.
     let mut rotated = offers.clone();
     rotated.rotate_left(1);
-    let rot = plan_assignments(&job, &rotated, 10, 1).unwrap();
+    let rot = plan_assignments(&job, &rotated, 10, 1, None).unwrap();
     assert_eq!(baseline.total_sat, rot.total_sat);
     assert_eq!(baseline.units(), rot.units());
 }
@@ -1065,7 +1066,7 @@ fn fair_allocation_respects_price_cap() {
         false,
         100,
     );
-    let plan = plan_assignments(&job, &offers, 10, 1).unwrap();
+    let plan = plan_assignments(&job, &offers, 10, 1, None).unwrap();
     assert_eq!(plan.units(), 50);
     for a in &plan.assignments {
         assert_eq!(a.provider, cheap.address().unwrap());

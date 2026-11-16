@@ -1,7 +1,7 @@
 //! Acceptance tests for the staged TEE execution log: activation switch,
 //! verified filing, replay refusal and snapshot replay.
 
-use srct_compute::tee::{TeeQuote, TeeType, TEE_VERSION};
+use srct_compute::tee::{TeeQuote, TeeType, TEE_VERSION_V1};
 use srct_core::hash::Hash;
 use srct_core::wallet::Wallet;
 use srct_l2::attested_log::AttestedExecutionLog;
@@ -18,7 +18,7 @@ fn wallet(seed: u8) -> Wallet {
 
 fn sla(provider: srct_core::hash::Address, workload: Hash) -> TeeSla {
     TeeSla {
-        version: TEE_VERSION,
+        version: TEE_VERSION_V1,
         network_id: NET.into(),
         provider,
         workload,
@@ -28,6 +28,9 @@ fn sla(provider: srct_core::hash::Address, workload: Hash) -> TeeSla {
         input_hash: [24u8; 32],
         tee: TeeType::SevSnp,
         max_age_heights: 10,
+        min_tcb_svn: [0u8; 16],
+        allow_debug: false,
+        measurement: [0u8; 32],
     }
 }
 
@@ -37,7 +40,7 @@ fn attestation(workload: Hash) -> (TeeBackedAttestation, AttestationRoots, Unifi
     let sla = sla(provider, workload);
     let quote = SignedTeeQuote::sign(
         TeeQuote {
-            version: TEE_VERSION,
+            version: TEE_VERSION_V1,
             network_id: sla.network_id.clone(),
             provider: sla.provider,
             tee: sla.tee,
@@ -49,6 +52,10 @@ fn attestation(workload: Hash) -> (TeeBackedAttestation, AttestationRoots, Unifi
             output_hash: [25u8; 32],
             height: HEIGHT,
             nonce: 1,
+            debug: false,
+            tcb_svn: [0u8; 16],
+            report_data: [0u8; 32],
+            vendor: None,
         },
         &attester,
     )
@@ -103,7 +110,7 @@ fn log_refuses_foreign_and_untrusted_evidence() {
     let sla = sla(provider, [13u8; 32]);
     let quote = SignedTeeQuote::sign(
         TeeQuote {
-            version: TEE_VERSION,
+            version: TEE_VERSION_V1,
             network_id: sla.network_id.clone(),
             provider: sla.provider,
             tee: sla.tee,
@@ -115,6 +122,10 @@ fn log_refuses_foreign_and_untrusted_evidence() {
             output_hash: [25u8; 32],
             height: HEIGHT,
             nonce: 1,
+            debug: false,
+            tcb_svn: [0u8; 16],
+            report_data: [0u8; 32],
+            vendor: None,
         },
         &stranger,
     )

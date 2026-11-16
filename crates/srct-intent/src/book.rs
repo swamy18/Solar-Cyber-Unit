@@ -208,6 +208,12 @@ impl ExpectedEvidence {
 
 /// Solver-submitted evidence. The request is checked against the pinned
 /// expectation (kind, worker binding) and then verified cryptographically.
+///
+/// The TEE variant is much larger than the others (a signed quote carries
+/// the full workload binding plus, since the confidential tier, the vendor
+/// evidence). Values are transient — verified once per intent, then
+/// dropped — so the enum is deliberately unboxed.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug)]
 pub enum IntentEvidence {
     Tee(SignedTeeQuote),

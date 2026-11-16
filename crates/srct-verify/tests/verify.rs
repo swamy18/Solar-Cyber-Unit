@@ -6,7 +6,7 @@ use srct_compute::market::{
     plan_assignments, ComputeJob, ComputeOffer, Verification, JOB_VERSION, OFFER_VERSION,
 };
 use srct_compute::tee::{
-    AttestationRoots, SignedTeeQuote, TeeError, TeeQuote, TeeSla, TeeType, TEE_VERSION,
+    AttestationRoots, SignedTeeQuote, TeeError, TeeQuote, TeeSla, TeeType, TEE_VERSION_V1,
 };
 use srct_compute::{
     ComputeError, ComputeReceipt, Determinism, DeviceClass, DeviceProfile, SignedAssignment,
@@ -87,7 +87,7 @@ fn tee_evidence() -> (AttestationRoots, TeeSla, SignedTeeQuote) {
     let provider = wallet(1);
     let attester = wallet(2);
     let sla = TeeSla {
-        version: TEE_VERSION,
+        version: TEE_VERSION_V1,
         network_id: NET.into(),
         provider: provider.address().unwrap(),
         workload: [11u8; 32],
@@ -97,9 +97,12 @@ fn tee_evidence() -> (AttestationRoots, TeeSla, SignedTeeQuote) {
         input_hash: [24u8; 32],
         tee: TeeType::SevSnp,
         max_age_heights: 10,
+        min_tcb_svn: [0u8; 16],
+        allow_debug: false,
+        measurement: [0u8; 32],
     };
     let quote = TeeQuote {
-        version: TEE_VERSION,
+        version: TEE_VERSION_V1,
         network_id: NET.into(),
         provider: provider.address().unwrap(),
         tee: TeeType::SevSnp,
@@ -111,6 +114,10 @@ fn tee_evidence() -> (AttestationRoots, TeeSla, SignedTeeQuote) {
         output_hash: [25u8; 32],
         height: HEIGHT,
         nonce: 1,
+        debug: false,
+        tcb_svn: [0u8; 16],
+        report_data: [0u8; 32],
+        vendor: None,
     };
     let signed = SignedTeeQuote::sign(quote, &attester).unwrap();
     let mut roots = AttestationRoots::new();
@@ -403,11 +410,12 @@ fn compute_evidence() -> (SignedAssignment, SignedReceipt) {
             input: [3u8; 32],
             deadline: 100,
             nonce: 1,
+            confidential: false,
         },
         &requester,
     )
     .unwrap();
-    let plan = plan_assignments(&job, std::slice::from_ref(&offer), 10, 1).unwrap();
+    let plan = plan_assignments(&job, std::slice::from_ref(&offer), 10, 1, None).unwrap();
     let assignment = plan.sign(&requester).unwrap().assignments.remove(0);
     let receipt = SignedReceipt::sign(
         ComputeReceipt::new(&assignment, 5, [4u8; 32], 1_000, 20, 1).unwrap(),

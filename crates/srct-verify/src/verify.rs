@@ -36,10 +36,27 @@ impl std::error::Error for VerifyError {}
 
 /// Evidence for one verification. Each variant carries everything its inner
 /// verifier needs: the signed proof plus its public context.
+///
+/// TeeV2 is much larger than the other variants (it carries vendor roots
+/// plus the presented key). Values are transient — verified once and
+/// dropped — so the enum is deliberately unboxed; do not put it in
+/// long-lived arrays.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug)]
 pub enum Evidence {
     /// TEE execution proof: the requester's SLA plus the worker's quote.
     Tee { sla: TeeSla, quote: SignedTeeQuote },
+    /// Confidential-tier TEE proof: SLA plus worker quote plus the vendor
+    /// verification inputs (pinned roots, CRL serials, TCB minimums, unix
+    /// time) and the enclave ephemeral key the consumer saw over the
+    /// attested channel. The data key must never be released unless this
+    /// verifies.
+    TeeV2 {
+        sla: TeeSla,
+        quote: SignedTeeQuote,
+        vendor: srct_compute::vendor::VendorInputs,
+        presented_pubkey: Vec<u8>,
+    },
     /// Encrypted-compute correctness: the signed task plus the worker receipt.
     Fhe {
         task: SignedFheTask,
@@ -108,6 +125,21 @@ impl UnifiedVerifier {
                 let output = self
                     .tee
                     .verify(sla, quote, roots, current_height)
+                    .map_err(VerifyError::Tee)?;
+                Ok(VerifiedOutput {
+                    kind: EvidenceKind::Tee,
+                    output: output.to_vec(),
+                })
+            }
+            Evidence::TeeV2 {
+                sla,
+                quote,
+                vendor,
+                presented_pubkey,
+            } => {
+                let output = self
+                    .tee
+                    .verify_v2(sla, quote, roots, vendor, presented_pubkey, current_height)
                     .map_err(VerifyError::Tee)?;
                 Ok(VerifiedOutput {
                     kind: EvidenceKind::Tee,

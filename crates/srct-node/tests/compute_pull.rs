@@ -171,6 +171,7 @@ fn post_job(node: &Node, requester: &Wallet, units: u32, max_total: u64) -> Stri
         input: [42u8; 32],
         deadline: 9_000,
         nonce: 100,
+        confidential: false,
     };
     let signed = srct_compute::SignedJob::sign(job, requester).unwrap();
     let hash = hex::encode(signed.hash());

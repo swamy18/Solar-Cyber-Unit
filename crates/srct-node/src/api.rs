@@ -211,7 +211,7 @@ const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
 /// would mix scopes that must never meet. Version 10 appends the Smart Gate
 /// sections (grant registry, revocations, capability book) last; v8/v9 files
 /// migrate with empty gate state.
-const STATE_ENVELOPE_VERSION: u8 = 17;
+const STATE_ENVELOPE_VERSION: u8 = 18;
 
 /// Largest entry count any single map section in the state envelope may
 /// declare, checked before allocation. Real books are bounded by their own
@@ -636,6 +636,9 @@ pub struct SharedNode {
     /// the matching receipt settles. A preauth that fails re-verification
     /// at settle time is skipped (payout stays manual), never forced.
     pub compute_preauth: BTreeMap<Hash, Vec<u8>>,
+    /// Provider attestations registered via `POST /v1/compute/attest/submit`.
+    /// Keyed by quote hash; gates confidential planning and verify queries.
+    pub compute_attestations: BTreeMap<Hash, srct_compute::StoredAttestation>,
     /// Locally created Smart Gate revocations awaiting P2P broadcast, as
     /// (policy, sigs, keys) bytes. Drained by the serve loop; persisted so a
     /// restart never silently drops a revocation no peer has heard yet.
@@ -764,6 +767,7 @@ impl SharedNode {
             compute_bonds: srct_compute::BondBook::new(network_id.clone()),
             compute_claims: srct_compute::ClaimBook::new(network_id.clone()),
             compute_preauth: BTreeMap::new(),
+            compute_attestations: BTreeMap::new(),
             compute_challenges: srct_compute::ChallengeBook::new(network_id.clone()),
             revoke_broadcast: Vec::new(),
             audit: srct_core::safety::AuditLog::default(),
@@ -1096,6 +1100,13 @@ impl SharedNode {
             &mut w,
             &encode_state_map(&self.compute_preauth, |b| b.clone()),
         );
+        // Compute attestations (v18): provider-signed tee quotes registered
+        // via the attestation API. Fail-closed: any version that doesn't
+        // include this section is refused on load.
+        put_section(
+            &mut w,
+            &encode_state_map(&self.compute_attestations, |sa| sa.encode()),
+        );
         {
             let mut rb = Writer::with_capacity(4 + self.revoke_broadcast.len() * 96);
             rb.u32le(self.revoke_broadcast.len() as u32);
@@ -1138,7 +1149,7 @@ impl SharedNode {
             && version != 8
         {
             return Err(format!(
-                "state envelope version {version}, this build reads {STATE_ENVELOPE_VERSION} (and migrates 8/9/10/11/12/13/14/15/16)"
+                "state envelope version {version}, this build reads {STATE_ENVELOPE_VERSION} (and migrates 8/9/10/11/12/13/14/15/16/17)"
             ));
         }
 
@@ -2224,6 +2235,19 @@ impl SharedNode {
         self.compute_challenges = compute_challenges;
         self.compute_claims = compute_claims;
         self.compute_preauth = compute_preauth;
+        // Compute attestations (v18): provider-signed tee quotes. Older
+        // versions migrate with an empty registry.
+        let compute_attestations = if version >= 18 {
+            decode_section(&mut r, "compute_attestations", |sr| {
+                decode_state_map(sr, "compute_attestations", |b| {
+                    srct_compute::StoredAttestation::decode(b)
+                        .map_err(|e| format!("attestation: {e}"))
+                })
+            })?
+        } else {
+            BTreeMap::new()
+        };
+        self.compute_attestations = compute_attestations;
         self.revoke_broadcast = revoke_broadcast;
         // Compute metering (v17): node-local usage ledger. Older versions
         // migrate with an empty ledger.
@@ -9319,7 +9343,7 @@ async fn compute_plan_post(
         let height = sh.chain.height();
         let offers: Vec<srct_compute::SignedOffer> = sh.compute_offers.values().cloned().collect();
 
-        let plan = srct_compute::market::plan_assignments(job, &offers, height, 0)
+        let plan = srct_compute::market::plan_assignments(job, &offers, height, 0, None)
             .map_err(|e| fail(StatusCode::CONFLICT, "plan_failed", e.to_string()))?;
 
         let shards: Vec<Value> = plan
@@ -10701,6 +10725,107 @@ async fn compute_ledger_query(
             "to": to,
             "count": list.len(),
             "entries": list,
+        })))
+    })?
+}
+
+/// `POST /v1/compute/attest/submit` — register a provider-signed tee quote.
+///
+/// The provider submits a `SignedTeeQuote` (hex-encoded). The node decodes
+/// it (verifying the signature), stores it in the local attestation
+/// registry keyed by quote hash, and returns the expiry height. Confidential
+/// jobs can then be planned against this provider only while the
+/// attestation is fresh.
+///
+/// This is node-local and never consensus: storing an attestation here does
+/// not move coin or bind any chain state.
+#[derive(Deserialize)]
+struct ComputeAttestSubmitReq {
+    quote_hex: String,
+}
+
+async fn compute_attest_submit(
+    State(state): State<ApiState>,
+    Json(req): Json<ComputeAttestSubmitReq>,
+) -> ApiResult {
+    let bytes = hex::decode(&req.quote_hex)
+        .map_err(|e| bad(format!("quote_hex is not hex: {e}")))?;
+    let signed = srct_compute::SignedTeeQuote::decode(&bytes)
+        .map_err(|e| fail(StatusCode::BAD_REQUEST, "invalid_quote", e.to_string()))?;
+    with_shared(&state, |sh| {
+        let height = sh.chain.height();
+        let quote_hash = srct_core::hash::sha256_dom(b"srct/compute/tee/quote/v1", &[&bytes]);
+        let provider = signed.attester().map_err(|e| {
+            fail(StatusCode::BAD_REQUEST, "bad_attester", e.to_string())
+        })?;
+        // Default max age of 256 heights (~2-3 days on mainnet).
+        let max_age: u64 = 256;
+        let expires = height.saturating_add(max_age);
+        let stored = srct_compute::StoredAttestation {
+            quote_hash,
+            provider,
+            quote_bytes: bytes,
+            registered_height: height,
+            expires_height: expires,
+        };
+        sh.compute_attestations.insert(quote_hash, stored);
+        audit_push(
+            sh,
+            "compute_attestation",
+            Some(quote_hash),
+            None,
+            format!("provider {} registered tee quote, expires at {}", address_to_hex(&provider), expires),
+        );
+        Ok(Json(json!({
+            "status": "registered",
+            "quote_hash": hash_to_hex(&quote_hash),
+            "provider": address_to_hex(&provider),
+            "registered_height": height,
+            "expires_height": expires,
+        })))
+    })?
+}
+
+/// `POST /v1/compute/attest/verify` — check whether a provider has a valid,
+/// fresh attestation on file.
+///
+/// Returns the expiry height if attested, or a refusal if the provider has
+/// no registered attestation or it has expired at the current height.
+#[derive(Deserialize)]
+struct ComputeAttestVerifyReq {
+    provider_hex: String,
+}
+
+async fn compute_attest_verify(
+    State(state): State<ApiState>,
+    Json(req): Json<ComputeAttestVerifyReq>,
+) -> ApiResult {
+    let provider = decode_address(&req.provider_hex)?;
+    with_shared(&state, |sh| {
+        let height = sh.chain.height();
+        let attested: Vec<_> = sh
+            .compute_attestations
+            .values()
+            .filter(|sa| sa.provider == provider && sa.expires_height >= height)
+            .collect();
+        if attested.is_empty() {
+            return Err(fail(
+                StatusCode::NOT_FOUND,
+                "not_attested",
+                "provider has no valid fresh attestation on file",
+            ));
+        }
+        let earliest_expiry = attested
+            .iter()
+            .map(|sa| sa.expires_height)
+            .min()
+            .unwrap_or(height);
+        Ok(Json(json!({
+            "status": "attested",
+            "provider": address_to_hex(&provider),
+            "attestations": attested.len(),
+            "earliest_expiry": earliest_expiry,
+            "current_height": height,
         })))
     })?
 }
@@ -12930,7 +13055,9 @@ pub fn router(state: ApiState, cfg: &ApiConfig) -> Router {
         .route("/v1/compute/bonds/withdraw", post(compute_bond_withdraw))
         .route("/v1/compute/bonds/dispute", post(compute_bond_dispute))
         .route("/v1/compute/bonds/{provider}", get(compute_bond_get))
-        .route("/v1/compute/ledger", get(compute_ledger_query));
+        .route("/v1/compute/ledger", get(compute_ledger_query))
+        .route("/v1/compute/attest/submit", post(compute_attest_submit))
+        .route("/v1/compute/attest/verify", post(compute_attest_verify));
     // The stack stays `Router<ApiState>` (no state yet) until the end, where a
     // single `with_state` resolves it to the servable `Router<()>`.
     let mut app: Router<ApiState> = app.layer(DefaultBodyLimit::max(MAX_BODY_BYTES));

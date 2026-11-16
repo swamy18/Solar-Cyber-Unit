@@ -75,11 +75,12 @@ fn assignment_for(requester: &Wallet, provider: &Wallet, job_nonce: u64) -> Sign
             input: [3u8; 32],
             deadline: 100,
             nonce: job_nonce,
+            confidential: false,
         },
         requester,
     )
     .unwrap();
-    let plan = plan_assignments(&job, &[offer], 10, 1).unwrap();
+    let plan = plan_assignments(&job, &[offer], 10, 1, None).unwrap();
     plan.sign(requester).unwrap().assignments.remove(0)
 }
 

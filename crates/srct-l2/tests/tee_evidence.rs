@@ -1,7 +1,7 @@
 //! Acceptance tests for TEE-backed L2 evidence: the attestation type,
 //! full cryptographic verification, wire codecs and the generic contract path.
 
-use srct_compute::tee::{TeeQuote, TeeType, TEE_VERSION};
+use srct_compute::tee::{TeeQuote, TeeType, TEE_VERSION_V1};
 use srct_core::compute_ir::{ComputeBackend, ComputeTask};
 use srct_core::deliverable::{Attestation, ComputeDeliverable};
 use srct_core::hash::{Address, Hash};
@@ -24,7 +24,7 @@ fn addr(n: u8) -> Address {
 
 fn sla(provider: Address) -> TeeSla {
     TeeSla {
-        version: TEE_VERSION,
+        version: TEE_VERSION_V1,
         network_id: "srct/testnet".into(),
         provider,
         workload: [11u8; 32],
@@ -34,13 +34,16 @@ fn sla(provider: Address) -> TeeSla {
         input_hash: [24u8; 32],
         tee: TeeType::SevSnp,
         max_age_heights: 10,
+        min_tcb_svn: [0u8; 16],
+        allow_debug: false,
+        measurement: [0u8; 32],
     }
 }
 
 fn signed_quote(sla: &TeeSla, attester: &Wallet, output: Hash, height: u64) -> SignedTeeQuote {
     SignedTeeQuote::sign(
         TeeQuote {
-            version: TEE_VERSION,
+            version: TEE_VERSION_V1,
             network_id: sla.network_id.clone(),
             provider: sla.provider,
             tee: sla.tee,
@@ -52,6 +55,10 @@ fn signed_quote(sla: &TeeSla, attester: &Wallet, output: Hash, height: u64) -> S
             output_hash: output,
             height,
             nonce: 1,
+            debug: false,
+            tcb_svn: [0u8; 16],
+            report_data: [0u8; 32],
+            vendor: None,
         },
         attester,
     )

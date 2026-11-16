@@ -105,10 +105,11 @@ fn main() {
         input: [3u8; 32],
         deadline: 100,
         nonce: 1,
+        confidential: false,
     };
     let job = SignedJob::sign(job, &requester).unwrap();
 
-    let plan = plan_assignments(&job, &offers, 10, 1).unwrap();
+    let plan = plan_assignments(&job, &offers, 10, 1, None).unwrap();
     println!(
         "plan: {} units in {} shards for {} sat",
         plan.units(),

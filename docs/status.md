@@ -2639,3 +2639,100 @@ wire untouched):
   code/weights/data; staged per session, shredded at session end (even on
   handler failure). Docs state plainly the provider sees the workload
   while it runs unless sealed input or a TEE is used.
+
+## Confidential Tier Phase A (threat model + docs, simulator-tested only)
+
+Docs only, no code changes. `docs/compute-sharing.md` §11 written first:
+threat model (malicious provider / hypervisor admin / tenants / network
+observers protected; vendor compromise / side channels / DoS / metadata
+not protected; no unconditional privacy), architecture plan for TDX +
+SEV-SNP + NVIDIA CC (H100/H200/Blackwell, CC on; no SGX for ML),
+DCAP/PCK + KDS VCEK/VLEK + RIM-style verification, HPKE-X25519 key release
+(never on failed attestation), XChaCha20 shield bundle, guest runtime,
+fair matching over fresh attestations, deferred inference/training scope.
+Decisions locked: new `srct-confid` crate with own CLI (key-release code
+never links into provider-side `srct-worker`); `hpke` crate pinned;
+`p256`/`x509-parser`/`base64`/`zeroize` approved (x509-parser gets a fuzz
+target; pinned roots, no network in verifier); `JOB_VERSION` 2 → 3 with
+v1/v2 decoding non-confidential; offline JWT/RIM fetcher split (node
+fetches, verifier takes evidence + time/height inputs); local Argon2id +
+ChaCha20-Poly1305 keystore, Vault/cloud as trait stubs. Confirmed against
+tree: envelope is 17 (prior commit), so the attestation-registry bump is
+17 → 18; `x25519-dalek`/`curve25519-dalek`/`base64`/`hpke`/`p256`/
+`x509-parser` absent from `Cargo.lock` (only `zeroize` present) — new deps
+with a `cargo tree -d` duplicate check at add time. Next: Phase B
+(attestation verification).
+
+## Confidential Tier Phase B (attestation verification, simulator-tested only)
+
+New deps pinned (workspace + `srct-compute` only, `p256` kept out of
+`srct-core`): `p256 0.13` (ecdsa), `x509-parser 0.18` (no default
+features), `base64 0.22`. `cargo tree -d` shows only the three
+pre-existing duplicate pairs (crypto-common, digest, signature) — no new
+duplicates, no curve25519 anywhere in the compute tree. `cargo deny check`
+passes bans/licenses/sources; the 3 advisory failures are pre-existing
+(subtle/crypto-bigint/tokio, all in HEAD's lock before this change).
+
+Implemented in `srct-compute/src/vendor.rs` (new) + `tee.rs` v2:
+`TeeType::NvidiaCc`, `TEE_VERSION` 2 with fail-closed v1 decode,
+7 new `TeeError` variants. Real-layout parsers: DCAP v4 (48+584+384+64,
+QE binding, trailing pubkey trailer documented), SNP ABI offsets
+(1184+512, policy bit 19 flagged for re-verification at HW gating),
+NVIDIA NRAS-style JWT (ES256, cc-mode/measurements/nonce/exp/iss claims).
+Chain verification via exact-TBS DER splitting (no re-encoding), DN
+chaining, validity windows, CRL serials, pinned root SPKI hashes.
+`verify_v2` enforces debug opt-in (setter and attester must agree),
+TCB minimums, measurement allowlist, report-data session binding, expiry;
+plain `verify` on v2 fails closed; Software refused on mainnet in both
+paths. `srct-verify` routes `Evidence::TeeV2`; `srct-l2/tee_evidence`
+decodes v1+v2 but stays signature-check-only and out of `apply()`.
+12 vendor tests (simulator PKI hand-built with p256: chain, QE binding,
+report binding, all negative paths incl. never-release-on-mismatch) +
+11 existing tee tests green. 4 new fuzz targets
+(`tdx/snp/nvidia/vendor_chain_parse`). SNP P-384 chain/signature
+fails closed with `UnsupportedCurve` — needs a `p384` decision.
+New deps introduce two `#[allow(clippy::large_enum_variant)]`
+(documented: transient evidence values in srct-verify and srct-intent).
+
+## Confidential Tier Phase B complete (attestation verification, simulator-tested only)
+
+`p384 0.13` approved and wired: SNP VCEK/VLEK P-384 chains verify
+end-to-end (hand-built simulator CA → VCEK, report signed over canonical
+ABI bytes), debug opt-in, TCB minimums, measurement allowlist,
+report-data binding all enforced; negatives pin every refusal. Updated:
+12 → 14 vendor tests green, all existing suites green (tee v1 ×11,
+srct-verify, srct-l2 evidence/attested-log, cnnp, intent, workgraph),
+fuzz targets compile, full-workspace clippy clean. `UnsupportedCurve`
+retained only for future families. Remaining gaps before hardware:
+RIM/KDS/PCS fetchers (node side), runbook + HW-gated runs, SNP debug-bit
+and signature-container placement to re-verify against real hosts.
+Next: Phase C (`srct-confid` crate + own CLI, HPKE key release).
+
+## Confidential Tier Phase C complete (key broker + HPKE key release, simulator-tested only)
+
+New crate `srct-confid` (consumer-side only; key-release code never links
+into provider-side `srct-worker`), own CLI:
+- `srct-confid keystore init` (Argon2id + ChaCha20-Poly1305 file, `0600`,
+  atomic temp-file + rename write, passphrase from
+  `SRCT_CONFID_PASSPHRASE`, never cached);
+- `key new|list|revoke|wrap|open` (HPKE seal/open to an enclave X25519 key);
+- `release --request` (attestation-gated key release: loads key only after
+  TTL/revocation checks, verifies full vendor attestation via
+  `TeeVerifier::verify_v2` with the presented ephemeral key bound into
+  `report_data`, then HPKE-seals — any failure means nothing is sealed).
+- KMS adapter trait: `LocalKeystore` (default), `VaultKms`/`CloudKms`
+  documented stubs.
+- `hpke 0.12.0` pinned, suite fixed to DHKEM(X25519, HKDF-SHA256) /
+  HKDF-SHA256 / ChaCha20-Poly1305 (base mode); verified against RFC 9180
+  Appendix A.1 base-mode test vector.
+- `JOB_VERSION` 2 → 3: `ComputeJob.confidential` field, v1/v2 decode as
+  non-confidential (fail-closed wire compat).
+- Tests: RFC 9180 base-vector open; keystore roundtrip / wrong-passphrase /
+  tamper / truncation / TTL expiry / revocation; release gate (full verify
+  releases; wrong measurement / stale binding / missing vendor context all
+  refuse). 4 new fuzz targets
+  (`tdx/snp/nvidia/vendor_chain_parse/confid_keystore_parse/confid_sealed_open`).
+- All existing suites green; full-workspace clippy clean. `UnsupportedCurve`
+  retained for future families (SNP P-384 now wired via `p384 0.13`).
+Remaining gaps before hardware: RIM/KDS/PCS fetchers (node side),
+runbook + HW-gated runs.

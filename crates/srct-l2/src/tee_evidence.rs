@@ -22,7 +22,7 @@ use srct_core::ser::{Reader, Writer};
 use srct_core::sig::Bundle;
 use srct_verify::{
     AttestationRoots, SignedTeeQuote, TeeQuote, TeeSla, TeeType, UnifiedVerifier, VerifyError,
-    TEE_VERSION,
+    TEE_VERSION, TEE_VERSION_V1,
 };
 
 use crate::error::{L2Error, L2Result};
@@ -128,7 +128,12 @@ impl Attestation for TeeBackedAttestation {
         }
         let mut sr = Reader::new(r.fixed_slice(sla_len).map_err(malformed)?);
         let sla_version = sr.u8().map_err(malformed)?;
-        if sla_version != TEE_VERSION {
+        // Version 1 SLAs decode as before; version 2 appends the
+        // confidential-tier fields (min TCB, debug opt-in, approved
+        // measurement). L2 evidence carries either, but full vendor
+        // verification never runs here — see verify() below and the
+        // non-consensus rule in the module docs.
+        if sla_version != TEE_VERSION && sla_version != TEE_VERSION_V1 {
             return Err(malformed_str("tee sla version"));
         }
         let net_len = sr.u16le().map_err(malformed)? as usize;
@@ -147,6 +152,18 @@ impl Attestation for TeeBackedAttestation {
         let config_hash = sr.fixed().map_err(malformed)?;
         let input_hash = sr.fixed().map_err(malformed)?;
         let max_age_heights = sr.u64le().map_err(malformed)?;
+        let (min_tcb_svn, allow_debug, measurement) = if sla_version == TEE_VERSION {
+            let mut tcb = [0u8; 16];
+            tcb.copy_from_slice(sr.fixed_slice(16).map_err(malformed)?);
+            let debug = sr.u8().map_err(malformed)?;
+            if debug > 1 {
+                return Err(malformed_str("tee sla debug flag"));
+            }
+            let m: [u8; 32] = sr.fixed().map_err(malformed)?;
+            (tcb, debug == 1, m)
+        } else {
+            ([0u8; 16], false, [0u8; 32])
+        };
         sr.expect_end().map_err(malformed)?;
         let quote_len = r.u32le().map_err(malformed)? as usize;
         if quote_len > 4 * 1024 {
@@ -195,6 +212,9 @@ impl Attestation for TeeBackedAttestation {
             input_hash,
             tee,
             max_age_heights,
+            min_tcb_svn,
+            allow_debug,
+            measurement,
         };
         Ok(TeeBackedAttestation { sla, quote: signed })
     }
@@ -213,6 +233,11 @@ fn encode_sla(sla: &TeeSla) -> Vec<u8> {
         .fixed(&sla.config_hash)
         .fixed(&sla.input_hash)
         .u64le(sla.max_age_heights);
+    if sla.version == TEE_VERSION {
+        w.fixed(&sla.min_tcb_svn)
+            .u8(sla.allow_debug as u8)
+            .fixed(&sla.measurement);
+    }
     w.into_vec()
 }
 

@@ -79,6 +79,7 @@ fn mk_job(
             input: [3u8; 32],
             deadline,
             nonce,
+            confidential: false,
         },
         requester,
     )
@@ -86,7 +87,7 @@ fn mk_job(
 }
 
 fn signed_plan(job: &SignedJob, offers: &[SignedOffer], requester: &Wallet) -> SignedPlan {
-    plan_assignments(job, offers, 10, 1)
+    plan_assignments(job, offers, 10, 1, None)
         .unwrap()
         .sign(requester)
         .unwrap()

@@ -463,7 +463,7 @@ fn wire_mutations_never_panic() {
 // --- Execution-evidence enforcement (Verification::Tee/Zk) ---
 
 use rand::{rngs::StdRng, SeedableRng};
-use srct_compute::tee::{SignedTeeQuote, TeeQuote, TeeSla, TeeType, TEE_VERSION};
+use srct_compute::tee::{SignedTeeQuote, TeeQuote, TeeSla, TeeType, TEE_VERSION_V1};
 use srct_zkml::{prove_linear, SignedZkReceipt, SignedZkTask, ZkReceipt, ZkTask, ZK_VERSION};
 
 fn ev_intent(creator: &Wallet, arbiter: &Wallet, level: Verification, nonce: u64) -> Intent {
@@ -533,7 +533,7 @@ fn open_accept_fulfill(
 
 fn tee_sla(provider: &Wallet) -> TeeSla {
     TeeSla {
-        version: TEE_VERSION,
+        version: TEE_VERSION_V1,
         network_id: "srct/testnet".into(),
         provider: provider.address().unwrap(),
         workload: [11u8; 32],
@@ -543,13 +543,16 @@ fn tee_sla(provider: &Wallet) -> TeeSla {
         input_hash: [24u8; 32],
         tee: TeeType::SevSnp,
         max_age_heights: 10,
+        min_tcb_svn: [0u8; 16],
+        allow_debug: false,
+        measurement: [0u8; 32],
     }
 }
 
 fn tee_quote_for(sla: &TeeSla, attester: &Wallet, output: [u8; 32]) -> SignedTeeQuote {
     SignedTeeQuote::sign(
         TeeQuote {
-            version: TEE_VERSION,
+            version: TEE_VERSION_V1,
             network_id: sla.network_id.clone(),
             provider: sla.provider,
             tee: sla.tee,
@@ -561,6 +564,10 @@ fn tee_quote_for(sla: &TeeSla, attester: &Wallet, output: [u8; 32]) -> SignedTee
             output_hash: output,
             height: 30,
             nonce: 1,
+            debug: false,
+            tcb_svn: [0u8; 16],
+            report_data: [0u8; 32],
+            vendor: None,
         },
         attester,
     )
@@ -1224,3 +1231,4 @@ fn adapter_rail_executes_settlement_end_to_end() {
     );
     assert!(rail.execute_refund(&refund).is_err());
 }
+

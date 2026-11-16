@@ -60,6 +60,7 @@ pub fn required_evidence(privacy: Privacy, verification: Verification) -> Vec<Ev
 fn evidence_providers(evidence: &Evidence) -> Vec<srct_core::hash::Address> {
     match evidence {
         Evidence::Tee { sla, quote } => vec![sla.provider, quote.quote.provider],
+        Evidence::TeeV2 { sla, quote, .. } => vec![sla.provider, quote.quote.provider],
         Evidence::Fhe { task, receipt } => vec![task.task.provider, receipt.receipt.worker],
         Evidence::Zk { task, receipt } => vec![task.task.provider, receipt.receipt.worker],
         Evidence::Compute {
@@ -71,7 +72,7 @@ fn evidence_providers(evidence: &Evidence) -> Vec<srct_core::hash::Address> {
 
 fn evidence_kind(evidence: &Evidence) -> EvidenceKind {
     match evidence {
-        Evidence::Tee { .. } => EvidenceKind::Tee,
+        Evidence::Tee { .. } | Evidence::TeeV2 { .. } => EvidenceKind::Tee,
         Evidence::Fhe { .. } => EvidenceKind::Fhe,
         Evidence::Zk { .. } => EvidenceKind::Zk,
         Evidence::Compute { .. } => EvidenceKind::Compute,

@@ -79,11 +79,12 @@ fn flow() -> (SignedOffer, SignedAssignment, SignedReceipt, Wallet) {
             input: [3u8; 32],
             deadline: 100,
             nonce: 1,
+            confidential: false,
         },
         &requester,
     )
     .unwrap();
-    let plan = plan_assignments(&job, std::slice::from_ref(&offer), 10, 1).unwrap();
+    let plan = plan_assignments(&job, std::slice::from_ref(&offer), 10, 1, None).unwrap();
     let assignment = plan.sign(&requester).unwrap().assignments.remove(0);
     let receipt = SignedReceipt::sign(
         ComputeReceipt::new(&assignment, 5, [4u8; 32], 1_000, 20, 1).unwrap(),

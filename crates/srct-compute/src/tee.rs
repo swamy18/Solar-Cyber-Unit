@@ -31,19 +31,26 @@ use srct_core::ser::{Reader, Writer};
 use srct_core::sig::{verify_bundle, Bundle};
 use srct_core::wallet::Wallet;
 
-pub const TEE_VERSION: u8 = 1;
+pub const TEE_VERSION: u8 = 2;
+
+/// Wire version 1: the original quote/SLA layout without vendor evidence.
+/// Still decodes; new quotes encode as version 2.
+pub const TEE_VERSION_V1: u8 = 1;
 
 const DOM_TEE_QUOTE: &[u8] = b"srct/compute/tee-quote/v1";
 
 /// Which execution-environment family produced the quote.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum TeeType {
-    /// Test/simulator builds. Accepted only when the SLA asks for it.
+    /// Test/simulator builds. Accepted only when the SLA asks for it —
+    /// and never on mainnet.
     Software = 0,
     /// Intel TDX.
     Tdx = 1,
     /// AMD SEV-SNP.
     SevSnp = 2,
+    /// NVIDIA confidential-computing GPUs (H100/H200/Blackwell, CC mode on).
+    NvidiaCc = 3,
 }
 
 impl TeeType {
@@ -56,6 +63,7 @@ impl TeeType {
             0 => Some(TeeType::Software),
             1 => Some(TeeType::Tdx),
             2 => Some(TeeType::SevSnp),
+            3 => Some(TeeType::NvidiaCc),
             _ => None,
         }
     }
@@ -75,6 +83,23 @@ pub enum TeeError {
     Expired,
     FutureHeight,
     Replay,
+    /// The guest ran with debugging enabled and the SLA did not opt into it.
+    DebugForbidden,
+    /// The evidence TCB is below the SLA minimum.
+    TcbTooOld,
+    /// The evidence report_data does not bind the presented ephemeral key
+    /// and session nonce. The key must never be released on this path.
+    BadReportData,
+    /// Simulator evidence is never accepted on mainnet, even when asked for.
+    SoftwareOnMainnet,
+    /// The evidence family needs a curve this crate does not implement
+    /// (SNP P-384 chain/signature until a P-384 verifier is approved).
+    /// Fail-closed: refuse, do not bypass.
+    UnsupportedCurve,
+    /// Unknown vendor evidence tag.
+    UnknownVendorFormat,
+    /// A certificate in the vendor chain appears in the revocation set.
+    RevokedVendorCert,
 }
 
 impl std::fmt::Display for TeeError {
@@ -93,6 +118,13 @@ impl std::fmt::Display for TeeError {
             TeeError::Expired => write!(f, "quote is older than the SLA allows"),
             TeeError::FutureHeight => write!(f, "quote claims a future height"),
             TeeError::Replay => write!(f, "quote was already accepted"),
+            TeeError::DebugForbidden => write!(f, "guest ran with debugging enabled"),
+            TeeError::TcbTooOld => write!(f, "evidence TCB is below the SLA minimum"),
+            TeeError::BadReportData => write!(f, "report_data does not bind the session key"),
+            TeeError::SoftwareOnMainnet => write!(f, "simulator evidence is never accepted on mainnet"),
+            TeeError::UnsupportedCurve => write!(f, "evidence needs an unapproved curve"),
+            TeeError::UnknownVendorFormat => write!(f, "unknown vendor evidence"),
+            TeeError::RevokedVendorCert => write!(f, "vendor certificate was revoked"),
         }
     }
 }
@@ -169,11 +201,21 @@ pub struct TeeSla {
     pub tee: TeeType,
     /// How many heights old a quote may be at verification time.
     pub max_age_heights: u64,
+    /// Minimum accepted TCB security version (16-byte big-endian,
+    /// family-normalised; see `vendor::VendorEvidence::tcb_svn`).
+    /// Zero means "any TCB the vendor chain accepts".
+    pub min_tcb_svn: [u8; 16],
+    /// Whether a debug-enabled guest is accepted. Defaults off; opting in
+    /// is explicit because debug guests are inspectable by the host.
+    pub allow_debug: bool,
+    /// Approved composite hardware measurement
+    /// (see `vendor::VendorEvidence::measurement_id`).
+    pub measurement: Hash,
 }
 
 impl TeeSla {
     fn validate(&self) -> Result<(), TeeError> {
-        if self.version != TEE_VERSION {
+        if self.version != TEE_VERSION && self.version != TEE_VERSION_V1 {
             return Err(TeeError::Malformed(format!(
                 "unsupported tee sla version {}",
                 self.version
@@ -195,6 +237,9 @@ impl TeeSla {
         if self.workload == [0u8; 32] {
             return Err(TeeError::Malformed("tee sla workload hash is zero".into()));
         }
+        if self.version == TEE_VERSION && self.measurement == [0u8; 32] {
+            return Err(TeeError::Malformed("tee sla measurement is zero".into()));
+        }
         Ok(())
     }
 
@@ -211,6 +256,11 @@ impl TeeSla {
             .fixed(&self.input_hash)
             .u8(self.tee.as_u8())
             .u64le(self.max_age_heights);
+        if self.version == TEE_VERSION {
+            w.fixed(&self.min_tcb_svn)
+                .u8(self.allow_debug as u8)
+                .fixed(&self.measurement);
+        }
         w.into_vec()
     }
 
@@ -233,6 +283,18 @@ impl TeeSla {
         let tee = TeeType::from_u8(r.u8().map_err(malformed)?)
             .ok_or_else(|| TeeError::Malformed("tee sla tee type is unknown".into()))?;
         let max_age_heights = r.u64le().map_err(malformed)?;
+        let (min_tcb_svn, allow_debug, measurement) = if version == TEE_VERSION {
+            let mut tcb = [0u8; 16];
+            tcb.copy_from_slice(&r.fixed::<16>().map_err(malformed)?);
+            let debug_byte = r.u8().map_err(malformed)?;
+            if debug_byte > 1 {
+                return Err(TeeError::Malformed("tee sla debug flag is not a bit".into()));
+            }
+            let measurement: Hash = r.fixed().map_err(malformed)?;
+            (tcb, debug_byte == 1, measurement)
+        } else {
+            ([0u8; 16], false, [0u8; 32])
+        };
         r.expect_end().map_err(malformed)?;
         let sla = TeeSla {
             version,
@@ -245,6 +307,9 @@ impl TeeSla {
             input_hash,
             tee,
             max_age_heights,
+            min_tcb_svn,
+            allow_debug,
+            measurement,
         };
         sla.validate()?;
         Ok(sla)
@@ -252,8 +317,12 @@ impl TeeSla {
 }
 
 /// A signed statement by a quoting key that the workload executed inside the
-/// approved environment. The signer is the **attester**, not the provider:
+/// approved environment. The signer is the *attester*, not the provider:
 /// the provider address is bound inside the signed body.
+///
+/// Version 1 carries the workload bindings only. Version 2 appends the
+/// confidential-tier fields (`debug`, `tcb_svn`, `report_data`, parsed
+/// vendor evidence). Version 1 still decodes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TeeQuote {
     pub version: u8,
@@ -268,11 +337,19 @@ pub struct TeeQuote {
     pub output_hash: Hash,
     pub height: u64,
     pub nonce: u64,
+    /// Whether the guest ran with debugging enabled (v2 only).
+    pub debug: bool,
+    /// Family-normalised TCB security version, big-endian (v2 only).
+    pub tcb_svn: [u8; 16],
+    /// Report-data commitment binding the session key and nonce (v2 only).
+    pub report_data: [u8; 32],
+    /// Parsed vendor evidence (v2 only; `None` on version 1 quotes).
+    pub vendor: Option<crate::vendor::VendorEvidence>,
 }
 
 impl TeeQuote {
     fn validate(&self) -> Result<(), TeeError> {
-        if self.version != TEE_VERSION {
+        if self.version != TEE_VERSION && self.version != TEE_VERSION_V1 {
             return Err(TeeError::Malformed(format!(
                 "unsupported tee quote version {}",
                 self.version
@@ -286,6 +363,9 @@ impl TeeQuote {
         }
         if self.nonce == 0 {
             return Err(TeeError::Malformed("tee quote nonce is zero".into()));
+        }
+        if self.version == TEE_VERSION && self.vendor.is_none() {
+            return Err(TeeError::Malformed("v2 quote names no vendor evidence".into()));
         }
         Ok(())
     }
@@ -305,6 +385,17 @@ impl TeeQuote {
             .fixed(&self.output_hash)
             .u64le(self.height)
             .u64le(self.nonce);
+        if self.version == TEE_VERSION {
+            // validate() refuses v2 quotes without vendor evidence, so a
+            // missing vendor here means a hand-built quote; encoding short
+            // fails closed at decode time.
+            if let Some(vendor) = &self.vendor {
+                w.u8(self.debug as u8)
+                    .fixed(&self.tcb_svn)
+                    .fixed(&self.report_data)
+                    .raw(&vendor.encode());
+            }
+        }
         w.into_vec()
     }
 
@@ -333,6 +424,24 @@ impl TeeQuote {
         let output_hash = r.fixed().map_err(malformed)?;
         let height = r.u64le().map_err(malformed)?;
         let nonce = r.u64le().map_err(malformed)?;
+        let (debug, tcb_svn, report_data, vendor) = if version == TEE_VERSION {
+            let debug_byte = r.u8().map_err(malformed)?;
+            if debug_byte > 1 {
+                return Err(TeeError::Malformed("tee quote debug flag is not a bit".into()));
+            }
+            let tcb_svn: [u8; 16] = r.fixed().map_err(malformed)?;
+            let binding: [u8; 32] = r.fixed().map_err(malformed)?;
+            let rest_len = r.remaining();
+            let rest = r.fixed_slice(rest_len).map_err(malformed)?;
+            let vendor = crate::vendor::VendorEvidence::decode(rest)?;
+            (debug_byte == 1, tcb_svn, binding, Some(vendor))
+        } else if version == TEE_VERSION_V1 {
+            (false, [0u8; 16], [0u8; 32], None)
+        } else {
+            return Err(TeeError::Malformed(format!(
+                "unsupported tee quote version {version}"
+            )));
+        };
         r.expect_end().map_err(malformed)?;
         let quote = TeeQuote {
             version,
@@ -347,6 +456,10 @@ impl TeeQuote {
             output_hash,
             height,
             nonce,
+            debug,
+            tcb_svn,
+            report_data,
+            vendor,
         };
         quote.validate()?;
         Ok(quote)
@@ -421,6 +534,51 @@ impl SignedTeeQuote {
     }
 }
 
+/// A provider's attested quote stored in the node's local registry.
+/// Keyed by the quote hash; the node uses it to gate confidential
+/// planning and to answer verify requests.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredAttestation {
+    /// Hash of the signed quote (registry key).
+    pub quote_hash: Hash,
+    /// Provider address the quote binds.
+    pub provider: Address,
+    /// Signed tee quote (opaque bytes, re-verified on load).
+    pub quote_bytes: Vec<u8>,
+    /// Chain height at which the attestation was registered.
+    pub registered_height: u64,
+    /// Height at which the attestation expires (registered + max_age_heights).
+    pub expires_height: u64,
+}
+
+impl StoredAttestation {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = srct_core::ser::Writer::with_capacity(256 + self.quote_bytes.len());
+        w.fixed(&self.quote_hash)
+            .fixed(&self.provider)
+            .u32le(self.quote_bytes.len() as u32)
+            .raw(&self.quote_bytes)
+            .u64le(self.registered_height)
+            .u64le(self.expires_height);
+        w.into_vec()
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, TeeError> {
+        let mut r = srct_core::ser::Reader::new(bytes);
+        let quote_hash = r.fixed().map_err(|e| TeeError::Malformed(format!("quote_hash: {e}")))?;
+        let provider = r.fixed().map_err(|e| TeeError::Malformed(format!("provider: {e}")))?;
+        let len = r.u32le().map_err(|e| TeeError::Malformed(format!("quote_bytes len: {e}")))? as usize;
+        if len > 64 * 1024 {
+            return Err(TeeError::Malformed("quote bytes too large".into()));
+        }
+        let quote_bytes = r.fixed_slice(len).map_err(|e| TeeError::Malformed(format!("quote_bytes: {e}")))?.to_vec();
+        let registered_height = r.u64le().map_err(|e| TeeError::Malformed(format!("registered_height: {e}")))?;
+        let expires_height = r.u64le().map_err(|e| TeeError::Malformed(format!("expires_height: {e}")))?;
+        r.expect_end().map_err(|e| TeeError::Malformed(format!("trailing: {e}")))?;
+        Ok(StoredAttestation { quote_hash, provider, quote_bytes, registered_height, expires_height })
+    }
+}
+
 /// Fail-closed verifier: trusted roots, an accepted-quote replay book, and
 /// the deterministic SLA checks from the master Section 6 rules.
 #[derive(Clone, Debug, Default)]
@@ -437,7 +595,9 @@ impl TeeVerifier {
 
     /// Accept the quote and return its output hash, or refuse with the exact
     /// reason. Accepting records the quote hash, so the same bytes can never
-    /// verify twice.
+    /// verify twice. Dispatches on quote version: v1 follows the legacy
+    /// attester-key path, v2 additionally verifies vendor evidence against
+    /// `vendor` with `presented_pubkey` bound into report_data.
     pub fn verify(
         &mut self,
         sla: &TeeSla,
@@ -445,7 +605,42 @@ impl TeeVerifier {
         roots: &AttestationRoots,
         current_height: u64,
     ) -> Result<Hash, TeeError> {
+        self.verify_inner(sla, signed, roots, None, &[], current_height)
+    }
+
+    /// Verify a version-2 quote with full vendor evidence checks. `vendor`
+    /// carries pinned roots, CRL serials, TCB minimums, the approved
+    /// measurement and the caller-vouched unix time; `presented_pubkey` is
+    /// the enclave ephemeral key the consumer saw over the attested channel.
+    /// The data key must never be released unless this returns `Ok`.
+    pub fn verify_v2(
+        &mut self,
+        sla: &TeeSla,
+        signed: &SignedTeeQuote,
+        roots: &AttestationRoots,
+        vendor: &crate::vendor::VendorInputs,
+        presented_pubkey: &[u8],
+        current_height: u64,
+    ) -> Result<Hash, TeeError> {
+        if signed.quote.version != TEE_VERSION {
+            return Err(TeeError::Malformed("verify_v2 needs a version 2 quote".into()));
+        }
+        self.verify_inner(sla, signed, roots, Some(vendor), presented_pubkey, current_height)
+    }
+
+    fn verify_inner(
+        &mut self,
+        sla: &TeeSla,
+        signed: &SignedTeeQuote,
+        roots: &AttestationRoots,
+        vendor: Option<&crate::vendor::VendorInputs>,
+        presented_pubkey: &[u8],
+        current_height: u64,
+    ) -> Result<Hash, TeeError> {
         sla.validate()?;
+        if sla.network_id == "srct/mainnet" && sla.tee == TeeType::Software {
+            return Err(TeeError::SoftwareOnMainnet);
+        }
         let signer = signed.verify_signature()?;
         let root = roots.lookup(&signer)?;
         let quote = &signed.quote;
@@ -473,11 +668,76 @@ impl TeeVerifier {
         if current_height.saturating_sub(quote.height) > sla.max_age_heights {
             return Err(TeeError::Expired);
         }
+        if quote.version == TEE_VERSION {
+            self.verify_v2_tail(sla, quote, vendor, presented_pubkey)?;
+        }
         let digest = quote.hash();
         if !self.seen.insert(digest) {
             return Err(TeeError::Replay);
         }
         Ok(quote.output_hash)
+    }
+
+    /// Confidential-tier checks for version 2 quotes: debug policy, TCB
+    /// minimum, vendor evidence chain, measurement allowlist, report-data
+    /// session binding. Every failure means the data key stays sealed.
+    fn verify_v2_tail(
+        &self,
+        sla: &TeeSla,
+        quote: &TeeQuote,
+        vendor: Option<&crate::vendor::VendorInputs>,
+        presented_pubkey: &[u8],
+    ) -> Result<(), TeeError> {
+        let inputs = vendor.ok_or_else(|| {
+            TeeError::Malformed("version 2 quote needs vendor inputs".into())
+        })?;
+        let evidence = quote.vendor.as_ref().ok_or_else(|| {
+            TeeError::Malformed("version 2 quote names no vendor evidence".into())
+        })?;
+        // The attester-signed header must agree with the vendor-signed
+        // evidence: a quote that claims non-debug for a debug guest (or a
+        // different TCB than the evidence carries) is a lying attester.
+        if quote.debug != evidence.debug_enabled() {
+            return Err(TeeError::BindingMismatch);
+        }
+        if quote.tcb_svn != evidence.tcb_svn() {
+            return Err(TeeError::BindingMismatch);
+        }
+        if sla.min_tcb_svn != [0u8; 16] && quote.tcb_svn < sla.min_tcb_svn {
+            return Err(TeeError::TcbTooOld);
+        }
+        // Debug policy lives in the vendor verifier (mirroring the SLA
+        // opt-in below); reaching it with a debug guest and no opt-in
+        // fails closed there.
+        match evidence {
+            crate::vendor::VendorEvidence::Tdx(q) => {
+                let mut full = inputs.clone();
+                full.approved_measurement = sla.measurement;
+                full.allow_debug = sla.allow_debug;
+                crate::vendor::verify_tdx(q, &full)?;
+            }
+            crate::vendor::VendorEvidence::Snp(r) => {
+                let mut full = inputs.clone();
+                full.approved_measurement = sla.measurement;
+                full.allow_debug = sla.allow_debug;
+                crate::vendor::verify_snp(r, &full)?;
+            }
+            crate::vendor::VendorEvidence::Nvidia(r) => {
+                let key = inputs.nvidia_signing_key.as_ref().ok_or_else(|| {
+                    TeeError::Malformed("nvidia evidence needs a pinned signing key".into())
+                })?;
+                let mut full = inputs.clone();
+                full.approved_measurement = sla.measurement;
+                crate::vendor::verify_nvidia(r, &full, key)?;
+            }
+        }
+        // Session binding on the quote header copy too: both must bind the
+        // same presented key and the quote nonce.
+        let expected = crate::vendor::expected_report_binding(presented_pubkey, quote.nonce);
+        if quote.report_data != expected {
+            return Err(TeeError::BadReportData);
+        }
+        Ok(())
     }
 }
 

@@ -1,0 +1,30 @@
+[package]
+publish = false
+name = "srct-confid"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Consumer-side confidential-tier key broker: HPKE key release, encrypted keystore, shield helpers. Never linked into the provider binary."
+
+[dependencies]
+srct-core.workspace = true
+srct-compute.workspace = true
+hpke.workspace = true
+chacha20poly1305.workspace = true
+argon2.workspace = true
+base64.workspace = true
+zeroize.workspace = true
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[[bin]]
+name = "srct-confid"
+path = "src/bin/main.rs"
+
+[dev-dependencies]
+serde_json.workspace = true
+p256.workspace = true
+sha2.workspace = true

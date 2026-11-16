@@ -1173,6 +1173,7 @@ fn compute_marketplace_offer_job_plan_and_settle() {
         input: [42u8; 32],
         deadline: 9_000,
         nonce: 100,
+        confidential: false,
     };
     let signed_job = srct_compute::SignedJob::sign(job, &requester_wallet).unwrap();
     let job_hex = hex::encode(signed_job.encode());
@@ -1195,7 +1196,7 @@ fn compute_marketplace_offer_job_plan_and_settle() {
 
     // 4. Requester signs the assignment: the authorization to pay for
     // the planned shard. Receipts settle only against a stored assignment.
-    let plan = srct_compute::market::plan_assignments(&signed_job, &[signed_offer], 1, 0).unwrap();
+    let plan = srct_compute::market::plan_assignments(&signed_job, &[signed_offer], 1, 0, None).unwrap();
     let signed_plan = plan.sign(&requester_wallet).unwrap();
     let assignment = &signed_plan.assignments[0];
     let assignment_hex = hex::encode(assignment.encode());

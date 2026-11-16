@@ -620,6 +620,180 @@ escrow, settle, bond, challenge, ticket, TEE, journal, gossip):
   strict-vs-best-effort enforcement, the backend plugin hook (register,
   execute, refuse-unclaimed), and session-sandbox deletion on success and
   on handler failure;
+
+## 11. Confidential Tier — threat model and plan (simulator-tested only)
+
+A consumer's data, model and keys stay under the consumer's control. The
+compute provider must never see plaintext or hold any key. This covers
+inference and training, is directly deployable with production-proven
+technology, and uses no research approaches. **Nothing in this section is
+validated on real hardware.** Every behaviour below is simulator-tested
+only until the hardware-gated runs (TDX, SEV-SNP, NVIDIA CC hosts) pass;
+the runbook for those runs is a deliverable of the later phases.
+
+### Threat model (read first)
+
+**Protected against:**
+- a malicious provider process (sees only ciphertext and attested-channel
+  bytes; plaintext exists only inside the approved guest image);
+- the provider's OS and hypervisor admin (memory encryption + attested
+  measurements; admin sees encrypted pages, not content);
+- other tenants on the same machine (per-job keys; no cross-job key reuse);
+- passive network observers (payloads are AEAD; the live channel is
+  attested TLS).
+
+**NOT protected against — stated plainly, no unconditional privacy claimed:**
+- hardware vendor compromise (Intel/AMD/NVIDIA roots are trust anchors;
+  a compromised root breaks everything below it);
+- microarchitectural side channels (cache, timing, power — no
+  constant-time claim is made on ML kernels);
+- denial of service (a malicious host can always refuse to compute);
+- traffic metadata (message sizes, timing and endpoints are visible).
+
+**Normal (non-TEE) providers keep working** but only get non-sensitive
+jobs, labelled non-confidential at match time. The existing `privacy`
+(sealed-input) flag is a delivery hint and **must never authorize a
+confidential job** — only a verified attestation matching the job SLA
+does. One test pins exactly this.
+
+### 1. Confidential providers (planned)
+
+- Confidential VMs: Intel TDX and AMD SEV-SNP, plus NVIDIA
+  confidential-computing GPUs (H100/H200/Blackwell) with CC mode on. No
+  SGX for ML workloads.
+- The provider runs a measured guest image (reproducible build)
+  containing the shield runtime and the inference/training runtimes. The
+  host never sees plaintext.
+- Provider offers carry TEE capability, TEE family, GPU CC support and
+  attestation evidence alongside the existing capability floors.
+
+### 2. Remote attestation (implemented, simulator-tested only)
+
+- Vendor evidence (`srct-compute/src/vendor.rs`): parsed Intel TDX DCAP
+  quotes (v4 layout: 48-byte header, 584-byte TD body, 384-byte QE
+  report, QE signature, auth data, concatenated DER PCK chain, plus a
+  65-byte attestation-pubkey trailer that makes the QE binding checkable),
+  AMD SEV-SNP reports (ABI offsets, 1184-byte report + 512-byte
+  signature), NVIDIA JWT reports (ES256 over `header_b64.payload_b64`,
+  claims-checked). All parsers are fail-closed and fuzzed
+  (`tdx_quote_parse`, `snp_report_parse`, `nvidia_report_parse`,
+  `vendor_chain_parse`).
+- Chain verification with `p256` + `p384` + `x509-parser` (kept out of
+  `srct-core`): exact-TBS DER splitting (no re-encoding), DN chaining,
+  validity windows, CRL serials, pinned root SPKI hashes. P-384 covers AMD
+  VCEK/VLEK chains and SNP report signatures; `TeeError::UnsupportedCurve`
+  remains as the fail-closed path for any future family needing an
+  unapproved curve.
+- Policy checks: debug off unless the SLA explicitly opts in (setter and
+  attester must agree — a mismatched quote header is a lying attester),
+  TCB minimums per family, approved-measurement allowlist (TDX: mr_td +
+  RTMRs; SNP: measurement; NVIDIA: sorted claims), nonce freshness, replay
+  protection, expiry, revocation. The enclave's ephemeral public key is
+  bound into `report_data` (`SHA256(pubkey || nonce_le)`); any mismatch
+  returns `BadReportData` and the data key is never released.
+- `TeeType::NvidiaCc` added; `TEE_VERSION` 2 with v1 still decoding
+  (v1 SLA/quote paths unchanged). `TeeVerifier::verify_v2` runs the full
+  confidential path; plain `verify` on a v2 quote fails closed. Software
+  evidence is refused on mainnet in both paths, even when asked for.
+- `srct-verify` routes new `Evidence::TeeV2` (mapped to `EvidenceKind::Tee`);
+  `srct-l2/tee_evidence` decodes v1 and v2 but stays signature-check-only
+  and out of `apply()` — no consensus change.
+- Not done here: RIM/KDS/PCS fetchers (node-side, later phase),
+  hardware-gated runs (runbook pending).
+
+### 3. Key management (implemented, simulator-tested only)
+
+- Per-job random data key (XChaCha20-Poly1305; AES-256-GCM also permitted
+  by the format).
+- Key release: the consumer verifies the attestation, then wraps the data
+  key to the enclave's ephemeral public key with HPKE (RFC 9180,
+  X25519, HKDF-SHA256, ChaCha20-Poly1305). **If attestation fails, the key
+  is never sent** — pinned by negative tests for tampered quotes, wrong
+  measurements, stale/replayed quotes, debug-enabled guests, revoked
+  attesters and `report_data` mismatches.
+- Separate result key and checkpoint key. Short TTL, rotation,
+  revocation, zeroization after the session. No key material in logs,
+  errors or crash dumps.
+- Pluggable KMS adapter: local encrypted keystore by default (same format
+  as `wallets.json`: Argon2id + ChaCha20-Poly1305, `0600`, atomic write);
+  HashiCorp Vault and cloud KMS as trait stubs + docs only.
+- New consumer-side crate `srct-confid` with its own CLI (`srct-confid`):
+  keystore init/list/revoke, key wrap/open, and attestation-gated release.
+  Key-release code never links into the provider-side `srct-worker`.
+
+### 4. Shield bundle (planned; data protection)
+
+- Versioned format: manifest plus AEAD-encrypted chunks with unique
+  nonces, integrity chain or Merkle tree, bound to job id, ticket and the
+  approved measurement; streaming support for large datasets.
+- Model weights encrypted the same way, or a public model pre-installed
+  inside the measured image and referenced by service name.
+- Consumer-to-enclave channel uses attested TLS. Results and checkpoints
+  are encrypted to the consumer's key before they leave the enclave.
+- The bundle parser gets a fuzz target (`cargo fuzz` style, like the
+  existing 18 targets).
+
+### 5. Guest runtime and attested metering (later phase, simulator-backed)
+
+- No outbound network except the attested channel. No unencrypted
+  persistent storage. Memory wipe on exit. Provider `--ram-pct`,
+  `--cpu-pct`, `--gpu-pct` limits still enforced from outside the guest.
+- Session lifecycle: attest, key release, run, seal output, wipe.
+- The enclave signs usage records per compute slice; these plug into the
+  existing slice and ledger design (§5 metering) and the delayed payout.
+
+### 6. Matching and policy (minimal slice in the first stage)
+
+- Jobs declare a confidentiality level (new `ComputeJob` field:
+  `JOB_VERSION` 2 → 3; v1/v2 decode as non-confidential). The planner
+  only considers providers with a valid, fresh attestation matching the
+  job SLA, then applies the existing fair allocation.
+- Re-attest per session and periodically for long jobs. Bond, capacity
+  and reputation rules stay unchanged. Attestation expiry and revocation
+  handling included; `state.bin` 17 → 18 with fail-closed decode.
+
+### 7. Inference (deferred)
+
+- Interactive and batch inference inside attested enclaves with encrypted
+  request/response streams. Batching, timeouts, and graceful failure
+  (no plaintext fallback, ever).
+
+### 8. Training — production-proven scope only (deferred)
+
+- (a) Training and fine-tuning (including LoRA) on one provider's
+  confidential GPU(s), with multi-GPU data parallelism inside that
+  single machine.
+- (b) Many independent parallel jobs (hyperparameter sweeps, per-dataset
+  fine-tunes), each in its own attested enclave.
+- (c) Encrypted checkpoints every N steps, resume after preemption or
+  failure, and migration to another attested provider using the
+  consumer's key.
+- Out of scope this round, documented here and in code: synchronous
+  training of one model across independent providers, split learning,
+  MPC, FHE, DiLoCo-style methods.
+
+### 9. Integration (later phases)
+
+- Consumer-side component: `srct-confid` CLI (job submit not yet wired to
+  node endpoints; attestation verification, key broker, bundle creation,
+  result decryption available as library + CLI). Key-release code never
+  links into `srct-worker`.
+- Node endpoints for attestation evidence submission and verification —
+  deferred (state.bin 17 → 18 with fail-closed decode, attestation
+  registry). No consensus changes.
+
+### Validation gates (what counts as done)
+
+- Simulator end-to-end tests for the full flow.
+- Negative tests: tampered quote, wrong measurement, stale or replayed
+  quote, debug-enabled guest, revoked attester, mismatched `report_data`
+  — the key must never be released in any of these.
+- Fuzz tests for bundle and quote parsing; hardware-gated tests behind
+  an env var with a runbook for real TDX, SEV-SNP and NVIDIA CC hosts.
+- No path is called "production-ready" until it has passed on real
+  hardware. Until then, every confidential claim is labelled
+  **simulator-tested only**.
+- All existing tests (wash-trading, capacity, fairness) keep passing.
 - challenge re-execution clears matching receipts and slashes fabricated ones:
   same result verifies clean, a different result produces a `WrongResult`
   dispute that halves the bond and bans the provider through the existing
@@ -671,3 +845,9 @@ escrow, settle, bond, challenge, ticket, TEE, journal, gossip):
    hard OS enforcement; extensible backend registry (CPU + loopback
    reference backends, GPU/NPU interface-only); session sandbox with the
    provider-visibility caveat stated plainly.
+7. Confidential tier — **in progress, simulator-tested only** (see §11):
+   TDX/SEV-SNP/NVIDIA-CC providers, vendor attestation verification,
+   consumer-side key broker with HPKE key release, shield bundle, attested
+   metering, confidential matching. Nothing here is validated on real
+   hardware; every claim below is marked simulator-only until the
+   hardware-gated runs pass.

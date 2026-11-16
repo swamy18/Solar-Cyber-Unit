@@ -75,6 +75,7 @@ fn job(requester: &Wallet) -> SignedJob {
             input: [3u8; 32],
             deadline: DEADLINE,
             nonce: 1,
+            confidential: false,
         },
         requester,
     )
@@ -106,7 +107,7 @@ fn a_job_runs_from_funding_to_settlement_to_refund() {
     let challenger_offer = offer(&challenger, 2, 7, 5);
     let offers = [worker_offer.clone(), challenger_offer.clone()];
     let job = job(&requester);
-    let plan = plan_assignments(&job, &offers, 10, 1)
+    let plan = plan_assignments(&job, &offers, 10, 1, None)
         .unwrap()
         .sign(&requester)
         .unwrap();
