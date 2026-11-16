@@ -1724,11 +1724,13 @@ impl SharedNode {
             compute_payouts,
             compute_payout_exit,
             compute_escrow,
+            compute_usage_ledger,
             compute_bonds,
             compute_challenges,
-            revoke_broadcast,
             compute_claims,
             compute_preauth,
+            compute_attestations,
+            revoke_broadcast,
         ) = if version == 8 {
             r.expect_end().map_err(|e| format!("state envelope: {e}"))?;
             (
@@ -1744,11 +1746,13 @@ impl SharedNode {
                 BTreeMap::new(),
                 BTreeMap::new(),
                 srct_compute::EscrowBook::new(mine.clone()),
+                srct_compute::ledger::ComputeUsageLedger::new(),
                 srct_compute::BondBook::new(mine.clone()),
                 srct_compute::ChallengeBook::new(mine.clone()),
-                Vec::new(),
-                srct_compute::ClaimBook::new(mine),
+                srct_compute::ClaimBook::new(mine.clone()),
                 BTreeMap::new(),
+                BTreeMap::new(),
+                Vec::new(),
             )
         } else if version == 9 {
             let t = decode_section(&mut r, "trials", |sr| {
@@ -1833,11 +1837,13 @@ impl SharedNode {
                 BTreeMap::new(),
                 BTreeMap::new(),
                 srct_compute::EscrowBook::new(mine.clone()),
+                srct_compute::ledger::ComputeUsageLedger::new(),
                 srct_compute::BondBook::new(mine.clone()),
                 srct_compute::ChallengeBook::new(mine.clone()),
-                Vec::new(),
                 srct_compute::ClaimBook::new(mine),
                 BTreeMap::new(),
+                BTreeMap::new(),
+                Vec::new(),
             )
         } else {
             let t = decode_section(&mut r, "trials", |sr| {
@@ -1962,12 +1968,13 @@ impl SharedNode {
                 compute_payouts,
                 compute_payout_exit,
                 compute_escrow,
-                _compute_usage_ledger,
+                compute_usage_ledger,
                 compute_bonds,
                 compute_challenges,
-                revoke_broadcast,
                 compute_claims,
                 compute_preauth,
+                compute_attestations,
+                revoke_broadcast,
             ) = if version >= 15 {
                 let co = decode_section(&mut r, "compute_offers", |sr| {
                     decode_state_map(sr, "compute_offers", |b| {
@@ -2019,6 +2026,22 @@ impl SharedNode {
                     srct_compute::EscrowBook::decode(bytes, &mine)
                         .map_err(|e| format!("compute_escrow: {e}"))
                 })?;
+                // v17 inserts the usage ledger here, right after escrow.
+                // It must be read in encode order: reading bonds here
+                // instead misaligned every later section, failing as
+                // `compute_bonds: compute object is for another network`.
+                let compute_usage_ledger = if version >= 17 {
+                    decode_section(&mut r, "compute_usage_ledger", |sr| {
+                        let n = sr.remaining();
+                        let bytes = sr
+                            .fixed_slice(n)
+                            .map_err(|e| format!("compute_usage_ledger: {e}"))?;
+                        srct_compute::ledger::ComputeUsageLedger::decode(bytes)
+                            .map_err(|e| format!("compute_usage_ledger: {e}"))
+                    })?
+                } else {
+                    srct_compute::ledger::ComputeUsageLedger::new()
+                };
                 let bonds = decode_section(&mut r, "compute_bonds", |sr| {
                     let n = sr.remaining();
                     let bytes = sr
@@ -2035,11 +2058,8 @@ impl SharedNode {
                     srct_compute::ChallengeBook::decode(bytes, &mine)
                         .map_err(|e| format!("compute_challenges: {e}"))
                 })?;
-                let rb = decode_section(&mut r, "revoke_broadcast", |sr| {
-                    decode_revoke_queue(sr).map_err(|e| format!("revoke_broadcast: {e}"))
-                })?;
                 // v16 appends the claim book and preauth exits. v15 files
-                // end here and migrate with empty books.
+                // have no sections here and migrate with empty books.
                 let (claims, preauth) = if version >= 16 {
                     let cb = decode_section(&mut r, "compute_claims", |sr| {
                         let n = sr.remaining();
@@ -2056,20 +2076,20 @@ impl SharedNode {
                 } else {
                     (srct_compute::ClaimBook::new(mine.clone()), BTreeMap::new())
                 };
-                // Compute metering (v17): node-local usage ledger. Older
-                // versions migrate with an empty ledger.
-                let compute_usage_ledger = if version >= 17 {
-                    decode_section(&mut r, "compute_usage_ledger", |sr| {
-                        let n = sr.remaining();
-                        let bytes = sr
-                            .fixed_slice(n)
-                            .map_err(|e| format!("compute_usage_ledger: {e}"))?;
-                        srct_compute::ledger::ComputeUsageLedger::decode(bytes)
-                            .map_err(|e| format!("compute_usage_ledger: {e}"))
+                // v18 appends attestations before the trailing revoke queue.
+                let attestations = if version >= 18 {
+                    decode_section(&mut r, "compute_attestations", |sr| {
+                        decode_state_map(sr, "compute_attestations", |b| {
+                            srct_compute::StoredAttestation::decode(b)
+                                .map_err(|e| format!("attestation: {e}"))
+                        })
                     })?
                 } else {
-                    srct_compute::ledger::ComputeUsageLedger::new()
+                    BTreeMap::new()
                 };
+                let rb = decode_section(&mut r, "revoke_broadcast", |sr| {
+                    decode_revoke_queue(sr).map_err(|e| format!("revoke_broadcast: {e}"))
+                })?;
                 r.expect_end().map_err(|e| format!("state envelope: {e}"))?;
                 (
                     co,
@@ -2082,9 +2102,10 @@ impl SharedNode {
                     compute_usage_ledger,
                     bonds,
                     challenges,
-                    rb,
                     claims,
                     preauth,
+                    attestations,
+                    rb,
                 )
             } else if version == 14 {
                 let co = decode_section(&mut r, "compute_offers", |sr| {
@@ -2116,9 +2137,10 @@ impl SharedNode {
                     srct_compute::ledger::ComputeUsageLedger::new(),
                     srct_compute::BondBook::new(mine.clone()),
                     srct_compute::ChallengeBook::new(mine.clone()),
-                    Vec::new(),
                     srct_compute::ClaimBook::new(mine.clone()),
                     BTreeMap::new(),
+                    BTreeMap::new(),
+                    Vec::new(),
                 )
             } else {
                 (
@@ -2132,9 +2154,10 @@ impl SharedNode {
                     srct_compute::ledger::ComputeUsageLedger::new(),
                     srct_compute::BondBook::new(mine.clone()),
                     srct_compute::ChallengeBook::new(mine.clone()),
-                    Vec::new(),
                     srct_compute::ClaimBook::new(mine.clone()),
                     BTreeMap::new(),
+                    BTreeMap::new(),
+                    Vec::new(),
                 )
             };
             (
@@ -2150,11 +2173,13 @@ impl SharedNode {
                 compute_payouts,
                 compute_payout_exit,
                 compute_escrow,
+                compute_usage_ledger,
                 compute_bonds,
                 compute_challenges,
-                revoke_broadcast,
                 compute_claims,
                 compute_preauth,
+                compute_attestations,
+                revoke_broadcast,
             )
         };
 
@@ -2246,34 +2271,10 @@ impl SharedNode {
         self.compute_challenges = compute_challenges;
         self.compute_claims = compute_claims;
         self.compute_preauth = compute_preauth;
-        // Compute attestations (v18): provider-signed tee quotes. Older
-        // versions migrate with an empty registry.
-        let compute_attestations = if version >= 18 {
-            decode_section(&mut r, "compute_attestations", |sr| {
-                decode_state_map(sr, "compute_attestations", |b| {
-                    srct_compute::StoredAttestation::decode(b)
-                        .map_err(|e| format!("attestation: {e}"))
-                })
-            })?
-        } else {
-            BTreeMap::new()
-        };
+        // v17/v18 books already decoded in encode order above; older
+        // versions migrate with empty books.
         self.compute_attestations = compute_attestations;
         self.revoke_broadcast = revoke_broadcast;
-        // Compute metering (v17): node-local usage ledger. Older versions
-        // migrate with an empty ledger.
-        let compute_usage_ledger = if version >= 17 {
-            decode_section(&mut r, "compute_usage_ledger", |sr| {
-                let n = sr.remaining();
-                let bytes = sr
-                    .fixed_slice(n)
-                    .map_err(|e| format!("compute_usage_ledger: {e}"))?;
-                srct_compute::ledger::ComputeUsageLedger::decode(bytes)
-                    .map_err(|e| format!("compute_usage_ledger: {e}"))
-            })?
-        } else {
-            srct_compute::ledger::ComputeUsageLedger::new()
-        };
         self.compute_usage_ledger = compute_usage_ledger;
         // Rebuild the settlement mirror from the persisted payouts. Receipts
         // and assignments re-verify through their own codecs before one is
