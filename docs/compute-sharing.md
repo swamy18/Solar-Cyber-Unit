@@ -1,6 +1,6 @@
 # Decentralized compute sharing
 
-Status: **production money loop** with core in `crates/srct-compute` and endpoints in `crates/srct-node`. Any device advertises capability (RAM, measured throughput, bandwidth, determinism) behind a signed bond, requesters shard work across devices, and verified receipts settle completed units — via planned assignments or the open ticket board. Offers, jobs, assignments, tickets, claims, receipts, payouts, preauth exits, escrow and bond books, and challenges persist in `state.bin` (envelope v16).
+Status: **production money loop** with core in `crates/srct-compute` and endpoints in `crates/srct-node`. Any device advertises capability (RAM, measured throughput, bandwidth, determinism) behind a signed bond, requesters shard work across devices, and verified receipts settle completed units — via planned assignments or the open ticket board. Offers, jobs, assignments, tickets, claims, receipts, payouts, preauth exits, escrow and bond books, challenges, usage records and the metering ledger persist in `state.bin` (envelope v17).
 
 ```bash
 cargo test -p srct-compute
@@ -36,6 +36,8 @@ and a settlement ledger. `srct-node` runs the full money loop over REST:
   `POST /v1/compute/claims` (first valid claim wins)
 - money in: `POST /v1/compute/escrow/fund`, money back: `POST /v1/compute/escrow/refund`
 - settlement: `POST /v1/compute/receipt` & `GET /v1/compute/receipts/list`
+- metering: `GET /v1/compute/ledger?from=&to=` (node-local usage ledger,
+  indexed by slice end height)
 - money out: `GET /v1/compute/payouts`,
   `GET /v1/compute/payouts/{receipt}/exit-template`,
   `POST /v1/compute/payouts/{receipt}/claim`
@@ -75,25 +77,34 @@ In `templates/srct_node.py`, participants operate under 100% dedicated allocatio
 - **`mode="ai_compute"`**: 100% of RAM/compute allocated to AI compute tasks.
 - **Consumer Task Dispatch**: Incoming consumer requests dynamically dispatch between AI inference (`task["type"] == "inference"`) and AI training (`task["type"] == "training"`).
 
-## 2. Device profile
+## 2. Device profile and backend registry
 
 ```
-DeviceProfile = version || class || determinism || ram_mib || cores ||
+DeviceProfile = version || class || backend || determinism || ram_mib || cores ||
                 max_units_per_shard || bandwidth_kbps ||
-                claimed_units_per_sec || kernel(32)   // v2; v1 stops at bandwidth
+                claimed_units_per_sec || kernel(32)   // v3; v2 lacks backend,
+                                                      // v1 lacks backend+throughput
 profile_hash = SHA256("srct/compute/device-profile/v1" || encode)
 ```
 
 - `class`: CPU, GPU, TPU, NPU, Apple silicon, photonic. **Display label
-  only.** Matching never consults it: a new hardware family joins without
-  any protocol change, and a job expresses "fast" as floors, not as a
-  class gate. An unknown byte is still refused rather than coerced.
+  only.** Matching never consults it. An unknown class byte is still
+  refused rather than coerced; an unknown *backend id* is accepted as
+  generic (labels behave differently by design — see below).
+- `backend`: open vendor/arch identifier (e.g. `"cpu/x86_64"`,
+  `"apple/silicon"`, `"mobile/snapdragon-x"`), v3 on the wire (≤128 bytes,
+  `[A-Za-z0-9/_.-]`). Unknown ids are accepted as `"generic"` and matched
+  purely on capabilities — a new hardware family joins with no protocol
+  change. Versions 1 and 2 still decode, with the legacy class mapping
+  (`cpu/generic`, `gpu/generic`, `tpu/generic`, `npu/generic`,
+  `apple/silicon`, `photonic/generic`) in place of the field.
 - `determinism`: `Statistical < Reproducible < BitExact`. A job requiring
   `BitExact` cannot be scheduled on a floating-point device.
 - `claimed_units_per_sec`: self-declared sustained throughput measured with
   the canonical benchmark kernel (units per second). Spot-checked by receipt
-  `elapsed_ms` and challenge re-execution, never trusted outright. Version
-  1 profiles decode with 0, which satisfies only jobs that require none.
+  `elapsed_ms` and challenge re-execution, never trusted outright. Versions
+  1 and 2 decode as before (v1 throughput 0, satisfying only jobs that
+  require none); v3 validates the backend id alongside throughput.
 - `max_units_per_shard` is a device-side cap, independent of the offer's
   per-job cap.
 - `kernel` is the declared kernel-set hash; zero means "any kernel". A job that
@@ -102,7 +113,24 @@ profile_hash = SHA256("srct/compute/device-profile/v1" || encode)
 `DeviceRequirement` matching is fail-closed on capabilities: too little RAM
 refuses, throughput below the floor refuses, bandwidth below the floor
 refuses, a weaker determinism class refuses and a different kernel refuses.
-The class mask rides the wire for compatibility and is ignored.
+The class mask rides the wire for compatibility and is ignored; the backend
+id is likewise not consulted — capability floors are the whole gate.
+
+### Backend plugin interface (prototype)
+
+Vendors (mobile, Apple NPU, discrete GPU, other accelerators) plug an
+executor in without protocol changes through the `ComputeBackend` Rust
+trait (`backend_id`, `describe`, `execute`) and the `register_backend`
+hook in `templates/srct_node.py`. The `BackendRegistry` advertises known
+ids; unknown ids stay unknown and match on capabilities only.
+
+Shipped with working execution code: `CpuBackend` (`"cpu/generic"`,
+deterministic mixing loop) and `LoopbackBackend` (`"ref/loopback"`,
+deterministic hash chain — labelled as a reference, not a performance
+claim). GPU/NPU support is **not** claimed: no `cuda/*`, `metal/*`,
+`rocm/*` or NPU backend ships, and the template refuses to run a workload
+on a named backend with no registered executor. A label without a working
+executor is interface-only, never support.
 
 ## 3. Signed offers
 
@@ -136,18 +164,30 @@ ComputeJob = version || network || requester || service || units ||
 so many shards cannot turn a low unit price into unbounded spend.
 
 `plan_assignments(job, offers, height, attempt)` is a pure, deterministic
-function:
+function using max-min fair allocation (water-filling) across provider
+identities:
 
 1. verify the job and every offer; drop any offer that fails;
 2. keep offers on the same network and service, inside their availability
    window, at or below the price cap, at or above the verification floor, with a
    privacy mode that matches `sealed_input`, and with a device profile that meets
    every hard requirement;
-3. sort by `(unit price, provider, offer hash)`;
-4. greedily take `min(remaining, offer-per-job left, device per-shard cap)` from
-   each offer, skipping any shard below `min_units`;
-5. refuse when no candidate exists, capacity cannot cover every unit, the shard
-   cap is exceeded, or the cheapest complete plan exceeds `max_total_sat`.
+3. group eligible offers by provider identity; each provider's capacity is the
+   sum of its offers' per-job caps;
+4. water-fill: every active provider receives an equal share of the remaining
+   units, capped at its remaining capacity; providers that hit capacity drop
+   out and the remainder is redistributed; a sub-unit remainder is handed out
+   one unit at a time. Price only breaks ties (shard order) and enforces the
+   price cap — it never sizes a provider's share;
+5. turn each provider's allocation into shards, drawing from its offers in
+   price order, skipping any shard below `min_units`; a remainder that cannot
+   form a valid shard is redistributed to providers with remaining capacity;
+6. refuse when no candidate exists, capacity cannot cover every unit, the shard
+   cap is exceeded, or the fair plan exceeds `max_total_sat`.
+
+Fairness is per identity: a provider with 100 machines gets no more than its
+equal share. Sybil resistance comes from the bond floor and the capacity rule
+(`bond × 10 + dampened settled volume × 100`), not from allocation.
 
 The result is a `Plan` of `Assignment`s. Each assignment names the job, offer,
 requester, provider, shard index, units, unit price, exact total, deadline and
@@ -163,15 +203,19 @@ Example from the demo (`fleet`: GPU 7 sat/unit, phone 10, laptop 12; 30 units,
 total budget 1,000 sat):
 
 ```
-plan: 30 units in 4 shards for 244 sat
-  shard 0: 20 units -> GPU      at 7 sat/unit
-  shard 1:  4 units -> phone    at 10 sat/unit
-  shard 2:  4 units -> phone    at 10 sat/unit
-  shard 3:  2 units -> laptop   at 12 sat/unit
+plan: 30 units in 5 shards for 284 sat
+  shard 0: 11 units -> desktop   at  7 sat/unit
+  shard 1:  4 units -> phone     at 10 sat/unit
+  shard 2:  4 units -> phone     at 10 sat/unit
+  shard 3: 10 units -> laptop    at 12 sat/unit
+  shard 4:  1 unit  -> desktop   at  7 sat/unit
 ```
 
-The phone participates because its shard cap is 4 units, not because the
-protocol has a phone-specific path.
+Desktop, phone and laptop each receive their equal share first (10 units);
+the phone caps at 8, so its overflow redistributes. The laptop's 10-unit
+per-shard cap means its 11-unit share lands as one 10-unit shard; the
+unshardable unit redistributes to the next provider with room. Price only
+ordered the shards — it never let the cheapest box take the whole job.
 
 ## 4b. Pull model: tickets and atomic claims
 
@@ -202,6 +246,25 @@ auto-built exit template. Settling immediately frees the provider for the
 next claim: no cooldown, no one-at-a-time rule, and many live offers can
 coexist as long as they fit the provider's capacity.
 
+### Demand broadcast
+
+A ticket posted on any node is gossiped over `srct-net` to all connected
+nodes (`Message::Ticket`, type 14 — additive per the frozen-type rule, so
+older nodes ignore it). Each relay re-verifies the requester's signature
+and only forwards what its own node accepts; the flood gate
+(`allow_control_from`) rate-limits control traffic per peer. The
+`TicketGossipSet` keeps signed live tickets with TTL (the ticket deadline),
+dedup, signature verification, per-peer insertion rate limits and a size
+bound — the same rules as offer gossip, which stays transport-agnostic.
+
+A provider node whose template limits and capabilities fit auto-claims
+received tickets through the existing atomic claim path
+(`try_auto_claim_ticket`): the node's provider wallet signs a `ShardClaim`,
+capacity is checked, and the first valid claim wins — so no double claim
+can succeed even when two providers race for the same ticket. Auto-claim is
+ON when the provider template (wallet + matching offer) is active, OFF for
+a bare node with no provider wallet.
+
 ## 5. Receipts and settlement
 
 ```
@@ -219,13 +282,27 @@ The provider signs `receipt_hash`. `ComputeLedger::settle` then checks:
 - neither settlement height nor the claimed finish height is past the deadline;
 - the assignment was not already settled and was not expired.
 
-It records a `PayoutInstruction { from, to, amount_sat, job, assignment, receipt }`
+It records a `PayoutInstruction { from, to, amount_sat, job, assignment, receipt, payable_at }`
 and returns it. The node executes the instruction through the claim path:
 the payout binds to a requester-signed L2 exit (`exit-template` then `claim`),
 queues with the same admission gate as every other L2 write, and pays the
 provider when consensus releases the exit. The crate itself never holds or
 moves coin; the node moves it only through signed exits the requester
 authorized. Duplicate settlement returns `AlreadySettled`.
+
+### Delayed scheduled payout
+
+Escrow releases each slice's payment only after `payout_delay_blocks` from
+the slice's end (`payable_at = settle_height + delay`): mainnet 2 blocks
+(~20 minutes at 10-minute blocks), testnet/mini 180 blocks. Release happens
+automatically at the scheduled height — each serve-loop tick runs
+`process_due_compute_payouts`, which binds stored pre-signed exits for due
+slices and marks them paid. The consumer is charged per slice actually
+consumed; unused escrow is refunded after the deadline. During the delay
+window a slice can be disputed: a held (disputed or slashed) slice never
+pays out, and its funds return to the pot, increasing the refundable
+remainder. No payout happens before the delay, and the delay is a
+per-network profile parameter, not a consensus rule.
 
 `expire` marks an assignment as timed out only after its deadline. Expired
 assignments can never settle, so a late receipt cannot resurrect work that was
@@ -255,6 +332,24 @@ refunded once.
 
 `PayoutInstruction` and `RefundInstruction` are instructions only; this crate
 never holds or moves coin.
+
+### Metering: slices, usage records and the node-local ledger
+
+Result correctness is **not** a goal. What the market verifies is metered
+consumption: capacity delivered and used.
+
+A *compute slice* is a fixed amount of units per fixed number of chain
+blocks: 100 units per 1 block on mainnet, per 10 blocks on testnet/mini.
+Per slice, both provider and consumer sign a `UsageRecord` (ticket,
+provider, units, height range). A mismatch between the two sides' records
+opens a dispute through the existing bond/challenge path.
+
+Each node keeps a local ledger indexed by chain height — where compute came
+from, how much each provider supplied, where it went — exposed at
+`GET /v1/compute/ledger?from=&to=` and persisted in `state.bin` with a
+fail-closed decode. There is **no** consensus change and no shared state
+machine: every node tracks its own view. A consensus commitment (ledger
+root) is a proposal only, not implemented.
 
 ## 6. Bonds, capacity and reputation
 
@@ -352,23 +447,69 @@ Honest limit, stated in code: a quote proves the approved environment
 *executed* the workload (proof of execution). It does not prove the output is
 correct or useful — that is challenge re-execution / ZKML, still future.
 
+## 7b. Provider template: percentage caps, hard limits, session sandbox
+
+`templates/srct_node.py` resolves `--ram-pct`, `--cpu-pct`,
+`--compute-pct` (optionally `--gpu-pct`) to absolute caps at start-up from
+detected hardware (RAM, core count, measured benchmark, discovered GPU).
+Percentages outside 0–100 refuse; a missing required flag refuses.
+
+`enforce_limits()` applies hard OS-level limits, never to be exceeded:
+
+- Linux: cgroups v2 (`memory.max` + `cpu.max`);
+- Windows: Job Objects (memory limit + CPU hard-cap rate);
+- anything else (or missing privilege): **refuses to start** unless
+  `--best-effort` is passed, which runs in a clearly labelled BEST-EFFORT
+  mode (in-process `ResourceGuard` only — token bucket + RAM ceilings).
+
+The active mode prints at start-up and is covered by `--selftest`, which
+reports the per-platform matrix (this repo's CI box: Windows enforces via
+Job Objects; Linux needs the memory and cpu controllers plus write
+access; macOS/others are best-effort only). A job that would exceed the
+resolved caps is refused before admission — verified by selftest.
+
+The backend registry hook (`register_backend` / `execute_with_backend`)
+lets vendors plug executors in without protocol changes; `"cpu/generic"`
+is pre-registered. Auto-capability (`--auto-capability`) reports the
+detected `backend_id` and passes `--backend` to `compute-join`.
+
+Each ticket runs in a `SessionSandbox`: workload artifacts stage into a
+private temp dir for the session and are shredded at session end — success,
+refusal or exception. See §8: this is lifecycle, not live-run
+confidentiality.
+
 ## 8. What is not enforced
 
-- **Correctness.** A receipt proves who claims units, and a TEE quote proves
-  approved execution — neither proves the output is correct. `Challenge`
-  re-execution catches a result that does not reproduce, by comparison, but it
-  cannot prove semantic correctness and ZK proofs remain future work.
-- **Hardware truth.** RAM, throughput, bandwidth, kernel hash and device class are
-  self-declared. They bound assignment, not reality; elapsed times and
-  re-execution are the spot-checks, attestation is not claimed.
+- **Correctness.** A receipt proves who claims units, a usage record proves
+  how many were delivered and used, and a TEE quote proves approved
+  execution — none proves the output is correct. `Challenge` re-execution
+  catches a result that does not reproduce, by comparison, but it cannot
+  prove semantic correctness and ZK proofs remain future work.
+- **Hardware truth.** RAM, throughput, bandwidth, kernel hash, device class
+  and backend id are self-declared. They bound assignment, not reality;
+  elapsed times and re-execution are the spot-checks, attestation is not
+  claimed. Unknown backend ids are accepted as generic: matching runs on
+  capabilities, so an unknown id neither helps nor hurts a provider.
+- **Workload confidentiality.** Say it plainly: **the provider can see the
+  workload while it runs** — code, weights and data execute in the
+  provider's process memory — unless sealed input or a TEE is used. The
+  consumer keeps code, weights and data under its own control; the
+  template stages them into the provider's sandbox only for the session
+  and deletes them at session end (success, refusal or exception). That is
+  a lifecycle guarantee, not confidentiality of a live run.
 - **Sybil resistance at the stake layer.** Bonds and reputation gate admission,
   but a slash is only as real as the escrow or payment rail that executes it,
-  and dispute evidence is unverified here.
+  and dispute evidence is unverified here. Fair allocation is per identity:
+  nothing stops one operator running many bonded identities.
 - **Liveness and leasing.** Planning is a pure function of offers, job and
-  height. Offer gossip, heartbeats, lease renewal and retry timers are the
-  operator's responsibility.
+  height. Heartbeats, lease renewal and retry timers are the operator's
+  responsibility. Ticket gossip carries demand; offer gossip stays
+  transport-agnostic.
 - **Confidential payloads.** `sealed_input` only requires a provider that accepts
   sealed input. Sealing itself is `srct-cnnp`'s envelope, keyed off-protocol.
+- **Ledger consensus.** The metering ledger is node-local and observational.
+  No ledger root is committed to consensus; the commitment is a proposal
+  only.
 
 ## 9. Verified behavior
 
@@ -383,6 +524,13 @@ escrow, settle, bond, challenge, ticket, TEE, journal, gossip):
 - ineligible offers (RAM, throughput, bandwidth, determinism, kernel,
   service, price, sealed input, verification, expired window) are never
   scheduled;
+- the fair plan splits a 30-unit job across three providers as equal shares
+  capped by capacity (desktop 12, phone 8, laptop 10), redistributes capped
+  and unshardable remainders, prices only the shards, stays inside the
+  budget, and reproduces exactly with the offer list reversed;
+- a large provider and a small provider both receive shares; a provider with
+  many offers (many "machines") gets no more than its single equal share;
+  a capped provider's overflow redistributes; over-cap prices are excluded;
 - two-sig tickets post, first claim wins, replays and wrong-provider claims
   refuse, designated tickets enforce the named provider, expired boards
   prune to nothing settleable, ticket escrow releases exactly and only
@@ -407,6 +555,15 @@ escrow, settle, bond, challenge, ticket, TEE, journal, gossip):
 - late receipts and expired assignments cannot settle; expiry is idempotent;
 - attempt cap and deadline are enforced;
 - assignment arithmetic and wire decoding are checked;
+- payouts carry `payable_at`: nothing is due before
+  `settle_height + payout_delay_blocks` (mainnet 2, testnet/mini 180),
+  due slices release automatically at the height, a held (disputed) slice
+  never pays and its funds return to the pot, unused escrow refunds after
+  the deadline, and a zero delay stays immediately payable;
+- usage records hash deterministically, slice windows follow the network
+  slice length (1 block mainnet, 10 testnet/mini), the node-local ledger
+  records and queries by height range, round-trips through `state.bin`,
+  and refuses tampered, truncated and wrong-version blobs;
 - an unbonded or under-bonded provider's offer is refused; a bonded one is
   admitted;
 - forged, tampered and replayed bond registrations are refused, and a
@@ -450,6 +607,19 @@ escrow, settle, bond, challenge, ticket, TEE, journal, gossip):
 - gossip keeps only signed live offers, dedups, merges order-independently,
   prunes on expiry, refuses forged/foreign/overflowed input, ships as signed
   batches re-verified on decode, and rides the agent transport end to end;
+- ticket gossip (`TicketGossipSet`) keeps only signed live tickets, dedups,
+  rate-limits per peer, merges order-independently, prunes on expiry and
+  ships as signed batches; a ticket announced on one of three real-TCP
+  nodes reaches all three with its signature intact, and when two holders
+  race to claim, the first valid claim wins and the second is refused;
+- device v3 profiles round-trip with backend ids, v1/v2 still decode with
+  the legacy backend mapping, unknown backends match purely on capabilities,
+  over-long and non-identifier backend ids refuse, and the CPU and loopback
+  reference backends execute deterministically (GPU/NPU ids stay unclaimed);
+- template `--selftest` pins percentage-cap resolution, over-limit refusal,
+  strict-vs-best-effort enforcement, the backend plugin hook (register,
+  execute, refuse-unclaimed), and session-sandbox deletion on success and
+  on handler failure;
 - challenge re-execution clears matching receipts and slashes fabricated ones:
   same result verifies clean, a different result produces a `WrongResult`
   dispute that halves the bond and bans the provider through the existing
@@ -491,3 +661,13 @@ escrow, settle, bond, challenge, ticket, TEE, journal, gossip):
    signed batch wire format, every offer re-verified on decode; the agent
    `LoopbackTransport` round-trip is pinned by test). Live P2P/HTTP/MCP
    rails and peer scoring stay the operator's job.
+6. Fair, metered, continuously-running market — **done**: max-min fair
+   allocation across provider identities (price only breaks ties); delayed
+   scheduled payout (`payable_at`, per-network delay, auto-release tick,
+   dispute hold, refund of unused escrow); node-local metering ledger
+   (slices, dual-signed usage records, `GET /v1/compute/ledger`,
+   `state.bin` v17); demand broadcast over `srct-net` (ticket gossip +
+   capability/capacity-gated auto-claim); percentage template caps with
+   hard OS enforcement; extensible backend registry (CPU + loopback
+   reference backends, GPU/NPU interface-only); session sandbox with the
+   provider-visibility caveat stated plainly.

@@ -73,6 +73,7 @@ struct Peer {
     relay: RelayManager,
     votes: srct_core::arbitration::VoteBook,
     revokes: srct_core::guard::GuardRevokeBook,
+    tickets_received: Vec<srct_compute::ticket::SignedTicket>,
     cursor: u64,
 }
 
@@ -106,6 +107,7 @@ impl Peer {
             relay: RelayManager::new(),
             votes: srct_core::arbitration::VoteBook::new(),
             revokes: srct_core::guard::GuardRevokeBook::new(),
+            tickets_received: Vec::new(),
             cursor,
         }
     }
@@ -121,6 +123,7 @@ impl Peer {
                 relay: &mut self.relay,
                 votes: &mut self.votes,
                 revokes: &mut self.revokes,
+                tickets_received: &mut self.tickets_received,
             },
             None,
         );

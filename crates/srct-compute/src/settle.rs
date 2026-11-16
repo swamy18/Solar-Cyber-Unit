@@ -248,6 +248,11 @@ impl SignedReceipt {
 }
 
 /// The exact transfer the payment or escrow layer should execute.
+///
+/// `payable_at` is the chain height at which the payout becomes payable.
+/// Zero means payable immediately. A payout with `payable_at` in the future
+/// is held until the delay window elapses, unless it is disputed or slashed
+/// first (in which case it never pays out).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PayoutInstruction {
     pub from: Address,
@@ -256,17 +261,20 @@ pub struct PayoutInstruction {
     pub job: Hash,
     pub assignment: Hash,
     pub receipt: Hash,
+    /// Height at which the payout becomes payable (0 = immediately).
+    pub payable_at: u64,
 }
 
 impl PayoutInstruction {
     pub fn encode(&self) -> Vec<u8> {
-        let mut w = Writer::with_capacity(20 + 20 + 8 + 32 * 3);
+        let mut w = Writer::with_capacity(20 + 20 + 8 + 32 * 3 + 8);
         w.fixed(&self.from)
             .fixed(&self.to)
             .u64le(self.amount_sat)
             .fixed(&self.job)
             .fixed(&self.assignment)
-            .fixed(&self.receipt);
+            .fixed(&self.receipt)
+            .u64le(self.payable_at);
         w.into_vec()
     }
 
@@ -279,8 +287,14 @@ impl PayoutInstruction {
             job: r.fixed().map_err(malformed)?,
             assignment: r.fixed().map_err(malformed)?,
             receipt: r.fixed().map_err(malformed)?,
+            // Backward compatible: payouts encoded without payable_at
+            // (older state.bin sections) decode with payable_at = 0.
+            payable_at: if r.remaining() >= 8 {
+                r.u64le().map_err(malformed)?
+            } else {
+                0
+            },
         };
-        r.expect_end().map_err(malformed)?;
         if payout.amount_sat == 0 {
             return Err(ComputeError::Malformed("payout amount is zero".into()));
         }
@@ -288,6 +302,7 @@ impl PayoutInstruction {
         {
             return Err(ComputeError::Malformed("payout names an empty id".into()));
         }
+        r.expect_end().map_err(malformed)?;
         Ok(payout)
     }
 }
@@ -398,6 +413,7 @@ impl ComputeLedger {
             job: a.job,
             assignment: assignment.hash(),
             receipt: receipt.hash(),
+            payable_at: 0,
         };
         self.settled.insert(assignment.hash(), payout.clone());
         Ok(payout)
@@ -454,6 +470,7 @@ impl ComputeLedger {
             job: t.job,
             assignment: claim_id,
             receipt: receipt.hash(),
+            payable_at: 0,
         };
         self.settled.insert(claim_id, payout.clone());
         Ok(payout)

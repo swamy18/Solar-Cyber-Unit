@@ -63,6 +63,8 @@ struct Peer {
     votes: srct_core::arbitration::VoteBook,
     /// Inbound Smart Gate revocations, verified per statement.
     revokes: srct_core::guard::GuardRevokeBook,
+    /// Inbound compute demand tickets, verified per statement.
+    tickets_received: Vec<srct_compute::ticket::SignedTicket>,
     /// Height the pool was last reconciled against.
     cursor: u64,
     /// Synthetic clock handed to `poll_events`.
@@ -106,6 +108,7 @@ impl Peer {
             relay: RelayManager::new(),
             votes: srct_core::arbitration::VoteBook::new(),
             revokes: srct_core::guard::GuardRevokeBook::new(),
+            tickets_received: Vec::new(),
             cursor,
             clock: None,
         }
@@ -122,6 +125,7 @@ impl Peer {
                 relay: &mut self.relay,
                 votes: &mut self.votes,
                 revokes: &mut self.revokes,
+                tickets_received: &mut self.tickets_received,
             },
             self.clock,
         );

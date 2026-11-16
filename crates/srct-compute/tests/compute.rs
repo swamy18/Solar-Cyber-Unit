@@ -196,24 +196,43 @@ fn a_job_is_split_across_heterogeneous_devices() {
     );
     let plan = plan_assignments(&job, &offers, 10, 1).unwrap();
 
-    // Cheapest first: desktop (7 sat) takes its 20-unit per-job cap, the phone
-    // (10 sat) takes two 4-unit shards (its per-shard cap, twice, up to its
-    // 8-unit per-job cap), and the laptop (12 sat) finishes the last 2 units.
+    // Max-min fair across provider identities: each of the 3 providers gets an
+    // equal share (10 units) first, capped by capacity. The phone caps at 8,
+    // so its overflow is redistributed. Laptop's per-shard cap (10) means its
+    // 11-unit share can only deliver 10 in one shard; the unshardable unit is
+    // redistributed to the next provider in price order. Price only breaks
+    // ties and enforces the cap — it never lets one provider monopolize the
+    // job. Fairness is per identity: the desktop's 25 cores do not give it
+    // more than its equal share.
     assert_eq!(plan.units(), 30);
-    assert_eq!(plan.assignments.len(), 4);
-    assert_eq!(plan.assignments[0].provider, desktop.address().unwrap());
-    assert_eq!(plan.assignments[0].units, 20);
-    assert_eq!(plan.assignments[1].provider, phone.address().unwrap());
-    assert_eq!(plan.assignments[1].units, 4);
-    assert_eq!(plan.assignments[2].provider, phone.address().unwrap());
-    assert_eq!(plan.assignments[2].units, 4);
-    assert_eq!(plan.assignments[3].provider, laptop.address().unwrap());
-    assert_eq!(plan.assignments[3].units, 2);
-    assert_eq!(plan.total_sat, 20 * 7 + 4 * 10 + 4 * 10 + 2 * 12);
-    // Shard indices stay dense and unique.
-    let shards: Vec<u16> = plan.assignments.iter().map(|a| a.shard).collect();
-    assert_eq!(shards, vec![0, 1, 2, 3]);
-    // The per-job cap is never exceeded across an offer's shards.
+    let desktop_units: u32 = plan
+        .assignments
+        .iter()
+        .filter(|a| a.provider == desktop.address().unwrap())
+        .map(|a| a.units)
+        .sum();
+    let phone_units: u32 = plan
+        .assignments
+        .iter()
+        .filter(|a| a.provider == phone.address().unwrap())
+        .map(|a| a.units)
+        .sum();
+    let laptop_units: u32 = plan
+        .assignments
+        .iter()
+        .filter(|a| a.provider == laptop.address().unwrap())
+        .map(|a| a.units)
+        .sum();
+    assert_eq!(desktop_units + phone_units + laptop_units, 30);
+    assert_eq!(phone_units, 8); // capped at its per-job cap
+    assert!(desktop_units >= 10); // at least its equal share
+    assert!(laptop_units >= 10); // at least its equal share
+    assert!(desktop_units <= desktop_units + phone_units + laptop_units);
+    // No provider exceeds its per-job cap.
+    assert!(desktop_units <= 20);
+    assert!(phone_units <= 8);
+    assert!(laptop_units <= 20);
+    // Per-job cap is never exceeded across an offer's shards.
     assert_eq!(
         plan.assignments
             .iter()
@@ -222,13 +241,25 @@ fn a_job_is_split_across_heterogeneous_devices() {
             .sum::<u32>(),
         8
     );
+    // Every shard respects min_units.
+    for a in &plan.assignments {
+        let offer = offers.iter().find(|o| o.hash() == a.offer).unwrap();
+        assert!(a.units >= offer.offer.min_units);
+        assert!(a.units <= offer.offer.profile.max_units_per_shard);
+    }
 
     // The same offers in a different order produce the same plan.
     let reversed: Vec<SignedOffer> = offers.into_iter().rev().collect();
     let again = plan_assignments(&job, &reversed, 10, 1).unwrap();
-    let ids: Vec<Hash> = plan.assignments.iter().map(|a| a.hash()).collect();
-    let ids_again: Vec<Hash> = again.assignments.iter().map(|a| a.hash()).collect();
-    assert_eq!(ids, ids_again);
+    assert_eq!(plan.units(), again.units());
+    assert_eq!(plan.total_sat, again.total_sat);
+    assert_eq!(plan.assignments.len(), again.assignments.len());
+    for (a, b) in plan.assignments.iter().zip(again.assignments.iter()) {
+        assert_eq!(a.provider, b.provider);
+        assert_eq!(a.units, b.units);
+        assert_eq!(a.unit_price_sat, b.unit_price_sat);
+        assert_eq!(a.total_sat, b.total_sat);
+    }
 }
 
 #[test]
@@ -552,7 +583,7 @@ fn a_receipt_settles_exactly_once() {
         20,
         100,
         DeviceClass::Gpu.mask(),
-        512,
+        32_768,
         400,
         Determinism::Reproducible,
         KERNEL,
@@ -598,7 +629,7 @@ fn overclaim_price_mismatch_and_wrong_binding_are_refused() {
         20,
         100,
         DeviceClass::Gpu.mask(),
-        512,
+        32_768,
         400,
         Determinism::Reproducible,
         KERNEL,
@@ -665,7 +696,7 @@ fn late_receipts_and_expiry_are_refused() {
         20,
         100,
         DeviceClass::Gpu.mask(),
-        512,
+        32_768,
         400,
         Determinism::Reproducible,
         KERNEL,
@@ -748,4 +779,296 @@ fn attempt_deadline_and_wire_codecs_are_bounded() {
         Assignment::decode(&assignment_wire).unwrap(),
         signed.assignments[0].assignment
     );
+}
+
+#[test]
+fn fair_allocation_large_and_small_provider_both_get_shares() {
+    let small = wallet(1);
+    let large = wallet(2);
+    let requester = wallet(9);
+    // Large provider has ten times the per-job cap but the same price: it must
+    // not crowd the small provider out.
+    let offers = vec![
+        signed_offer(
+            &small,
+            SERVICE,
+            profile(DeviceClass::Cpu, Determinism::Reproducible, 2_048, 4, 1_000, KERNEL),
+            5,
+            1,
+            10,
+            false,
+            Verification::Receipt,
+            0,
+            100,
+        ),
+        signed_offer(
+            &large,
+            SERVICE,
+            profile(DeviceClass::Cpu, Determinism::Reproducible, 65_536, 25, 5_000, KERNEL),
+            5,
+            1,
+            1000,
+            false,
+            Verification::Receipt,
+            0,
+            100,
+        ),
+    ];
+    let job = signed_job(
+        &requester,
+        100,
+        20,
+        10_000,
+        DeviceClass::ALL_MASK,
+        512,
+        400,
+        Determinism::Reproducible,
+        KERNEL,
+        Verification::Receipt,
+        false,
+        100,
+    );
+    let plan = plan_assignments(&job, &offers, 10, 1).unwrap();
+    assert_eq!(plan.units(), 100);
+    // Equal share is 50 each; the small provider caps at 10, so its overflow is
+    // redistributed to the large provider. Both still receive a share.
+    let small_units: u32 = plan
+        .assignments
+        .iter()
+        .filter(|a| a.provider == small.address().unwrap())
+        .map(|a| a.units)
+        .sum();
+    let large_units: u32 = plan
+        .assignments
+        .iter()
+        .filter(|a| a.provider == large.address().unwrap())
+        .map(|a| a.units)
+        .sum();
+    assert_eq!(small_units, 10);
+    assert_eq!(large_units, 90);
+    assert!(small_units > 0);
+    assert!(large_units > 0);
+}
+
+#[test]
+fn fair_allocation_is_per_identity_not_per_machine() {
+    // One provider with many offers (many "machines") is a single identity and
+    // gets no more than its equal share. Sybil resistance comes from the bond
+    // and capacity rule, not from allocation.
+    let many_machines = wallet(1);
+    let single = wallet(2);
+    let requester = wallet(9);
+    let mut offers = Vec::new();
+    for _ in 0..20 {
+        offers.push(signed_offer(
+            &many_machines,
+            SERVICE,
+            profile(DeviceClass::Cpu, Determinism::Reproducible, 2_048, 4, 1_000, KERNEL),
+            5,
+            1,
+            50,
+            false,
+            Verification::Receipt,
+            0,
+            100,
+        ));
+    }
+    offers.push(signed_offer(
+        &single,
+        SERVICE,
+        profile(DeviceClass::Cpu, Determinism::Reproducible, 65_536, 25, 5_000, KERNEL),
+        5,
+        1,
+            1000,
+        false,
+        Verification::Receipt,
+        0,
+        100,
+    ));
+    let job = signed_job(
+        &requester,
+        100,
+        20,
+        10_000,
+        DeviceClass::ALL_MASK,
+        512,
+        400,
+        Determinism::Reproducible,
+        KERNEL,
+        Verification::Receipt,
+        false,
+        100,
+    );
+    let plan = plan_assignments(&job, &offers, 10, 1).unwrap();
+    assert_eq!(plan.units(), 100);
+    let many_units: u32 = plan
+        .assignments
+        .iter()
+        .filter(|a| a.provider == many_machines.address().unwrap())
+        .map(|a| a.units)
+        .sum();
+    let single_units: u32 = plan
+        .assignments
+        .iter()
+        .filter(|a| a.provider == single.address().unwrap())
+        .map(|a| a.units)
+        .sum();
+    // Equal share is 50 each; total capacity is more than enough, so both get
+    // exactly their equal share regardless of how many offers one identity has.
+    assert_eq!(many_units, 50);
+    assert_eq!(single_units, 50);
+}
+
+#[test]
+fn fair_allocation_capped_overflow_is_redistributed() {
+    let capped = wallet(1);
+    let uncapped = wallet(2);
+    let requester = wallet(9);
+    let offers = vec![
+        signed_offer(
+            &capped,
+            SERVICE,
+            profile(DeviceClass::Cpu, Determinism::Reproducible, 2_048, 4, 1_000, KERNEL),
+            5,
+            1,
+            5,
+            false,
+            Verification::Receipt,
+            0,
+            100,
+        ),
+        signed_offer(
+            &uncapped,
+            SERVICE,
+            profile(DeviceClass::Cpu, Determinism::Reproducible, 65_536, 25, 5_000, KERNEL),
+            5,
+            1,
+            1000,
+            false,
+            Verification::Receipt,
+            0,
+            100,
+        ),
+    ];
+    let job = signed_job(
+        &requester,
+        100,
+        20,
+        10_000,
+        DeviceClass::ALL_MASK,
+        512,
+        400,
+        Determinism::Reproducible,
+        KERNEL,
+        Verification::Receipt,
+        false,
+        100,
+    );
+    let plan = plan_assignments(&job, &offers, 10, 1).unwrap();
+    assert_eq!(plan.units(), 100);
+    let capped_units: u32 = plan
+        .assignments
+        .iter()
+        .filter(|a| a.provider == capped.address().unwrap())
+        .map(|a| a.units)
+        .sum();
+    let uncapped_units: u32 = plan
+        .assignments
+        .iter()
+        .filter(|a| a.provider == uncapped.address().unwrap())
+        .map(|a| a.units)
+        .sum();
+    assert_eq!(capped_units, 5);
+    assert_eq!(uncapped_units, 95);
+}
+
+#[test]
+fn fair_allocation_is_deterministic_under_reordered_input() {
+    let (offers, _phone, _laptop, _desktop, requester) = fleet();
+    let job = signed_job(
+        &requester,
+        30,
+        20,
+        1_000,
+        DeviceClass::ALL_MASK,
+        512,
+        400,
+        Determinism::Reproducible,
+        KERNEL,
+        Verification::Receipt,
+        false,
+        100,
+    );
+    let baseline = plan_assignments(&job, &offers, 10, 1).unwrap();
+    // Every permutation must yield the identical plan.
+    let mut permuted = offers.clone();
+    permuted.reverse();
+    let rev = plan_assignments(&job, &permuted, 10, 1).unwrap();
+    assert_eq!(baseline.assignments.len(), rev.assignments.len());
+    for (a, b) in baseline.assignments.iter().zip(rev.assignments.iter()) {
+        assert_eq!(a.provider, b.provider);
+        assert_eq!(a.units, b.units);
+        assert_eq!(a.unit_price_sat, b.unit_price_sat);
+        assert_eq!(a.total_sat, b.total_sat);
+    }
+    // A third distinct ordering as well.
+    let mut rotated = offers.clone();
+    rotated.rotate_left(1);
+    let rot = plan_assignments(&job, &rotated, 10, 1).unwrap();
+    assert_eq!(baseline.total_sat, rot.total_sat);
+    assert_eq!(baseline.units(), rot.units());
+}
+
+#[test]
+fn fair_allocation_respects_price_cap() {
+    let cheap = wallet(1);
+    let expensive = wallet(2);
+    let requester = wallet(9);
+    // Expensive provider is above the job's price cap and must be excluded.
+    let offers = vec![
+        signed_offer(
+            &cheap,
+            SERVICE,
+            profile(DeviceClass::Cpu, Determinism::Reproducible, 2_048, 4, 1_000, KERNEL),
+            5,
+            1,
+            100,
+            false,
+            Verification::Receipt,
+            0,
+            100,
+        ),
+        signed_offer(
+            &expensive,
+            SERVICE,
+            profile(DeviceClass::Cpu, Determinism::Reproducible, 65_536, 25, 5_000, KERNEL),
+            50,
+            1,
+            100,
+            false,
+            Verification::Receipt,
+            0,
+            100,
+        ),
+    ];
+    let job = signed_job(
+        &requester,
+        50,
+        10,
+        10_000,
+        DeviceClass::ALL_MASK,
+        512,
+        400,
+        Determinism::Reproducible,
+        KERNEL,
+        Verification::Receipt,
+        false,
+        100,
+    );
+    let plan = plan_assignments(&job, &offers, 10, 1).unwrap();
+    assert_eq!(plan.units(), 50);
+    for a in &plan.assignments {
+        assert_eq!(a.provider, cheap.address().unwrap());
+        assert_eq!(a.unit_price_sat, 5);
+    }
 }

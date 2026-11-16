@@ -64,6 +64,25 @@ Fail-closed (locked):
   this process.
 - keys never enter Python: claim/submit/grant shell to `srct-worker`.
 
+Percentage caps (Item 5): `--ram-pct`, `--cpu-pct`, `--compute-pct`
+(optionally `--gpu-pct`) resolve against detected hardware at start-up —
+RAM against physical RAM, CPU against core count, compute against the
+measured benchmark, GPU RAM against discovered GPU memory. Absolute
+`ResourceCaps` construction still works, but the CLI path prefers
+percentages so one command runs unchanged on any box size.
+
+OS-level hard limits, enforced at start-up by `enforce_limits()`:
+
+- Linux: cgroups v2 (`memory.max` + `cpu.max`). Needs the memory and cpu
+  controllers plus write access to /sys/fs/cgroup.
+- Windows: Job Objects (JOB_MEMORY_LIMIT + CPU HARD_CAP rate).
+- Other/no-privilege: refused by default. Pass `--best-effort` to run in a
+  clearly labelled BEST-EFFORT mode (in-process `ResourceGuard` only).
+
+Strict by default: `enforce_limits()` raises `OSEnforcementError` when no
+hard limit can be enforced and `--best-effort` was not given. The active
+mode is printed at start-up and covered by `--selftest`.
+
 Stdlib only: hashlib + json + os + subprocess + tempfile + time + urllib.
 No new dependencies. Offline self-test: python templates/srct_node.py --selftest
 
@@ -245,8 +264,11 @@ def measure_units_per_sec(calls=5):
 
 def measure_capability(benchmark_calls=5):
     """One auto-generated capability profile: measured RAM + benchmarked
-    throughput + core count. No manual hardware description: the provider
-    runs this, posts the result, and the network verifies by spot-check."""
+    throughput + core count + backend id. No manual hardware description:
+    the provider runs this, posts the result, and the network verifies by
+    spot-check. The short benchmark at join time doubles as the backend
+    smoke test: a box that cannot run the canonical kernel cannot quote
+    throughput for it."""
     total = measure_total_ram_mib()
     reserve = min(2048, max(1024, total // 4))
     return {
@@ -254,7 +276,448 @@ def measure_capability(benchmark_calls=5):
         "allocatable_ram_mib": total - reserve,
         "cores": max(1, os.cpu_count() or 1),
         "units_per_sec": measure_units_per_sec(benchmark_calls),
+        "backend_id": _detect_backend_id(),
     }
+
+
+def detect_hardware():
+    """Hardware this box actually has: physical RAM, CPU count, GPU info.
+
+    RAM comes from the OS (Linux /proc/meminfo, Windows GlobalMemoryStatusEx
+    via ctypes, macOS sysctl, POSIX sysconf fallback). CPU count comes from
+    `os.cpu_count()`. GPU info is best-effort discovery only (nvidia-smi when
+    present); a box with no discoverable GPU reports `gpu=None`, which is not
+    an error — CPU-only providers are first-class.
+    """
+    return {
+        "total_ram_mib": measure_total_ram_mib(),
+        "cpu_count": max(1, os.cpu_count() or 1),
+        "gpu": detect_gpu(),
+    }
+
+
+def detect_gpu():
+    """Best-effort GPU discovery. Returns a dict or None.
+
+    This is discovery only, not capability attestation: the network verifies
+    throughput by spot-check, never by self-report.
+    """
+    try:
+        proc = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name,memory.total",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (FileNotFoundError, OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    line = (proc.stdout or "").strip().splitlines()
+    if not line:
+        return None
+    parts = [p.strip() for p in line[0].split(",")]
+    try:
+        return {"name": parts[0], "memory_mib": int(float(parts[1]))}
+    except (IndexError, ValueError):
+        return {"name": parts[0] if parts else "unknown", "memory_mib": 0}
+
+
+def _check_pct(name, value):
+    if value is None:
+        return None
+    try:
+        pct = float(value)
+    except (TypeError, ValueError):
+        raise SrctError(f"--{name} must be a number 0 < pct <= 100")
+    if not 0.0 < pct <= 100.0:
+        raise SrctError(f"--{name} must satisfy 0 < pct <= 100, got {value}")
+    return pct
+
+
+def resolve_caps_from_pct(ram_pct, cpu_pct, compute_pct, gpu_pct=None,
+                          hardware=None):
+    """Resolve `--ram-pct/--cpu-pct/--compute-pct/--gpu-pct` to absolute caps.
+
+    Percentages resolve against detected hardware at start-up: RAM against
+    physical RAM, CPU against core count, compute against measured
+    units/sec x10 (same headroom factor as `--auto-capability`), GPU RAM
+    against discovered GPU memory. Returns a `ResourceCaps`.
+    """
+    hw = dict(hardware) if hardware is not None else detect_hardware()
+    ram_pct = _check_pct("ram-pct", ram_pct)
+    cpu_pct = _check_pct("cpu-pct", cpu_pct)
+    compute_pct = _check_pct("compute-pct", compute_pct)
+    gpu_pct = _check_pct("gpu-pct", gpu_pct)
+    if ram_pct is None or cpu_pct is None or compute_pct is None:
+        raise SrctError("--ram-pct, --cpu-pct and --compute-pct are all required")
+    total_ram = int(hw["total_ram_mib"])
+    allocatable = max(1, int(total_ram * ram_pct / 100.0))
+    cores = max(1, int(hw["cpu_count"] * cpu_pct / 100.0))
+    bench = measure_units_per_sec()
+    max_units = max(1, int(bench * 10 * compute_pct / 100.0))
+    caps = ResourceCaps(
+        total_ram_mib=total_ram,
+        allocatable_ram_mib=min(allocatable, total_ram),
+        max_compute_units_per_sec=max_units,
+    )
+    return {
+        "caps": caps,
+        "cores": cores,
+        "benchmark_units_per_sec": bench,
+        "gpu_mib": (
+            max(1, int((hw.get("gpu") or {}).get("memory_mib", 0)
+                       * gpu_pct / 100.0))
+            if gpu_pct is not None and hw.get("gpu") else None
+        ),
+    }
+
+
+class OSEnforcementError(SrctError):
+    """Raised when an OS-level hard limit cannot be enforced on this box."""
+
+
+def enforcement_report():
+    """Which OS-level hard limits this platform can enforce.
+
+    Returns a dict: {"cgroups_v2": bool, "job_objects": bool,
+    "rlimit": bool, "platform": sys.platform}. Linux enforces via cgroups v2
+    (needs cgroup controllers + write access), Windows via Job Objects
+    (ctypes), everything else falls back to rlimit/nice (best-effort only).
+    """
+    platform = sys.platform
+    cgroups_v2 = False
+    if platform.startswith("linux"):
+        try:
+            with open("/sys/fs/cgroup/cgroup.controllers", "r") as f:
+                controllers = f.read()
+            cgroups_v2 = ("memory" in controllers and "cpu" in controllers
+                          and os.access("/sys/fs/cgroup", os.W_OK))
+        except OSError:
+            cgroups_v2 = False
+    job_objects = False
+    if platform.startswith("win"):
+        try:
+            import ctypes
+            job_objects = hasattr(ctypes, "windll")
+        except ImportError:
+            job_objects = False
+    try:
+        import resource  # noqa: F401
+        rlimit = True
+    except ImportError:
+        rlimit = False
+    return {
+        "platform": platform,
+        "cgroups_v2": cgroups_v2,
+        "job_objects": job_objects,
+        "rlimit": rlimit,
+    }
+
+
+def enforce_limits(caps, *, best_effort=False):
+    """Enforce `caps` as hard OS-level limits, never to be exceeded.
+
+    Linux: cgroups v2 memory.max + cpu.max (needs controllers + write).
+    Windows: Job Objects (JOBOBJECT_EXTENDED_LIMIT_INFORMATION via ctypes).
+    Fallback: rlimit (RLIMIT_AS/RLIMIT_CPU) + nice — best-effort only.
+
+    Strict by default: raises `OSEnforcementError` when no hard limit can be
+    enforced on this platform. Pass `best_effort=True` (explicit
+    `--best-effort` flag) to run in a clearly labelled BEST-EFFORT mode where
+    only the in-process `ResourceGuard` applies. Returns the enforcement
+    report dict.
+    """
+    report = enforcement_report()
+    hard = ((report["platform"].startswith("linux") and report["cgroups_v2"])
+            or (report["platform"].startswith("win") and report["job_objects"]))
+    if hard:
+        applied = (_apply_cgroups_v2(caps) if report["platform"].startswith("linux")
+                   else _apply_job_object(caps))
+        report["enforced"] = applied
+        report["mode"] = "hard"
+        print(f"[limits] hard enforcement via "
+              f"{'cgroups-v2' if report['platform'].startswith('linux') else 'job-objects'}: "
+              f"RAM {caps.allocatable_ram_mib} MiB / "
+              f"{caps.max_compute_units_per_sec} units/s", flush=True)
+        return report
+    if not best_effort:
+        raise OSEnforcementError(
+            f"no hard OS limit enforceable on {report['platform']} "
+            f"(cgroups_v2={report['cgroups_v2']} "
+            f"job_objects={report['job_objects']} "
+            f"rlimit={report['rlimit']}): refusing to start. "
+            f"Pass --best-effort to run in labelled BEST-EFFORT mode.")
+    report["enforced"] = _apply_rlimit_fallback(caps)
+    report["mode"] = "best-effort"
+    print("[limits] BEST-EFFORT mode: no hard OS limit enforceable on this "
+          f"platform ({report['platform']}); only the in-process "
+          "ResourceGuard applies. Labels: best-effort, not hard-capped.",
+          flush=True)
+    return report
+
+
+def _apply_cgroups_v2(caps):
+    """Write this process into a scoped cgroup with memory/cpu ceilings."""
+    import pathlib
+    scope = (pathlib.Path("/sys/fs/cgroup")
+             / f"srct-node-{os.getpid()}")
+    try:
+        scope.mkdir(exist_ok=True)
+        (scope / "memory.max").write_text(f"{caps.allocatable_ram_mib * 1024 * 1024}\n")
+        (scope / "cpu.max").write_text(
+            f"{caps.max_compute_units_per_sec} 1000000\n")
+        (scope / "cgroup.procs").write_text(f"{os.getpid()}\n")
+    except OSError as exc:
+        raise OSEnforcementError(f"cgroups v2 write failed: {exc}")
+    return "cgroups-v2"
+
+
+def _apply_job_object(caps):
+    """Cap this process with a Windows Job Object (RAM + CPU rate).
+
+    Memory: JobObjectExtendedLimitInformation (class 9) with
+    JOB_OBJECT_LIMIT_JOB_MEMORY. CPU: JobObjectCpuRateControlInformation
+    (class 15) with a HARD_CAP rate. Both are kernel-enforced; exceeding
+    them is impossible for the process, not merely refused in Python.
+    """
+    import ctypes
+    from ctypes import wintypes
+    try:
+        kernel32 = ctypes.windll.kernel32
+        # 64-bit handles are truncated to c_int without restypes (error 6).
+        kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+        kernel32.CreateJobObjectW.argtypes = [wintypes.LPCWSTR,
+                                              wintypes.LPCWSTR]
+        kernel32.SetInformationJobObject.restype = wintypes.BOOL
+        kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+        kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE,
+                                                     wintypes.HANDLE]
+        kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+
+        class JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+            _fields_ = [
+                ("PerProcessUserTimeLimit", ctypes.c_int64),
+                ("PerJobUserTimeLimit", ctypes.c_int64),
+                ("LimitFlags", wintypes.DWORD),
+                ("MinimumWorkingSetSize", ctypes.c_size_t),
+                ("MaximumWorkingSetSize", ctypes.c_size_t),
+                ("ActiveProcessLimit", wintypes.DWORD),
+                ("Affinity", ctypes.c_size_t),
+                ("PriorityClass", wintypes.DWORD),
+                ("SchedulingClass", wintypes.DWORD),
+            ]
+
+        class IO_COUNTERS(ctypes.Structure):
+            _fields_ = [(n, ctypes.c_ulonglong) for n in (
+                "ReadOperationCount", "WriteOperationCount",
+                "OtherOperationCount", "ReadTransferCount",
+                "WriteTransferCount", "OtherTransferCount")]
+
+        class JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+            _fields_ = [
+                ("BasicLimitInformation",
+                 JOBOBJECT_BASIC_LIMIT_INFORMATION),
+                ("IoInfo", IO_COUNTERS),
+                ("ProcessMemoryLimit", ctypes.c_size_t),
+                ("JobMemoryLimit", ctypes.c_size_t),
+                ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                ("PeakJobMemoryUsed", ctypes.c_size_t),
+            ]
+
+        job = kernel32.CreateJobObjectW(None, None)
+        if not job:
+            raise OSEnforcementError("CreateJobObjectW returned NULL")
+        info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+        # JOB_OBJECT_LIMIT_JOB_MEMORY (0x200): the whole job dies past it.
+        info.BasicLimitInformation.LimitFlags = 0x200
+        info.JobMemoryLimit = caps.allocatable_ram_mib * 1024 * 1024
+        info.ProcessMemoryLimit = caps.total_ram_mib * 1024 * 1024
+        if not kernel32.SetInformationJobObject(
+                job, 9, ctypes.byref(info), ctypes.sizeof(info)):
+            raise OSEnforcementError("SetInformationJobObject(memory) failed")
+
+        class JOBOBJECT_CPU_RATE_CONTROL_INFORMATION(ctypes.Structure):
+            _fields_ = [("ControlFlags", wintypes.DWORD),
+                        ("CpuRate", wintypes.DWORD)]
+
+        cpu = JOBOBJECT_CPU_RATE_CONTROL_INFORMATION()
+        # ENABLE (0x1) | HARD_CAP (0x4): kernel throttles past the rate.
+        cpu.ControlFlags = 0x1 | 0x4
+        cpu.CpuRate = max(1, min(10000, int(
+            10000 * caps.max_compute_units_per_sec // max(1, 10_000_000))))
+        if not kernel32.SetInformationJobObject(
+                job, 15, ctypes.byref(cpu), ctypes.sizeof(cpu)):
+            raise OSEnforcementError("SetInformationJobObject(cpu) failed")
+        if not kernel32.AssignProcessToJobObject(
+                job, kernel32.GetCurrentProcess()):
+            raise OSEnforcementError("AssignProcessToJobObject failed")
+    except (OSError, AttributeError) as exc:
+        raise OSEnforcementError(f"job object setup failed: {exc}")
+    return "job-objects"
+
+
+def _apply_rlimit_fallback(caps):
+    """Best-effort fallback: rlimit address space + CPU time, then nice."""
+    try:
+        import resource
+        as_bytes = caps.allocatable_ram_mib * 1024 * 1024
+        resource.setrlimit(resource.RLIMIT_AS, (as_bytes, as_bytes))
+        cpu_secs = max(60, caps.max_compute_units_per_sec // 1_000_000)
+        try:
+            resource.setrlimit(resource.RLIMIT_CPU, (cpu_secs, cpu_secs))
+        except (ValueError, OSError):
+            pass
+    except (ImportError, ValueError, OSError):
+        pass
+    try:
+        os.nice(10)
+    except OSError:
+        pass
+    return "rlimit+nice"
+
+
+# -- backend plugin interface --------------------------------------------
+# Vendors (mobile, Apple NPU, discrete GPU, other accelerators) plug an
+# executor in without protocol changes: register_backend(backend_id,
+# execute_fn) where execute_fn(task) -> bytes. The built-in CPU workers are
+# pre-registered as "cpu/generic". GPU/NPU support is interface-only until
+# a vendor ships a working executor — registering a label without working
+# code is not support.
+
+BACKENDS = {}
+
+
+def register_backend(backend_id, execute_fn):
+    """Register an executor plugin for `backend_id` (vendor/arch string).
+
+    `execute_fn` takes the task dict and returns result bytes. Overwrites
+    any previous registration for the same id. Unknown ids are accepted
+    (matched purely on capabilities by the network); registration only
+    decides which local code runs them.
+    """
+    if not backend_id or not isinstance(backend_id, str):
+        raise SrctError("backend_id must be a non-empty string")
+    if not callable(execute_fn):
+        raise SrctError("execute_fn must be callable")
+    BACKENDS[backend_id] = execute_fn
+    return backend_id
+
+
+def execute_with_backend(task, backend_id=None):
+    """Run `task` with the executor registered for `backend_id`.
+
+    Falls back to the built-in CPU workers when `backend_id` is None,
+    `"cpu/generic"`, or unregistered. Raises `SrctError` when the task
+    names an explicit non-CPU backend with no working executor registered —
+    an interface label without code never silently runs on the wrong
+    hardware.
+    """
+    if backend_id is None or backend_id in ("cpu/generic", "generic"):
+        handler = (default_cpu_train
+                   if (task.get("type") or task.get("service")) in
+                   ("training", "ai/training") else default_cpu_infer)
+        return bytes(handler(task))
+    fn = BACKENDS.get(backend_id)
+    if fn is None:
+        raise SrctError(
+            f"backend '{backend_id}' has no working executor registered: "
+            f"interface-only, refusing to run on unclaimed hardware")
+    result = fn(task)
+    if not isinstance(result, (bytes, bytearray)):
+        raise SrctError(f"backend '{backend_id}' must return bytes")
+    return bytes(result)
+
+
+def _detect_backend_id():
+    """Open backend identifier for this box (vendor/arch string)."""
+    import platform
+    machine = (platform.machine() or "unknown").lower()
+    if machine in ("x86_64", "amd64"):
+        return "cpu/x86_64"
+    if machine in ("aarch64", "arm64"):
+        # Apple Silicon reports arm64; bare-metal ARM servers do too.
+        # The id is a label — the network matches on capabilities.
+        import sys as _sys
+        if _sys.platform == "darwin":
+            return "apple/silicon"
+        return "cpu/aarch64"
+    return f"cpu/{machine}"
+
+
+register_backend("cpu/generic", lambda task: bytes(
+    (default_cpu_train if (task.get("type") or task.get("service")) in
+     ("training", "ai/training") else default_cpu_infer)(task)))
+
+
+# -- workload ownership: per-session provider sandbox -------------------
+# The consumer keeps code, weights and data under its own control. The
+# provider's sandbox receives them only for the session and deletes them
+# at session end — including on handler failure. Say it plainly: the
+# provider CAN see the workload while it runs (it executes in the
+# provider's process memory) unless sealed input or a TEE is used. No
+# sandboxing in this file changes that; the guarantee here is lifecycle
+# (staged late, deleted always), not confidentiality of a live run.
+
+class SessionSandbox:
+    """Per-session staging area for one ticket's workload.
+
+    Created when a session starts, destroyed when it ends — success,
+    refusal or exception. `stage()` writes session artifacts under a
+    private temp dir; `__exit__` overwrites then removes everything so no
+    session's code, weights or data survive past the session on this box.
+    """
+
+    def __init__(self, session_id):
+        import tempfile
+        safe = "".join(c if c.isalnum() else "_" for c in str(session_id))
+        self.session_id = safe[:48] or "session"
+        self.dir = tempfile.mkdtemp(prefix=f"srct-session-{self.session_id}-")
+        self.staged = []
+
+    def stage(self, name, data):
+        """Write `data` bytes into the sandbox under `name`."""
+        import os
+        safe = "".join(c if (c.isalnum() or c in "-_.") else "_"
+                       for c in str(name))[:64] or "blob"
+        path = os.path.join(self.dir, safe)
+        with open(path, "wb") as f:
+            f.write(bytes(data))
+        self.staged.append(path)
+        return path
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        import os
+        for path in self.staged:
+            try:
+                with open(path, "r+b") as f:
+                    size = os.path.getsize(path)
+                    f.write(os.urandom(size))
+                    f.flush()
+                    try:
+                        os.fsync(f.fileno())
+                    except OSError:
+                        pass
+            except OSError:
+                pass
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        self.staged = []
+        try:
+            os.rmdir(self.dir)
+        except OSError:
+            pass
+        return False
+
+    def __del__(self):
+        try:
+            self.__exit__()
+        except Exception:
+            pass
 
 
 class ResourceCaps:
@@ -487,7 +950,7 @@ class Participant:
     def auto_join(self, service="ai/inference", price_sat=200,
                   max_units_per_job=100, max_units_per_shard=100,
                   bond_sat=1_000, window_blocks=14_400,
-                  benchmark_calls=5):
+                  benchmark_calls=5, backend_id=None):
         """Join the compute marketplace in one command.
 
         Measures this box (RAM + canonical benchmark), shells `srct-worker
@@ -497,6 +960,7 @@ class Participant:
         network (elapsed times, challenge re-execution), never trusted.
         """
         caps = measure_capability(benchmark_calls)
+        backend = backend_id or caps.get("backend_id") or "cpu/generic"
         status, body = self._get("/v1/status")
         if status == 200 and isinstance(body.get("height"), int):
             available_until = int(body["height"]) + int(window_blocks)
@@ -518,6 +982,7 @@ class Participant:
             "--available-from", "0",
             "--available-until", str(available_until),
             "--bond-sat", str(bond_sat),
+            "--backend", str(backend),
         ])
         if code != 0:
             raise SrctError(f"compute join refused:\n{out}")
@@ -577,12 +1042,32 @@ class Participant:
             task = {"task_id": ticket_hash, "compute_units": units,
                     "type": service}
             started = time.monotonic()
+            # Session sandbox: workload artifacts are staged for this session
+            # only and deleted at session end, even when the handler raises.
+            sandbox_dir = None
             try:
-                result = handler(task)
-            except Exception as exc:  # noqa: BLE001 - operator sees it
-                self.guard.release_ram(self.infer_ram_mib)
-                print(f"[tickets] {ticket_hash[:12]} handler raised: {exc}")
-                continue
+                with SessionSandbox(ticket_hash) as sandbox:
+                    sandbox_dir = sandbox.dir
+                    sandbox.stage("task.json", json.dumps(task).encode("utf-8"))
+                    try:
+                        result = handler(task)
+                    except Exception as exc:  # noqa: BLE001 - operator sees it
+                        self.guard.release_ram(self.infer_ram_mib)
+                        print(f"[tickets] {ticket_hash[:12]} handler raised: {exc}")
+                        continue
+            finally:
+                # Belt and suspenders: the context manager already shreds the
+                # dir; a surviving dir here means cleanup failed loudly.
+                if sandbox_dir is not None:
+                    import os as _os
+                    if _os.path.isdir(sandbox_dir):
+                        print(f"[tickets] {ticket_hash[:12]} sandbox leftovers "
+                              f"removed late: {sandbox_dir}")
+                        try:
+                            import shutil as _shutil
+                            _shutil.rmtree(sandbox_dir, ignore_errors=True)
+                        except OSError:
+                            pass
             elapsed_ms = int((time.monotonic() - started) * 1000)
             if not isinstance(result, (bytes, bytearray)):
                 self.guard.release_ram(self.infer_ram_mib)
@@ -885,11 +1370,23 @@ def _selftest():
     miner_launched = {"threads": None, "batch": None}
 
     class FakeProc:
-        def __init__(self, argv):
+        def __init__(self, argv, **kwargs):
             calls["popen"].append(argv)
-            miner_launched["threads"] = argv[argv.index("--threads") + 1]
-            miner_launched["batch"] = argv[argv.index("--batch") + 1]
+            if "--threads" in argv:
+                miner_launched["threads"] = argv[argv.index("--threads") + 1]
+                miner_launched["batch"] = argv[argv.index("--batch") + 1]
             self._active = True
+            self._kwargs = kwargs
+            self.args = argv
+            self.returncode = 1
+            self.stdout = ""
+            self.stderr = ""
+        def __enter__(self):
+            return self
+        def __exit__(self, *exc):
+            return False
+        def communicate(self, *args, **kwargs):
+            return (self.stdout, self.stderr)
         def poll(self):
             return None if self._active else 1
         def terminate(self):
@@ -1170,6 +1667,8 @@ def _selftest():
         assert join[join.index("--service") + 1] == "ai/inference", join
         assert int(join[join.index("--units-per-sec") + 1]) >= 1, join
         assert int(join[join.index("--ram-mib") + 1]) >= _MIN_TOTAL_RAM_MIB, join
+        assert join[join.index("--backend") + 1], join
+        assert measured["backend_id"], measured
 
         # 11. Ticket cycle: open board -> claim -> run -> submit, no waiting.
         board = [{"ticket_hash": "tt" * 32, "units": 4,
@@ -1185,6 +1684,103 @@ def _selftest():
         ran = [a for a in calls["run"]]
         assert any(a[0] == "compute-claim-ticket" for a in ran), ran
         assert any(a[0] == "compute-submit-receipt" for a in ran), ran
+
+        # 12. Backend plugin interface: register, execute, refuse unclaimed.
+        # GPU/NPU support is interface-only: no working executor ships.
+        assert "cpu/generic" in BACKENDS
+        probe_t = {"task_id": "be", "compute_units": 4, "type": "inference"}
+        assert execute_with_backend(probe_t) == default_cpu_infer(probe_t)
+        assert execute_with_backend(probe_t, "cpu/generic") == \
+            default_cpu_infer(probe_t)
+        register_backend("ref/loopback",
+                         lambda task: b"loopback:" + task["task_id"].encode())
+        assert execute_with_backend(probe_t, "ref/loopback") == b"loopback:be"
+        try:
+            execute_with_backend(probe_t, "cuda/sm_90")
+            raise AssertionError("unclaimed GPU backend must refuse")
+        except SrctError:
+            pass
+        try:
+            register_backend("", lambda task: b"x")
+            raise AssertionError("empty backend id must refuse")
+        except SrctError:
+            pass
+        del BACKENDS["ref/loopback"]
+        # Unknown Python-side ids still run the CPU default when unset.
+        assert execute_with_backend(probe_t, None) == \
+            default_cpu_infer(probe_t)
+
+        # 13. Percentage caps resolve against detected hardware; a job over
+        # the resolved limit is refused, never admitted.
+        fake_hw = {"total_ram_mib": 8192, "cpu_count": 8,
+                   "gpu": {"name": "fake-gpu", "memory_mib": 4096}}
+        resolved = resolve_caps_from_pct(
+            50, 50, 50, gpu_pct=25, hardware=fake_hw)
+        assert resolved["caps"].total_ram_mib == 8192
+        assert resolved["caps"].allocatable_ram_mib == 4096
+        assert resolved["cores"] == 4, resolved
+        assert resolved["gpu_mib"] == 1024, resolved
+        assert resolved["caps"].max_compute_units_per_sec >= 1
+        for bad in (0, -10, 101, "half"):
+            try:
+                resolve_caps_from_pct(bad, 50, 50, hardware=fake_hw)
+                raise AssertionError(f"pct {bad!r} must refuse")
+            except SrctError:
+                pass
+        try:
+            resolve_caps_from_pct(None, 50, 50, hardware=fake_hw)
+            raise AssertionError("missing ram-pct must refuse")
+        except SrctError:
+            pass
+        pct_caps = resolved["caps"]
+        pj = Participant(node="http://fake", wallet="w.json",
+                         caps=pct_caps, mode=MODE_AI_COMPUTE, poll_secs=0)
+        install(pj)
+        # A job needing more than the resolved allocatable RAM is refused.
+        pj.infer_ram_mib = pct_caps.allocatable_ram_mib + 1
+        n_pct = pj.run(max_cycles=1)
+        assert n_pct == 1
+        assert pj.guard.used_ram_mib == 0  # refused, nothing admitted
+        assert pj.guard.credited_units == 0
+
+        # 14. OS enforcement: strict by default, best-effort only on flag.
+        report = enforcement_report()
+        assert set(report) >= {"platform", "cgroups_v2", "job_objects",
+                               "rlimit"}, report
+        if not ((report["platform"].startswith("linux") and report["cgroups_v2"])
+                or (report["platform"].startswith("win") and report["job_objects"])):
+            try:
+                enforce_limits(pct_caps)
+                raise AssertionError("unenforceable box must refuse without --best-effort")
+            except OSEnforcementError:
+                pass
+            be = enforce_limits(pct_caps, best_effort=True)
+            assert be["mode"] == "best-effort", be
+        else:
+            hard = enforce_limits(pct_caps)
+            assert hard["mode"] == "hard", hard
+
+        # 15. Session sandbox: staged for the session, deleted at its end —
+        # success or exception. The provider sees the workload while it runs
+        # (documented, not hidden); nothing survives after.
+        sb_dir = None
+        with SessionSandbox("tt-test-session") as sb:
+            sb_dir = sb.dir
+            assert os.path.isdir(sb_dir), sb_dir
+            p1 = sb.stage("weights.bin", b"W" * 1024)
+            p2 = sb.stage("task.json", b'{"task_id": "tt"}')
+            assert os.path.isfile(p1) and os.path.isfile(p2)
+        assert not os.path.exists(sb_dir), "sandbox deleted at session end"
+        assert not os.path.exists(p1) and not os.path.exists(p2)
+        sb_dir2 = None
+        try:
+            with SessionSandbox("tt-fail-session") as sb2:
+                sb_dir2 = sb2.dir
+                sb2.stage("data.bin", b"D" * 64)
+                raise RuntimeError("handler blew up")
+        except RuntimeError:
+            pass
+        assert not os.path.exists(sb_dir2), "sandbox deleted on failure"
     finally:
         subprocess.Popen = real_popen
     print("srct_node selftest: ok "
@@ -1210,13 +1806,33 @@ if __name__ == "__main__":
         node = flag("--node")
         wallet_file = flag("--wallet")
         network = flag("--network", "mini")
-        caps_dict = measure_capability()
-        caps = ResourceCaps(
-            total_ram_mib=caps_dict["total_ram_mib"],
-            allocatable_ram_mib=caps_dict["allocatable_ram_mib"],
-            max_compute_units_per_sec=max(
-                caps_dict["units_per_sec"] * 10, 1_000_000),
-        )
+        best_effort = "--best-effort" in sys.argv
+        pct_flags = [a for a in ("--ram-pct", "--cpu-pct", "--compute-pct",
+                                 "--gpu-pct") if a in sys.argv]
+        if pct_flags:
+            # Percentage caps: resolve against detected hardware at start-up,
+            # then enforce as hard OS-level limits (strict unless --best-effort).
+            def pct(name):
+                return (sys.argv[sys.argv.index(name) + 1]
+                        if name in sys.argv else None)
+            resolved = resolve_caps_from_pct(
+                pct("--ram-pct"), pct("--cpu-pct"),
+                pct("--compute-pct"), pct("--gpu-pct"))
+            caps_dict = measure_capability()
+            report = enforce_limits(resolved["caps"], best_effort=best_effort)
+            print(f"limits mode={report['mode']} platform={report['platform']} "
+                  f"cgroups_v2={report['cgroups_v2']} "
+                  f"job_objects={report['job_objects']} "
+                  f"rlimit={report['rlimit']}")
+            caps = resolved["caps"]
+        else:
+            caps_dict = measure_capability()
+            caps = ResourceCaps(
+                total_ram_mib=caps_dict["total_ram_mib"],
+                allocatable_ram_mib=caps_dict["allocatable_ram_mib"],
+                max_compute_units_per_sec=max(
+                    caps_dict["units_per_sec"] * 10, 1_000_000),
+            )
         p = Participant(node=node, wallet=wallet_file, caps=caps,
                         mode=MODE_AI_COMPUTE, network=network, poll_secs=5)
         joined = p.auto_join(

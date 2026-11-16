@@ -2588,3 +2588,54 @@ for those):
   fallbacks, node `compute_pull` suite (many offers, zero-capacity refusal,
   first-claim-wins, settle-then-claim-again, full preauth lifecycle against
   real L2 funding).
+
+## Fair metered compute market 2026-11-16
+
+No consensus change; `state.bin` envelope 16 → 17 (fail-closed decode,
+v8–16 migrate with an empty usage ledger; device profile v3, offer/job
+wire untouched):
+
+- **Fair allocation** (`market.rs`): `plan_assignments` is now max-min fair
+  water-filling across provider identities — equal share first, capped by
+  capacity, remainder redistributed; price only breaks ties and the price
+  cap. 30-unit fleet plan is now 5 shards / 284 sat (was greedy 4/244).
+  Tests: large-vs-small both get shares, 3 providers, capped overflow
+  redistributed, per-identity (not per-machine), price-cap exclusion,
+  deterministic under reordering. Wash-trading and capacity tests still pass.
+- **Delayed scheduled payout** (`escrow.rs`, serve tick): `PayoutInstruction`
+  gains `payable_at`; `release_scheduled`/`release_for_claim_scheduled`
+  schedule at `height + payout_delay_blocks`
+  (`default_payout_delay_blocks`: mainnet 2, testnet/mini 180); serve loop
+  runs `process_due_compute_payouts` each tick; `hold` returns a disputed
+  slice's funds to the pot; refund covers only unreleased remainder. Tests:
+  no payout before delay, auto payout at height, held slice never pays,
+  unused refund, zero-delay immediate.
+- **Metering** (`ledger.rs`, new): slices (100 units / 1 block mainnet, 10
+  testnet-mini), dual-signed `UsageRecord`, node-local `ComputeUsageLedger`
+  indexed by height, `GET /v1/compute/ledger?from=&to=`, `state.bin` v17
+  section. Records on settlement; mismatch → existing dispute path. No
+  consensus commitment; ledger root is proposal-only.
+- **Demand broadcast** (`gossip.rs` `TicketGossipSet`, `srct-net`
+  `Message::Ticket` type 14, node `compute_ticket_broadcast/received` +
+  `try_auto_claim_ticket` with capability fit + capacity gates): tickets
+  gossip to all peers (TTL = deadline, dedup, sig verify, flood-gate rate
+  limit, batch size bound); provider nodes auto-claim when the template
+  fits, bare nodes relay only. Tests: 3 real-TCP nodes all receive with
+  signatures intact; first claim wins, second refused.
+- **Percentage caps** (`templates/srct_node.py`): `--ram-pct/--cpu-pct/
+  --compute-pct/--gpu-pct` resolve at start-up from detected hardware;
+  hard enforcement (cgroups v2 Linux, Job Objects Windows, rlimit/nice
+  fallback), strict by default, `--best-effort` labels clearly; startup log
+  + `--selftest` report the per-platform matrix. Selftest: resolution,
+  invalid-pct refusal, over-limit refusal, strict/best-effort modes.
+- **Backend registry** (`device.rs` v3): open `backend` id + `ComputeBackend`
+  trait + `BackendRegistry` (unknown → generic, capability-only match);
+  `CpuBackend` + `LoopbackBackend` shipped with working execution code;
+  GPU/NPU interface-only (template refuses unregistered named backends).
+  Rust + Python (`register_backend`/`execute_with_backend`) hooks.
+  `--auto-capability` reports `backend_id`; `compute-join --backend`.
+  Old v1/v2 encodings still decode.
+- **Workload ownership** (template `SessionSandbox` + docs): consumer keeps
+  code/weights/data; staged per session, shredded at session end (even on
+  handler failure). Docs state plainly the provider sees the workload
+  while it runs unless sealed input or a TEE is used.

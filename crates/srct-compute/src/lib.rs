@@ -58,6 +58,7 @@ pub mod challenge;
 pub mod device;
 pub mod escrow;
 pub mod gossip;
+pub mod ledger;
 pub mod market;
 pub mod settle;
 pub mod store;
@@ -72,12 +73,22 @@ pub use bond::{
 pub use challenge::{
     Challenge, ChallengeBook, ChallengeVerdict, SignedChallenge, CHALLENGE_VERSION,
 };
-pub use device::{Determinism, DeviceClass, DeviceProfile, DeviceRequirement};
+pub use device::{
+    BackendCapabilities, BackendRegistry, ComputeBackend, CpuBackend, Determinism, DeviceClass,
+    DeviceProfile, DeviceRequirement, LoopbackBackend, GENERIC_BACKEND, MAX_BACKEND_ID_LEN,
+    legacy_backend,
+};
 pub use escrow::{
     EscrowAccount, EscrowBook, EscrowFunding, RefundInstruction, SignedFunding, ESCROW_VERSION,
 };
 pub use gossip::{
-    decode_batch, encode_batch, GossipSet, GOSSIP_BATCH_VERSION, MAX_BATCH_BYTES, MAX_GOSSIP_OFFERS,
+    decode_batch, decode_ticket_batch, encode_batch, encode_ticket_batch, GossipSet,
+    GOSSIP_BATCH_VERSION, MAX_BATCH_BYTES, MAX_GOSSIP_OFFERS, TicketGossipSet,
+    MAX_GOSSIP_TICKETS,
+};
+pub use ledger::{
+    ComputeUsageLedger, LedgerEntry, SliceWindow, UsageRecord, LEDGER_VERSION, SLICE_BLOCKS_MAINNET,
+    SLICE_BLOCKS_TESTNET_MINI, SLICE_UNITS, slice_blocks, slice_index, slice_window,
 };
 pub use market::{
     plan_assignments, Assignment, ComputeJob, ComputeOffer, Plan, SignedAssignment, SignedJob,

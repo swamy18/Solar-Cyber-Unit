@@ -68,6 +68,11 @@ pub enum MessageType {
     /// verifies the owner's signature itself instead of trusting the sender,
     /// and there is no revocation store to serve a getdata from.
     GuardRevoke = 13,
+    /// Compute demand ticket relay (M6, §13.14). A requester-signed shard
+    /// ticket announced to all peers so capable providers can auto-claim.
+    /// Additive per the freeze rule: older nodes ignore it without
+    /// disconnecting.
+    Ticket = 14,
 }
 
 impl MessageType {
@@ -86,6 +91,7 @@ impl MessageType {
             11 => MessageType::Checkpoint,
             12 => MessageType::ArbitrationVote,
             13 => MessageType::GuardRevoke,
+            14 => MessageType::Ticket,
             _ => return None,
         })
     }
@@ -130,6 +136,10 @@ pub enum Message {
     /// network, revoked flag set) and applied to the node's revocation set;
     /// enforcement stays in the node, exactly like votes.
     GuardRevoke(GuardRevokeMsg),
+    /// A compute demand ticket announced to peers. Carried complete so the
+    /// receiver verifies the requester's signature itself instead of fetching
+    /// it from a store. Additive per the freeze rule.
+    Ticket(Box<srct_compute::ticket::SignedTicket>),
     /// An unknown type number — ignored, per the freeze rule. Retained so
     /// tests can assert that unknown types are dropped without disconnect.
     Unknown {
@@ -270,6 +280,9 @@ impl Message {
                     .u32le(m.keys.len() as u32)
                     .raw(&m.keys);
             }
+            Message::Ticket(t) => {
+                w.raw(&t.encode());
+            }
             Message::Unknown { raw, .. } => {
                 // `raw` is the payload verbatim as received — decode stores the
                 // whole payload, not a re-framed copy — so encoding is a
@@ -317,6 +330,10 @@ impl Message {
                     .map_err(|e| NetError::Decode(format!("arbitration vote deserialize: {e}")))?,
             )),
             Some(MessageType::GuardRevoke) => Message::GuardRevoke(decode_revoke(payload)?),
+            Some(MessageType::Ticket) => Message::Ticket(Box::new(
+                srct_compute::ticket::SignedTicket::decode(payload)
+                    .map_err(|e| NetError::Decode(format!("ticket deserialize: {e}")))?,
+            )),
             None => {
                 // Unknown: preserve the raw payload so callers can log it, but
                 // do not act on it. §13.5 freeze rule.

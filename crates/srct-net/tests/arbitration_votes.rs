@@ -42,6 +42,7 @@ struct LocalNode {
     relay: RelayManager,
     votes: srct_core::arbitration::VoteBook,
     revokes: srct_core::guard::GuardRevokeBook,
+    tickets_received: Vec<srct_compute::ticket::SignedTicket>,
 }
 
 impl LocalNode {
@@ -73,6 +74,7 @@ impl LocalNode {
             relay: RelayManager::new(),
             votes: srct_core::arbitration::VoteBook::new(),
             revokes: srct_core::guard::GuardRevokeBook::new(),
+            tickets_received: Vec::new(),
         }
     }
 
@@ -87,6 +89,7 @@ impl LocalNode {
                     relay: &mut self.relay,
                     votes: &mut self.votes,
                     revokes: &mut self.revokes,
+                    tickets_received: &mut self.tickets_received,
                 },
                 None,
             );

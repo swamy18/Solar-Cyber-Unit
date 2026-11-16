@@ -512,6 +512,7 @@ pub fn spawn_peer(
                 Message::Checkpoint(_) => MessageType::Checkpoint as u8,
                 Message::ArbitrationVote(_) => MessageType::ArbitrationVote as u8,
                 Message::GuardRevoke(_) => MessageType::GuardRevoke as u8,
+                Message::Ticket(_) => MessageType::Ticket as u8,
                 Message::Unknown { ty, .. } => *ty,
             };
             let payload = msg.encode();

@@ -2379,6 +2379,9 @@ fn cmd_serve(args: &Args) -> Result<(), String> {
         // safe on every tick alongside the mine step.
         sh.advance_escrow_finality();
 
+        // Item 4: release compute payouts whose delay window has elapsed.
+        sh.process_due_compute_payouts();
+
         // Drain the inclusion queue every tick, not only when mining. With
         // `--no-mine` (or while mining is stalled) nothing else would ever
         // take it, and `live_proposals` re-derives the same tasks each tick,
@@ -2530,6 +2533,7 @@ fn cmd_serve(args: &Args) -> Result<(), String> {
                 relay: &mut relay,
                 votes: &mut votes,
                 revokes: &mut revoke_book,
+                tickets_received: &mut sh.compute_ticket_received,
             },
             Some(now_ms()),
         );
@@ -2573,6 +2577,23 @@ fn cmd_serve(args: &Args) -> Result<(), String> {
             std::mem::take(&mut sh.revoke_broadcast);
         for (policy, sigs, keys) in pending_revokes {
             node.broadcast_revoke(srct_net::msg::GuardRevokeMsg { policy, sigs, keys });
+        }
+
+        // Compute demand tickets: broadcast locally posted tickets to peers,
+        // then try to auto-claim tickets received from peers. Auto-claim is
+        // capacity-gated through the existing claim path — the first valid
+        // claim wins and no double claim can settle.
+        let pending_tickets: Vec<srct_compute::ticket::SignedTicket> =
+            std::mem::take(&mut sh.compute_ticket_broadcast);
+        for ticket in pending_tickets {
+            node.broadcast_ticket(ticket);
+        }
+
+        // Auto-claim received tickets. The claim path is atomic (first valid
+        // claim wins) and capacity-gated (bond + capacity rule), so no double
+        // claim can succeed even if two providers race.
+        for ticket in std::mem::take(&mut sh.compute_ticket_received) {
+            let _ = srct_node::api::try_auto_claim_ticket(&mut *sh, &ticket);
         }
 
         // §13.6 reconnect sweep: dial back to bootnodes and address-book peers

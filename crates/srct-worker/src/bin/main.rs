@@ -786,6 +786,11 @@ fn cmd_compute_join(args: &[String]) -> Result<i32, String> {
         num_arg(args, "--bandwidth-kbps", 50_000)? as u32,
         num_arg(args, "--units-per-sec", 0)? as u32,
         [0u8; 32],
+    )
+    .with_backend(
+        str_arg(args, "--backend")
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| srct_compute::legacy_backend(class).to_string()),
     );
     let offer = ComputeOffer {
         version: OFFER_VERSION,

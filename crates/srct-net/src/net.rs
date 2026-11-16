@@ -177,6 +177,10 @@ pub struct NodeState<'a> {
     /// node so it survives across polls; the node drains them into its own
     /// revocation set through the same path as its HTTP revoke endpoint.
     pub revokes: &'a mut srct_core::guard::GuardRevokeBook,
+    /// Inbound compute demand tickets, verified per statement. Owned by the
+    /// node so it survives across polls; the node drains them into its own
+    /// claim book through the same path as its HTTP ticket endpoint.
+    pub tickets_received: &'a mut Vec<srct_compute::ticket::SignedTicket>,
 }
 
 impl<'a> NodeState<'a> {
@@ -192,6 +196,7 @@ impl<'a> NodeState<'a> {
             relay: self.relay,
             votes: self.votes,
             revokes: self.revokes,
+            tickets_received: self.tickets_received,
         }
     }
 }
@@ -601,6 +606,15 @@ impl P2pNode {
         }
     }
 
+    /// Announce a compute demand ticket to all peers (§13.14). Capable
+    /// providers that receive it may auto-claim.
+    pub fn broadcast_ticket(&self, ticket: srct_compute::ticket::SignedTicket) {
+        let peers = self.peers.lock().unwrap_or_else(|e| e.into_inner()); // poison-tolerant
+        for peer in peers.values() {
+            let _ = peer.send(crate::msg::Message::Ticket(Box::new(ticket.clone())));
+        }
+    }
+
     /// Announce transaction ids to all peers except `exclude_peer` (§13.14).
     ///
     /// The caller is expected to have admitted these to its own pool first.
@@ -632,7 +646,11 @@ impl P2pNode {
     /// reason `Chain` is: the mempool is validated against chain state, so all of
     /// it has to be in the same hands to be consistent, and only the chain thread
     /// mutates any of it. See [`NodeState`].
-    pub fn poll_events(&self, mut state: NodeState<'_>, now_ms: Option<u64>) -> usize {
+    pub fn poll_events(
+        &self,
+        mut state: NodeState<'_>,
+        now_ms: Option<u64>,
+    ) -> usize {
         let mut count = 0;
 
         // Peers stopped since the last call are released here rather than waiting
@@ -813,7 +831,7 @@ impl P2pNode {
         &self,
         peer_id: usize,
         msg: Message,
-        state: NodeState<'_>,
+        mut state: NodeState<'_>,
         now_ms: Option<u64>,
     ) {
         // Destructured rather than reached through `state.` at every use: the
@@ -827,6 +845,7 @@ impl P2pNode {
             relay,
             votes,
             revokes,
+            ref mut tickets_received,
         } = state;
         match msg {
             Message::GetBlocks { locator, stop } => {
@@ -1132,6 +1151,28 @@ impl P2pNode {
                         if *id != peer_id {
                             let _ = peer.send(Message::GuardRevoke(revoke.clone()));
                         }
+                    }
+                }
+            }
+            Message::Ticket(ticket) => {
+                // Compute demand ticket: verified by decode (requester signature,
+                // network, liveness) before reaching here. Hand it up to the
+                // node layer for auto-claim, and relay to all other peers so
+                // capable providers can auto-claim. Rate limiting on
+                // insertions is enforced by the upper layer's TicketGossipSet.
+                tickets_received.push((*ticket).clone());
+                let clock = now_ms.unwrap_or_else(crate::net::now_ms);
+                if !relay.allow_control_from(peer_id, clock) {
+                    let peers = self.peers.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(peer) = peers.get(&peer_id) {
+                        peer.add_ban_score(INBOUND_VIOLATION_SCORE);
+                    }
+                    return;
+                }
+                let peers = self.peers.lock().unwrap_or_else(|e| e.into_inner());
+                for (id, peer) in peers.iter() {
+                    if *id != peer_id {
+                        let _ = peer.send(Message::Ticket(ticket.clone()));
                     }
                 }
             }

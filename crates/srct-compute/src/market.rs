@@ -1,9 +1,17 @@
 //! Offers, jobs, capacity-aware sharding and signed assignments.
 //!
 //! The scheduler is a pure function: given a signed job, a set of signed offers
-//! and a height, it returns the cheapest complete plan it can build. Every
-//! selection is deterministic, so two callers holding the same offers reach the
-//! same shard layout and the same total price.
+//! and a height, it returns a complete plan it can build. Every selection is
+//! deterministic, so two callers holding the same offers reach the same shard
+//! layout and the same total price.
+//!
+//! Allocation is max-min fair across provider identities, not greedy by price:
+//! every eligible provider first receives an equal share of the units, capped
+//! by its capacity. Providers that reach capacity drop out and the remainder is
+//! redistributed. Price only breaks ties and enforces the price cap — it never
+//! lets one provider monopolize a job. Fairness is per provider identity: a
+//! provider with 100 machines gets no more than its equal share. Sybil
+//! resistance comes from the bond and capacity rule, not from allocation.
 //!
 //! Planning rules are fail-closed:
 //!
@@ -783,11 +791,23 @@ fn decode_signed(bytes: &[u8], what: &str) -> Result<(Vec<u8>, Bundle, Bundle), 
     Ok((body, sigs, keys))
 }
 
-/// Build the cheapest complete plan for `job`.
+/// Build the cheapest complete plan for `job` using max-min fair allocation
+/// across provider identities.
 ///
 /// `height` is the planning height; offers whose window excludes it and jobs
 /// whose deadline has passed are refused. `attempt` is the rescheduling round
 /// and is capped at [`MAX_ATTEMPTS`].
+///
+/// Each eligible provider first receives an equal share of the units, capped at
+/// its remaining capacity. Providers that reach capacity drop out and the
+/// remainder is redistributed among the rest. Price only breaks ties and
+/// enforces the price cap — it never influences share size. Fairness is per
+/// provider identity, so a provider with 100 machines gets no more than its
+/// equal share; Sybil resistance comes from the bond and capacity rule, not
+/// from allocation.
+///
+/// The plan is deterministic: the same offers, job and height always produce
+/// the same shard layout and the same total price.
 pub fn plan_assignments(
     job: &SignedJob,
     offers: &[SignedOffer],
@@ -803,7 +823,7 @@ pub fn plan_assignments(
     }
     let requirement = job.job.requirement();
 
-    let mut candidates: Vec<&SignedOffer> = offers
+    let candidates: Vec<&SignedOffer> = offers
         .iter()
         .filter(|offer| {
             offer.verify().is_ok()
@@ -820,67 +840,169 @@ pub fn plan_assignments(
     if candidates.is_empty() {
         return Err(ComputeError::NoEligibleOffer);
     }
-    candidates.sort_by_key(|offer| {
+
+    // Group eligible offers by provider identity. Within a provider, offers are
+    // ordered by price so the cheapest offer is drawn from first.
+    let mut by_provider: BTreeMap<Address, Vec<&SignedOffer>> = BTreeMap::new();
+    for offer in &candidates {
+        by_provider.entry(offer.offer.provider).or_default().push(offer);
+    }
+    for offer_list in by_provider.values_mut() {
+        offer_list.sort_by_key(|o| (o.offer.unit_price_sat, o.hash()));
+    }
+
+    // Total capacity per provider: the sum of per-job caps across its offers.
+    let mut capacity: BTreeMap<Address, u32> = BTreeMap::new();
+    for (provider, list) in &by_provider {
+        let cap: u32 = list.iter().map(|o| o.offer.max_units_per_job).sum();
+        capacity.insert(*provider, cap);
+    }
+
+    // Max-min fair water-filling. Each active provider receives an equal share
+    // of the remaining units, capped at its remaining capacity. Providers that
+    // reach capacity drop out and the remainder is redistributed. Price only
+    // breaks ties; it never influences share size.
+    let mut allocation: BTreeMap<Address, u32> = BTreeMap::new();
+    for provider in by_provider.keys() {
+        allocation.insert(*provider, 0);
+    }
+    let mut remaining = job.job.units;
+    let mut active: Vec<Address> = by_provider.keys().cloned().collect();
+    while remaining > 0 && !active.is_empty() {
+        let mut next_active: Vec<Address> = Vec::new();
+        let share = remaining / active.len() as u32;
+        if share == 0 {
+            // Not enough units for a full equal share: hand out one unit at a
+            // time until the remainder is exhausted.
+            for provider in &active {
+                if remaining == 0 {
+                    break;
+                }
+                let already = allocation[provider];
+                let room = capacity[provider].saturating_sub(already);
+                if room > 0 {
+                    allocation.insert(*provider, already + 1);
+                    remaining -= 1;
+                    if already + 1 < capacity[provider] {
+                        next_active.push(*provider);
+                    }
+                }
+            }
+        } else {
+            for provider in &active {
+                let already = allocation[provider];
+                let room = capacity[provider].saturating_sub(already);
+                let take = share.min(room);
+                allocation.insert(*provider, already + take);
+                remaining = remaining.saturating_sub(take);
+                if already + take < capacity[provider] {
+                    next_active.push(*provider);
+                }
+            }
+        }
+        active = next_active;
+    }
+    if remaining > 0 {
+        return Err(ComputeError::InsufficientCapacity);
+    }
+
+    // Turn each provider's allocation into shards, drawing from its offers in
+    // price order. Every shard respects min_units, max_units_per_shard and the
+    // offer's max_units_per_job cap. When a provider's fair share cannot be
+    // sharded (e.g. its min_units is larger than its allocated remainder), the
+    // unshardable units are redistributed to other providers with remaining
+    // capacity so the plan never truncates when capacity exists.
+    let mut taken_per_offer: BTreeMap<Hash, u32> = BTreeMap::new();
+    let mut assignments = Vec::new();
+    let mut total_sat = 0u64;
+    let mut sharded_total = 0u32;
+
+    // Process providers in price order for a deterministic shard layout.
+    let mut provider_order: Vec<Address> = by_provider.keys().cloned().collect();
+    provider_order.sort_by_key(|p| {
         (
-            offer.offer.unit_price_sat,
-            offer.offer.provider,
-            offer.hash(),
+            by_provider[p][0].offer.unit_price_sat,
+            *p,
         )
     });
 
-    let mut remaining = job.job.units;
-    let mut total_sat = 0u64;
-    let mut assignments = Vec::new();
-    let mut assigned_per_offer: BTreeMap<Hash, u32> = BTreeMap::new();
-
-    for offer in candidates {
-        // One offer can own several shards: a phone with a 4-unit shard cap and
-        // an 8-unit per-job cap must still be able to take all 8 units. The
-        // loop stops at the per-job cap, so an offer is never over-assigned.
-        loop {
-            if remaining == 0 {
+    // Try to place `units` units from providers in `order`, drawing from each
+    // offer's remaining capacity. Returns the number of units placed.
+    let mut place_units = |units: u32, order: &[Address], taken: &mut BTreeMap<Hash, u32>| -> Result<u32, ComputeError> {
+        let mut left = units;
+        for provider in order {
+            if left == 0 {
                 break;
             }
-            let already = assigned_per_offer.get(&offer.hash()).copied().unwrap_or(0);
-            let per_job_left = offer.offer.max_units_per_job.saturating_sub(already);
-            let take = remaining
-                .min(per_job_left)
-                .min(offer.offer.profile.max_units_per_shard);
-            if take < offer.offer.min_units || take == 0 {
-                break;
+            let mut remaining_for_provider = left;
+            for offer in &by_provider[provider] {
+                if remaining_for_provider == 0 {
+                    break;
+                }
+                let offer_hash = offer.hash();
+                let already_taken = taken.get(&offer_hash).copied().unwrap_or(0);
+                let offer_left = offer.offer.max_units_per_job.saturating_sub(already_taken);
+                if offer_left == 0 {
+                    continue;
+                }
+                loop {
+                    if remaining_for_provider == 0 {
+                        break;
+                    }
+                    let take = remaining_for_provider
+                        .min(offer_left)
+                        .min(offer.offer.profile.max_units_per_shard);
+                    if take < offer.offer.min_units || take == 0 {
+                        break;
+                    }
+                    if assignments.len() >= MAX_SHARDS {
+                        return Err(ComputeError::TooManyShards);
+                    }
+                    let cost = (take as u64)
+                        .checked_mul(offer.offer.unit_price_sat)
+                        .ok_or_else(|| ComputeError::Malformed("assignment total overflows".into()))?;
+                    let new_total = total_sat
+                        .checked_add(cost)
+                        .ok_or_else(|| ComputeError::Malformed("plan total overflows".into()))?;
+                    if new_total > job.job.max_total_sat {
+                        return Err(ComputeError::BudgetExceeded);
+                    }
+                    assignments.push(Assignment {
+                        version: ASSIGNMENT_VERSION,
+                        job: job.hash(),
+                        offer: offer_hash,
+                        requester: job.job.requester,
+                        provider: *provider,
+                        shard: assignments.len() as u16,
+                        units: take,
+                        unit_price_sat: offer.offer.unit_price_sat,
+                        total_sat: cost,
+                        deadline: job.job.deadline,
+                        attempt,
+                    });
+                    taken.insert(offer_hash, already_taken + take);
+                    remaining_for_provider -= take;
+                    total_sat = new_total;
+                }
             }
-            if assignments.len() >= MAX_SHARDS {
-                return Err(ComputeError::TooManyShards);
-            }
-            let cost = (take as u64)
-                .checked_mul(offer.offer.unit_price_sat)
-                .ok_or_else(|| ComputeError::Malformed("assignment total overflows".into()))?;
-            let new_total = total_sat
-                .checked_add(cost)
-                .ok_or_else(|| ComputeError::Malformed("plan total overflows".into()))?;
-            if new_total > job.job.max_total_sat {
-                return Err(ComputeError::BudgetExceeded);
-            }
-            assignments.push(Assignment {
-                version: ASSIGNMENT_VERSION,
-                job: job.hash(),
-                offer: offer.hash(),
-                requester: job.job.requester,
-                provider: offer.offer.provider,
-                shard: assignments.len() as u16,
-                units: take,
-                unit_price_sat: offer.offer.unit_price_sat,
-                total_sat: cost,
-                deadline: job.job.deadline,
-                attempt,
-            });
-            *assigned_per_offer.entry(offer.hash()).or_insert(0) += take;
-            remaining -= take;
-            total_sat = new_total;
+            left = remaining_for_provider;
         }
+        Ok(units - left)
+    };
+
+    // First pass: shard each provider's fair-share allocation.
+    for provider in &provider_order {
+        sharded_total += place_units(allocation[provider], &[*provider], &mut taken_per_offer)?;
     }
 
-    if remaining > 0 {
+    // Second pass: redistribute any units that could not be sharded (min_units
+    // indivisibility) to providers with remaining capacity, in price order.
+    let unsharded = job.job.units - sharded_total;
+    if unsharded > 0 {
+        sharded_total += place_units(unsharded, &provider_order, &mut taken_per_offer)?;
+    }
+
+    if sharded_total < job.job.units {
         return Err(ComputeError::InsufficientCapacity);
     }
     Ok(Plan {

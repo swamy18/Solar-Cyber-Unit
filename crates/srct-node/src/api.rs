@@ -211,7 +211,7 @@ const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
 /// would mix scopes that must never meet. Version 10 appends the Smart Gate
 /// sections (grant registry, revocations, capability book) last; v8/v9 files
 /// migrate with empty gate state.
-const STATE_ENVELOPE_VERSION: u8 = 16;
+const STATE_ENVELOPE_VERSION: u8 = 17;
 
 /// Largest entry count any single map section in the state envelope may
 /// declare, checked before allocation. Real books are bounded by their own
@@ -602,6 +602,19 @@ pub struct SharedNode {
     /// Settlement mirror over `compute_payouts` (binding, once-only and
     /// replay checks). Rebuilt from the persisted payouts on load.
     pub compute_ledger: srct_compute::ComputeLedger,
+    /// Node-local compute usage metering ledger, indexed by chain height.
+    /// Where compute came from, how much each provider supplied, where it went.
+    pub compute_usage_ledger: srct_compute::ledger::ComputeUsageLedger,
+    /// Tickets received via P2P gossip, awaiting auto-claim by this node if
+    /// it is a capable provider.
+    pub compute_ticket_received: Vec<srct_compute::ticket::SignedTicket>,
+    /// Tickets posted locally, awaiting P2P broadcast to peers.
+    pub compute_ticket_broadcast: Vec<srct_compute::ticket::SignedTicket>,
+    /// Optional provider wallet for auto-claiming gossip-received tickets.
+    /// When `None`, the node relays tickets but never auto-claims (bare node
+    /// mode). When `Some`, the node tries to claim any received ticket that
+    /// fits its capacity and template limits.
+    pub compute_provider_wallet: Option<srct_core::wallet::Wallet>,
     /// Settled compute payouts by receipt hash: the exact transfers the
     /// payment rail must execute. Persisted; the money record.
     pub compute_payouts: BTreeMap<Hash, srct_compute::PayoutInstruction>,
@@ -741,6 +754,10 @@ impl SharedNode {
             compute_assignments: BTreeMap::new(),
             compute_receipts: BTreeMap::new(),
             compute_ledger: srct_compute::ComputeLedger::new(),
+            compute_usage_ledger: srct_compute::ledger::ComputeUsageLedger::new(),
+            compute_ticket_received: Vec::new(),
+            compute_ticket_broadcast: Vec::new(),
+            compute_provider_wallet: None,
             compute_payouts: BTreeMap::new(),
             compute_payout_exit: BTreeMap::new(),
             compute_escrow: srct_compute::EscrowBook::new(network_id.clone()),
@@ -1067,6 +1084,8 @@ impl SharedNode {
             }),
         );
         put_section(&mut w, &self.compute_escrow.encode());
+        // Compute metering (v17): node-local usage ledger indexed by chain height.
+        put_section(&mut w, &self.compute_usage_ledger.encode());
         put_section(&mut w, &self.compute_bonds.encode());
         put_section(&mut w, &self.compute_challenges.encode());
         // Compute pull model (v16): ticket board with atomic claims, plus
@@ -1108,6 +1127,7 @@ impl SharedNode {
         // Smart Gate sections: migrate them with empty books instead of
         // refusing to boot.
         if version != STATE_ENVELOPE_VERSION
+            && version != 16
             && version != 15
             && version != 14
             && version != 13
@@ -1118,7 +1138,7 @@ impl SharedNode {
             && version != 8
         {
             return Err(format!(
-                "state envelope version {version}, this build reads {STATE_ENVELOPE_VERSION} (and migrates 8/9/10/11/12/13/14)"
+                "state envelope version {version}, this build reads {STATE_ENVELOPE_VERSION} (and migrates 8/9/10/11/12/13/14/15/16)"
             ));
         }
 
@@ -1692,8 +1712,8 @@ impl SharedNode {
             compute_receipts,
             compute_payouts,
             compute_payout_exit,
-            compute_escrow,
-            compute_bonds,
+                compute_escrow,
+                compute_bonds,
             compute_challenges,
             revoke_broadcast,
             compute_claims,
@@ -1931,6 +1951,7 @@ impl SharedNode {
                 compute_payouts,
                 compute_payout_exit,
                 compute_escrow,
+                _compute_usage_ledger,
                 compute_bonds,
                 compute_challenges,
                 revoke_broadcast,
@@ -2020,14 +2041,28 @@ impl SharedNode {
                     let pa = decode_section(&mut r, "compute_preauth", |sr| {
                         decode_state_map(sr, "compute_preauth", |b| Ok(b.to_vec()))
                     })?;
-                    r.expect_end().map_err(|e| format!("state envelope: {e}"))?;
                     (cb, pa)
                 } else {
-                    r.expect_end().map_err(|e| format!("state envelope: {e}"))?;
                     (srct_compute::ClaimBook::new(mine.clone()), BTreeMap::new())
                 };
+                // Compute metering (v17): node-local usage ledger. Older
+                // versions migrate with an empty ledger.
+                let compute_usage_ledger = if version >= 17 {
+                    decode_section(&mut r, "compute_usage_ledger", |sr| {
+                        let n = sr.remaining();
+                        let bytes = sr
+                            .fixed_slice(n)
+                            .map_err(|e| format!("compute_usage_ledger: {e}"))?;
+                        srct_compute::ledger::ComputeUsageLedger::decode(bytes)
+                            .map_err(|e| format!("compute_usage_ledger: {e}"))
+                    })?
+                } else {
+                    srct_compute::ledger::ComputeUsageLedger::new()
+                };
+                r.expect_end().map_err(|e| format!("state envelope: {e}"))?;
                 (
-                    co, cj, ca, cr, cp, ce, escrow, bonds, challenges, rb, claims, preauth,
+                    co, cj, ca, cr, cp, ce, escrow, compute_usage_ledger, bonds, challenges, rb,
+                    claims, preauth,
                 )
             } else if version == 14 {
                 let co = decode_section(&mut r, "compute_offers", |sr| {
@@ -2056,6 +2091,7 @@ impl SharedNode {
                     BTreeMap::new(),
                     BTreeMap::new(),
                     srct_compute::EscrowBook::new(mine.clone()),
+                    srct_compute::ledger::ComputeUsageLedger::new(),
                     srct_compute::BondBook::new(mine.clone()),
                     srct_compute::ChallengeBook::new(mine.clone()),
                     Vec::new(),
@@ -2071,6 +2107,7 @@ impl SharedNode {
                     BTreeMap::new(),
                     BTreeMap::new(),
                     srct_compute::EscrowBook::new(mine.clone()),
+                    srct_compute::ledger::ComputeUsageLedger::new(),
                     srct_compute::BondBook::new(mine.clone()),
                     srct_compute::ChallengeBook::new(mine.clone()),
                     Vec::new(),
@@ -2188,6 +2225,21 @@ impl SharedNode {
         self.compute_claims = compute_claims;
         self.compute_preauth = compute_preauth;
         self.revoke_broadcast = revoke_broadcast;
+        // Compute metering (v17): node-local usage ledger. Older versions
+        // migrate with an empty ledger.
+        let compute_usage_ledger = if version >= 17 {
+            decode_section(&mut r, "compute_usage_ledger", |sr| {
+                let n = sr.remaining();
+                let bytes = sr
+                    .fixed_slice(n)
+                    .map_err(|e| format!("compute_usage_ledger: {e}"))?;
+                srct_compute::ledger::ComputeUsageLedger::decode(bytes)
+                    .map_err(|e| format!("compute_usage_ledger: {e}"))
+            })?
+        } else {
+            srct_compute::ledger::ComputeUsageLedger::new()
+        };
+        self.compute_usage_ledger = compute_usage_ledger;
         // Rebuild the settlement mirror from the persisted payouts. Receipts
         // and assignments re-verify through their own codecs before one is
         // restored, so a payout that lost its evidence fails the load
@@ -2291,6 +2343,32 @@ impl SharedNode {
         for id in expired {
             if let Some(reservation) = self.reservations.remove(&id) {
                 let _ = self.credit.release(&reservation);
+            }
+        }
+    }
+
+    /// Execute compute payouts whose delay window has elapsed.
+    ///
+    /// Called each serve-loop tick. For every scheduled payout whose
+    /// `payable_at` is at or below the current height, and that is not yet
+    /// paid or held, the stored pre-authorized exit (if any) is bound and
+    /// queued. The payout is then marked paid so it is not processed again.
+    /// Payouts without a pre-auth remain due (the requester can claim them
+    /// manually) but are not auto-executed.
+    pub fn process_due_compute_payouts(&mut self) {
+        let height = self.chain.height();
+        let due: Vec<Hash> = self.compute_escrow.due_payouts(height);
+        for assignment_hash in due {
+            let Some((receipt_hash, payout)) = self
+                .compute_payouts
+                .iter()
+                .find(|(_, p)| p.assignment == assignment_hash)
+                .map(|(h, p)| (*h, p.clone()))
+            else {
+                continue;
+            };
+            if try_auto_preauth(self, receipt_hash, &assignment_hash, &payout) {
+                self.compute_escrow.mark_paid(&assignment_hash);
             }
         }
     }
@@ -8859,6 +8937,89 @@ fn bind_exit_to_payout(
 
 /// Execute a stored pre-authorized exit after settlement. Returns `true`
 /// when the exit queued. `key` is the assignment or ticket hash the preauth
+/// Try to auto-claim a gossip-received ticket on behalf of this node's
+/// provider wallet. Returns `true` when a claim was successfully entered.
+/// The claim path is atomic and capacity-gated, so no double claim can
+/// succeed even if two providers race for the same ticket.
+pub fn try_auto_claim_ticket(
+    sh: &mut SharedNode,
+    ticket: &srct_compute::ticket::SignedTicket,
+) -> bool {
+    let Some(wallet) = &sh.compute_provider_wallet else {
+        return false;
+    };
+    let height = sh.chain.height();
+    let provider = wallet.address().unwrap_or_default();
+    let t = &ticket.ticket;
+    // Ticket must be for this network and not yet claimed.
+    if t.network_id != sh.chain.params().network_id {
+        return false;
+    }
+    if sh.compute_claims.claim_for(&ticket.hash()).is_some() {
+        return false;
+    }
+    // Capability-gated: the node auto-claims only when one of its own live
+    // offers meets the ticket's requirement (template limits and device
+    // capabilities fit). A bare node (no wallet, no offers) never claims —
+    // auto-claim is ON when the provider template is active, OFF otherwise.
+    let requirement = srct_compute::device::DeviceRequirement {
+        class_mask: srct_compute::device::DeviceClass::ALL_MASK,
+        min_ram_mib: t.min_ram_mib,
+        min_units_per_sec: t.min_units_per_sec,
+        min_bandwidth_kbps: t.min_bandwidth_kbps,
+        determinism: t.determinism,
+        kernel: t.required_kernel,
+    };
+    let fits = sh.compute_offers.values().any(|offer| {
+        offer.verify().is_ok()
+            && offer.offer.provider == provider
+            && offer.offer.network_id == t.network_id
+            && offer.offer.available_from <= height
+            && height <= offer.offer.available_until
+            && offer.offer.verification >= t.min_verification
+            && (!t.sealed_input || offer.offer.privacy)
+            && offer.offer.profile.meets(&requirement)
+    });
+    if !fits {
+        return false;
+    }
+    // Capacity-gated: the ticket total must fit the provider's remaining
+    // headroom.
+    if check_compute_capacity(sh, &provider, t.total_sat, height).is_err() {
+        return false;
+    }
+    // Build a claim: provider takes the whole shard.
+    let claim = srct_compute::ticket::ShardClaim {
+        version: srct_compute::ticket::CLAIM_VERSION,
+        network_id: t.network_id.clone(),
+        ticket: ticket.hash(),
+        provider,
+        units: t.units,
+        nonce: height,
+    };
+    let signed = match srct_compute::ticket::SignedClaim::sign(claim, wallet) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    match sh.compute_claims.claim(&signed, height) {
+        Ok(_) => {
+            audit_push(
+                sh,
+                "compute_auto_claim",
+                Some(signed.hash()),
+                None,
+                format!(
+                    "auto-claimed ticket {} for {} units",
+                    hash_to_hex(&ticket.hash()),
+                    t.units
+                ),
+            );
+            true
+        }
+        Err(_) => false,
+    }
+}
+
 /// was stored under (`id` is the receipt hash the payout is recorded
 /// under). Any failure — corrupt bytes, binding drift, admission refusal,
 /// full queue — leaves the payout manual and records why, instead of
@@ -9288,9 +9449,12 @@ async fn compute_receipt_post(
             sh.compute_assignments.get(&auth_id).cloned()
         {
             // Push path: the receipt fulfils a planned assignment.
+            let delay = srct_compute::escrow::default_payout_delay_blocks(
+                sh.chain.params().network_id.as_str(),
+            );
             let payout = sh
                 .compute_escrow
-                .release(&signed_receipt, &assignment, height)
+                .release_scheduled(&signed_receipt, &assignment, height, delay)
                 .map_err(map_settle_err)?;
             sh.compute_ledger
                 .settle(&signed_receipt, &assignment, height)
@@ -9339,9 +9503,18 @@ async fn compute_receipt_post(
                         "the claim's ticket is no longer on the board",
                     )
                 })?;
+            let delay = srct_compute::escrow::default_payout_delay_blocks(
+                sh.chain.params().network_id.as_str(),
+            );
             let payout = sh
                 .compute_escrow
-                .release_for_claim(&signed_receipt, &ticket, &claim, height)
+                .release_for_claim_scheduled(
+                    &signed_receipt,
+                    &ticket,
+                    &claim,
+                    height,
+                    delay,
+                )
                 .map_err(map_settle_err)?;
             sh.compute_ledger
                 .settle_claim(&signed_receipt, &ticket, &claim, height)
@@ -9368,9 +9541,66 @@ async fn compute_receipt_post(
         let provider = address_to_hex(&signed_receipt.receipt.provider);
         let total_sat = signed_receipt.receipt.total_sat;
         let units_done = signed_receipt.receipt.units_done;
+        let provider_address = signed_receipt.receipt.provider;
+        let provider_sig = signed_receipt
+            .sigs
+            .components
+            .first()
+            .and_then(|c| {
+                if c.bytes.len() == 64 {
+                    let mut s = [0u8; 64];
+                    s.copy_from_slice(&c.bytes);
+                    Some(s)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or([0u8; 64]);
 
         sh.compute_receipts.insert(hash, signed_receipt);
         sh.compute_payouts.insert(hash, payout.clone());
+
+        // Record the usage in the node-local metering ledger, indexed by the
+        // slice's end height. The provider's signature comes from the receipt;
+        // the consumer counter-signs on its own node. A mismatch between the
+        // two sides' records opens a dispute through the existing bond path.
+        let network_id = sh.chain.params().network_id.clone();
+        let (_start_height, end_height) =
+            srct_compute::ledger::slice_window(height, network_id.as_str());
+        let usage = srct_compute::ledger::UsageRecord {
+            version: srct_compute::ledger::LEDGER_VERSION,
+            ticket: auth_id,
+            provider: provider_address,
+            units: units_done,
+            start_height: end_height.saturating_sub(
+                srct_compute::ledger::slice_blocks(network_id.as_str()).saturating_sub(1),
+            ),
+            end_height,
+            consumer_sig: [0u8; 64],
+            provider_sig,
+        };
+        let consumer = if let Some(assignment) = sh.compute_assignments.get(&auth_id) {
+            assignment.assignment.requester
+        } else if let Some(claim) = sh
+            .compute_claims
+            .all_claims()
+            .find(|c| c.hash() == auth_id)
+        {
+            sh.compute_claims
+                .ticket(&claim.claim.ticket)
+                .map(|t| t.ticket.requester)
+                .unwrap_or(Address::default())
+        } else {
+            Address::default()
+        };
+        if let Err(e) = sh.compute_usage_ledger.record(&usage, consumer) {
+            return Err(fail(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                format!("usage ledger rejected settled receipt: {e}"),
+            ));
+        }
+
         audit_push(
             sh,
             "compute_receipt",
@@ -9644,6 +9874,9 @@ async fn compute_ticket_post(
             )
         })?;
         sh.compute_claims.prune(height);
+        // Gossip: queue the ticket for P2P broadcast to peers. The serve loop
+        // drains compute_ticket_broadcast and sends it to all connected nodes.
+        sh.compute_ticket_broadcast.push(signed.clone());
         audit_push(
             sh,
             "compute_ticket",
@@ -10435,7 +10668,49 @@ async fn compute_receipts_list(State(state): State<ApiState>) -> ApiResult {
     })?
 }
 
-// --- Receipt status (every payment gets its receipt) ---
+/// `GET /v1/compute/ledger?from=&to=` — node-local compute usage ledger,
+/// indexed by chain height. Returns entries whose slice end height falls in
+/// `[from, to]` (inclusive). Each entry names the ticket, provider, units and
+/// consumer for one metered slice.
+///
+/// This is observational, not consensus: each node tracks its own view of
+/// what compute was delivered and consumed. There is no ledger-root
+/// commitment in this round (a proposal only).
+async fn compute_ledger_query(
+    State(state): State<ApiState>,
+    Query(params): Query<ComputeLedgerQuery>,
+) -> ApiResult {
+    let from = params.from.unwrap_or(0);
+    let to = params.to.unwrap_or(u64::MAX);
+    with_shared(&state, |sh| {
+        let entries = sh.compute_usage_ledger.query(from, to);
+        let list: Vec<Value> = entries
+            .iter()
+            .map(|e| {
+                json!({
+                    "height": e.height,
+                    "ticket": hash_to_hex(&e.ticket),
+                    "provider": address_to_hex(&e.provider),
+                    "units": e.units,
+                    "consumer": address_to_hex(&e.consumer),
+                })
+            })
+            .collect();
+        Ok(Json(json!({
+            "from": from,
+            "to": to,
+            "count": list.len(),
+            "entries": list,
+        })))
+    })?
+}
+
+/// Query parameters for `GET /v1/compute/ledger`.
+#[derive(Debug, serde::Deserialize)]
+struct ComputeLedgerQuery {
+    from: Option<u64>,
+    to: Option<u64>,
+}
 
 /// `GET /v1/payments/{id}/receipt_status` — is the payment recorded, is its
 /// receipt present, is its settlement bound? Agents poll this and demand the
@@ -12654,7 +12929,8 @@ pub fn router(state: ApiState, cfg: &ApiConfig) -> Router {
         .route("/v1/compute/bonds/register", post(compute_bond_register))
         .route("/v1/compute/bonds/withdraw", post(compute_bond_withdraw))
         .route("/v1/compute/bonds/dispute", post(compute_bond_dispute))
-        .route("/v1/compute/bonds/{provider}", get(compute_bond_get));
+        .route("/v1/compute/bonds/{provider}", get(compute_bond_get))
+        .route("/v1/compute/ledger", get(compute_ledger_query));
     // The stack stays `Router<ApiState>` (no state yet) until the end, where a
     // single `with_state` resolves it to the servable `Router<()>`.
     let mut app: Router<ApiState> = app.layer(DefaultBodyLimit::max(MAX_BODY_BYTES));

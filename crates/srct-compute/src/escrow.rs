@@ -37,6 +37,19 @@ use crate::ComputeError;
 pub const ESCROW_VERSION: u8 = 1;
 const DOM_FUNDING: &[u8] = b"srct/compute/escrow/v1";
 
+/// Default payout delay (in chain blocks) per network profile.
+///
+/// Mainnet blocks are ~10 minutes, so a short 2-block delay gives the
+/// consumer time to dispute. Testnet and mini use 180 blocks to keep the
+/// window long enough to observe on fast chains.
+pub fn default_payout_delay_blocks(network_id: &str) -> u64 {
+    match network_id {
+        "srct/mainnet" => 2,
+        "srct/testnet" | "srct/mini" => 180,
+        _ => 0,
+    }
+}
+
 /// A requester's signed commitment to lock a job budget.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EscrowFunding {
@@ -209,17 +222,36 @@ impl EscrowAccount {
     }
 }
 
+/// A payout recorded by the escrow book: the job it pays from, the amount,
+/// and the height at which it becomes payable.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScheduledPayout {
+    pub job: Hash,
+    pub amount_sat: u64,
+    pub payable_at: u64,
+}
+
 /// Escrow book for one network.
 ///
 /// The book stores signed instructions and accounting only. Funding does not
 /// lock coin and a release does not move it; the payment or escrow rail
 /// executes both.
+///
+/// Releases can be immediate (`payable_at = 0`) or scheduled (`payable_at`
+/// in the future). During the delay window a slice can be disputed; a held
+/// payout never pays out and its funds return to the pot.
 #[derive(Clone, Debug, Default)]
 pub struct EscrowBook {
     network_id: String,
     accounts: BTreeMap<Hash, EscrowAccount>,
     fundings: BTreeSet<Hash>,
     releases: BTreeSet<Hash>,
+    /// Assignment hash -> scheduled payout record.
+    scheduled: BTreeMap<Hash, ScheduledPayout>,
+    /// Assignment hashes whose payout has been paid out.
+    paid: BTreeSet<Hash>,
+    /// Assignment hashes whose payout is held (disputed/slashed).
+    held: BTreeSet<Hash>,
 }
 
 /// Cap for persisted escrow accounts and single-use sets. Bounds the worst-case
@@ -256,6 +288,21 @@ impl EscrowBook {
         }
         w.u32le(self.releases.len() as u32);
         for h in &self.releases {
+            w.fixed(h);
+        }
+        w.u32le(self.scheduled.len() as u32);
+        for (h, sp) in &self.scheduled {
+            w.fixed(h)
+                .fixed(&sp.job)
+                .u64le(sp.amount_sat)
+                .u64le(sp.payable_at);
+        }
+        w.u32le(self.paid.len() as u32);
+        for h in &self.paid {
+            w.fixed(h);
+        }
+        w.u32le(self.held.len() as u32);
+        for h in &self.held {
             w.fixed(h);
         }
         w.into_vec()
@@ -326,12 +373,61 @@ impl EscrowBook {
                 return Err(ComputeError::Malformed("duplicate escrow release".into()));
             }
         }
+        let n_scheduled = r.u32le().map_err(malformed)? as usize;
+        if n_scheduled > MAX_ESCROW_ACCOUNTS {
+            return Err(ComputeError::Malformed("escrow scheduled entries over cap".into()));
+        }
+        let mut scheduled = BTreeMap::new();
+        for _ in 0..n_scheduled {
+            let h: Hash = r.fixed().map_err(malformed)?;
+            let job: Hash = r.fixed().map_err(malformed)?;
+            let amount_sat = r.u64le().map_err(malformed)?;
+            let payable_at = r.u64le().map_err(malformed)?;
+            if scheduled
+                .insert(
+                    h,
+                    ScheduledPayout {
+                        job,
+                        amount_sat,
+                        payable_at,
+                    },
+                )
+                .is_some()
+            {
+                return Err(ComputeError::Malformed("duplicate escrow scheduled entry".into()));
+            }
+        }
+        let n_paid = r.u32le().map_err(malformed)? as usize;
+        if n_paid > MAX_ESCROW_ACCOUNTS {
+            return Err(ComputeError::Malformed("escrow paid entries over cap".into()));
+        }
+        let mut paid = BTreeSet::new();
+        for _ in 0..n_paid {
+            let h: Hash = r.fixed().map_err(malformed)?;
+            if !paid.insert(h) {
+                return Err(ComputeError::Malformed("duplicate escrow paid entry".into()));
+            }
+        }
+        let n_held = r.u32le().map_err(malformed)? as usize;
+        if n_held > MAX_ESCROW_ACCOUNTS {
+            return Err(ComputeError::Malformed("escrow held entries over cap".into()));
+        }
+        let mut held = BTreeSet::new();
+        for _ in 0..n_held {
+            let h: Hash = r.fixed().map_err(malformed)?;
+            if !held.insert(h) {
+                return Err(ComputeError::Malformed("duplicate escrow held entry".into()));
+            }
+        }
         r.expect_end().map_err(malformed)?;
         Ok(EscrowBook {
             network_id: network_id.into(),
             accounts,
             fundings,
             releases,
+            scheduled,
+            paid,
+            held,
         })
     }
 }
@@ -460,6 +556,80 @@ impl EscrowBook {
             job: a.job,
             assignment: assignment.hash(),
             receipt: receipt.hash(),
+            payable_at: 0,
+        })
+    }
+
+    /// Release a settled receipt on a schedule: the payout becomes payable at
+    /// `height + payout_delay_blocks`. Until then the slice can be disputed.
+    /// A disputed or slashed slice never pays out (`hold`). `payable_at = 0`
+    /// means immediately payable.
+    pub fn release_scheduled(
+        &mut self,
+        receipt: &SignedReceipt,
+        assignment: &SignedAssignment,
+        height: u64,
+        payout_delay_blocks: u64,
+    ) -> Result<PayoutInstruction, ComputeError> {
+        receipt.verify()?;
+        assignment.verify()?;
+        let a = &assignment.assignment;
+        let r = &receipt.receipt;
+        if r.job != a.job || r.assignment != assignment.hash() || r.provider != a.provider {
+            return Err(ComputeError::BindingMismatch);
+        }
+        if r.units_done > a.units {
+            return Err(ComputeError::Overclaim);
+        }
+        if r.unit_price_sat != a.unit_price_sat {
+            return Err(ComputeError::PriceMismatch);
+        }
+        if height > a.deadline || r.height > a.deadline {
+            return Err(ComputeError::Expired);
+        }
+        let account = self
+            .accounts
+            .get_mut(&a.job)
+            .ok_or(ComputeError::NotFunded)?;
+        if account.requester != a.requester || account.deadline != a.deadline {
+            return Err(ComputeError::BindingMismatch);
+        }
+        if account.refunded {
+            return Err(ComputeError::AlreadyRefunded);
+        }
+        if self.releases.contains(&assignment.hash()) {
+            return Err(ComputeError::AlreadySettled);
+        }
+        let released = account
+            .released_sat
+            .checked_add(r.total_sat)
+            .ok_or_else(|| ComputeError::Malformed("escrow release overflows".into()))?;
+        if released > account.funded_sat {
+            return Err(ComputeError::BudgetExceeded);
+        }
+        let payable_at = if payout_delay_blocks > 0 {
+            height.saturating_add(payout_delay_blocks)
+        } else {
+            0
+        };
+        self.releases.insert(assignment.hash());
+        self.scheduled.insert(
+            assignment.hash(),
+            ScheduledPayout {
+                job: a.job,
+                amount_sat: r.total_sat,
+                payable_at,
+            },
+        );
+        account.released_sat = released;
+        Ok(PayoutInstruction {
+            from: a.requester,
+            to: a.provider,
+            amount_sat: r.total_sat,
+            job: a.job,
+            assignment: assignment.hash(),
+            receipt: receipt.hash(),
+            payable_at,
         })
     }
 
@@ -527,9 +697,124 @@ impl EscrowBook {
             job: t.job,
             assignment: claim_id,
             receipt: receipt.hash(),
+            payable_at: 0,
         })
     }
 
+    /// Scheduled variant of [`release_for_claim`] with a payout delay.
+    pub fn release_for_claim_scheduled(
+        &mut self,
+        receipt: &SignedReceipt,
+        ticket: &crate::ticket::SignedTicket,
+        claim: &crate::ticket::SignedClaim,
+        height: u64,
+        payout_delay_blocks: u64,
+    ) -> Result<PayoutInstruction, ComputeError> {
+        receipt.verify()?;
+        ticket.verify()?;
+        claim.verify()?;
+        let t = &ticket.ticket;
+        let c = &claim.claim;
+        let r = &receipt.receipt;
+        let claim_id = claim.hash();
+        if c.ticket != ticket.hash() {
+            return Err(ComputeError::BindingMismatch);
+        }
+        if r.job != t.job || r.assignment != claim_id || r.provider != c.provider {
+            return Err(ComputeError::BindingMismatch);
+        }
+        if r.units_done > t.units {
+            return Err(ComputeError::Overclaim);
+        }
+        if r.unit_price_sat != t.unit_price_sat {
+            return Err(ComputeError::PriceMismatch);
+        }
+        if height > t.deadline || r.height > t.deadline {
+            return Err(ComputeError::Expired);
+        }
+        let account = self
+            .accounts
+            .get_mut(&t.job)
+            .ok_or(ComputeError::NotFunded)?;
+        if account.requester != t.requester || account.deadline != t.deadline {
+            return Err(ComputeError::BindingMismatch);
+        }
+        if account.refunded {
+            return Err(ComputeError::AlreadyRefunded);
+        }
+        if self.releases.contains(&claim_id) {
+            return Err(ComputeError::AlreadySettled);
+        }
+        let released = account
+            .released_sat
+            .checked_add(r.total_sat)
+            .ok_or_else(|| ComputeError::Malformed("escrow release overflows".into()))?;
+        if released > account.funded_sat {
+            return Err(ComputeError::BudgetExceeded);
+        }
+        let payable_at = if payout_delay_blocks > 0 {
+            height.saturating_add(payout_delay_blocks)
+        } else {
+            0
+        };
+        self.releases.insert(claim_id);
+        self.scheduled.insert(
+            claim_id,
+            ScheduledPayout {
+                job: t.job,
+                amount_sat: r.total_sat,
+                payable_at,
+            },
+        );
+        account.released_sat = released;
+        Ok(PayoutInstruction {
+            from: t.requester,
+            to: c.provider,
+            amount_sat: r.total_sat,
+            job: t.job,
+            assignment: claim_id,
+            receipt: receipt.hash(),
+            payable_at,
+        })
+    }
+
+    /// Assignment hashes whose scheduled payouts are due at `height`
+    /// (`payable_at <= height`, not yet paid, not held). Immediate payouts
+    /// (`payable_at = 0`) are not returned here — they are payable at release
+    /// time.
+    pub fn due_payouts(&self, height: u64) -> Vec<Hash> {
+        self.scheduled
+            .iter()
+            .filter(|(_, sp)| sp.payable_at > 0 && sp.payable_at <= height)
+            .filter(|(h, _)| !self.paid.contains(*h) && !self.held.contains(*h))
+            .map(|(h, _)| *h)
+            .collect()
+    }
+
+    /// Mark a scheduled payout as paid. No-op if unknown or already paid.
+    pub fn mark_paid(&mut self, assignment: &Hash) {
+        self.paid.insert(*assignment);
+    }
+
+    /// Hold a scheduled payout (disputed or slashed). It never pays out and
+    /// its funds return to the pot, increasing the refundable remainder.
+    /// Returns `true` when the payout was found and held.
+    pub fn hold(&mut self, assignment: &Hash) -> bool {
+        if let Some(sp) = self.scheduled.get(assignment) {
+            if sp.payable_at == 0 || self.paid.contains(assignment) || self.held.contains(assignment)
+            {
+                return false;
+            }
+            self.held.insert(*assignment);
+            // Return funds to the pot: reduce released_sat on the job's account.
+            if let Some(account) = self.accounts.get_mut(&sp.job) {
+                account.released_sat = account.released_sat.saturating_sub(sp.amount_sat);
+            }
+            true
+        } else {
+            false
+        }
+    }
     /// Refund the unspent remainder after the job deadline, exactly once.
     ///
     /// A fully released pot refunds zero and still closes, so a later release
