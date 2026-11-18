@@ -431,12 +431,8 @@ impl Chain {
         // Fork-aware committee derivation for active bond rotation is required
         // before mainnet activation (see C1/N1 design doc).
         let committee = self.settlement_committee_at(cp.payload.height);
-        if crate::bls_checkpoint::verify_checkpoint(cp, &committee, self.bls_verifier.verifier())
-            .is_err()
-        {
-            return false;
-        }
-        true
+        crate::bls_checkpoint::verify_checkpoint(cp, &committee, self.bls_verifier.verifier())
+            .is_ok()
     }
 
     pub fn utxo(&self) -> &UtxoSet {
