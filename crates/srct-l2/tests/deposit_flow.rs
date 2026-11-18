@@ -76,6 +76,7 @@ fn block_with(tx: Transaction, height: u64) -> Block {
         l2_txs: Vec::new(),
         l2_state_root: None,
         exit_claims: Vec::new(),
+        checkpoint: None,
     }
 }
 
@@ -161,6 +162,7 @@ fn coinbase_to_sink_is_never_a_deposit() {
         l2_txs: Vec::new(),
         l2_state_root: None,
         exit_claims: Vec::new(),
+        checkpoint: None,
     };
     let (found, ignored) = srct_l2::deposits::scan_block(&block, 9, &p);
     assert!(found.is_empty());

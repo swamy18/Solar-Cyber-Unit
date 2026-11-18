@@ -37,15 +37,16 @@ use srct_core::fees::split_flat_fee;
 use srct_core::hash::{Address, Hash, Hash512};
 use srct_core::l2::{
     settle_fee_sat, AgentSpendPayload, ClaimTaskPayload, CreditCollateralPayload,
-    CreditDefaultPayload, CreditOpenPayload, CreditRepayPayload, DisputePayload, ExitQueuePayload,
-    L2Payload, L2Transaction, PolicyPayload, PolicyRevokePayload, PostTaskPayload, SettlePayload,
-    SubmitResultPayload, Verdict, MIN_EXIT_FEE_SAT, VWC_HASH_EXPIRED,
+    CreditDefaultPayload, CreditOpenPayload, CreditOpenV2Payload, CreditRepayPayload,
+    DisputePayload, ExitQueuePayload, L2Payload, L2Transaction, PolicyPayload, PolicyRevokePayload,
+    PostTaskPayload, SettlePayload, SubmitResultPayload, Verdict, MIN_EXIT_FEE_SAT, VWC_HASH_EXPIRED,
 };
 use srct_core::params::MAX_CREDIT_RATE_BPS_PER_WINDOW;
 use srct_core::ser::{Reader, Writer};
 use srct_core::slash::SlashVault;
 use srct_core::state_root::{
-    account_leaf, exit_record_leaf, prove_inclusion, state_root, InclusionProof,
+    account_leaf, exit_record_leaf, exit_record_leaf_v7, prove_inclusion, state_root,
+    InclusionProof,
 };
 
 use crate::error::{L2Error, L2Result};
@@ -153,6 +154,14 @@ pub enum L2Effect {
         shortfall_sat: u64,
         excess_returned_sat: u64,
     },
+    /// A guarded account was opted in (Phase 3).
+    GuardedOptedIn { owner: Address, guardian: Address },
+    /// A guarded action was taken (cancel/freeze, Phase 3).
+    GuardedAction { account: Address, kind: &'static str },
+    /// An audit root was anchored (Phase 3).
+    AuditAnchored { anchorer: Address, root: Hash },
+    /// Generic catch-all for future effects (kept for extensibility).
+    Custom(&'static str),
 }
 
 /// Equality here is *state* equality: two nodes that replayed the same
@@ -244,6 +253,14 @@ pub struct L2State {
     /// Collateral locked against credit positions. Part of the conservation
     /// sum: it is in the system, but not spendable.
     credit_locked: u64,
+    /// Guarded accounts (Phase 3), keyed by owner address. An opt-in protected
+    /// account with its own record (leaf tag 0x07, state wire 8). Opt-in is per
+    /// account only, never a global key. Guarded accounts protect L2 balances;
+    /// they must never become a place where L1-destined earnings get stuck.
+    guarded: BTreeMap<Address, GuardedAccount>,
+    /// Audit anchor roots (Phase 3), keyed by anchor id. Commits an off-chain
+    /// audit Merkle root on-chain. No dust-to-derived-address hack.
+    audit_anchors: BTreeMap<Hash, AuditAnchorRecord>,
 }
 
 /// One queued L2 → L1 exit: the exact record the L1 release proof re-states.
@@ -259,12 +276,17 @@ pub struct ExitRecord {
     pub destination: Address,
     pub exit_fee_sat: u64,
     pub queued_height: u64,
+    /// True when the owner was guarded at queue time. Committed in the leaf
+    /// (v8) so L1 can distinguish guarded exits without L2 state access:
+    /// guarded claims must prove against a post-delay root.
+    pub guarded: bool,
 }
 
 impl ExitRecord {
-    /// Fixed 72-byte encoding: owner(20) + nonce(8) + amount(8) +
+    /// Fixed 72-byte v7 encoding: owner(20) + nonce(8) + amount(8) +
     /// destination(20) + fee(8) + height(8). Fixed size, so the wire count is
-    /// bounded by the buffer with no prefix to lie about.
+    /// bounded by the buffer with no prefix to lie about. v8 appends one
+    /// guarded byte (73 total); v7 blobs decode with `guarded: false`.
     pub const ENCODED_LEN: usize = 72;
 
     pub fn encode(&self, w: &mut Writer) {
@@ -273,10 +295,17 @@ impl ExitRecord {
             .u64le(self.amount_sat)
             .fixed(&self.destination)
             .u64le(self.exit_fee_sat)
-            .u64le(self.queued_height);
+            .u64le(self.queued_height)
+            .u8(u8::from(self.guarded));
     }
 
+    /// v7 decode: 72-byte records, no guarded flag (pre-activation exits are
+    /// never guarded, and guarded mode did not exist).
     pub fn decode(r: &mut Reader<'_>) -> L2Result<Self> {
+        Self::decode_inner(r, false)
+    }
+
+    fn decode_inner(r: &mut Reader<'_>, guarded_default: bool) -> L2Result<Self> {
         let owner: Address = r.fixed().map_err(|_| codec_err("exit owner"))?;
         let nonce = r.u64le().map_err(|_| codec_err("exit nonce"))?;
         let amount_sat = r.u64le().map_err(|_| codec_err("exit amount"))?;
@@ -290,19 +319,229 @@ impl ExitRecord {
             destination,
             exit_fee_sat,
             queued_height,
+            guarded: guarded_default,
         })
     }
 
+    pub fn decode_v8(r: &mut Reader<'_>) -> L2Result<Self> {
+        let mut rec = Self::decode_inner(r, false)?;
+        rec.guarded = match r.u8().map_err(|_| codec_err("exit guarded flag"))? {
+            0 => false,
+            1 => true,
+            _ => return Err(codec_err("exit guarded flag out of range")),
+        };
+        Ok(rec)
+    }
+
+    /// The committed leaf for this exit. Unguarded exits keep the exact
+    /// pre-upgrade encoding (byte-identical to v7), so all existing roots,
+    /// proofs, and tests are untouched. Guarded exits commit one extra flag
+    /// byte: the guarded bit is part of what the Merkle proof binds, which is
+    /// what makes a legacy (unguarded) claim against a guarded exit fail
+    /// closed without any extra flag to trust.
     pub fn leaf(&self) -> Hash {
-        exit_record_leaf(
-            &self.owner,
-            self.nonce,
-            self.amount_sat,
-            &self.destination,
-            self.exit_fee_sat,
-            self.queued_height,
+        if self.guarded {
+            exit_record_leaf(
+                &self.owner,
+                self.nonce,
+                self.amount_sat,
+                &self.destination,
+                self.exit_fee_sat,
+                self.queued_height,
+                true,
+            )
+        } else {
+            Self::leaf_v7_inner(self)
+        }
+    }
+
+    /// v7 leaf: byte-identical to the pre-guarded format.
+    pub fn leaf_v7(&self) -> Hash {
+        Self::leaf_v7_inner(self)
+    }
+
+    fn leaf_v7_inner(r: &ExitRecord) -> Hash {
+        exit_record_leaf_v7(
+            &r.owner,
+            r.nonce,
+            r.amount_sat,
+            &r.destination,
+            r.exit_fee_sat,
+            r.queued_height,
         )
     }
+}
+
+/// A guarded L2 account (Phase 3). Opt-in per account only, never global.
+/// Protects L2 balances with guardian oversight, delayed allow-lists, and
+/// price-independent caps. Must never become a place where L1-destined
+/// earnings get stuck.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuardedAccount {
+    /// The protected account owner.
+    pub owner: Address,
+    /// Guardian address (independent of owner, enforced distinct). Signs
+    /// GuardedCancel/GuardedFreeze and co-signs high-value transfers.
+    pub guardian: Address,
+    /// Destination allow-list for exits and AgentSpend recipients. Changes
+    /// take effect only after `allowlist_delay_blocks`.
+    pub allow_list: Vec<Address>,
+    /// Height at which the current allow-list became active.
+    pub allowlist_active_height: u64,
+    /// Pending allow-list change (new list + activation height), if any.
+    pub pending_allowlist: Option<(Vec<Address>, u64)>,
+    /// Grant-activation delay D (blocks). Policies for guarded owners require
+    /// `not_before_height >= publish_height + D`. Revocation stays instant.
+    pub grant_delay_blocks: u64,
+    /// Maximum grant lifetime in blocks (`expires_at - not_before <= max`).
+    pub max_grant_lifetime_blocks: u64,
+    /// Balance-relative outflow cap in basis points per window (e.g. 1000 = 10%).
+    /// Total outflow per window <= balance_snapshot * bps / 10000.
+    pub outflow_cap_bps: u64,
+    /// Window length for outflow cap in blocks.
+    pub outflow_window_blocks: u64,
+    /// Balance snapshot at window start (prevents mid-window deposit inflation).
+    pub window_balance_snapshot: u64,
+    /// Window start height (0 = no window open yet).
+    pub window_start_height: u64,
+    /// Outflow total inside current window.
+    pub window_outflow_total: u64,
+    /// Whether the account is frozen by guardian (halts all outflows).
+    pub frozen: bool,
+    /// Height at which the opt-in took effect.
+    pub created_height: u64,
+}
+
+impl GuardedAccount {
+    pub fn leaf(&self) -> Hash {
+        use srct_core::hash::sha256_dom;
+        use srct_core::ser::Writer;
+        // Domain-separated leaf: tag 0x07 + owner + guardian + allow-list commitment
+        // + delays + caps + frozen flag + heights. Allow-list hashed (not listed)
+        // to keep leaves constant-size regardless of list length.
+        const DOM_GUARDED_LEAF: &[u8] = b"srct/l2/guarded-leaf/v1";
+        let mut w = Writer::new();
+        w.fixed(&self.owner).fixed(&self.guardian);
+        // Allow-list commitment: sorted join hashed.
+        let mut sorted = self.allow_list.clone();
+        sorted.sort_unstable();
+        let mut lw = Writer::new();
+        for a in &sorted {
+            lw.fixed(a);
+        }
+        w.fixed(&sha256_dom(DOM_GUARDED_LEAF, &[lw.as_slice()]));
+        w.u64le(self.allowlist_active_height)
+            .u64le(self.grant_delay_blocks)
+            .u64le(self.max_grant_lifetime_blocks)
+            .u64le(self.outflow_cap_bps)
+            .u64le(self.outflow_window_blocks)
+            .u64le(self.window_balance_snapshot)
+            .u64le(self.window_start_height)
+            .u64le(self.window_outflow_total)
+            .u8(u8::from(self.frozen))
+            .u64le(self.created_height);
+        // Pending allow-list (if any) committed too.
+        if let Some((list, height)) = &self.pending_allowlist {
+            let mut pw = Writer::new();
+            let mut s2 = list.clone();
+            s2.sort_unstable();
+            for a in &s2 {
+                pw.fixed(a);
+            }
+            w.fixed(&sha256_dom(DOM_GUARDED_LEAF, &[pw.as_slice()]))
+                .u64le(*height);
+        } else {
+            w.fixed(&[0u8; 32]).u64le(0);
+        }
+        srct_core::state_root::guarded_account_leaf(&w.into_vec())
+    }
+
+    pub fn encode(&self, w: &mut Writer) {
+        w.fixed(&self.owner).fixed(&self.guardian);
+        w.u64le(self.allow_list.len() as u64);
+        for a in &self.allow_list {
+            w.fixed(a);
+        }
+        w.u64le(self.allowlist_active_height);
+        match &self.pending_allowlist {
+            None => {
+                w.u64le(0);
+            }
+            Some((list, height)) => {
+                w.u64le(list.len() as u64);
+                for a in list {
+                    w.fixed(a);
+                }
+                w.u64le(*height);
+            }
+        }
+        w.u64le(self.grant_delay_blocks)
+            .u64le(self.max_grant_lifetime_blocks)
+            .u64le(self.outflow_cap_bps)
+            .u64le(self.outflow_window_blocks)
+            .u64le(self.window_balance_snapshot)
+            .u64le(self.window_start_height)
+            .u64le(self.window_outflow_total)
+            .u8(u8::from(self.frozen))
+            .u64le(self.created_height);
+    }
+
+    pub fn decode(r: &mut Reader) -> L2Result<Self> {
+        let owner: Address = r.fixed().map_err(|_| codec_err("guarded owner"))?;
+        let guardian: Address = r.fixed().map_err(|_| codec_err("guardian"))?;
+        let n = r.u64le().map_err(|_| codec_err("allow-list len"))? as usize;
+        if n > 10_000 {
+            return Err(codec_err("allow-list too long"));
+        }
+        let mut allow_list = Vec::with_capacity(n.min(64));
+        for _ in 0..n {
+            allow_list.push(r.fixed().map_err(|_| codec_err("allow-list entry"))?);
+        }
+        let m = r.u64le().map_err(|_| codec_err("pending allow-list len"))? as usize;
+        let pending_allowlist = if m == 0 {
+            None
+        } else {
+            if m > 10_000 {
+                return Err(codec_err("pending allow-list too long"));
+            }
+            let mut list = Vec::with_capacity(m.min(64));
+            for _ in 0..m {
+                list.push(r.fixed().map_err(|_| codec_err("pending entry"))?);
+            }
+            let height = r.u64le().map_err(|_| codec_err("pending height"))?;
+            Some((list, height))
+        };
+        Ok(GuardedAccount {
+            owner,
+            guardian,
+            allow_list,
+            allowlist_active_height: r.u64le().map_err(|_| codec_err("allowlist height"))?,
+            pending_allowlist,
+            grant_delay_blocks: r.u64le().map_err(|_| codec_err("grant delay"))?,
+            max_grant_lifetime_blocks: r.u64le().map_err(|_| codec_err("max lifetime"))?,
+            outflow_cap_bps: r.u64le().map_err(|_| codec_err("cap bps"))?,
+            outflow_window_blocks: r.u64le().map_err(|_| codec_err("cap window"))?,
+            window_balance_snapshot: r.u64le().map_err(|_| codec_err("window snapshot"))?,
+            window_start_height: r.u64le().map_err(|_| codec_err("window start"))?,
+            window_outflow_total: r.u64le().map_err(|_| codec_err("window total"))?,
+            frozen: match r.u8().map_err(|_| codec_err("frozen"))? {
+                0 => false,
+                1 => true,
+                _ => return Err(codec_err("frozen flag out of range")),
+            },
+            created_height: r.u64le().map_err(|_| codec_err("created height"))?,
+        })
+    }
+}
+
+/// An audit anchor record (Phase 3). Commits an off-chain audit Merkle root
+/// on-chain. No dust-to-derived-address hack.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuditAnchorRecord {
+    pub anchorer: Address,
+    pub root: Hash,
+    pub height: u64,
+    pub nonce: u64,
 }
 
 /// Where a credit position stands.
@@ -475,6 +714,8 @@ impl L2State {
             policy_by_agent: BTreeMap::new(),
             positions: BTreeMap::new(),
             credit_locked: 0,
+            guarded: BTreeMap::new(),
+            audit_anchors: BTreeMap::new(),
         }
     }
 
@@ -640,6 +881,12 @@ impl L2State {
         let mut positions: Vec<(&Hash, &CreditPosition)> = self.positions.iter().collect();
         positions.sort_by_key(|(h, _)| **h);
         leaves.extend(positions.iter().map(|(_, p)| p.leaf()));
+        // Guarded accounts (Phase 3, leaf tag 0x07) in owner address order.
+        let mut guarded: Vec<(&Address, &GuardedAccount)> = self.guarded.iter().collect();
+        guarded.sort_by_key(|(a, _)| **a);
+        leaves.extend(guarded.iter().map(|(_, g)| g.leaf()));
+        // Audit anchors are NOT in the commitment tree (they are attestations,
+        // not value state). They are stored and proven separately.
         leaves
     }
 
@@ -825,6 +1072,12 @@ impl L2State {
         if p.exit_fee_sat < MIN_EXIT_FEE_SAT {
             return Err(L2Error::ExitFeeBelowMinimum);
         }
+        // Phase 3 guarded enforcement: guarded owners may only exit to an
+        // allow-listed destination active for at least the delay, never while
+        // frozen, and the principal counts against the outflow cap.
+        if self.guarded.contains_key(&p.owner) {
+            self.guarded_check_spend(&p.owner, &p.destination, p.amount_sat, height)?;
+        }
         // Nonces start at 1 (see the spend path): a first queue with
         // nonce 0 is refused by name.
         let last = self.exit_nonce.get(&p.owner).copied().unwrap_or(0);
@@ -918,6 +1171,10 @@ impl L2State {
         if window_on {
             self.exit_window_owner.insert(p.owner, owner_total);
         }
+        // Guarded exits commit the guarded bit so L1 can distinguish them:
+        // a guarded exit is only claimable with a guarded proof against a
+        // post-delay root; an unguarded one with the legacy queue-block proof.
+        let is_guarded = self.guarded.contains_key(&p.owner);
         self.exits.insert(
             (p.owner, p.nonce),
             ExitRecord {
@@ -927,9 +1184,12 @@ impl L2State {
                 destination: p.destination,
                 exit_fee_sat: p.exit_fee_sat,
                 queued_height: height,
+                guarded: is_guarded,
             },
         );
         self.exit_nonce.insert(p.owner, p.nonce);
+        // Record guarded outflow (window accounting, Phase 3).
+        self.guarded_record_outflow(&p.owner, p.amount_sat, height)?;
         Ok(L2Effect::ExitQueued {
             owner: p.owner,
             nonce: p.nonce,
@@ -1062,6 +1322,18 @@ impl L2State {
         self.credit_locked
     }
 
+    /// Guarded accounts, for audit and cross-checks (Phase 3).
+    pub fn guarded_accounts(&self) -> Vec<&GuardedAccount> {
+        let mut out: Vec<&GuardedAccount> = self.guarded.values().collect();
+        out.sort_by_key(|g| g.owner);
+        out
+    }
+
+    /// Number of anchored audit roots (Phase 3).
+    pub fn audit_anchor_count(&self) -> usize {
+        self.audit_anchors.len()
+    }
+
     // --- task view -----------------------------------------------------
 
     pub fn task(&self, task_id: &Hash) -> Option<&TaskContract> {
@@ -1131,10 +1403,26 @@ impl L2State {
             L2Payload::Policy(p) => self.apply_policy(p, height, fee),
             L2Payload::PolicyRevoke(p) => self.apply_policy_revoke(p, height, fee),
             L2Payload::AgentSpend(p) => self.apply_agent_spend(p, height, fee),
-            L2Payload::CreditOpen(p) => self.apply_credit_open(p, height, fee),
+            L2Payload::CreditOpen(p) => {
+                // Phase 2: at/after activation, new positions require the
+                // borrower-consented 0x1D form. Old 0x19 blocks still replay
+                // (pre-activation history), but new 0x19 opens are refused.
+                let a = self.config.credit_consent_activation_height;
+                if a != 0 && height >= a {
+                    return Err(L2Error::CreditTerms(
+                        "legacy credit open retired: use guarded CreditOpenV2",
+                    ));
+                }
+                self.apply_credit_open(p, height, fee)
+            }
             L2Payload::CreditCollateral(p) => self.apply_credit_collateral(p, height, fee),
             L2Payload::CreditRepay(p) => self.apply_credit_repay(p, height, fee),
             L2Payload::CreditDefault(p) => self.apply_credit_default(p, height, fee),
+            L2Payload::CreditOpenV2(p) => self.apply_credit_open_v2(p, height, fee),
+            L2Payload::GuardedOptIn(p) => self.apply_guarded_optin(p, height, fee),
+            L2Payload::GuardedCancel(p) => self.apply_guarded_cancel(p, height, fee),
+            L2Payload::GuardedFreeze(p) => self.apply_guarded_freeze(p, height, fee),
+            L2Payload::AuditAnchor(p) => self.apply_audit_anchor(p, height, fee),
         }?;
 
         // Only a transaction that actually applied is marked applied. A
@@ -1200,6 +1488,32 @@ impl L2State {
                 .ok_or(L2Error::UnknownPolicy)?;
             delegation::dominates(&parent.policy, &policy)
                 .map_err(|e| L2Error::Policy(format!("grant widens its parent: {e:?}")))?;
+        }
+        // Phase 3 guarded enforcement: for guarded owners, not_before must be
+        // at least `grant_delay_blocks` after the publish height, and the grant
+        // lifetime must fit `max_grant_lifetime_blocks`. Revocation stays
+        // instant (handled by PolicyRevoke, unchanged).
+        if let Some(g) = self.guarded.get(&p.owner) {
+            if g.frozen {
+                return Err(L2Error::AccountFrozen);
+            }
+            let delay = g.grant_delay_blocks.max(self.config.guarded_grant_delay_blocks);
+            if policy.not_before_height < height.saturating_add(delay) {
+                return Err(L2Error::GrantDelayNotSatisfied);
+            }
+            let lifetime = policy
+                .expires_at_height
+                .saturating_sub(policy.not_before_height);
+            // Account-level cap wins when set; otherwise the chain default.
+            // Zero (either side) means no lifetime cap.
+            let max_life = if g.max_grant_lifetime_blocks != 0 {
+                g.max_grant_lifetime_blocks
+            } else {
+                self.config.guarded_max_grant_lifetime_blocks
+            };
+            if max_life != 0 && lifetime > max_life {
+                return Err(L2Error::GrantLifetimeExceeded);
+            }
         }
         // The fee comes out of the owner's balance, like every other L2 fee.
         self.ensure_balance(&p.owner, fee)?;
@@ -1315,6 +1629,28 @@ impl L2State {
         if !policy.allowed_recipients.contains(&p.recipient) {
             return Err(L2Error::PolicyRecipient);
         }
+        // Phase 3 guarded enforcement: the grant owner's account may be
+        // guarded. Then the recipient must be in the allow-list that has been
+        // active for at least the delay, the account must not be frozen, and
+        // the spend counts against the balance-relative window cap.
+        if self.guarded.contains_key(&policy.owner) {
+            self.guarded_check_spend(&policy.owner, &p.recipient, p.amount_sat, height)?;
+            // Human-approval tier: spends at/above the configured tier need
+            // the guardian's co-signature on the identical terms, verified
+            // against the registered guardian (verify_auth already checked
+            // the signature itself; this binds it to the right guardian).
+            let tier = self.config.guarded_approval_threshold_sat;
+            if tier != 0 && p.amount_sat >= tier {
+                let co = p.guardian_approval.as_ref().ok_or(L2Error::GuardedApprovalRequired)?;
+                let g = self
+                    .guarded
+                    .get(&policy.owner)
+                    .ok_or(L2Error::GuardedNotOptedIn)?;
+                if co.guardian != g.guardian {
+                    return Err(L2Error::GuardedGuardianMismatch);
+                }
+            }
+        }
         match &p.service {
             None => {
                 if !policy.allowed_services.is_empty() {
@@ -1359,6 +1695,8 @@ impl L2State {
         self.charge(&owner, need)?;
         self.pay(&p.recipient, p.amount_sat)?;
         self.collect_fee(fee);
+        // Record guarded outflow (window accounting, Phase 3).
+        self.guarded_record_outflow(&owner, p.amount_sat, height)?;
         let e = self.policies.get_mut(&hash).ok_or(L2Error::UnknownPolicy)?;
         e.window_start_height = window_start;
         e.spent_in_window_sat = requested;
@@ -1371,6 +1709,103 @@ impl L2State {
             recipient: p.recipient,
             amount_sat: p.amount_sat,
         })
+    }
+
+    /// Phase 3 guarded pre-check for an outflow (AgentSpend or ExitQueue).
+    ///
+    /// Fails closed: unknown owner is not guarded (Ok), frozen guarded
+    /// accounts refuse, recipients outside the allow-list active for at least
+    /// the delay are refused, and outflows beyond the balance-relative window
+    /// cap are refused. Pure check — accounting happens in
+    /// [`Self::guarded_record_outflow`] after the spend succeeds.
+    fn guarded_check_spend(
+        &self,
+        owner: &Address,
+        recipient: &Address,
+        amount_sat: u64,
+        height: u64,
+    ) -> L2Result<()> {
+        let Some(g) = self.guarded.get(owner) else {
+            return Ok(());
+        };
+        if g.frozen {
+            return Err(L2Error::AccountFrozen);
+        }
+        // Allow-list must contain the recipient AND have been active long
+        // enough (changes take effect only after the delay).
+        let delay = g.grant_delay_blocks.max(self.config.guarded_grant_delay_blocks);
+        if !g.allow_list.contains(recipient)
+            || height < g.allowlist_active_height.saturating_add(delay)
+        {
+            return Err(L2Error::GuardedDestinationNotAllowed);
+        }
+        // Balance-relative window cap: total outflow per window <= snapshot * bps / 10000.
+        let window = if g.outflow_window_blocks != 0 {
+            g.outflow_window_blocks
+        } else {
+            self.config.guarded_outflow_window_blocks
+        };
+        let bps = if g.outflow_cap_bps != 0 {
+            g.outflow_cap_bps
+        } else {
+            self.config.guarded_outflow_cap_bps
+        };
+        if window == 0 || bps == 0 {
+            return Ok(());
+        }
+        let (window_total, snapshot) = if height >= g.window_start_height.saturating_add(window) {
+            // New window would start at this height; snapshot is the current balance.
+            (0u64, self.balance(owner))
+        } else {
+            (g.window_outflow_total, g.window_balance_snapshot)
+        };
+        let cap = (snapshot as u128)
+            .saturating_mul(bps as u128)
+            .saturating_div(10_000) as u64;
+        let after = window_total.saturating_add(amount_sat);
+        if after > cap {
+            return Err(L2Error::GuardedOutflowCapped {
+                allowed: cap.saturating_sub(window_total),
+                requested: amount_sat,
+            });
+        }
+        Ok(())
+    }
+
+    /// Phase 3 guarded outflow accounting. Called after a guarded-account
+    /// outflow succeeds. Rolls windows forward (snapshot = current balance,
+    /// which the spend just reduced) and accumulates the window total.
+    fn guarded_record_outflow(
+        &mut self,
+        owner: &Address,
+        amount_sat: u64,
+        height: u64,
+    ) -> L2Result<()> {
+        let window = self
+            .guarded
+            .get(owner)
+            .map(|g| {
+                if g.outflow_window_blocks != 0 {
+                    g.outflow_window_blocks
+                } else {
+                    self.config.guarded_outflow_window_blocks
+                }
+            })
+            .unwrap_or(0);
+        if window == 0 {
+            return Ok(());
+        }
+        // Read-only snapshot first: `balance` borrows `self` immutably and
+        // must not run while the guarded entry is mutably borrowed below.
+        let snap = self.balance(owner);
+        let g = self.guarded.get_mut(owner).ok_or(L2Error::GuardedNotOptedIn)?;
+        if height >= g.window_start_height.saturating_add(window) {
+            g.window_start_height = height;
+            g.window_balance_snapshot = snap;
+            g.window_outflow_total = 0;
+        }
+        g.window_outflow_total = g.window_outflow_total.saturating_add(amount_sat);
+        Ok(())
     }
 
     /// Is this grant live — not revoked itself, and with no revoked ancestor?
@@ -1479,6 +1914,385 @@ impl L2State {
             lender: p.lender,
             borrower: p.borrower,
             amount_sat: p.amount_sat,
+        })
+    }
+
+    /// Open a credit position with borrower consent (Phase 2 fix, type 0x1D).
+    ///
+    /// Requires BOTH lender and borrower signatures (verified by `verify_auth`
+    /// before dispatch). Caps enforced when configured (non-zero).
+    ///
+    /// Old 0x19 path unchanged for pre-activation replay.
+    fn apply_credit_open_v2(
+        &mut self,
+        p: &CreditOpenV2Payload,
+        height: u64,
+        fee: u64,
+    ) -> L2Result<L2Effect> {
+        // NOTE: CreditOpenV2Payload lives in srct-core::l2; import via full path
+        // to avoid cycle. Field-for-field identical to CreditOpen plus borrower_auth.
+        self.apply_credit_open_v2_inner(
+            &p.lender,
+            &p.borrower,
+            p.amount_sat,
+            p.collateral_sat,
+            p.rate_bps_per_window,
+            p.window_blocks,
+            p.deadline_height,
+            p.nonce,
+            height,
+            fee,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn apply_credit_open_v2_inner(
+        &mut self,
+        lender: &Address,
+        borrower: &Address,
+        amount_sat: u64,
+        collateral_sat: u64,
+        rate_bps_per_window: u32,
+        window_blocks: u64,
+        deadline_height: u64,
+        nonce: u64,
+        height: u64,
+        fee: u64,
+    ) -> L2Result<L2Effect> {
+        // Phase 2 activation: V2 opens exist only at/after the consent height.
+        // Pre-activation, 0x1D is refused so old replay stays byte-identical
+        // and no new consented position can be created before the rules do.
+        if self.config.credit_consent_activation_height == 0
+            || height < self.config.credit_consent_activation_height
+        {
+            return Err(L2Error::BadConfig("credit consent not active"));
+        }
+        use srct_core::credit::CreditTerms;
+        if amount_sat == 0 {
+            return Err(L2Error::ZeroAmount("credit principal"));
+        }
+        if collateral_sat == 0 {
+            return Err(L2Error::ZeroAmount("credit collateral"));
+        }
+        if window_blocks == 0 {
+            return Err(L2Error::CreditTerms("the window must be non-zero"));
+        }
+        // Phase 2 caps (enforced only when configured non-zero).
+        if self.config.credit_min_window_blocks != 0
+            && window_blocks < self.config.credit_min_window_blocks
+        {
+            return Err(L2Error::CreditTerms("the window is below the minimum"));
+        }
+        if rate_bps_per_window > MAX_CREDIT_RATE_BPS_PER_WINDOW {
+            return Err(L2Error::CreditTerms("the rate is above the cap"));
+        }
+        if deadline_height <= height {
+            return Err(L2Error::CreditTerms("the deadline must be in the future"));
+        }
+        if self.config.credit_max_term_blocks != 0
+            && deadline_height.saturating_sub(height) > self.config.credit_max_term_blocks
+        {
+            return Err(L2Error::CreditTerms("the term exceeds the maximum"));
+        }
+        let required = CreditTerms::default()
+            .required_collateral(amount_sat, 0)
+            .map_err(|_| L2Error::CreditTerms("the collateral rule refused the amount"))?;
+        if collateral_sat < required {
+            return Err(L2Error::CreditUndercollateralised {
+                required,
+                posted: collateral_sat,
+            });
+        }
+        if self.config.credit_max_collateral_multiple != 0 {
+            let max_allowed = required
+                .checked_mul(self.config.credit_max_collateral_multiple)
+                .ok_or(L2Error::Overflow)?;
+            if collateral_sat > max_allowed {
+                return Err(L2Error::CreditTerms("collateral exceeds the maximum multiple"));
+            }
+        }
+        // Position id covers all terms (same scheme as v1 so vectors stay comparable).
+        let id = {
+            use srct_core::hash::sha256_dom;
+            use srct_core::l2::DOM_L2_CREDIT_POSITION;
+            use srct_core::ser::Writer;
+            let mut w = Writer::new();
+            w.fixed(lender)
+                .fixed(borrower)
+                .u64le(amount_sat)
+                .u64le(collateral_sat)
+                .u32le(rate_bps_per_window)
+                .u64le(window_blocks)
+                .u64le(deadline_height)
+                .u64le(nonce);
+            sha256_dom(DOM_L2_CREDIT_POSITION, &[w.as_slice()])
+        };
+        if self.positions.contains_key(&id) {
+            return Err(L2Error::CreditPositionExists);
+        }
+        let lender_total = amount_sat.checked_add(fee).ok_or(L2Error::Overflow)?;
+        self.ensure_balance(lender, lender_total)?;
+        self.ensure_balance(borrower, collateral_sat)?;
+        self.charge(lender, lender_total)?;
+        self.pay(borrower, amount_sat)?;
+        self.charge(borrower, collateral_sat)?;
+        self.credit_locked = self
+            .credit_locked
+            .checked_add(collateral_sat)
+            .ok_or(L2Error::Overflow)?;
+        self.collect_fee(fee);
+        self.positions.insert(
+            id,
+            CreditPosition {
+                id,
+                lender: *lender,
+                borrower: *borrower,
+                principal_sat: amount_sat,
+                outstanding_sat: amount_sat,
+                interest_paid_sat: 0,
+                collateral_sat,
+                rate_bps_per_window,
+                window_blocks,
+                opened_height: height,
+                deadline_height,
+                interest_settled_height: height,
+                state: CreditPositionState::Open,
+            },
+        );
+        Ok(L2Effect::CreditOpened {
+            position_id: id,
+            lender: *lender,
+            borrower: *borrower,
+            amount_sat,
+        })
+    }
+
+    /// Opt an L2 account into guarded mode (Phase 3).
+    /// Creates the guarded-account record; per-account only, never global.
+    /// Guardian must be distinct from owner. Requires activation height.
+    fn apply_guarded_optin(
+        &mut self,
+        p: &srct_core::l2::GuardedOptInPayload,
+        height: u64,
+        fee: u64,
+    ) -> L2Result<L2Effect> {
+        if self.config.guarded_activation_height == 0
+            || height < self.config.guarded_activation_height
+        {
+            return Err(L2Error::BadConfig("guarded accounts not active"));
+        }
+        // Guardian must be independent of the owner: a self-guardian is a
+        // no-op control, refused by name (Phase 3 SPEC).
+        if p.guardian == p.owner {
+            return Err(L2Error::GuardedGuardianMustDiffer);
+        }
+        if self.guarded.contains_key(&p.owner) {
+            return Err(L2Error::GuardedAlreadyOptedIn);
+        }
+        // Empty allow-list locks every outflow until a delayed update lands.
+        // That is fail-closed and intentional: opt-in is explicit.
+        self.ensure_balance(&p.owner, fee)?;
+        self.charge(&p.owner, fee)?;
+        self.collect_fee(fee);
+        let snapshot = self.balance(&p.owner);
+        self.guarded.insert(
+            p.owner,
+            GuardedAccount {
+                owner: p.owner,
+                guardian: p.guardian,
+                allow_list: p.allow_list.clone(),
+                allowlist_active_height: height,
+                pending_allowlist: None,
+                grant_delay_blocks: p.grant_delay_blocks,
+                max_grant_lifetime_blocks: p.max_grant_lifetime_blocks,
+                outflow_cap_bps: p.outflow_cap_bps,
+                outflow_window_blocks: p.outflow_window_blocks,
+                window_balance_snapshot: snapshot,
+                window_start_height: height,
+                window_outflow_total: 0,
+                frozen: false,
+                created_height: height,
+            },
+        );
+        Ok(L2Effect::GuardedOptedIn {
+            owner: p.owner,
+            guardian: p.guardian,
+        })
+    }
+
+    /// Guardian cancellation (Phase 3): GuardedCancel.
+    ///
+    /// `target_kind == 0`: queued exit — `target_id[0..8]` is the exit nonce
+    /// (LE u64). Cancelling removes the exit record and returns the locked
+    /// principal to the owner's balance, so conservation holds. Valid only
+    /// while `tip < queued_height + D` (the shared guarded delay): after the
+    /// delay the exit is claimable and cancellation would race a proof that a
+    /// post-delay root already commits to. A claim against a post-delay root
+    /// then finds no record — the L1 side refuses it as unbacked, so the
+    /// cancel/claim order is deterministic by block height.
+    /// `target_kind == 1`: published grant — `target_id` is the grant hash;
+    /// marks the grant revoked (instant, like owner revocation).
+    fn apply_guarded_cancel(
+        &mut self,
+        p: &srct_core::l2::GuardedCancelPayload,
+        height: u64,
+        fee: u64,
+    ) -> L2Result<L2Effect> {
+        if self.config.guarded_activation_height == 0 {
+            return Err(L2Error::BadConfig("guarded accounts not active"));
+        }
+        let g = self
+            .guarded
+            .get(&p.account)
+            .ok_or(L2Error::GuardedNotOptedIn)?;
+        if g.guardian != p.guardian {
+            return Err(L2Error::GuardedGuardianMismatch);
+        }
+        // The guarded account pays: the guardian authorizes (signature above)
+        // but holds no balance requirement; the protected owner funds it.
+        // This also keeps frozen accounts actionable — the freeze itself does
+        // not block the guardian's fee debit (outflow caps apply to spends,
+        // not to protection actions).
+        self.ensure_balance(&p.account, fee)?;
+        self.charge(&p.account, fee)?;
+        self.collect_fee(fee);
+        match p.kind {
+            0 => {
+                let mut nb = [0u8; 8];
+                nb.copy_from_slice(&p.target[..8]);
+                let nonce = u64::from_le_bytes(nb);
+                let key = (p.account, nonce);
+                let record = self
+                    .exits
+                    .get(&key)
+                    .ok_or(L2Error::UnknownExit)?
+                    .clone();
+                // Cancel window: only before queued_height + D. At or after,
+                // the exit is claimable and the L1 side may already hold a
+                // post-delay proof; removing the record then would fork the
+                // two halves of the release. The shared constant D makes the
+                // cancel/claim ordering deterministic by block height.
+                let d = self.config.guarded_exit_delay_blocks.max(1);
+                if height >= record.queued_height.saturating_add(d) {
+                    return Err(L2Error::GuardedCancelWindowClosed);
+                }
+                // Reverse exactly what queue_exit booked: locked principal +
+                // prepaid exit fee return to the owner; the queue's own L2
+                // fee stays burned (the work was done). `exited_total` is
+                // untouched: it only moves on L1 release (`note_release`),
+                // and a cancelled exit never reaches L1.
+                let locked = record
+                    .amount_sat
+                    .checked_add(record.exit_fee_sat)
+                    .ok_or(L2Error::Overflow)?;
+                let record = self.exits.remove(&key).ok_or(L2Error::UnknownExit)?;
+                self.exits_locked = self
+                    .exits_locked
+                    .checked_sub(locked)
+                    .ok_or(L2Error::Overflow)?;
+                self.pay(&p.account, locked)?;
+                // Release the window budget this queue consumed: queueing counts
+                // only `amount_sat` (fees burn separately), so unwind exactly
+                // that. A cancelled exit never left; counting it would brick
+                // the account for the rest of the window. Bounded wart: if
+                // the window rolled between queue and cancel, this frees
+                // budget in the *new* window (saturating at zero) - at most
+                // one exit of extra headway.
+                if let Some(g) = self.guarded.get_mut(&p.account) {
+                    g.window_outflow_total = g
+                        .window_outflow_total
+                        .saturating_sub(record.amount_sat);
+                }
+                Ok(L2Effect::GuardedAction {
+                    account: p.account,
+                    kind: "cancel-exit",
+                })
+            }
+            1 => {
+                let mut hash = [0u8; 32];
+                hash.copy_from_slice(&p.target);
+                let entry = self.policies.get_mut(&hash).ok_or(L2Error::UnknownPolicy)?;
+                entry.revoked = true;
+                Ok(L2Effect::GuardedAction {
+                    account: p.account,
+                    kind: "cancel-grant",
+                })
+            }
+            _ => Err(L2Error::GuardedUnknownTarget),
+        }
+    }
+
+    /// Guardian freeze (Phase 3): GuardedFreeze.
+    fn apply_guarded_freeze(
+        &mut self,
+        p: &srct_core::l2::GuardedFreezePayload,
+        height: u64,
+        fee: u64,
+    ) -> L2Result<L2Effect> {
+        let _ = height;
+        if self.config.guarded_activation_height == 0 {
+            return Err(L2Error::BadConfig("guarded accounts not active"));
+        }
+        // Check guardian identity first and drop the borrow before the fee
+        // calls below (each borrows `self` mutably in turn).
+        let registered = self
+            .guarded
+            .get(&p.account)
+            .map(|g| g.guardian)
+            .ok_or(L2Error::GuardedNotOptedIn)?;
+        if registered != p.guardian {
+            return Err(L2Error::GuardedGuardianMismatch);
+        }
+        // The guarded account pays (same rule as cancellation: the guardian
+        // authorizes, the protected owner funds).
+        self.ensure_balance(&p.account, fee)?;
+        self.charge(&p.account, fee)?;
+        self.collect_fee(fee);
+        let g = self
+            .guarded
+            .get_mut(&p.account)
+            .ok_or(L2Error::GuardedNotOptedIn)?;
+        g.frozen = p.frozen;
+        Ok(L2Effect::GuardedAction {
+            account: p.account,
+            kind: if p.frozen { "freeze" } else { "unfreeze" },
+        })
+    }
+
+    /// Audit anchor (Phase 3): commits an off-chain audit Merkle root.
+    fn apply_audit_anchor(
+        &mut self,
+        p: &srct_core::l2::AuditAnchorPayload,
+        height: u64,
+        fee: u64,
+    ) -> L2Result<L2Effect> {
+        let _ = fee;
+        if self.config.guarded_activation_height == 0 {
+            return Err(L2Error::BadConfig("audit anchor not active"));
+        }
+        use srct_core::hash::sha256_dom;
+        const DOM_AUDIT: &[u8] = b"srct/l2/audit-anchor/v1";
+        let id = sha256_dom(DOM_AUDIT, &[&p.anchorer, &p.root, &height.to_le_bytes(), &p.nonce.to_le_bytes()]);
+        if self.audit_anchors.contains_key(&id) {
+            return Err(L2Error::Replay);
+        }
+        // Charge fee from anchorer.
+        let total = fee;
+        self.ensure_balance(&p.anchorer, total)?;
+        self.charge(&p.anchorer, total)?;
+        self.collect_fee(fee);
+        self.audit_anchors.insert(
+            id,
+            AuditAnchorRecord {
+                anchorer: p.anchorer,
+                root: p.root,
+                height,
+                nonce: p.nonce,
+            },
+        );
+        Ok(L2Effect::AuditAnchored {
+            anchorer: p.anchorer,
+            root: p.root,
         })
     }
 
@@ -2226,7 +3040,7 @@ impl L2State {
 /// state (Decision 26). Pre-bump blobs are refused rather than guessed at,
 /// because a state that cannot describe a committed policy or credit position
 /// would silently diverge from the chain.
-pub const L2_STATE_WIRE_VERSION: u8 = 7;
+pub const L2_STATE_WIRE_VERSION: u8 = 8;
 
 /// Smallest possible encoded account entry: `20` address + `8` balance.
 const WIRE_ACCOUNT_MIN: usize = 28;
@@ -2294,7 +3108,19 @@ impl L2State {
             .u64le(self.config.max_exit_per_owner_window_sat)
             .u64le(self.config.large_exit_threshold_sat)
             .u64le(self.config.large_exit_extra_delay_blocks)
-            .u8(u8::from(self.genesis_applied))
+            // v8: credit-consent activation + caps, guarded activation + caps.
+            .u64le(self.config.credit_consent_activation_height)
+            .u64le(self.config.credit_max_collateral_multiple)
+            .u64le(self.config.credit_max_term_blocks)
+            .u64le(self.config.credit_min_window_blocks)
+            .u64le(self.config.guarded_activation_height)
+            .u64le(self.config.guarded_grant_delay_blocks)
+            .u64le(self.config.guarded_max_grant_lifetime_blocks)
+            .u64le(self.config.guarded_outflow_cap_bps)
+        .u64le(self.config.guarded_outflow_window_blocks)
+        .u64le(self.config.guarded_exit_delay_blocks)
+        .u64le(self.config.guarded_approval_threshold_sat)
+        .u8(u8::from(self.genesis_applied))
             .u64le(self.funded_total)
             .u64le(self.deposited_total)
             .u64le(self.exited_total)
@@ -2382,6 +3208,19 @@ impl L2State {
         w.u64le(self.credit_locked);
 
         w.raw(&self.slash_vault.encode());
+        // v8: guarded accounts + audit anchors (Phase 3), in address/id order.
+        let mut guarded: Vec<(&Address, &GuardedAccount)> = self.guarded.iter().collect();
+        guarded.sort_by_key(|(a, _)| **a);
+        w.u64le(guarded.len() as u64);
+        for (_, g) in guarded {
+            g.encode(&mut w);
+        }
+        let mut anchors: Vec<(&Hash, &AuditAnchorRecord)> = self.audit_anchors.iter().collect();
+        anchors.sort_by_key(|(h, _)| **h);
+        w.u64le(anchors.len() as u64);
+        for (id, a) in anchors {
+            w.fixed(id).fixed(&a.anchorer).fixed(&a.root).u64le(a.height).u64le(a.nonce);
+        }
         w.into_vec()
     }
 
@@ -2395,12 +3234,15 @@ impl L2State {
     pub fn decode(bytes: &[u8]) -> L2Result<Self> {
         let mut r = Reader::new(bytes);
         let version = r.u8().map_err(|_| codec_err("state version"))?;
-        if version != L2_STATE_WIRE_VERSION {
+        // Accept v7 (pre-guarded) and v8 (guarded). v7 blobs have no guarded
+        // section; v8 blobs do. This preserves pre-activation replay.
+        if version != 7 && version != 8 && version != L2_STATE_WIRE_VERSION {
             return Err(L2Error::Codec(srct_core::Error::Malformed(match version {
                 v if v > L2_STATE_WIRE_VERSION => "state version ahead of this build",
                 _ => "state version not supported",
             })));
         }
+        let wire_v8 = version >= 8;
         let id_len = r.u32le().map_err(|_| codec_err("network id length"))? as usize;
         if id_len > 64 || id_len > r.remaining() {
             return Err(codec_err("network id over cap"));
@@ -2423,6 +3265,63 @@ impl L2State {
                 .map_err(|_| codec_err("exit per-owner window cap"))?,
             large_exit_threshold_sat: r.u64le().map_err(|_| codec_err("large exit threshold"))?,
             large_exit_extra_delay_blocks: r.u64le().map_err(|_| codec_err("large exit delay"))?,
+            // v8: credit-consent + guarded activation and caps. v7 blobs end
+            // above; they decode with zeros (never active), preserving replay.
+            credit_consent_activation_height: if wire_v8 {
+                r.u64le().map_err(|_| codec_err("credit consent height"))?
+            } else {
+                0
+            },
+            credit_max_collateral_multiple: if wire_v8 {
+                r.u64le().map_err(|_| codec_err("credit max multiple"))?
+            } else {
+                0
+            },
+            credit_max_term_blocks: if wire_v8 {
+                r.u64le().map_err(|_| codec_err("credit max term"))?
+            } else {
+                0
+            },
+            credit_min_window_blocks: if wire_v8 {
+                r.u64le().map_err(|_| codec_err("credit min window"))?
+            } else {
+                0
+            },
+            guarded_activation_height: if wire_v8 {
+                r.u64le().map_err(|_| codec_err("guarded activation"))?
+            } else {
+                0
+            },
+            guarded_grant_delay_blocks: if wire_v8 {
+                r.u64le().map_err(|_| codec_err("guarded delay"))?
+            } else {
+                0
+            },
+            guarded_max_grant_lifetime_blocks: if wire_v8 {
+                r.u64le().map_err(|_| codec_err("guarded max lifetime"))?
+            } else {
+                0
+            },
+            guarded_outflow_cap_bps: if wire_v8 {
+                r.u64le().map_err(|_| codec_err("guarded cap bps"))?
+            } else {
+                0
+            },
+        guarded_outflow_window_blocks: if wire_v8 {
+            r.u64le().map_err(|_| codec_err("guarded window"))?
+        } else {
+            0
+        },
+        guarded_exit_delay_blocks: if wire_v8 {
+            r.u64le().map_err(|_| codec_err("guarded exit delay"))?
+        } else {
+            0
+        },
+            guarded_approval_threshold_sat: if wire_v8 {
+                r.u64le().map_err(|_| codec_err("guarded approval tier"))?
+            } else {
+                0
+            },
         };
         // A blob carrying a config the constructors would never build (a
         // 200% bounty, a zero window) decodes into what `apply` could never
@@ -2529,7 +3428,12 @@ impl L2State {
         let mut exits = HashMap::with_capacity(n_exits);
         let mut exits_locked = 0u64;
         for _ in 0..n_exits {
-            let record = ExitRecord::decode(&mut r)?;
+            // v8 records carry the guarded flag byte; v7 records do not.
+            let record = if wire_v8 {
+                ExitRecord::decode_v8(&mut r)?
+            } else {
+                ExitRecord::decode(&mut r)?
+            };
             exits_locked = exits_locked
                 .checked_add(
                     record
@@ -2689,6 +3593,43 @@ impl L2State {
         }
 
         let slash_vault = SlashVault::decode(&mut r)?;
+
+        // v8: guarded accounts + audit anchors (Phase 3). v7 blobs end here.
+        let (guarded, audit_anchors) = if wire_v8 {
+            let ng = r.u64le().map_err(|_| codec_err("guarded count"))? as usize;
+            if ng > 10_000 {
+                return Err(codec_err("guarded count too large"));
+            }
+            let mut guarded = BTreeMap::new();
+            for _ in 0..ng {
+                let g = GuardedAccount::decode(&mut r)?;
+                if guarded.insert(g.owner, g).is_some() {
+                    return Err(codec_err("duplicate guarded account"));
+                }
+            }
+            let na = r.u64le().map_err(|_| codec_err("audit anchor count"))? as usize;
+            if na > 10_000 {
+                return Err(codec_err("audit anchor count too large"));
+            }
+            let mut audit_anchors = BTreeMap::new();
+            for _ in 0..na {
+                let id: Hash = r.fixed().map_err(|_| codec_err("audit id"))?;
+                let anchorer: Address = r.fixed().map_err(|_| codec_err("audit anchorer"))?;
+                let root: Hash = r.fixed().map_err(|_| codec_err("audit root"))?;
+                let height = r.u64le().map_err(|_| codec_err("audit height"))?;
+                let nonce = r.u64le().map_err(|_| codec_err("audit nonce"))?;
+                if audit_anchors
+                    .insert(id, AuditAnchorRecord { anchorer, root, height, nonce })
+                    .is_some()
+                {
+                    return Err(codec_err("duplicate audit anchor"));
+                }
+            }
+            (guarded, audit_anchors)
+        } else {
+            (BTreeMap::new(), BTreeMap::new())
+        };
+
         r.expect_end()
             .map_err(|_| codec_err("state has trailing bytes"))?;
 
@@ -2716,6 +3657,8 @@ impl L2State {
             policy_by_agent,
             positions,
             credit_locked,
+            guarded,
+            audit_anchors,
         };
         // The protocol's own invariant. A state that does not conserve is not
         // a valid observation of the chain, whatever its structure said.

@@ -433,7 +433,20 @@ impl Store {
         // block is re-validated on load by `Chain::submit`, so a store bug that
         // hands the chain a bad block fails here, not silently.
         let params = self.params.clone();
-        let mut chain = Chain::new(params).map_err(|e| e.to_string())?;
+        let mut chain = Chain::new(params.clone()).map_err(|e| e.to_string())?;
+        // C1/N1 Approach (ii): wire deterministic L2 root validator when
+        // the profile enables root validation. Uses ancestry-derived binding,
+        // never node-local P2P checkpoint state. RealBls everywhere in
+        // production: the validator must replay with the same backend real
+        // nodes use, or identical blocks map to different roots.
+        if params.l2_root_validation_height != 0 {
+            let v = srct_l2::replay::AncestryRootValidator::new(
+                srct_l2::L2Config::mini(),
+                srct_l2::DepositParams::for_params(&params),
+                srct_core::chain::ChainVerifier::Real,
+            );
+            chain.set_l2_validator(std::sync::Arc::new(v));
+        }
         {
             let bs = self.ensure_block_store()?;
             let (_tip, height) = bs.tip();

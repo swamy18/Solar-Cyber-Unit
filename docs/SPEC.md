@@ -3528,3 +3528,97 @@ the collateral and reports the shortfall; a default returns the surplus to the
 borrower; a closed position cannot be settled twice; the state encoding
 round-trips the positions; and two nodes replaying the same loan agree on the
 root.
+
+### 22.8 Borrower consent and term caps (Decision 35)
+
+Lender-only opens (type 0x19) charge the borrower's balance as collateral on
+the lender's signature alone, with no upper bound on collateral, deadline, or
+window narrowness. At and after `credit_consent_activation_height`, new
+positions require type 0x1D `CreditOpenV2`, which carries BOTH the lender's
+and the borrower's signatures over identical terms and is refused unless:
+`collateral <= 2 * required_collateral`, `deadline - height <= 100_000`, and
+`window_blocks >= 1`. Type 0x19 still decodes so pre-activation history
+replays; new 0x19 opens at or after activation are refused by name.
+
+## 23. Guarded accounts (Phase 3, Decision 36)
+
+### 23.1 Opt-in and record
+
+Any L2 account owner may opt that account — and only that account — into
+guarded mode via type 0x1E. Opt-in is never global and never transfers
+L1-destined value: guarded accounts protect L2 balances; mining rewards and
+compute earnings remain L1-owned and never rest in a guarded balance as their
+resting place. The guardian must differ from the owner. The record (leaf tag
+0x07, state wire 8, committed under `l2_state_root`) holds: the guardian,
+the destination allow-list plus the height it became active, an optional
+pending allow-list plus its activation height, the grant-activation delay D,
+the maximum grant lifetime, the balance-relative outflow cap in basis points
+per window with its window length and window-start snapshot, a frozen flag,
+and the creation height.
+
+### 23.2 Price-independent caps (no oracle, no external feed, no floats)
+
+(a) Outflow cap: total outflow per window <= `window_balance_snapshot * bps / 10000`
+(u128 multiply then divide; the snapshot is taken at window start so a
+mid-window deposit cannot inflate the cap). (b) Bounded grant lifetime:
+`expires_at - not_before <= max_grant_lifetime`, so the owner re-signs caps
+periodically and re-prices by their own judgment. (c) Adaptive top-up: agent
+funding follows a bracket formula over a deterministic log-bucket histogram of
+recent chain flows (integer math, bounded memory); the exact bracket table is
+documented with the implementation. (d) The absolute exit throttle
+(`max_exit_window_sat`, `max_exit_per_owner_window_sat`) still applies on top,
+unchanged.
+
+### 23.3 Enforcement points
+
+`apply_policy`: for guarded owners, `not_before >= publish_height + D` and
+`lifetime <= max_lifetime`; revocation stays instant. `AgentSpend` and
+`ExitQueue` from a guarded account: the recipient/destination must be in the
+allow-list active for at least D blocks; the amount counts against the bps
+cap; frozen accounts refuse every outflow. Human-approval tiers move into
+`apply` for guarded accounts: transfers above a tier require the guardian's
+co-signature, enforced in consensus rather than only at node admission.
+
+### 23.4 Guardian actions and the guarded exit claim rule
+
+Guarded accounts support `GuardedCancel` (0x1F: removes a queued exit and
+returns locked funds, so no later L1 claim can prove it; or revokes a grant)
+and `GuardedFreeze` (0x20: sets/clears the frozen flag), valid only during the
+extra delay window and only by the registered guardian. A guarded exit may be
+cancelled only while `tip < queued_height + D` (shared chain constant
+`guarded_exit_delay_blocks`); at or after, the exit is claimable and a cancel
+is refused by name. Ordinary queued exits keep the E-4/E-6 no-cancel/no-freeze
+rule; this amends E-4 for guarded accounts only (Decision 36).
+A guarded exit commits a guarded-tagged leaf (unguarded exits keep the exact
+pre-upgrade leaf, so all existing roots, proofs, and tests are untouched).
+An L1 claim for a guarded exit carries `proof_height: Some(h)` and must prove
+the record against block h's committed root with `h >= queued_height + D`:
+a cancelled exit has no block left that still commits it, so no valid guarded
+proof exists after cancellation — the cancel/claim order is decided by block
+height alone. An unguarded exit is claimed exactly as before (no
+`proof_height`), and its guarded-variant proof cannot verify. Reorgs unwind
+deposit credits, exit queues, and exit claims together by full L2 rebuild
+plus L1 undo, so no irreversible release precedes binding finality (the
+claim-time binding check in `check_claim` is unchanged).
+
+### 23.5 Audit anchoring
+
+Type 0x21 `AuditAnchor` commits an off-chain audit Merkle root on-chain
+(`anchor id = H(anchorer, root, height, nonce)`). Anchors are stored, not
+committed under `committed_root` (they are attestations, not value state).
+No dust-to-derived-address construction exists or is permitted.
+
+## 19.7 C1/N1 resolution: block-carried checkpoint finality (Decision 34)
+
+§19.6 C1/N1 is closed. At and after `checkpoint_carry_activation_height`,
+blocks MAY carry one full BLS checkpoint certificate (merkle leaf tag 0x05,
+BLS-only, no PQ sidecar) certifying a strictly earlier height. At and after
+`l2_root_validation_height` (which must be at or after the carry activation
+plus at least one checkpoint interval), every block's `l2_state_root` must
+equal deterministic replay with `tip = block height` and `binding =
+binding(block height)` derived from ancestry-carried certificates — never
+from node-local P2P `FinalityManager` state. Mismatch fails closed before any
+state is mutated. Pre-activation blocks are unchanged (checkpoint section
+refused below activation; roots not validated). Reorgs unwind L1 state and
+rebuild L2 by full replay; checkpoints in unwound blocks cease to count, and
+`adopt` still refuses reorgs crossing L1 `finalized_height`.

@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::block::{genesis_block, Block, Header};
 use crate::bls::RealBls;
-use crate::bls_checkpoint::BlsPublicKey;
+use crate::bls_checkpoint::{BlsPublicKey, Checkpoint};
 use crate::bond::{
     check_bond_tx, check_slash_tx, check_unbond_tx, slash_vesting_period, unwind_bond_op,
     BondLedger, BondRecord, BondUndoOp, StakeApply,
@@ -38,6 +38,67 @@ use crate::tx::{OutPoint, Output, Transaction, TX_BOND, TX_COINBASE, TX_SLASH, T
 /// Upper bound on mining attempts for a single block. Difficulty that would need
 /// more work than this is a bug or an attack, not something to hang on.
 pub const DEFAULT_MAX_ATTEMPTS: u64 = 200_000_000;
+
+/// Error from L2 root validation (C1/N1 Approach (ii)).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum L2RootError {
+    /// The block's committed root does not match deterministic replay.
+    Mismatch { expected: Hash, got: Option<Hash> },
+    /// Replay failed (malformed L2 data, overflow, etc.).
+    Replay(String),
+}
+
+/// Deterministic L2 root validator (C1/N1 Approach (ii)).
+///
+/// Defined in `srct-core`, implemented by `srct-l2` (dependency direction is
+/// `l2 -> core`). The implementor computes the expected L2 committed root for
+/// a candidate block by replaying L2 state from genesis up to and including
+/// the block, using `tip = block.height()` and `binding = binding(block.height())`
+/// derived deterministically from block ancestry (never node-local P2P state).
+///
+/// The validator takes the candidate's parent hash and reads that fork's
+/// ancestors via `chain.block_by_hash` — never the canonical `Chain` tip.
+/// Cache state lives inside the implementor, never in consensus-critical paths.
+pub trait L2RootValidator: Send + Sync + std::fmt::Debug {
+    /// Expected L2 committed root for `block`, computed deterministically.
+    fn expected_root_at(
+        &self,
+        chain: &Chain,
+        parent_hash: Hash512,
+        block: &Block,
+    ) -> std::result::Result<Hash, L2RootError>;
+}
+
+/// Which BLS verifier a [`Chain`] uses for block-carried checkpoint
+/// certificates (C1/N1 Approach (ii)).
+///
+/// This is deliberately a closed set, not an `Arc<dyn BlsVerifier>`: every
+/// option is auditable, `Copy` keeps [`Chain`]'s `Clone`/`Debug` derives, and
+/// there is exactly one production choice. `Real` (backed by
+/// [`crate::bls::REAL_BLS`]) is the default and the ONLY correct choice for
+/// consensus nodes; `Mock` ([`crate::bls_checkpoint::MOCK_BLS`]) exists
+/// exclusively so unit tests can build structurally-valid certificates
+/// without real BLS signatures. A production node running `Mock` would accept
+/// forged checkpoints as final — a consensus split against every honest peer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChainVerifier {
+    /// Production BLS verification via `blst`.
+    Real,
+    /// Structural-only acceptance (non-zero sig + non-empty signers).
+    /// Tests only.
+    Mock,
+}
+
+impl ChainVerifier {
+    /// The verifier this setting names. Returned as a shared reference so
+    /// callers never construct (or worse, mix up) their own.
+    pub fn verifier(&self) -> &'static dyn crate::bls_checkpoint::BlsVerifier {
+        match self {
+            ChainVerifier::Real => &crate::bls::REAL_BLS,
+            ChainVerifier::Mock => &crate::bls_checkpoint::MOCK_BLS,
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 struct Snapshot {
@@ -165,6 +226,19 @@ pub struct Chain {
     /// history. Restored from the store on load, never re-derived from blocks
     /// (see `restore_finality`).
     finality: FinalityManager,
+    /// Deterministic L2 root validator (C1/N1 Approach (ii)). `None` means no
+    /// root validation (pre-activation behavior). Set by `srct-node` at
+    /// construction when the profile enables `l2_root_validation_height`.
+    /// The validator is read-only: it never mutates canonical chain state.
+    /// `Arc` (not `Box`) so `Chain` stays `Clone` for fork-management in
+    /// tests and `syncer` — cloning a chain shares the validator.
+    l2_validator: Option<std::sync::Arc<dyn L2RootValidator>>,
+    /// BLS verifier used for block-carried checkpoint certificates (C1/N1).
+    /// Defaults to [`ChainVerifier::Real`]; tests that build structurally
+    /// valid but unsigned checkpoints switch it to [`ChainVerifier::Mock`]
+    /// via [`Chain::set_bls_verifier`]. Running consensus with `Mock` would
+    /// accept forged checkpoints as final — the default is the safe one.
+    bls_verifier: ChainVerifier,
 }
 
 impl Chain {
@@ -211,6 +285,8 @@ impl Chain {
             exit_undo: HashMap::new(),
             disconnected_txs: Vec::new(),
             finality: FinalityManager::default(),
+            l2_validator: None,
+            bls_verifier: ChainVerifier::Real,
         };
         chain.finality = FinalityManager::new(&chain.params);
         chain.blocks.insert(hash, genesis.clone());
@@ -220,6 +296,20 @@ impl Chain {
         chain.undo.insert(hash, Undo::default());
         chain.canon = vec![hash];
         Ok(chain)
+    }
+
+    /// Install the deterministic L2 root validator (C1/N1). Called by
+    /// `srct-node` at construction when the profile enables root validation.
+    pub fn set_l2_validator(&mut self, v: std::sync::Arc<dyn L2RootValidator>) {
+        self.l2_validator = Some(v);
+    }
+
+    /// Select the BLS verifier used for block-carried checkpoint certificates
+    /// (C1/N1). Defaults to [`ChainVerifier::Real`]; unit tests that build
+    /// structurally valid but unsigned checkpoints switch to
+    /// [`ChainVerifier::Mock`]. Never set `Mock` outside tests.
+    pub fn set_bls_verifier(&mut self, v: ChainVerifier) {
+        self.bls_verifier = v;
     }
 
     pub fn params(&self) -> &NetworkParams {
@@ -257,6 +347,96 @@ impl Chain {
 
     pub fn block_by_hash(&self, h: &Hash512) -> Option<&Block> {
         self.blocks.get(h)
+    }
+
+    /// Derive binding-finalized height from block ancestry (C1/N1 Approach ii).
+    ///
+    /// Walks from `tip_hash` backward through `prev_hash` links, collecting the
+    /// greatest checkpoint-certified height whose certificate verifies against
+    /// the fork's own state. Deterministic in block ancestry alone — never
+    /// consults node-local `FinalityManager` P2P state.
+    ///
+    /// Returns 0 if no valid block-carried certificate is found in ancestry.
+    /// Fork-aware: uses `block_by_hash` (the block store), not `canon`.
+    pub fn ancestry_binding_height(&self, tip_hash: &Hash512) -> u64 {
+        let mut best: u64 = 0;
+        let mut cursor = *tip_hash;
+        // Bound the walk to chain height to avoid infinite loops on corrupt data.
+        for _ in 0..self.height().saturating_add(1) {
+            let Some(block) = self.blocks.get(&cursor) else {
+                break;
+            };
+            if block.header.height == 0 {
+                break;
+            }
+            // Check this block's carried certificate, if any.
+            if let Some(cp) = &block.checkpoint {
+                let c = cp.payload.height;
+                if c > best && self.verify_ancestry_checkpoint(&cursor, cp) {
+                    best = c;
+                }
+            }
+            cursor = block.header.prev_hash;
+        }
+        best
+    }
+
+    /// Verify a block-carried checkpoint against the fork containing it.
+    /// Returns true iff: (a) structural checks pass, (b) the certified block
+    /// hash matches the fork's block at that height, (c) the BLS aggregate
+    /// verifies against the fork-appropriate committee with this chain's
+    /// configured verifier ([`ChainVerifier`]), (d) height is strictly less
+    /// than the carrying block's height (no self-certification).
+    fn verify_ancestry_checkpoint(
+        &self,
+        carrier_hash: &Hash512,
+        cp: &crate::bls_checkpoint::Checkpoint,
+    ) -> bool {
+        // (a) BLS-only in blocks; sidecar refused at parse time, double-check.
+        if !cp.pq_sidecar.is_empty() {
+            return false;
+        }
+        let Some(carrier) = self.blocks.get(carrier_hash) else {
+            return false;
+        };
+        // (d) No self-certification or future certification.
+        if cp.payload.height >= carrier.header.height {
+            return false;
+        }
+        // (b) Canonical hash on THIS fork: walk from carrier back to cert height.
+        let mut cursor = *carrier_hash;
+        let mut found_hash: Option<Hash512> = None;
+        for _ in 0..carrier.header.height.saturating_add(1) {
+            let Some(b) = self.blocks.get(&cursor) else {
+                break;
+            };
+            if b.header.height == cp.payload.height {
+                found_hash = Some(b.block_hash());
+                break;
+            }
+            if b.header.height == 0 {
+                break;
+            }
+            cursor = b.header.prev_hash;
+        }
+        let Some(fork_hash) = found_hash else {
+            return false;
+        };
+        if fork_hash != cp.payload.block_hash {
+            return false;
+        }
+        // (c) Committee from seed state; fail closed if unavailable.
+        // Note: uses canonical snapshots; valid because cert heights that matter
+        // are finalized (or being finalized) and thus common across forks.
+        // Fork-aware committee derivation for active bond rotation is required
+        // before mainnet activation (see C1/N1 design doc).
+        let committee = self.settlement_committee_at(cp.payload.height);
+        if crate::bls_checkpoint::verify_checkpoint(cp, &committee, self.bls_verifier.verifier())
+            .is_err()
+        {
+            return false;
+        }
+        true
     }
 
     pub fn utxo(&self) -> &UtxoSet {
@@ -643,6 +823,67 @@ impl Chain {
             ));
         }
 
+        // Checkpoint section (C1/N1 Approach (ii)). Refused below activation
+        // so history stays byte-identical. At/after activation the section, if
+        // present, must hold exactly one BLS-only certificate (no PQ sidecar —
+        // sidecars ride P2P, not in blocks).
+        let ck_active = self.checkpoint_carry_active_at(block.header.height);
+        if !ck_active {
+            if block.checkpoint.is_some() {
+                return Err(Error::Malformed("checkpoint before carry activation"));
+            }
+        } else if let Some(cp) = &block.checkpoint {
+            if !cp.pq_sidecar.is_empty() {
+                return Err(Error::Malformed(
+                    "block-carried checkpoint must not carry PQ sidecar",
+                ));
+            }
+            // Full certificate verification against this fork (C1/N1).
+            // (a) No self-certification or future heights.
+            if cp.payload.height >= block.header.height {
+                return Err(Error::Malformed(
+                    "checkpoint must certify a strictly earlier height",
+                ));
+            }
+            // (b) Canonical hash: the fork's block at the certified height must
+            // match the certificate. Walk from the parent back to that height.
+            let mut cursor = block.header.prev_hash;
+            let mut fork_hash: Option<Hash512> = None;
+            while let Some(b) = self.blocks.get(&cursor) {
+                if b.header.height == cp.payload.height {
+                    fork_hash = Some(b.block_hash());
+                    break;
+                }
+                if b.header.height == 0 || b.header.height < cp.payload.height {
+                    break;
+                }
+                cursor = b.header.prev_hash;
+            }
+            match fork_hash {
+                Some(h) if h == cp.payload.block_hash => {}
+                _ => {
+                    return Err(Error::Malformed(
+                        "checkpoint does not match this fork's canonical block",
+                    ))
+                }
+            }
+            // (c) Committee + BLS quorum at the certified height, using this
+            // chain's configured verifier (RealBls in production; Mock only
+            // in unit tests that explicitly opt in via set_bls_verifier).
+            let committee = self.settlement_committee_at(cp.payload.height);
+            let v = self.bls_verifier.verifier();
+            if crate::bls_checkpoint::verify_checkpoint(cp, &committee, v).is_err() {
+                return Err(Error::Malformed("checkpoint certificate does not verify"));
+            }
+            // (d) Monotonicity: must advance binding over the parent ancestry.
+            let parent_binding = self.ancestry_binding_height(&block.header.prev_hash);
+            if cp.payload.height <= parent_binding {
+                return Err(Error::Malformed(
+                    "checkpoint does not advance binding finality",
+                ));
+            }
+        }
+
         // Proof of work. `puzzle_for` (called inside `pow_satisfies`) rejects
         // any puzzle_id the registry does not know; the hybrid solver is used
         // for id 1, the HBM scratchpad path for id 2. Mining and validation
@@ -715,6 +956,21 @@ impl Chain {
         };
         if block.header.base_fee_sat != expected_base_fee {
             return Err(Error::BadFee("base fee does not follow the schedule"));
+        }
+
+        // L2 root validation (C1/N1 Approach (ii)). When active and a validator
+        // is wired, the block's committed root must equal deterministic replay
+        // with tip = block.height() and binding derived from block ancestry.
+        // Runs before any state mutation so a mismatched root fails closed.
+        if self.l2_root_validation_active_at(height) {
+            if let Some(v) = &self.l2_validator {
+                let expected = v
+                    .expected_root_at(self, parent_hash, block)
+                    .map_err(|_| Error::Malformed("L2 state root mismatch"))?;
+                if block.l2_state_root.as_ref() != Some(&expected) {
+                    return Err(Error::Malformed("L2 state root mismatch"));
+                }
+            }
         }
 
         // Coinbase shape: SPEC.md §9.2 rules 1-3.
@@ -1450,6 +1706,21 @@ impl Chain {
         activation != 0 && height >= activation
     }
 
+    /// Whether block-carried checkpoint certificates are permitted at `height`
+    /// (C1/N1 Approach (ii)). `0` means never.
+    pub fn checkpoint_carry_active_at(&self, height: u64) -> bool {
+        let activation = self.params.checkpoint_carry_activation_height;
+        activation != 0 && height >= activation
+    }
+
+    /// Whether L2 state roots are validated against deterministic replay at
+    /// `height` (C1/N1 fix). `0` means never (current behavior: roots recorded
+    /// but not enforced).
+    pub fn l2_root_validation_active_at(&self, height: u64) -> bool {
+        let activation = self.params.l2_root_validation_height;
+        activation != 0 && height >= activation
+    }
+
     fn check_claim(
         &self,
         utxo: &UtxoSet,
@@ -1505,12 +1776,56 @@ impl Chain {
         // record proof must verify against it. A queue in a block that
         // committed no root cannot be proven — which is why post-activation
         // L2 sections must carry one.
-        let root = self
-            .block_at(claim.queued_height)
-            .and_then(|b| b.l2_state_root)
-            .ok_or(Error::Malformed("no committed root at queue height"))?;
-        if !claim.verify_proof(&root) {
-            return Err(Error::Malformed("exit proof does not verify"));
+        // Proof verification, version-gated (C1/N1 + Phase 3, Decision 36).
+        //
+        // Unguarded exits always commit the legacy v7 leaf — pre-activation
+        // and post-activation alike — so `verify_proof` below is unchanged
+        // from before. A guarded exit can never satisfy it: its committed
+        // leaf carries the guarded bit, and no v7 preimage matches it.
+        //
+        // Guarded exits (`proof_height: Some(h)`) commit the v8 guarded leaf
+        // and must prove against a block at or after `queued + D`. A
+        // cancelled exit has no block left that still commits it, so no
+        // valid proof exists after cancellation — this is what closes the
+        // cancel/claim race (Decision 36 amends E-4 for guarded accounts
+        // only; unguarded exits keep E-4 verbatim).
+        let guarded_active = self.params.guarded_activation_height != 0
+            && claim.queued_height >= self.params.guarded_activation_height;
+        match claim.proof_height {
+            None => {
+                let root = self
+                    .block_at(claim.queued_height)
+                    .and_then(|b| b.l2_state_root)
+                    .ok_or(Error::Malformed("no committed root at queue height"))?;
+                if !claim.verify_proof(&root) {
+                    return Err(Error::Malformed("exit proof does not verify"));
+                }
+            }
+            Some(ph) => {
+                if !guarded_active {
+                    return Err(Error::Malformed(
+                        "guarded proof requires guarded activation",
+                    ));
+                }
+                let d = self.params.guarded_exit_delay_blocks;
+                if ph < claim.queued_height.saturating_add(d) {
+                    return Err(Error::Malformed(
+                        "guarded proof precedes the delay window",
+                    ));
+                }
+                if ph >= height {
+                    return Err(Error::Malformed(
+                        "guarded proof block is not yet canonical",
+                    ));
+                }
+                let root = self
+                    .block_at(ph)
+                    .and_then(|b| b.l2_state_root)
+                    .ok_or(Error::Malformed("no committed root at proof height"))?;
+                if !claim.verify_proof_v8(&root, true) {
+                    return Err(Error::Malformed("guarded exit proof does not verify"));
+                }
+            }
         }
         // Sink inputs: real UTXOs, all sink outputs, no duplicates (a doubled
         // outpoint would resolve twice and count its value twice), totalling
@@ -2106,14 +2421,15 @@ impl Chain {
             Vec::new(),
             Vec::new(),
             None,
+            None,
             now_ms,
             difficulty_override,
         )
     }
 
-    // Nine parameters: body, L2 trailer, claims and root are independent
-    // caller-supplied lists, like `apply_body`'s accumulators. Bundling them
-    // would trade one lint for a struct every caller constructs.
+    // Ten parameters: body, L2 trailer, claims, root and checkpoint are
+    // independent caller-supplied lists, like `apply_body`'s accumulators.
+    // Bundling them would trade one lint for a struct every caller constructs.
     #[allow(clippy::too_many_arguments)]
     fn build_template_inner(
         &mut self,
@@ -2122,6 +2438,7 @@ impl Chain {
         l2_txs: Vec<crate::l2::L2Transaction>,
         exit_claims: Vec<ExitClaim>,
         l2_root: Option<Hash>,
+        checkpoint: Option<Checkpoint>,
         now_ms: u64,
         difficulty_override: Option<u128>,
     ) -> Result<Block> {
@@ -2211,8 +2528,13 @@ impl Chain {
 
         let mut txs = vec![cb_tx];
         txs.extend(body);
-        let merkle =
-            crate::block::merkle_root_with_l2(&txs, &l2_txs, l2_root.as_ref(), &exit_claims);
+        let merkle = crate::block::merkle_root_with_checkpoint(
+            &txs,
+            &l2_txs,
+            l2_root.as_ref(),
+            &exit_claims,
+            checkpoint.as_ref(),
+        );
 
         let header = Header {
             version: crate::block::BLOCK_VERSION,
@@ -2240,6 +2562,7 @@ impl Chain {
             l2_txs,
             l2_state_root: l2_root,
             exit_claims,
+            checkpoint,
         })
     }
 
@@ -2254,6 +2577,7 @@ impl Chain {
         l2_txs: Vec<crate::l2::L2Transaction>,
         exit_claims: Vec<ExitClaim>,
         l2_root: Option<Hash>,
+        checkpoint: Option<Checkpoint>,
         now_ms: u64,
         difficulty_override: Option<u128>,
         max_attempts: u64,
@@ -2264,6 +2588,7 @@ impl Chain {
             l2_txs,
             exit_claims,
             l2_root,
+            checkpoint,
             now_ms,
             difficulty_override,
         )?;
@@ -2316,6 +2641,7 @@ impl Chain {
             Vec::new(),
             Vec::new(),
             None,
+            None,
             now_ms,
             difficulty_override,
             max_attempts,
@@ -2349,6 +2675,7 @@ impl Chain {
             l2_txs,
             Vec::new(),
             None,
+            None,
             now_ms,
             difficulty_override,
             max_attempts,
@@ -2380,6 +2707,40 @@ impl Chain {
             l2_txs,
             Vec::new(),
             Some(l2_root),
+            None,
+            now_ms,
+            difficulty_override,
+            max_attempts,
+        )
+    }
+
+    /// Mine a block carrying a block-carried checkpoint certificate
+    /// (C1/N1 Approach (ii)).
+    ///
+    /// The caller supplies a fully verified certificate for a strictly
+    /// earlier height; the merkle root commits to it alongside every other
+    /// section. Carried certificates must verify against the fork being
+    /// built (`verify_ancestry` rules); `submit` re-verifies independently.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mine_block_with_checkpoint(
+        &mut self,
+        miner_address: crate::hash::Address,
+        body: Vec<Transaction>,
+        l2_txs: Vec<crate::l2::L2Transaction>,
+        exit_claims: Vec<ExitClaim>,
+        l2_root: Option<Hash>,
+        checkpoint: Checkpoint,
+        now_ms: u64,
+        difficulty_override: Option<u128>,
+        max_attempts: u64,
+    ) -> Result<Block> {
+        self.build_block(
+            miner_address,
+            body,
+            l2_txs,
+            exit_claims,
+            l2_root,
+            Some(checkpoint),
             now_ms,
             difficulty_override,
             max_attempts,
@@ -2465,6 +2826,7 @@ impl Chain {
             l2_txs,
             exit_claims,
             l2_root,
+            None,
             now_ms,
             None,
             DEFAULT_MAX_ATTEMPTS,
@@ -3032,9 +3394,12 @@ mod tests {
         assert_eq!(chain.tip_hash(), tip.block_hash());
 
         // Now a high-difficulty block where a single header bit is flipped.
-        // At 2^18 work a lucky pass has probability 2^-18.
+        // At 2^14 work a lucky pass has probability 2^-14 — still negligible,
+        // and any difficulty above 1 exercises the identical rejection path
+        // (`pow_satisfies` false after tamper -> `PowInvalid`). Kept low so
+        // this test mines in seconds, not a minute.
         let hard = chain
-            .mine_block_with(addr(1), vec![], fast_ts(7), Some(1u128 << 18), 4_000_000)
+            .mine_block_with(addr(1), vec![], fast_ts(7), Some(1u128 << 14), 4_000_000)
             .unwrap();
         chain.validate_standalone(&hard).unwrap();
         let mut flipped = hard.clone();

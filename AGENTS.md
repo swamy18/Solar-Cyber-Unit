@@ -12,6 +12,18 @@ cargo build --workspace
 
 ## Tests
 
+Fast inner loop (iteration; same assertions, smaller build/test surface —
+use while editing a single crate; the full suite below remains the gate):
+```bash
+# Unit tests only for the crate being edited (no integration binaries, no doc tests).
+cargo test -p srct-core --lib
+# Integration tests for one crate only, one binary at a time.
+cargo test -p srct-core --test api
+# Skip doc tests during iteration (each doc example is a separate rustc invocation).
+cargo test -p srct-core --lib --tests
+```
+
+Full verification gate (unchanged semantics — run before reporting done):
 ```bash
 # Run everything.
 cargo test --workspace

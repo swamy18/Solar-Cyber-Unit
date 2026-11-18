@@ -39,11 +39,24 @@ use srct_worker::{GuardGate, HttpNode, NodeGateAuthority, WorkerError};
 
 const NET: &str = "srct/mini";
 
+/// Test audience (Phase 1 rule: requires_approval grants need non-zero).
+/// Mirrors `api.rs`: the node reads `SRCT_GUARD_AUDIENCE`, so both sides use
+/// this value. Set once per binary to avoid env races.
+const TEST_AUDIENCE: [u8; 32] = [0xAAu8; 32];
+
+fn ensure_guard_audience() {
+    static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    ONCE.get_or_init(|| {
+        std::env::set_var("SRCT_GUARD_AUDIENCE", "aa".repeat(32));
+    });
+}
+
 fn wallet(seed: u8, label: &str) -> Wallet {
     Wallet::from_private_key_bytes(&[seed; 32], label).unwrap()
 }
 
 fn spawn_node() -> (SocketAddr, Arc<Mutex<SharedNode>>) {
+    ensure_guard_audience();
     let params = NetworkParams::mini();
     let chain = Chain::new(params.clone()).unwrap();
     let mut l2 = NodeL2::fresh(&params).unwrap();
@@ -145,7 +158,7 @@ fn signed_cap(
         context_hash: derive_context_hash(workload, h),
         expiry_height: h + 10,
         nonce,
-        audience: [0u8; 32],
+        audience: TEST_AUDIENCE,
     };
     SignedCapability::issue(owner, &cap).unwrap()
 }
@@ -171,7 +184,7 @@ fn gate_for(
         network_id: NET.to_string(),
         height,
         workload_id: workload,
-        node_audience: [0u8; 32],
+        node_audience: TEST_AUDIENCE,
         escalate_to_approval: false,
     }
 }
@@ -463,7 +476,7 @@ fn approval_gated_grant_executes_over_http() {
         context_hash: ctx,
         expiry_height: h + 10,
         nonce: 1,
-        audience: [0u8; 32],
+        audience: TEST_AUDIENCE,
     };
     let signed = SignedCapability::issue(&owner, &cap).unwrap();
 

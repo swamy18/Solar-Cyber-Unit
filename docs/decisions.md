@@ -1916,3 +1916,29 @@ stop drifting from code. Findings, all reflected in the docs themselves:
 8. Stale in-code comments found but not touched (docs task changes no code):
    agentnet ratchet/lib headers, zkml folding header — recorded in
    `status.md` for a future code-touching pass.
+
+## Decision 34 — C1/N1: block-carried checkpoint finality (Approach ii)
+
+C1/N1 (SPEC §19.6) is resolved by making L2 state roots consensus-checked against deterministic replay, with binding finality derived from checkpoint certificates carried in blocks — never from node-local P2P state.
+
+Rule. At/after `checkpoint_carry_activation_height`, blocks MAY carry one full BLS checkpoint certificate (tag 0x05, BLS-only, no PQ sidecar) certifying a strictly earlier height. At/after `l2_root_validation_height`, every block's `l2_state_root` must equal deterministic replay with `tip` equal to the block height and `binding` equal to the ancestry-derived binding. Mismatch fails closed.
+
+Why not node-local binding. `FinalityManager::binding_finalized_height` depends on P2P delivery order; two honest nodes with identical blocks compute different L2 roots (reproduced: 18/50 mismatched heights in the deposit-maturity window). Block-carried certs make binding a pure function of ancestry.
+
+Compatibility. Pre-activation blocks unchanged (checkpoint section refused below activation; root not validated). Merkle gains leaf tag 0x05, appended after exit-claim leaves.
+
+## Decision 35 — Credit consent: borrower-signed opens with caps
+
+`apply_credit_open` (0x19) was lender-only: it charged the borrower's balance as collateral without the borrower's signature, with no upper bound on collateral, deadline, or rate window. A malicious lender could pick tiny principal, huge collateral, 10 percent per window, 1-block window, far deadline, and permissionlessly default the victim's collateral.
+
+Rule. At/after `credit_consent_activation_height`, new positions require 0x1D `CreditOpenV2` carrying BOTH lender and borrower signatures over identical terms. Enforced caps: collateral at most 2x required, `deadline - height` at most `max_term_blocks`, `window_blocks` at least 1. Old 0x19 still decodes for pre-activation replay, but new 0x19 opens are refused at/after activation.
+
+Precedent. Mirrors the node-local `/v1/credit/open` endpoint, which already requires both signatures.
+
+## Decision 36 — Guarded accounts (amends E-4 for guarded accounts only)
+
+L2 owners may opt individual accounts into guarded mode. A guarded account has its own record (leaf tag 0x07, state wire 8), holding: an independent guardian address distinct from the owner, a destination allow-list whose changes take effect only after delay D, a grant-activation delay D, a maximum grant lifetime, and price-independent caps (balance-relative outflow per window in basis points against a window-start snapshot; bounded grant lifetime; adaptive top-up reference).
+
+Scope. Opt-in is per account only — never a global governance key, so this does not violate E-6. This amends E-4 for guarded accounts only: no-cancel/no-freeze stays for ordinary queued exits, but guarded exits support `GuardedCancel` (removes the queued exit, returns locked funds) and `GuardedFreeze` (halts outflows), valid during the extra delay window. An exit claim for a guarded exit must prove the record against a root committed at or after `queued_height + delay` with the record still pending and uncancelled; the ordering rule and reorg-replay test are specified in SPEC.
+
+Enforcement. `apply_policy`: guarded owners require `not_before` at or after `publish_height + D` and lifetime within `max_lifetime`; revocation stays instant. `AgentSpend`/`ExitQueue` from a guarded account: destination must be in the allow-list active for at least D blocks; counted against the bps cap; the existing absolute exit throttle still applies on top. Human-approval tiers move into `apply` for guarded accounts (guardian co-signature above tier), not only at node admission. Audit anchoring is an L2 anchor tx type, not a dust-to-derived-address hack.

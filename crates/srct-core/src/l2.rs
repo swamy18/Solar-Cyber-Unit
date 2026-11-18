@@ -91,6 +91,17 @@ pub const DOM_L2_CREDIT_COLLATERAL: &[u8] = b"srct/l2/credit-collateral/v1";
 pub const DOM_L2_CREDIT_REPAY: &[u8] = b"srct/l2/credit-repay/v1";
 /// Credit default (SPEC.md §22.6).
 pub const DOM_L2_CREDIT_DEFAULT: &[u8] = b"srct/l2/credit-default/v1";
+/// Guarded opt-in (Phase 3). Covers the account opting into guarded mode and
+/// the per-account nonce, so an opt-in cannot be replayed for another account.
+pub const DOM_L2_GUARDED_OPTIN: &[u8] = b"srct/l2/guarded-optin/v1";
+/// Guardian cancellation (Phase 3). Covers the guardian, the guarded account,
+/// the cancelled target and the nonce.
+pub const DOM_L2_GUARDED_CANCEL: &[u8] = b"srct/l2/guarded-cancel/v1";
+/// Guardian freeze (Phase 3). Covers the guardian, the frozen account and the nonce.
+pub const DOM_L2_GUARDED_FREEZE: &[u8] = b"srct/l2/guarded-freeze/v1";
+/// Audit anchor (Phase 3). Covers the anchorer, the anchored Merkle root, the
+/// height and the nonce.
+pub const DOM_L2_AUDIT_ANCHOR: &[u8] = b"srct/l2/audit-anchor/v1";
 
 /// Wire type codes. Deliberately `0x10`-based: L1 uses `0` and `1`, and leaving a
 /// clear gap means an L1 `tx_type` this build does not know is rejected as an
@@ -122,6 +133,23 @@ pub const L2_TX_CREDIT_REPAY: u8 = 0x1B;
 /// Settle a credit position that was not repaid by its deadline
 /// (SPEC.md §22.6). Permissionless: anyone may trigger it.
 pub const L2_TX_CREDIT_DEFAULT: u8 = 0x1C;
+/// Open a credit position with borrower consent (Phase 2 fix).
+/// Requires BOTH lender and borrower signatures over identical terms.
+/// Caps: collateral <= 2x required, deadline bounded, window >= minimum.
+/// Activated at `credit_consent_activation_height`; old 0x19 kept decoding
+/// for pre-activation replay.
+pub const L2_TX_CREDIT_OPEN_V2: u8 = 0x1D;
+/// Opt an L2 account into guarded mode (Phase 3). Creates the guarded-account
+/// record (leaf tag 0x07, state wire 8). Per-account opt-in only, never global.
+pub const L2_TX_GUARDED_OPTIN: u8 = 0x1E;
+/// Guardian cancellation of a pending guarded exit or grant (Phase 3).
+/// Valid only during the extra delay window, only for guarded accounts.
+pub const L2_TX_GUARDED_CANCEL: u8 = 0x1F;
+/// Guardian freeze of a guarded account (Phase 3). Halts outflows pending review.
+pub const L2_TX_GUARDED_FREEZE: u8 = 0x20;
+/// Anchor an audit Merkle root (Phase 3). Commits an off-chain audit log root
+/// on-chain for verifiability. No dust-to-derived-address hack.
+pub const L2_TX_AUDIT_ANCHOR: u8 = 0x21;
 
 /// Largest policy grant accepted in a publish transaction, in bytes. The policy
 /// encoding is bounded by its own field caps (64 recipients, 64 services), so
@@ -154,6 +182,11 @@ pub enum L2TxType {
     CreditCollateral,
     CreditRepay,
     CreditDefault,
+    CreditOpenV2,
+    GuardedOptIn,
+    GuardedCancel,
+    GuardedFreeze,
+    AuditAnchor,
 }
 
 impl L2TxType {
@@ -172,6 +205,11 @@ impl L2TxType {
             L2TxType::CreditCollateral => L2_TX_CREDIT_COLLATERAL,
             L2TxType::CreditRepay => L2_TX_CREDIT_REPAY,
             L2TxType::CreditDefault => L2_TX_CREDIT_DEFAULT,
+            L2TxType::CreditOpenV2 => L2_TX_CREDIT_OPEN_V2,
+            L2TxType::GuardedOptIn => L2_TX_GUARDED_OPTIN,
+            L2TxType::GuardedCancel => L2_TX_GUARDED_CANCEL,
+            L2TxType::GuardedFreeze => L2_TX_GUARDED_FREEZE,
+            L2TxType::AuditAnchor => L2_TX_AUDIT_ANCHOR,
         }
     }
 
@@ -190,6 +228,11 @@ impl L2TxType {
             L2_TX_CREDIT_COLLATERAL => Ok(L2TxType::CreditCollateral),
             L2_TX_CREDIT_REPAY => Ok(L2TxType::CreditRepay),
             L2_TX_CREDIT_DEFAULT => Ok(L2TxType::CreditDefault),
+            L2_TX_CREDIT_OPEN_V2 => Ok(L2TxType::CreditOpenV2),
+            L2_TX_GUARDED_OPTIN => Ok(L2TxType::GuardedOptIn),
+            L2_TX_GUARDED_CANCEL => Ok(L2TxType::GuardedCancel),
+            L2_TX_GUARDED_FREEZE => Ok(L2TxType::GuardedFreeze),
+            L2_TX_AUDIT_ANCHOR => Ok(L2TxType::AuditAnchor),
             _ => Err(Error::Malformed("unknown L2 transaction type")),
         }
     }
@@ -209,6 +252,11 @@ impl L2TxType {
             L2TxType::CreditCollateral => "CreditCollateral",
             L2TxType::CreditRepay => "CreditRepay",
             L2TxType::CreditDefault => "CreditDefault",
+            L2TxType::CreditOpenV2 => "CreditOpenV2",
+            L2TxType::GuardedOptIn => "GuardedOptIn",
+            L2TxType::GuardedCancel => "GuardedCancel",
+            L2TxType::GuardedFreeze => "GuardedFreeze",
+            L2TxType::AuditAnchor => "AuditAnchor",
         }
     }
 
@@ -243,6 +291,11 @@ impl L2TxType {
             L2TxType::CreditCollateral => FEE_TX_CREDIT_COLLATERAL_SAT,
             L2TxType::CreditRepay => FEE_TX_CREDIT_REPAY_SAT,
             L2TxType::CreditDefault => FEE_TX_CREDIT_DEFAULT_SAT,
+            L2TxType::CreditOpenV2 => FEE_TX_CREDIT_OPEN_SAT,
+            L2TxType::GuardedOptIn => FEE_TX_POLICY_SAT,
+            L2TxType::GuardedCancel => FEE_TX_POLICY_SAT,
+            L2TxType::GuardedFreeze => FEE_TX_POLICY_SAT,
+            L2TxType::AuditAnchor => FEE_TX_POLICY_SAT,
         }
     }
 }
@@ -1177,6 +1230,16 @@ impl PolicyRevokePayload {
 /// per-window cap, recipient allow-list, service allow-list, validity window,
 /// strictly increasing nonce — and enforces them against state it keeps, so
 /// the limits are rules rather than advice.
+/// Guardian co-signature for a guarded-account spend above the human-approval
+/// tier (Phase 3). The guardian signs the same body message as the agent, so
+/// both signatures commit to identical terms. Carried only when present;
+/// old blobs without the trailing section decode as `None`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuardianCoSign {
+    pub guardian: Address,
+    pub auth: Auth,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentSpendPayload {
     /// The spender's address: the actor whose signature authorises this spend.
@@ -1192,6 +1255,9 @@ pub struct AgentSpendPayload {
     pub amount_sat: u64,
     /// The service tag, when the grant restricts spending to named services.
     pub service: Option<[u8; 32]>,
+    /// Guardian co-signature for guarded accounts above the approval tier.
+    /// `None` for ordinary spends and all pre-upgrade blobs.
+    pub guardian_approval: Option<GuardianCoSign>,
 }
 
 impl AgentSpendPayload {
@@ -1211,6 +1277,7 @@ impl AgentSpendPayload {
             recipient,
             amount_sat,
             service,
+            guardian_approval: None,
         };
         p.auth.keys = Auth::keys_for(wallet)?;
         let msg = p.signing_hash();
@@ -1218,12 +1285,72 @@ impl AgentSpendPayload {
         Ok(p)
     }
 
+    /// Build a spend with a guardian co-signature (Phase 3 guarded accounts
+    /// above the human-approval tier). The agent builds and signs first with
+    /// the guardian's public bundle present in the body; the guardian then
+    /// countersigns the identical body message via [`Self::co_sign`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_with_guardian(
+        wallet: &Wallet,
+        guardian_keys: crate::sig::Bundle,
+        policy_hash: Hash,
+        nonce: u64,
+        recipient: Address,
+        amount_sat: u64,
+        service: Option<[u8; 32]>,
+        guardian: Address,
+    ) -> Result<Self> {
+        use crate::sig::Bundle;
+        let guardian_auth = Auth {
+            keys: guardian_keys,
+            sigs: Bundle { components: vec![] },
+        };
+        let mut p = AgentSpendPayload {
+            agent: wallet.address()?,
+            auth: Auth::default(),
+            policy_hash,
+            nonce,
+            recipient,
+            amount_sat,
+            service,
+            guardian_approval: Some(GuardianCoSign {
+                guardian,
+                auth: guardian_auth,
+            }),
+        };
+        p.auth.keys = Auth::keys_for(wallet)?;
+        let msg = p.signing_hash();
+        p.auth.sigs = Auth::sigs_for(wallet, &msg)?;
+        Ok(p)
+    }
+
+    /// Guardian countersignature over the identical body message. Call after
+    /// the agent has signed; both signatures commit to the same terms.
+    pub fn co_sign(&mut self, guardian_wallet: &Wallet) -> Result<()> {
+        let guardian = guardian_wallet.address()?;
+        // Compute the message first: it borrows `self` immutably, which would
+        // conflict with the mutable slot borrow below.
+        let msg = self.signing_hash();
+        let slot = self.guardian_approval.as_mut().ok_or(Error::Malformed(
+            "no guardian approval slot to co-sign",
+        ))?;
+        if slot.guardian != guardian {
+            return Err(Error::WrongAddress);
+        }
+        slot.auth.sigs = Auth::sigs_for(guardian_wallet, &msg)?;
+        Ok(())
+    }
+
     pub fn signing_hash(&self) -> Hash {
         sha256_dom(DOM_L2_AGENT_SPEND, &[&self.body()])
     }
 
     pub fn verify_auth(&self) -> Result<()> {
-        self.auth.verify_as(&self.agent, &self.signing_hash())
+        self.auth.verify_as(&self.agent, &self.signing_hash())?;
+        if let Some(co) = &self.guardian_approval {
+            co.auth.verify_as(&co.guardian, &self.signing_hash())?;
+        }
+        Ok(())
     }
 
     fn body(&self) -> Vec<u8> {
@@ -1257,6 +1384,16 @@ impl AgentSpendPayload {
                 w.u8(0);
             }
         }
+        // Guardian co-signature section (Phase 3). Omitted entirely when
+        // absent, so pre-upgrade spends keep their exact bytes and txids.
+        if let Some(co) = &self.guardian_approval {
+            w.u8(1).fixed(&co.guardian);
+            if with_sigs {
+                co.auth.write_full(w);
+            } else {
+                co.auth.write_body(w);
+            }
+        }
     }
 
     pub fn from_reader(r: &mut Reader<'_>) -> Result<Self> {
@@ -1271,6 +1408,23 @@ impl AgentSpendPayload {
             1 => Some(r.fixed::<32>()?),
             _ => return Err(Error::Malformed("service tag out of range")),
         };
+        // Trailing guardian section: absent on pre-upgrade blobs.
+        let guardian_approval = if r.remaining() == 0 {
+            None
+        } else {
+            match r.u8()? {
+                0 => None,
+                1 => {
+                    let guardian: Address = r.fixed()?;
+                    let gauth = Auth::read(r)?;
+                    Some(GuardianCoSign {
+                        guardian,
+                        auth: gauth,
+                    })
+                }
+                _ => return Err(Error::Malformed("guardian flag out of range")),
+            }
+        };
         Ok(AgentSpendPayload {
             agent,
             auth,
@@ -1279,6 +1433,7 @@ impl AgentSpendPayload {
             recipient,
             amount_sat,
             service,
+            guardian_approval,
         })
     }
 }
@@ -1421,6 +1576,135 @@ impl CreditOpenPayload {
             deadline_height,
             nonce,
         })
+    }
+}
+
+/// Open a credit position with borrower consent (Phase 2 fix).
+/// Identical terms to CreditOpen plus a borrower signature over the exact
+/// same terms. Both lender and borrower must sign; the position id covers
+/// both signatures' messages (same terms hash).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreditOpenV2Payload {
+    pub lender: Address,
+    pub lender_auth: Auth,
+    pub borrower: Address,
+    pub borrower_auth: Auth,
+    pub amount_sat: u64,
+    pub collateral_sat: u64,
+    pub rate_bps_per_window: u32,
+    pub window_blocks: u64,
+    pub deadline_height: u64,
+    pub nonce: u64,
+}
+
+impl CreditOpenV2Payload {
+    #[allow(clippy::too_many_arguments)]
+    pub fn build(
+        lender: &Wallet,
+        borrower: &Wallet,
+        amount_sat: u64,
+        collateral_sat: u64,
+        rate_bps_per_window: u32,
+        window_blocks: u64,
+        deadline_height: u64,
+        nonce: u64,
+    ) -> Result<Self> {
+        let borrower_addr = borrower.address()?;
+        let mut p = CreditOpenV2Payload {
+            lender: lender.address()?,
+            lender_auth: Auth::default(),
+            borrower: borrower_addr,
+            borrower_auth: Auth::default(),
+            amount_sat,
+            collateral_sat,
+            rate_bps_per_window,
+            window_blocks,
+            deadline_height,
+            nonce,
+        };
+        // Both parties sign the identical terms body.
+        p.lender_auth.keys = Auth::keys_for(lender)?;
+        p.borrower_auth.keys = Auth::keys_for(borrower)?;
+        let msg = p.signing_hash();
+        p.lender_auth.sigs = Auth::sigs_for(lender, &msg)?;
+        p.borrower_auth.sigs = Auth::sigs_for(borrower, &msg)?;
+        Ok(p)
+    }
+
+    pub fn signing_hash(&self) -> Hash {
+        sha256_dom(DOM_L2_CREDIT_OPEN, &[&self.body()])
+    }
+    pub fn verify_auth(&self) -> Result<()> {
+        let msg = self.signing_hash();
+        self.lender_auth.verify_as(&self.lender, &msg)?;
+        self.borrower_auth.verify_as(&self.borrower, &msg)?;
+        Ok(())
+    }
+    fn body(&self) -> Vec<u8> {
+        let mut w = Writer::new();
+        self.encode(&mut w, false);
+        w.into_vec()
+    }
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut w = Writer::new();
+        self.encode(&mut w, true);
+        w.into_vec()
+    }
+    fn encode(&self, w: &mut Writer, with_sigs: bool) {
+        w.fixed(&self.lender);
+        if with_sigs {
+            self.lender_auth.write_full(w);
+        } else {
+            self.lender_auth.write_body(w);
+        }
+        w.fixed(&self.borrower);
+        if with_sigs {
+            self.borrower_auth.write_full(w);
+        } else {
+            self.borrower_auth.write_body(w);
+        }
+        w.u64le(self.amount_sat)
+            .u64le(self.collateral_sat)
+            .u32le(self.rate_bps_per_window)
+            .u64le(self.window_blocks)
+            .u64le(self.deadline_height)
+            .u64le(self.nonce);
+    }
+    pub fn from_reader(r: &mut Reader<'_>) -> Result<Self> {
+        let lender: Address = r.fixed()?;
+        let lender_auth = Auth::read(r)?;
+        let borrower: Address = r.fixed()?;
+        let borrower_auth = Auth::read(r)?;
+        let amount_sat = r.u64le()?;
+        let collateral_sat = r.u64le()?;
+        let rate_bps_per_window = r.u32le()?;
+        let window_blocks = r.u64le()?;
+        let deadline_height = r.u64le()?;
+        let nonce = r.u64le()?;
+        Ok(CreditOpenV2Payload {
+            lender,
+            lender_auth,
+            borrower,
+            borrower_auth,
+            amount_sat,
+            collateral_sat,
+            rate_bps_per_window,
+            window_blocks,
+            deadline_height,
+            nonce,
+        })
+    }
+    pub fn derived_position_id(&self) -> Hash {
+        let mut w = Writer::new();
+        w.fixed(&self.lender)
+            .fixed(&self.borrower)
+            .u64le(self.amount_sat)
+            .u64le(self.collateral_sat)
+            .u32le(self.rate_bps_per_window)
+            .u64le(self.window_blocks)
+            .u64le(self.deadline_height)
+            .u64le(self.nonce);
+        sha256_dom(DOM_L2_CREDIT_POSITION, &[w.as_slice()])
     }
 }
 
@@ -1626,6 +1910,377 @@ impl CreditDefaultPayload {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 3: guarded accounts and audit anchors
+// ---------------------------------------------------------------------------
+
+/// Opt an L2 account into guarded mode (Phase 3).
+///
+/// Creates the guarded-account record (leaf tag 0x07, state wire 8).
+/// Per-account opt-in only, never global. The owner signs; the guardian
+/// named here must differ from the owner. The allow-list, delay, lifetime
+/// and cap travel in the transaction so the record is fully determined by
+/// consensus bytes. At most [`MAX_GUARDED_ALLOW_LIST`] entries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuardedOptInPayload {
+    pub owner: Address,
+    pub auth: Auth,
+    pub guardian: Address,
+    pub allow_list: Vec<Address>,
+    pub grant_delay_blocks: u64,
+    pub max_grant_lifetime_blocks: u64,
+    pub outflow_cap_bps: u64,
+    pub outflow_window_blocks: u64,
+    pub nonce: u64,
+}
+
+/// Maximum allow-list entries per guarded account (mirrors the recipient-list
+/// discipline of [`MAX_POLICY_RECIPIENTS`]).
+pub const MAX_GUARDED_ALLOW_LIST: usize = 64;
+
+impl GuardedOptInPayload {
+    #[allow(clippy::too_many_arguments)]
+    pub fn build(
+        owner_wallet: &Wallet,
+        guardian: Address,
+        allow_list: Vec<Address>,
+        grant_delay_blocks: u64,
+        max_grant_lifetime_blocks: u64,
+        outflow_cap_bps: u64,
+        outflow_window_blocks: u64,
+        nonce: u64,
+    ) -> Result<Self> {
+        if allow_list.len() > MAX_GUARDED_ALLOW_LIST {
+            return Err(Error::Malformed("guarded allow-list too long"));
+        }
+        let mut p = GuardedOptInPayload {
+            owner: owner_wallet.address()?,
+            auth: Auth::default(),
+            guardian,
+            allow_list,
+            grant_delay_blocks,
+            max_grant_lifetime_blocks,
+            outflow_cap_bps,
+            outflow_window_blocks,
+            nonce,
+        };
+        p.auth.keys = Auth::keys_for(owner_wallet)?;
+        let msg = p.signing_hash();
+        p.auth.sigs = Auth::sigs_for(owner_wallet, &msg)?;
+        Ok(p)
+    }
+
+    pub fn signing_hash(&self) -> Hash {
+        sha256_dom(DOM_L2_GUARDED_OPTIN, &[&self.body()])
+    }
+
+    pub fn verify_auth(&self) -> Result<()> {
+        self.auth.verify_as(&self.owner, &self.signing_hash())
+    }
+
+    fn body(&self) -> Vec<u8> {
+        let mut w = Writer::new();
+        self.encode(&mut w, false);
+        w.into_vec()
+    }
+
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut w = Writer::new();
+        self.encode(&mut w, true);
+        w.into_vec()
+    }
+
+    fn encode(&self, w: &mut Writer, with_sigs: bool) {
+        w.fixed(&self.owner);
+        if with_sigs {
+            self.auth.write_full(w);
+        } else {
+            self.auth.write_body(w);
+        }
+        w.fixed(&self.guardian);
+        w.u16le(self.allow_list.len() as u16);
+        for a in &self.allow_list {
+            w.fixed(a);
+        }
+        w.u64le(self.grant_delay_blocks)
+            .u64le(self.max_grant_lifetime_blocks)
+            .u64le(self.outflow_cap_bps)
+            .u64le(self.outflow_window_blocks)
+            .u64le(self.nonce);
+    }
+
+    pub fn from_reader(r: &mut Reader<'_>) -> Result<Self> {
+        let owner: Address = r.fixed()?;
+        let auth = Auth::read(r)?;
+        let guardian: Address = r.fixed()?;
+        let n = r.u16le()? as usize;
+        if n > MAX_GUARDED_ALLOW_LIST {
+            return Err(Error::Malformed("guarded allow-list too long"));
+        }
+        let mut allow_list = Vec::with_capacity(n.min(64));
+        for _ in 0..n {
+            allow_list.push(r.fixed()?);
+        }
+        Ok(GuardedOptInPayload {
+            owner,
+            auth,
+            guardian,
+            allow_list,
+            grant_delay_blocks: r.u64le()?,
+            max_grant_lifetime_blocks: r.u64le()?,
+            outflow_cap_bps: r.u64le()?,
+            outflow_window_blocks: r.u64le()?,
+            nonce: r.u64le()?,
+        })
+    }
+}
+
+/// Guardian cancellation of a pending guarded exit or grant (Phase 3).
+///
+/// Valid only during the extra delay window, only for guarded accounts.
+/// `kind` selects the target: 0 = queued exit (target's first 8 bytes are the
+/// exit nonce, little-endian), 1 = published grant (target is the grant
+/// hash). `nonce` is the guardian's replay counter for this guarded account.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuardedCancelPayload {
+    pub guardian: Address,
+    pub auth: Auth,
+    pub account: Address,
+    pub kind: u8,
+    pub target: Hash,
+    pub nonce: u64,
+}
+
+impl GuardedCancelPayload {
+    pub fn build(
+        wallet: &Wallet,
+        account: Address,
+        kind: u8,
+        target: Hash,
+        nonce: u64,
+    ) -> Result<Self> {
+        if kind > 1 {
+            return Err(Error::Malformed("guarded cancel names an unknown kind"));
+        }
+        let mut p = GuardedCancelPayload {
+            guardian: wallet.address()?,
+            auth: Auth::default(),
+            account,
+            kind,
+            target,
+            nonce,
+        };
+        p.auth.keys = Auth::keys_for(wallet)?;
+        let msg = p.signing_hash();
+        p.auth.sigs = Auth::sigs_for(wallet, &msg)?;
+        Ok(p)
+    }
+
+    pub fn signing_hash(&self) -> Hash {
+        sha256_dom(DOM_L2_GUARDED_CANCEL, &[&self.body()])
+    }
+
+    pub fn verify_auth(&self) -> Result<()> {
+        self.auth.verify_as(&self.guardian, &self.signing_hash())
+    }
+
+    fn body(&self) -> Vec<u8> {
+        let mut w = Writer::new();
+        self.encode(&mut w, false);
+        w.into_vec()
+    }
+
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut w = Writer::new();
+        self.encode(&mut w, true);
+        w.into_vec()
+    }
+
+    fn encode(&self, w: &mut Writer, with_sigs: bool) {
+        w.fixed(&self.guardian);
+        if with_sigs {
+            self.auth.write_full(w);
+        } else {
+            self.auth.write_body(w);
+        }
+        w.fixed(&self.account)
+            .u8(self.kind)
+            .fixed(&self.target)
+            .u64le(self.nonce);
+    }
+
+    pub fn from_reader(r: &mut Reader<'_>) -> Result<Self> {
+        let guardian: Address = r.fixed()?;
+        let auth = Auth::read(r)?;
+        let account: Address = r.fixed()?;
+        let kind = r.u8()?;
+        if kind > 1 {
+            return Err(Error::Malformed("guarded cancel names an unknown kind"));
+        }
+        let target: Hash = r.fixed()?;
+        let nonce = r.u64le()?;
+        Ok(GuardedCancelPayload {
+            guardian,
+            auth,
+            account,
+            kind,
+            target,
+            nonce,
+        })
+    }
+}
+
+/// Guardian freeze of a guarded account (Phase 3). Halts outflows while frozen;
+/// unfreezing restores them. Both directions require the guardian's signature.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuardedFreezePayload {
+    pub guardian: Address,
+    pub auth: Auth,
+    pub account: Address,
+    pub frozen: bool,
+    pub nonce: u64,
+}
+
+impl GuardedFreezePayload {
+    pub fn build(wallet: &Wallet, account: Address, frozen: bool, nonce: u64) -> Result<Self> {
+        let mut p = GuardedFreezePayload {
+            guardian: wallet.address()?,
+            auth: Auth::default(),
+            account,
+            frozen,
+            nonce,
+        };
+        p.auth.keys = Auth::keys_for(wallet)?;
+        let msg = p.signing_hash();
+        p.auth.sigs = Auth::sigs_for(wallet, &msg)?;
+        Ok(p)
+    }
+
+    pub fn signing_hash(&self) -> Hash {
+        sha256_dom(DOM_L2_GUARDED_FREEZE, &[&self.body()])
+    }
+
+    pub fn verify_auth(&self) -> Result<()> {
+        self.auth.verify_as(&self.guardian, &self.signing_hash())
+    }
+
+    fn body(&self) -> Vec<u8> {
+        let mut w = Writer::new();
+        self.encode(&mut w, false);
+        w.into_vec()
+    }
+
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut w = Writer::new();
+        self.encode(&mut w, true);
+        w.into_vec()
+    }
+
+    fn encode(&self, w: &mut Writer, with_sigs: bool) {
+        w.fixed(&self.guardian);
+        if with_sigs {
+            self.auth.write_full(w);
+        } else {
+            self.auth.write_body(w);
+        }
+        w.fixed(&self.account)
+            .u8(u8::from(self.frozen))
+            .u64le(self.nonce);
+    }
+
+    pub fn from_reader(r: &mut Reader<'_>) -> Result<Self> {
+        let guardian: Address = r.fixed()?;
+        let auth = Auth::read(r)?;
+        let account: Address = r.fixed()?;
+        let frozen = match r.u8()? {
+            0 => false,
+            1 => true,
+            _ => return Err(Error::Malformed("guarded freeze flag out of range")),
+        };
+        let nonce = r.u64le()?;
+        Ok(GuardedFreezePayload {
+            guardian,
+            auth,
+            account,
+            frozen,
+            nonce,
+        })
+    }
+}
+
+/// Anchor an audit Merkle root on chain (Phase 3). Commits an off-chain audit
+/// log root for verifiability. No dust-to-derived-address hack: the root rides
+/// as an explicit field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuditAnchorPayload {
+    pub anchorer: Address,
+    pub auth: Auth,
+    pub root: Hash,
+    pub height: u64,
+    pub nonce: u64,
+}
+
+impl AuditAnchorPayload {
+    pub fn build(wallet: &Wallet, root: Hash, height: u64, nonce: u64) -> Result<Self> {
+        let mut p = AuditAnchorPayload {
+            anchorer: wallet.address()?,
+            auth: Auth::default(),
+            root,
+            height,
+            nonce,
+        };
+        p.auth.keys = Auth::keys_for(wallet)?;
+        let msg = p.signing_hash();
+        p.auth.sigs = Auth::sigs_for(wallet, &msg)?;
+        Ok(p)
+    }
+
+    pub fn signing_hash(&self) -> Hash {
+        sha256_dom(DOM_L2_AUDIT_ANCHOR, &[&self.body()])
+    }
+
+    pub fn verify_auth(&self) -> Result<()> {
+        self.auth.verify_as(&self.anchorer, &self.signing_hash())
+    }
+
+    fn body(&self) -> Vec<u8> {
+        let mut w = Writer::new();
+        self.encode(&mut w, false);
+        w.into_vec()
+    }
+
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut w = Writer::new();
+        self.encode(&mut w, true);
+        w.into_vec()
+    }
+
+    fn encode(&self, w: &mut Writer, with_sigs: bool) {
+        w.fixed(&self.anchorer);
+        if with_sigs {
+            self.auth.write_full(w);
+        } else {
+            self.auth.write_body(w);
+        }
+        w.fixed(&self.root).u64le(self.height).u64le(self.nonce);
+    }
+
+    pub fn from_reader(r: &mut Reader<'_>) -> Result<Self> {
+        let anchorer: Address = r.fixed()?;
+        let auth = Auth::read(r)?;
+        let root: Hash = r.fixed()?;
+        let height = r.u64le()?;
+        let nonce = r.u64le()?;
+        Ok(AuditAnchorPayload {
+            anchorer,
+            auth,
+            root,
+            height,
+            nonce,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The envelope
 // ---------------------------------------------------------------------------
 
@@ -1644,6 +2299,11 @@ pub enum L2Payload {
     CreditCollateral(CreditCollateralPayload),
     CreditRepay(CreditRepayPayload),
     CreditDefault(CreditDefaultPayload),
+    CreditOpenV2(CreditOpenV2Payload),
+    GuardedOptIn(GuardedOptInPayload),
+    GuardedCancel(GuardedCancelPayload),
+    GuardedFreeze(GuardedFreezePayload),
+    AuditAnchor(AuditAnchorPayload),
 }
 
 impl L2Payload {
@@ -1662,6 +2322,11 @@ impl L2Payload {
             L2Payload::CreditCollateral(_) => L2TxType::CreditCollateral,
             L2Payload::CreditRepay(_) => L2TxType::CreditRepay,
             L2Payload::CreditDefault(_) => L2TxType::CreditDefault,
+            L2Payload::CreditOpenV2(_) => L2TxType::CreditOpenV2,
+            L2Payload::GuardedOptIn(_) => L2TxType::GuardedOptIn,
+            L2Payload::GuardedCancel(_) => L2TxType::GuardedCancel,
+            L2Payload::GuardedFreeze(_) => L2TxType::GuardedFreeze,
+            L2Payload::AuditAnchor(_) => L2TxType::AuditAnchor,
         }
     }
 
@@ -1682,6 +2347,11 @@ impl L2Payload {
             L2Payload::CreditCollateral(p) => Some(p.borrower),
             L2Payload::CreditRepay(p) => Some(p.borrower),
             L2Payload::CreditDefault(p) => Some(p.actor),
+            L2Payload::CreditOpenV2(p) => Some(p.lender),
+            L2Payload::GuardedOptIn(p) => Some(p.owner),
+            L2Payload::GuardedCancel(p) => Some(p.guardian),
+            L2Payload::GuardedFreeze(p) => Some(p.guardian),
+            L2Payload::AuditAnchor(p) => Some(p.anchorer),
         }
     }
 
@@ -1700,6 +2370,11 @@ impl L2Payload {
             L2Payload::CreditCollateral(p) => p.signing_hash(),
             L2Payload::CreditRepay(p) => p.signing_hash(),
             L2Payload::CreditDefault(p) => p.signing_hash(),
+            L2Payload::CreditOpenV2(p) => p.signing_hash(),
+            L2Payload::GuardedOptIn(p) => p.signing_hash(),
+            L2Payload::GuardedCancel(p) => p.signing_hash(),
+            L2Payload::GuardedFreeze(p) => p.signing_hash(),
+            L2Payload::AuditAnchor(p) => p.signing_hash(),
         }
     }
 
@@ -1720,6 +2395,11 @@ impl L2Payload {
             L2Payload::CreditCollateral(p) => p.verify_auth(),
             L2Payload::CreditRepay(p) => p.verify_auth(),
             L2Payload::CreditDefault(p) => p.verify_auth(),
+            L2Payload::CreditOpenV2(p) => p.verify_auth(),
+            L2Payload::GuardedOptIn(p) => p.verify_auth(),
+            L2Payload::GuardedCancel(p) => p.verify_auth(),
+            L2Payload::GuardedFreeze(p) => p.verify_auth(),
+            L2Payload::AuditAnchor(p) => p.verify_auth(),
         }
     }
 
@@ -1738,6 +2418,11 @@ impl L2Payload {
             L2Payload::CreditCollateral(p) => p.serialize(),
             L2Payload::CreditRepay(p) => p.serialize(),
             L2Payload::CreditDefault(p) => p.serialize(),
+            L2Payload::CreditOpenV2(p) => p.serialize(),
+            L2Payload::GuardedOptIn(p) => p.serialize(),
+            L2Payload::GuardedCancel(p) => p.serialize(),
+            L2Payload::GuardedFreeze(p) => p.serialize(),
+            L2Payload::AuditAnchor(p) => p.serialize(),
         }
     }
 
@@ -1759,6 +2444,21 @@ impl L2Payload {
             L2TxType::CreditRepay => L2Payload::CreditRepay(CreditRepayPayload::from_reader(r)?),
             L2TxType::CreditDefault => {
                 L2Payload::CreditDefault(CreditDefaultPayload::from_reader(r)?)
+            }
+            L2TxType::CreditOpenV2 => {
+                L2Payload::CreditOpenV2(CreditOpenV2Payload::from_reader(r)?)
+            }
+            L2TxType::GuardedOptIn => {
+                L2Payload::GuardedOptIn(GuardedOptInPayload::from_reader(r)?)
+            }
+            L2TxType::GuardedCancel => {
+                L2Payload::GuardedCancel(GuardedCancelPayload::from_reader(r)?)
+            }
+            L2TxType::GuardedFreeze => {
+                L2Payload::GuardedFreeze(GuardedFreezePayload::from_reader(r)?)
+            }
+            L2TxType::AuditAnchor => {
+                L2Payload::AuditAnchor(AuditAnchorPayload::from_reader(r)?)
             }
         })
     }

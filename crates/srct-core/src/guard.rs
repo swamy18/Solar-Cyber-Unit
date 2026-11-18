@@ -1272,6 +1272,13 @@ impl GuardBook {
         if signed.cap.audience != *node_audience {
             return Decision::Deny(GuardError::WrongAudience);
         }
+        // High-assurance grants (requires_approval) must be audience-scoped:
+        // a zero audience on such a grant is refused even when the node itself
+        // runs unscoped, so legacy unscoped semantics stay legal only for
+        // low-value grants. This is consensus-critical and deterministic.
+        if policy.requires_approval && signed.cap.audience == [0u8; 32] {
+            return Decision::Deny(GuardError::WrongAudience);
+        }
         let recomputed = derive_action_hash(action_preimage);
         if recomputed != signed.cap.action_hash {
             return Decision::Deny(GuardError::ActionMismatch);
@@ -1988,7 +1995,9 @@ mod tests {
         let bound = policy.workload_id;
         let height = 50u64;
         let preimage = b"deploy-42";
-        let cap = owned_cap(&policy, preimage, &bound, height, 1);
+        let node_aud = [0xAAu8; 32];
+        let mut cap = owned_cap(&policy, preimage, &bound, height, 1);
+        cap.audience = node_aud;
         let signed = SignedCapability::issue(&owner, &cap).unwrap();
 
         // The caller claims low risk. The grant says otherwise: gated anyway.
@@ -2002,7 +2011,7 @@ mod tests {
                 height,
                 preimage,
                 &bound,
-                &[0u8; 32],
+                &node_aud,
                 false,
                 None,
                 None
@@ -2042,7 +2051,7 @@ mod tests {
                 height,
                 preimage,
                 &bound,
-                &[0u8; 32],
+                &node_aud,
                 false,
                 Some(&honest),
                 None
@@ -2067,7 +2076,7 @@ mod tests {
                 height,
                 preimage,
                 &bound,
-                &[0u8; 32],
+                &node_aud,
                 false,
                 Some(&owner_signed),
                 None
@@ -2114,7 +2123,9 @@ mod tests {
         let bound = policy.workload_id;
         let height = 50u64;
         let preimage = b"deploy-42";
-        let cap = owned_cap(&policy, preimage, &bound, height, 1);
+        let node_aud = [0xAAu8; 32];
+        let mut cap = owned_cap(&policy, preimage, &bound, height, 1);
+        cap.audience = node_aud;
         let signed = SignedCapability::issue(&owner, &cap).unwrap();
 
         // The caller presents a stranger's workload id. The grant is bound,
@@ -2131,7 +2142,7 @@ mod tests {
                 height,
                 preimage,
                 &[9u8; 32],
-                &[0u8; 32],
+                &node_aud,
                 true,
                 None,
                 None
@@ -2154,7 +2165,7 @@ mod tests {
                 height,
                 preimage,
                 &[9u8; 32],
-                &[0u8; 32],
+                &node_aud,
                 true,
                 None,
                 None
@@ -2211,6 +2222,39 @@ mod tests {
             Decision::Deny(GuardError::WrongAudience)
         );
         assert!(book2.is_empty(), "a mis-scoped capability commits no nonce");
+    }
+
+    #[test]
+    fn requires_approval_grant_refuses_zero_audience() {
+        // High-assurance grants must be audience-scoped: even on a zero-audience
+        // node, a zero-audience capability for a requires_approval grant denies.
+        let (owner, mut policy) = owned_policy();
+        policy.requires_approval = true;
+        policy.approver = [9u8; 20];
+        let workload = [7u8; 32];
+        let height = 100;
+        let node_zero = [0u8; 32];
+        let mut cap = owned_cap(&policy, b"deploy-42", &workload, height, 1);
+        cap.audience = node_zero;
+        let signed = SignedCapability::issue(&owner, &cap).unwrap();
+        let mut book = GuardBook::default();
+        assert_eq!(
+            book.authorize_signed(
+                &policy,
+                &signed,
+                &policy.agent_id,
+                "srct/testnet",
+                height,
+                b"deploy-42",
+                &workload,
+                &node_zero,
+                false,
+                None,
+                None
+            ),
+            Decision::Deny(GuardError::WrongAudience)
+        );
+        assert!(book.is_empty(), "refused high-assurance zero-audience commits nothing");
     }
 
     #[test]

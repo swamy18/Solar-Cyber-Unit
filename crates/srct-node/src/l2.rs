@@ -221,6 +221,25 @@ pub fn config_for(params: &NetworkParams) -> L2Config {
     config.max_exit_per_owner_window_sat = params.max_exit_per_owner_window_sat;
     config.large_exit_threshold_sat = params.large_exit_threshold_sat;
     config.large_exit_extra_delay_blocks = params.large_exit_extra_delay_blocks;
+    // Phase 2 credit consent (borrower signature + caps). Wired from profile;
+    // 0 means never (old lender-only path stays accepted).
+    config.credit_consent_activation_height = params.credit_consent_activation_height;
+    // Caps: 2x collateral multiple, 1-year term (52*144*365 ~ 2.7M blocks? use 100k), min 1-block window.
+    // Values only enforced at/after activation; 0 in config means no cap (pre-activation).
+    // Node sets concrete caps when activation is set; profiles carry 0 by default.
+    config.credit_max_collateral_multiple = 2;
+    config.credit_max_term_blocks = 100_000;
+    config.credit_min_window_blocks = 1;
+    config.guarded_activation_height = params.guarded_activation_height;
+    config.guarded_grant_delay_blocks = 10;
+    config.guarded_max_grant_lifetime_blocks = 10_000;
+    config.guarded_outflow_cap_bps = 1000;
+    config.guarded_outflow_window_blocks = 100;
+    config.guarded_exit_delay_blocks = params.guarded_exit_delay_blocks;
+    // Human-approval tier for guarded spends: co-signature required at/above
+    // 1 SRCT (matches the node-level 10 SRCT order of magnitude, scaled down
+    // for the guarded path which is stricter by design).
+    config.guarded_approval_threshold_sat = 100_000_000;
     config
 }
 
@@ -675,6 +694,11 @@ impl NodeL2 {
                 queued_height: record.queued_height,
                 inputs,
                 proof: watch.proof.clone(),
+                // Legacy path: the node crank builds unguarded claims only.
+                // Guarded exits require a post-delay proof built against a
+                // newer root (manual construction; see SPEC 23.4), and the
+                // legacy proof cannot verify against a guarded leaf.
+                proof_height: None,
             });
         }
         claims

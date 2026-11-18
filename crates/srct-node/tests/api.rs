@@ -71,6 +71,20 @@ struct Node {
     shared: Arc<Mutex<SharedNode>>,
 }
 
+/// Test audience for Smart Gate capabilities (Phase 1 rule: requires_approval
+/// grants need a non-zero audience). The node reads its audience from
+/// `SRCT_GUARD_AUDIENCE`, so every guard test in this binary uses this value
+/// on both sides. Standardized per binary to avoid env races between parallel
+/// tests.
+const TEST_AUDIENCE: [u8; 32] = [0xAAu8; 32];
+
+fn ensure_guard_audience() {
+    static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    ONCE.get_or_init(|| {
+        std::env::set_var("SRCT_GUARD_AUDIENCE", "aa".repeat(32));
+    });
+}
+
 /// Start a server on an ephemeral loopback port over a fresh mini chain.
 fn start() -> Node {
     start_with(Chain::new(NetworkParams::mini()).unwrap())
@@ -84,6 +98,7 @@ fn start_with(chain: Chain) -> Node {
 /// Start a server over `chain` that trusts `issuers` to sign credit
 /// attestations; empty issuers means every `/v1/credit/mint` is refused.
 fn start_with_issuers(chain: Chain, issuers: Vec<srct_core::bls_checkpoint::BlsPublicKey>) -> Node {
+    ensure_guard_audience();
     let params = NetworkParams::mini();
     let l2 = NodeL2::fresh(&params).unwrap();
     let shared = Arc::new(Mutex::new(SharedNode::new(chain, l2)));
@@ -1149,7 +1164,7 @@ fn guard_grant_authorize_replay_revoke_round_trip() {
             context_hash: derive_context_hash(&workload, h),
             expiry_height: h + 10,
             nonce,
-            audience: [0u8; 32],
+            audience: TEST_AUDIENCE,
         };
         hex::encode(SignedCapability::issue(&owner, &cap).unwrap().serialize())
     };
@@ -1173,7 +1188,7 @@ fn guard_grant_authorize_replay_revoke_round_trip() {
         context_hash: derive_context_hash(&workload, h),
         expiry_height: h + 10,
         nonce: 9,
-        audience: [0u8; 32],
+        audience: TEST_AUDIENCE,
     };
     let (s, forged) = post(
         &node,
@@ -1292,7 +1307,7 @@ fn guard_owner_set_risk_and_independent_approver_are_enforced() {
             context_hash: derive_context_hash(&bound, h),
             expiry_height: h + 10,
             nonce,
-            audience: [0u8; 32],
+            audience: TEST_AUDIENCE,
         };
         hex::encode(SignedCapability::issue(&owner, &cap).unwrap().serialize())
     };
@@ -1340,7 +1355,7 @@ fn guard_owner_set_risk_and_independent_approver_are_enforced() {
             context_hash: derive_context_hash(&bound, h),
             expiry_height: h + 10,
             nonce,
-            audience: [0u8; 32],
+            audience: TEST_AUDIENCE,
         };
         let draft = GuardApproval {
             version: GUARD_POLICY_VERSION,
@@ -1442,7 +1457,7 @@ fn guard_keybound_grant_requires_workload_credential_over_http() {
         context_hash: ctx,
         expiry_height: h + 10,
         nonce: 1,
-        audience: [0u8; 32],
+        audience: TEST_AUDIENCE,
     };
     let signed_hex = hex::encode(SignedCapability::issue(&owner, &cap).unwrap().serialize());
     let authorize = |cred_hex: Option<String>| {
@@ -2323,10 +2338,10 @@ fn an_oversize_body_is_refused_before_it_is_parsed() {
 fn a_withdrawal_shaped_l2_payload_is_refused_by_name() {
     let node = start();
 
-    // Version 1 envelope, type byte 0x1D — the byte immediately after the
-    // highest defined L2 type (0x1C CreditDefault), which is where a withdrawal
+    // Version 1 envelope, type byte 0x22 — the byte immediately after the
+    // highest defined L2 type (0x21 AuditAnchor), which is where a withdrawal
     // would sit if one existed.
-    let mut envelope = vec![1u8, 0, 0, 0, 0x1D];
+    let mut envelope = vec![1u8, 0, 0, 0, 0x22];
     envelope.extend_from_slice(&[0u8; 32]);
     let hex_body = hex::encode(&envelope);
 
@@ -2358,15 +2373,15 @@ fn a_withdrawal_shaped_l2_payload_is_refused_by_name() {
 #[test]
 fn an_undefined_l2_type_byte_is_refused_by_the_decoder() {
     let mut envelope = vec![1u8, 0, 0, 0];
-    envelope.push(0x1D);
+    envelope.push(0x22);
     envelope.extend_from_slice(&[0u8; 32]);
     let err = srct_core::l2::L2Transaction::deserialize(&envelope)
-        .expect_err("0x1D is not an L2 transaction type");
+        .expect_err("0x22 is not an L2 transaction type");
     assert!(err.to_string().contains("unknown L2 transaction type"));
     // And the boundary is exact: the highest real type decodes, the next byte
     // does not.
-    assert!(srct_core::l2::L2TxType::from_wire(0x1C).is_ok());
-    assert!(srct_core::l2::L2TxType::from_wire(0x1D).is_err());
+    assert!(srct_core::l2::L2TxType::from_wire(0x21).is_ok());
+    assert!(srct_core::l2::L2TxType::from_wire(0x22).is_err());
 }
 
 // ---------------------------------------------------------------------------

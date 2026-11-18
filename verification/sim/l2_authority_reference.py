@@ -58,6 +58,22 @@ FEE_CREDIT_OPEN = 2_000
 FEE_CREDIT_COLLATERAL = 2_000
 FEE_CREDIT_REPAY = 2_000
 FEE_CREDIT_DEFAULT = 2_000
+FEE_CREDIT_OPEN_V2 = 2_000
+FEE_GUARDED_OPTIN = 2_000
+FEE_GUARDED_CANCEL = 2_000
+FEE_GUARDED_FREEZE = 2_000
+FEE_AUDIT_ANCHOR = 2_000
+
+# Phase 2 consent caps (mirror Rust NodeL2::config_for defaults).
+CREDIT_MAX_COLLATERAL_MULTIPLE = 2
+CREDIT_MAX_TERM_BLOCKS = 100_000
+CREDIT_MIN_WINDOW_BLOCKS = 1
+# Phase 3 guarded defaults (mirror Rust NodeL2::config_for defaults).
+GUARDED_GRANT_DELAY_BLOCKS = 10
+GUARDED_MAX_GRANT_LIFETIME_BLOCKS = 10_000
+GUARDED_OUTFLOW_CAP_BPS = 1_000
+GUARDED_OUTFLOW_WINDOW_BLOCKS = 100
+GUARDED_APPROVAL_THRESHOLD_SAT = 100_000_000
 
 ROLE_HUMAN, ROLE_MACHINE, ROLE_SERVICE = 0, 1, 2
 
@@ -254,6 +270,10 @@ class State:
     policy_by_agent: dict = field(default_factory=dict)
     positions: dict = field(default_factory=dict)
     credit_locked: int = 0
+    guarded: dict = field(default_factory=dict)
+    audit_anchors: dict = field(default_factory=dict)
+    credit_consent_from: int = 0
+    guarded_from: int = 0
     height: int = 1
     # The position ids in the order the scenarios refer to them by index.
     position_ids: list = field(default_factory=list)
@@ -335,6 +355,15 @@ class State:
                 refuse("PolicyRevoked")
             parent = self.policies[parent_hash].policy
             dominates(parent, policy)
+        # Phase 3: guarded owners need a delayed, bounded grant.
+        g = self.guarded.get(policy.owner)
+        if g is not None:
+            if g["frozen"]:
+                refuse("AccountFrozen")
+            if policy.not_before_height < self.height + GUARDED_GRANT_DELAY_BLOCKS:
+                refuse("GrantDelayNotSatisfied")
+            if policy.expires_at_height - policy.not_before_height > GUARDED_MAX_GRANT_LIFETIME_BLOCKS:
+                refuse("GrantLifetimeExceeded")
         fee = FEE_POLICY
         self.charge(owner, fee)
         self.collect_fee(fee)
@@ -383,6 +412,7 @@ class State:
         recipient: bytes,
         amount: int,
         service: bytes | None,
+        guardian: bytes | None = None,
     ) -> None:
         entry = self.policies.get(h)
         if entry is None:
@@ -404,6 +434,14 @@ class State:
             refuse("PolicyLimit")
         if recipient not in policy.allowed_recipients:
             refuse("PolicyRecipient")
+        # Phase 3: guarded owners need an active allow-list entry plus cap room.
+        self.guarded_check_spend(policy.owner, recipient, amount)
+        # Human-approval tier: at/above the threshold the guardian must
+        # co-sign the identical terms; absence refuses, wrong guardian refuses.
+        if policy.owner in self.guarded and amount >= GUARDED_APPROVAL_THRESHOLD_SAT:
+            g = self.guarded[policy.owner]
+            if guardian is None or guardian != g["guardian"]:
+                refuse("GuardedApprovalRequired")
         if service is None:
             if policy.allowed_services:
                 refuse("PolicyService")
@@ -434,6 +472,127 @@ class State:
         entry.total_spent_sat += amount
         entry.last_nonce = nonce
         entry.spends += 1
+        # Phase 3: guarded outflow accounting.
+        self.guarded_record_outflow(policy.owner, amount)
+
+    def guarded_check_spend(
+        self, owner: bytes, recipient: bytes, amount: int
+    ) -> None:
+        g = self.guarded.get(owner)
+        if g is None:
+            return
+        if g["frozen"]:
+            refuse("AccountFrozen")
+        if (
+            recipient not in g["allow_list"]
+            or self.height < g["allowlist_active_height"] + GUARDED_GRANT_DELAY_BLOCKS
+        ):
+            refuse("GuardedDestinationNotAllowed")
+        window = GUARDED_OUTFLOW_WINDOW_BLOCKS
+        bps = GUARDED_OUTFLOW_CAP_BPS
+        if window == 0 or bps == 0:
+            return
+        if self.height >= g["window_start_height"] + window:
+            total, snapshot = 0, self.balance(owner)
+        else:
+            total, snapshot = g["window_outflow_total"], g["window_balance_snapshot"]
+        cap = snapshot * bps // 10_000
+        if total + amount > cap:
+            refuse("GuardedOutflowCapped")
+
+    def guarded_record_outflow(self, owner: bytes, amount: int) -> None:
+        g = self.guarded.get(owner)
+        if g is None:
+            return
+        window = GUARDED_OUTFLOW_WINDOW_BLOCKS
+        if window != 0 and self.height >= g["window_start_height"] + window:
+            g["window_start_height"] = self.height
+            g["window_balance_snapshot"] = self.balance(owner)
+            g["window_outflow_total"] = 0
+        g["window_outflow_total"] += amount
+
+    # --- guarded accounts (Phase 3) ------------------------------------
+    def apply_guarded_optin(
+        self, owner: bytes, guardian: bytes, allow_list: list, height_unused=None
+    ) -> None:
+        if self.guarded_from == 0 or self.height < self.guarded_from:
+            refuse("BadConfig")
+        if guardian == owner:
+            refuse("GuardedGuardianMustDiffer")
+        if owner in self.guarded:
+            refuse("GuardedAlreadyOptedIn")
+        fee = FEE_GUARDED_OPTIN
+        if self.balance(owner) < fee:
+            refuse("InsufficientBalance")
+        self.charge(owner, fee)
+        self.collect_fee(fee)
+        self.guarded[owner] = {
+            "owner": owner,
+            "guardian": guardian,
+            "allow_list": list(allow_list),
+            "allowlist_active_height": self.height,
+            "frozen": False,
+            "window_balance_snapshot": self.balance(owner),
+            "window_start_height": self.height,
+            "window_outflow_total": 0,
+        }
+
+    def apply_guarded_cancel(self, account: bytes, guardian: bytes, kind: int, target: bytes) -> None:
+        if self.guarded_from == 0 or self.height < self.guarded_from:
+            refuse("GuardedNotOptedIn")
+        g = self.guarded.get(account)
+        if g is None:
+            refuse("GuardedNotOptedIn")
+        if g["guardian"] != guardian:
+            refuse("GuardedGuardianMismatch")
+        fee = FEE_GUARDED_CANCEL
+        # The guarded account pays: the guardian authorizes, the protected
+        # owner funds the protection (mirrors the Rust implementation).
+        if self.balance(account) < fee:
+            refuse("InsufficientBalance")
+        self.charge(account, fee)
+        self.collect_fee(fee)
+        if kind == 0:
+            # Canceling an exit is out of scope for the authority vectors:
+            # exits are not modeled in this reference. Refuse by name so the
+            # vector file cannot silently claim coverage it does not have.
+            refuse("GuardedUnknownTarget")
+        elif kind == 1:
+            entry = self.policies.get(target)
+            if entry is None:
+                refuse("UnknownPolicy")
+            entry.revoked = True
+        else:
+            refuse("GuardedUnknownTarget")
+
+    def apply_guarded_freeze(self, account: bytes, guardian: bytes, frozen: bool) -> None:
+        if self.guarded_from == 0 or self.height < self.guarded_from:
+            refuse("GuardedNotOptedIn")
+        g = self.guarded.get(account)
+        if g is None:
+            refuse("GuardedNotOptedIn")
+        if g["guardian"] != guardian:
+            refuse("GuardedGuardianMismatch")
+        fee = FEE_GUARDED_FREEZE
+        if self.balance(account) < fee:
+            refuse("InsufficientBalance")
+        self.charge(account, fee)
+        self.collect_fee(fee)
+        g["frozen"] = frozen
+
+    def apply_audit_anchor(self, anchorer: bytes, root: bytes, nonce: int) -> None:
+        fee = FEE_AUDIT_ANCHOR
+        if self.balance(anchorer) < fee:
+            refuse("InsufficientBalance")
+        self.charge(anchorer, fee)
+        self.collect_fee(fee)
+        key = anchorer + root + nonce.to_bytes(8, "little")
+        self.audit_anchors[key] = {
+            "anchorer": anchorer,
+            "root": root,
+            "height": self.height,
+            "nonce": nonce,
+        }
 
     # --- credit --------------------------------------------------------
     def apply_credit_open(
@@ -447,6 +606,10 @@ class State:
         deadline: int,
         nonce: int,
     ) -> None:
+        # Phase 2: at/after activation, legacy single-signature opens are
+        # refused; new positions must use the borrower-consented form.
+        if self.credit_consent_from != 0 and self.height >= self.credit_consent_from:
+            refuse("CreditTerms")
         if amount == 0:
             refuse("ZeroAmount")
         if collateral == 0:
@@ -471,6 +634,68 @@ class State:
             refuse("InsufficientBalance")
         # The collateral must be the borrower's own money, so it is checked
         # before the principal arrives.
+        if self.balance(borrower) < collateral:
+            refuse("InsufficientBalance")
+        self.charge(lender, amount + fee)
+        self.pay(borrower, amount)
+        self.charge(borrower, collateral)
+        self.credit_locked += collateral
+        self.collect_fee(fee)
+        self.positions[pos_id] = Position(
+            id=pos_id,
+            lender=lender,
+            borrower=borrower,
+            principal_sat=amount,
+            outstanding_sat=amount,
+            collateral_sat=collateral,
+            rate_bps_per_window=rate,
+            window_blocks=window,
+            opened_height=self.height,
+            deadline_height=deadline,
+            interest_settled_height=self.height,
+        )
+
+    def apply_credit_open_v2(
+        self,
+        lender: bytes,
+        borrower: bytes,
+        amount: int,
+        collateral: int,
+        rate: int,
+        window: int,
+        deadline: int,
+        nonce: int,
+    ) -> None:
+        # Phase 2: consent is structural here — a V2 step carries both the
+        # lender and the borrower, which is exactly what the two-signature
+        # rule means for a signature-free reference implementation.
+        if self.credit_consent_from == 0 or self.height < self.credit_consent_from:
+            refuse("CreditTerms")
+        if amount == 0:
+            refuse("ZeroAmount")
+        if collateral == 0:
+            refuse("ZeroAmount")
+        if window < CREDIT_MIN_WINDOW_BLOCKS:
+            refuse("CreditTerms")
+        if rate > MAX_CREDIT_RATE_BPS_PER_WINDOW:
+            refuse("CreditTerms")
+        if deadline <= self.height:
+            refuse("CreditTerms")
+        if deadline - self.height > CREDIT_MAX_TERM_BLOCKS:
+            refuse("CreditTerms")
+        required = amount
+        if collateral < required:
+            refuse("CreditUndercollateralised")
+        if collateral > required * CREDIT_MAX_COLLATERAL_MULTIPLE:
+            refuse("CreditTerms")
+        pos_id = credit_position_id(
+            lender, borrower, amount, collateral, rate, window, deadline, nonce
+        )
+        if pos_id in self.positions:
+            refuse("CreditPositionExists")
+        fee = FEE_CREDIT_OPEN_V2
+        if self.balance(lender) < amount + fee:
+            refuse("InsufficientBalance")
         if self.balance(borrower) < collateral:
             refuse("InsufficientBalance")
         self.charge(lender, amount + fee)
@@ -1057,6 +1282,242 @@ def run_scenarios() -> list:
     ]
     scenarios.append(("credit_default_after_deadline", state, steps))
 
+    # 7. Phase 2: borrower-consented opens with caps.
+    state = State()
+    state.credit_consent_from = 1
+    for a in ("lender", "borrower"):
+        state.credit(ADDR[a], 100_000_000)
+    steps = [
+        # A good V2 open: 1x collateral, bounded term, window >= 1.
+        {
+            "op": "credit_open_v2",
+            "lender": ADDR["lender"],
+            "borrower": ADDR["borrower"],
+            "amount": 1_000_000,
+            "collateral": 1_000_000,
+            "rate": 100,
+            "window": 10,
+            "deadline": 1_000,
+            "nonce": 1,
+        },
+        # Over-collateral: 3x the required 1x, above the 2x cap.
+        {
+            "op": "credit_open_v2",
+            "lender": ADDR["lender"],
+            "borrower": ADDR["borrower"],
+            "amount": 1_000_000,
+            "collateral": 3_000_000,
+            "rate": 100,
+            "window": 10,
+            "deadline": 1_000,
+            "nonce": 2,
+        },
+        # Far deadline: term exceeds the cap.
+        {
+            "op": "credit_open_v2",
+            "lender": ADDR["lender"],
+            "borrower": ADDR["borrower"],
+            "amount": 1_000_000,
+            "collateral": 1_000_000,
+            "rate": 100,
+            "window": 10,
+            "deadline": 500_000,
+            "nonce": 3,
+        },
+        # Zero window: below the minimum.
+        {
+            "op": "credit_open_v2",
+            "lender": ADDR["lender"],
+            "borrower": ADDR["borrower"],
+            "amount": 1_000_000,
+            "collateral": 1_000_000,
+            "rate": 100,
+            "window": 0,
+            "deadline": 1_000,
+            "nonce": 4,
+        },
+        # The legacy single-signature open is refused once consent activates.
+        {
+            "op": "credit_open",
+            "lender": ADDR["lender"],
+            "borrower": ADDR["borrower"],
+            "amount": 1_000_000,
+            "collateral": 1_000_000,
+            "rate": 100,
+            "window": 10,
+            "deadline": 1_000,
+            "nonce": 5,
+        },
+        # A repayment against the V2 position works normally.
+        {
+            "op": "credit_repay",
+            "position": 0,
+            "borrower": ADDR["borrower"],
+            "amount": 100_000,
+        },
+    ]
+    scenarios.append(("credit_consent_v2", state, steps))
+
+    # 8. Phase 3: guarded accounts.
+    state = State()
+    state.guarded_from = 1
+    for a in ("owner", "agent", "recipient", "stranger"):
+        state.credit(ADDR[a], 100_000_000)
+    gpolicy = Policy(
+        network_id="srct/mini",
+        agent_id=derive_agent_id("srct/mini", ROLE_MACHINE, ADDR["owner"]),
+        owner=ADDR["owner"],
+        role=ROLE_MACHINE,
+        per_tx_max_sat=10_000_000,
+        window_blocks=100,
+        cumulative_max_sat=200_000_000,
+        allowed_recipients=[ADDR["recipient"]],
+        allowed_services=[],
+        not_before_height=15,
+        expires_at_height=100,
+    )
+    steps = [
+        # Opt in: guardian must differ from the owner.
+        {
+            "op": "guarded_optin",
+            "owner": ADDR["owner"],
+            "guardian": ADDR["stranger"],
+            "allow_list": [ADDR["recipient"]],
+        },
+        # A second opt-in for the same account is refused.
+        {
+            "op": "guarded_optin",
+            "owner": ADDR["owner"],
+            "guardian": ADDR["stranger"],
+            "allow_list": [ADDR["recipient"]],
+        },
+        # A self-guardian is refused.
+        {
+            "op": "guarded_optin",
+            "owner": ADDR["stranger"],
+            "guardian": ADDR["stranger"],
+            "allow_list": [],
+        },
+        # A grant that ignores the activation delay is refused
+        # (published at height 4, not_before 4 < 4 + 10).
+        {
+            "op": "policy",
+            "policy": Policy(
+                network_id="srct/mini",
+                agent_id=derive_agent_id("srct/mini", ROLE_MACHINE, ADDR["owner"]),
+                owner=ADDR["owner"],
+                role=ROLE_MACHINE,
+                per_tx_max_sat=10_000_000,
+                window_blocks=100,
+                cumulative_max_sat=200_000_000,
+                allowed_recipients=[ADDR["recipient"]],
+                allowed_services=[],
+                not_before_height=4,
+                expires_at_height=100,
+            ),
+            "spender": ADDR["agent"],
+            "owner": ADDR["owner"],
+        },
+        # A delayed grant publishes fine.
+        {
+            "op": "policy",
+            "policy": gpolicy,
+            "spender": ADDR["agent"],
+            "owner": ADDR["owner"],
+        },
+        # A spend before the allow-list delay is refused.
+        {
+            "op": "spend",
+            "policy_hash": gpolicy.hash(),
+            "spender": ADDR["agent"],
+            "nonce": 1,
+            "recipient": ADDR["recipient"],
+            "amount": 6_000_000,
+            "service": None,
+        },
+        # Skip past the delay.
+        {"op": "advance", "to": 20},
+        # A spend inside the cap applies.
+        {
+            "op": "spend",
+            "policy_hash": gpolicy.hash(),
+            "spender": ADDR["agent"],
+            "nonce": 1,
+            "recipient": ADDR["recipient"],
+            "amount": 6_000_000,
+            "service": None,
+        },
+        # A second spend that would breach the 10%-of-snapshot window cap.
+        {
+            "op": "spend",
+            "policy_hash": gpolicy.hash(),
+            "spender": ADDR["agent"],
+            "nonce": 2,
+            "recipient": ADDR["recipient"],
+            "amount": 6_000_000,
+            "service": None,
+        },
+        # The guardian freezes the account.
+        {
+            "op": "guarded_freeze",
+            "account": ADDR["owner"],
+            "guardian": ADDR["stranger"],
+            "frozen": True,
+        },
+        # Frozen: even an in-cap spend is refused.
+        {
+            "op": "spend",
+            "policy_hash": gpolicy.hash(),
+            "spender": ADDR["agent"],
+            "nonce": 2,
+            "recipient": ADDR["recipient"],
+            "amount": 1_000,
+            "service": None,
+        },
+        # Unfreeze, then the in-cap spend applies.
+        {
+            "op": "guarded_freeze",
+            "account": ADDR["owner"],
+            "guardian": ADDR["stranger"],
+            "frozen": False,
+        },
+        {
+            "op": "spend",
+            "policy_hash": gpolicy.hash(),
+            "spender": ADDR["agent"],
+            "nonce": 2,
+            "recipient": ADDR["recipient"],
+            "amount": 1_000,
+            "service": None,
+        },
+        # The guardian cancels the grant (kind=1, target=grant hash).
+        {
+            "op": "guarded_cancel",
+            "account": ADDR["owner"],
+            "guardian": ADDR["stranger"],
+            "kind": 1,
+            "target": gpolicy.hash().hex(),
+        },
+        # A cancelled grant no longer spends.
+        {
+            "op": "spend",
+            "policy_hash": gpolicy.hash(),
+            "spender": ADDR["agent"],
+            "nonce": 3,
+            "recipient": ADDR["recipient"],
+            "amount": 1_000,
+            "service": None,
+        },
+        # Anchoring an audit root always works.
+        {
+            "op": "audit_anchor",
+            "anchorer": ADDR["stranger"],
+            "root": "ab" * 32,
+            "nonce": 1,
+        },
+    ]
+    scenarios.append(("guarded_accounts", state, steps))
+
     return scenarios
 
 
@@ -1125,6 +1586,7 @@ def apply_step(state: State, step: dict) -> None:
             as_bytes(step["recipient"]),
             step["amount"],
             as_bytes(step["service"]) if step.get("service") else None,
+            as_bytes(step["guardian"]) if step.get("guardian") else None,
         )
     elif op == "credit_open":
         state.apply_credit_open(
@@ -1153,6 +1615,42 @@ def apply_step(state: State, step: dict) -> None:
         state.apply_credit_default(
             as_bytes(state.position_ids[step["position"]]),
             as_bytes(step["actor"]),
+        )
+    elif op == "credit_open_v2":
+        state.apply_credit_open_v2(
+            as_bytes(step["lender"]),
+            as_bytes(step["borrower"]),
+            step["amount"],
+            step["collateral"],
+            step["rate"],
+            step["window"],
+            step["deadline"],
+            step["nonce"],
+        )
+    elif op == "guarded_optin":
+        state.apply_guarded_optin(
+            as_bytes(step["owner"]),
+            as_bytes(step["guardian"]),
+            [as_bytes(a) for a in step["allow_list"]],
+        )
+    elif op == "guarded_cancel":
+        state.apply_guarded_cancel(
+            as_bytes(step["account"]),
+            as_bytes(step["guardian"]),
+            step["kind"],
+            bytes.fromhex(step["target"]),
+        )
+    elif op == "guarded_freeze":
+        state.apply_guarded_freeze(
+            as_bytes(step["account"]),
+            as_bytes(step["guardian"]),
+            bool(step["frozen"]),
+        )
+    elif op == "audit_anchor":
+        state.apply_audit_anchor(
+            as_bytes(step["anchorer"]),
+            bytes.fromhex(step["root"]),
+            step["nonce"],
         )
     elif op == "advance":
         state.height = step["to"]
@@ -1195,6 +1693,20 @@ def snapshot(state: State) -> dict:
             }
             for _, p in sorted(state.positions.items())
         ],
+        "guarded": [
+            {
+                "owner": role_of(g["owner"]),
+                "guardian": role_of(g["guardian"]),
+                "allow_list": [role_of(a) for a in sorted(g["allow_list"])],
+                "allowlist_active_height": g["allowlist_active_height"],
+                "frozen": g["frozen"],
+                "window_balance_snapshot": g["window_balance_snapshot"],
+                "window_start_height": g["window_start_height"],
+                "window_outflow_total": g["window_outflow_total"],
+            }
+            for _, g in sorted(state.guarded.items())
+        ],
+        "audit_anchors": len(state.audit_anchors),
     }
 
 
@@ -1230,7 +1742,9 @@ def build_vectors() -> dict:
                     state.applied.add(signature)
                 except Refused as r:
                     outcome = {"ok": False, "error": r.error}
-            if step["op"] == "credit_open" and len(state.positions) > before:
+            if step["op"] in ("credit_open", "credit_open_v2") and len(
+                state.positions
+            ) > before:
                 state.position_ids.append(
                     list(sorted(state.positions.keys()))[len(state.positions) - 1]
                 )
@@ -1241,14 +1755,21 @@ def build_vectors() -> dict:
             # increment it.
             if step["op"] != "advance":
                 state.height += 1
-        out.append(
-            {
-                "name": name,
-                "funding": funding,
-                "steps": recorded,
-                "final": snapshot(state),
+        scenario_out = {
+            "name": name,
+            "funding": funding,
+            "steps": recorded,
+            "final": snapshot(state),
+        }
+        # Activation heights for Phase 2/3 rules. Old scenarios carry none
+        # (everything stays 0 = inactive); new scenarios opt in explicitly so
+        # both implementations enable the same rules at the same heights.
+        if state.credit_consent_from != 0 or state.guarded_from != 0:
+            scenario_out["config"] = {
+                "credit_consent_from": state.credit_consent_from,
+                "guarded_from": state.guarded_from,
             }
-        )
+        out.append(scenario_out)
     return {
         "version": 1,
         "description": (
@@ -1270,6 +1791,8 @@ def step_out(step: dict) -> dict:
             out[k] = json_policy(v)
         elif isinstance(v, bytes):
             out[k] = role_of(v)
+        elif isinstance(v, list):
+            out[k] = [role_of(x) if isinstance(x, bytes) else x for x in v]
         else:
             out[k] = v
     return out

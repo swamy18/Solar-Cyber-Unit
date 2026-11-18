@@ -81,6 +81,38 @@ pub struct L2Config {
     /// Extra maturity blocks for large exits. Wired from
     /// `NetworkParams::large_exit_extra_delay_blocks`.
     pub large_exit_extra_delay_blocks: u64,
+    /// First L1 height at which CreditOpenV2 (borrower-consented) is required.
+    /// `0` means never. Wired from `NetworkParams::credit_consent_activation_height`.
+    pub credit_consent_activation_height: u64,
+    /// Maximum collateral as a multiple of required collateral (e.g. 2 = max 2x).
+    /// `0` means no cap (pre-activation behavior).
+    pub credit_max_collateral_multiple: u64,
+    /// Maximum term in blocks (deadline_height - height). `0` means no cap.
+    pub credit_max_term_blocks: u64,
+    /// Minimum window_blocks. `0` means no minimum (pre-activation behavior).
+    pub credit_min_window_blocks: u64,
+    /// First L1 height at which guarded accounts may be created (Phase 3).
+    /// `0` means never.
+    pub guarded_activation_height: u64,
+    /// Grant-activation delay D for guarded accounts (blocks).
+    pub guarded_grant_delay_blocks: u64,
+    /// Maximum grant lifetime for guarded accounts (blocks).
+    pub guarded_max_grant_lifetime_blocks: u64,
+    /// Balance-relative outflow cap in basis points per window.
+    pub guarded_outflow_cap_bps: u64,
+    /// Outflow window length in blocks.
+    pub guarded_outflow_window_blocks: u64,
+    /// Guarded-exit delay D (blocks), shared with L1 consensus. A guarded
+    /// exit may only be cancelled while `tip < queued_height + D`, and a
+    /// guarded L1 claim must prove the record against a block at or after
+    /// `queued_height + D`. Must equal
+    /// `NetworkParams::guarded_exit_delay_blocks` (wired by the node); the
+    /// two sides sharing one constant is what makes the cancel/claim race
+    /// decide deterministically by block order.
+    pub guarded_exit_delay_blocks: u64,
+    /// Single-spend amount above which a guarded account needs the guardian's
+    /// co-signature on the spend. `0` means never required (tier disabled).
+    pub guarded_approval_threshold_sat: u64,
 }
 
 impl L2Config {
@@ -119,6 +151,19 @@ impl L2Config {
                 "large exit threshold and delay must be set together",
             ));
         }
+        // Guarded caps: basis points are a fraction of 10_000; anything above
+        // is nonsense. Zero disables each guarded feature (pre-activation).
+        if self.guarded_outflow_cap_bps > 10_000 {
+            return Err(L2Error::BadConfig(
+                "guarded outflow cap exceeds 100 percent",
+            ));
+        }
+        // Cap/window pairing: a cap with no window (or vice versa) is a half-rule.
+        if (self.guarded_outflow_cap_bps == 0) != (self.guarded_outflow_window_blocks == 0) {
+            return Err(L2Error::BadConfig(
+                "guarded outflow cap and window must be set together",
+            ));
+        }
         Ok(())
     }
 
@@ -136,6 +181,17 @@ impl L2Config {
             max_exit_per_owner_window_sat: 0,
             large_exit_threshold_sat: 0,
             large_exit_extra_delay_blocks: 0,
+            credit_consent_activation_height: 0,
+            credit_max_collateral_multiple: 0,
+            credit_max_term_blocks: 0,
+            credit_min_window_blocks: 0,
+            guarded_activation_height: 0,
+            guarded_grant_delay_blocks: 0,
+            guarded_max_grant_lifetime_blocks: 0,
+            guarded_outflow_cap_bps: 0,
+            guarded_outflow_window_blocks: 0,
+        guarded_exit_delay_blocks: 0,
+        guarded_approval_threshold_sat: 0,
         }
     }
 
@@ -155,6 +211,17 @@ impl L2Config {
             max_exit_per_owner_window_sat: 0,
             large_exit_threshold_sat: 0,
             large_exit_extra_delay_blocks: 0,
+            credit_consent_activation_height: 0,
+            credit_max_collateral_multiple: 0,
+            credit_max_term_blocks: 0,
+            credit_min_window_blocks: 0,
+            guarded_activation_height: 0,
+            guarded_grant_delay_blocks: 0,
+            guarded_max_grant_lifetime_blocks: 0,
+            guarded_outflow_cap_bps: 0,
+            guarded_outflow_window_blocks: 0,
+        guarded_exit_delay_blocks: 0,
+        guarded_approval_threshold_sat: 0,
         }
     }
 }

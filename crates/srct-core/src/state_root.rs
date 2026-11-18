@@ -68,6 +68,12 @@ pub const POLICY_LEAF_TAG: u8 = 0x05;
 /// as anything else.
 pub const CREDIT_LEAF_TAG: u8 = 0x06;
 
+/// Guarded-account leaves (Phase 3): an opt-in protected account record,
+/// committed under the same state root. Tag 0x07 is the first free tag after
+/// 0x03-0x06. A distinct tag so a guarded record can never be reinterpreted
+/// as any other leaf kind.
+pub const GUARDED_LEAF_TAG: u8 = 0x07;
+
 /// The leaf for one credit position.
 ///
 /// Commits to the position id, the two parties, the principal, the outstanding
@@ -106,6 +112,13 @@ pub fn credit_position_leaf(
     ])
 }
 
+/// Guarded-account leaf (Phase 3): commits the pre-hashed record bytes under
+/// tag 0x07. The caller hashes the record fields (see
+/// `GuardedAccount::leaf`); this function applies the domain tag.
+pub fn guarded_account_leaf(record_bytes: &[u8]) -> Hash {
+    sha256(&[&[GUARDED_LEAF_TAG], record_bytes])
+}
+
 /// The leaf for one published spending policy.
 ///
 /// Commits to the policy's own hash (which commits to the owner's signed grant
@@ -134,13 +147,41 @@ pub fn policy_leaf(
 }
 
 /// The leaf for one queued exit: owner, per-owner nonce, amount, destination,
-/// prepaid release fee and the L1 height that queued it.
+/// prepaid release fee, the L1 height that queued it, and whether the owner
+/// was guarded at queue time.
 ///
 /// Every field is fixed-width and little-endian where numeric, so two records
 /// differing in one digit cannot collide by concatenation. The leaf commits to
 /// the *queue-time* facts only: maturity and release are judged by consensus
-/// against the chain, never by this hash.
+/// against the chain, never by this hash. The trailing guarded byte (always
+/// present post-activation) lets L1 distinguish guarded exits without L2
+/// state: a guarded exit can only be proven with the guarded leaf, and an
+/// unguarded one only with the unguarded leaf.
 pub fn exit_record_leaf(
+    owner: &Address,
+    nonce: u64,
+    amount_sat: u64,
+    destination: &Address,
+    exit_fee_sat: u64,
+    queued_height: u64,
+    guarded: bool,
+) -> Hash {
+    sha256(&[
+        &[EXIT_LEAF_TAG],
+        owner,
+        &nonce.to_le_bytes(),
+        &amount_sat.to_le_bytes(),
+        destination,
+        &exit_fee_sat.to_le_bytes(),
+        &queued_height.to_le_bytes(),
+        &[u8::from(guarded)],
+    ])
+}
+
+/// The pre-guarded exit leaf, byte-identical to every exit leaf committed
+/// before guarded accounts activated. Used only to verify claims whose queue
+/// block predates activation; post-activation leaves always carry the flag.
+pub fn exit_record_leaf_v7(
     owner: &Address,
     nonce: u64,
     amount_sat: u64,

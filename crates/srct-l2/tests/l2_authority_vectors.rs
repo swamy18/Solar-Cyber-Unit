@@ -20,8 +20,10 @@ use srct_core::agent::{AgentId, AgentRole, SpendPolicy, POLICY_VERSION};
 use srct_core::bls_checkpoint::{BlsPublicKey, MockBls, ValidatorSet};
 use srct_core::hash::{Address, Hash};
 use srct_core::l2::{
-    AgentSpendPayload, CreditCollateralPayload, CreditDefaultPayload, CreditOpenPayload,
-    CreditRepayPayload, L2Payload, L2Transaction, PolicyPayload, PolicyRevokePayload,
+    AgentSpendPayload, AuditAnchorPayload, CreditCollateralPayload, CreditDefaultPayload,
+    CreditOpenPayload, CreditOpenV2Payload, CreditRepayPayload, GuardedCancelPayload,
+    GuardedFreezePayload, GuardedOptInPayload, L2Payload, L2Transaction, PolicyPayload,
+    PolicyRevokePayload,
 };
 use srct_core::wallet::Wallet;
 use srct_l2::{L2Config, L2Error, L2State};
@@ -115,6 +117,18 @@ fn error_name(e: &L2Error) -> &'static str {
         L2Error::CreditInterestOverflow => "CreditInterestOverflow",
         L2Error::CreditRepaymentExceedsDebt { .. } => "CreditRepaymentExceedsDebt",
         L2Error::InvalidContractSpec(_) => "InvalidContractSpec",
+        L2Error::AccountFrozen => "AccountFrozen",
+        L2Error::GrantDelayNotSatisfied => "GrantDelayNotSatisfied",
+        L2Error::GrantLifetimeExceeded => "GrantLifetimeExceeded",
+        L2Error::GuardedDestinationNotAllowed => "GuardedDestinationNotAllowed",
+        L2Error::GuardedOutflowCapped { .. } => "GuardedOutflowCapped",
+        L2Error::GuardedGuardianMustDiffer => "GuardedGuardianMustDiffer",
+        L2Error::GuardedAlreadyOptedIn => "GuardedAlreadyOptedIn",
+        L2Error::GuardedNotOptedIn => "GuardedNotOptedIn",
+        L2Error::GuardedGuardianMismatch => "GuardedGuardianMismatch",
+        L2Error::GuardedUnknownTarget => "GuardedUnknownTarget",
+        L2Error::GuardedCancelWindowClosed => "GuardedCancelWindowClosed",
+        L2Error::GuardedApprovalRequired => "GuardedApprovalRequired",
     }
 }
 
@@ -250,7 +264,25 @@ fn the_authority_and_credit_rules_match_the_independent_implementation() {
             .get("name")
             .and_then(Value::as_str)
             .expect("a name");
-        let mut state = L2State::new(L2Config::mini());
+        let mut config = L2Config::mini();
+        // Per-scenario consensus config (Phase 2/3 activation + caps). Old
+        // scenarios carry no "config" and run with everything disabled,
+        // preserving their original expectations.
+        if let Some(cfg) = scenario.get("config") {
+            let on = |key: &str| cfg.get(key).and_then(Value::as_u64).unwrap_or(0);
+            config.credit_consent_activation_height = on("credit_consent_from");
+            config.credit_max_collateral_multiple = 2;
+            config.credit_max_term_blocks = 100_000;
+            config.credit_min_window_blocks = 1;
+            config.guarded_activation_height = on("guarded_from");
+            config.guarded_grant_delay_blocks = 10;
+            config.guarded_max_grant_lifetime_blocks = 10_000;
+            config.guarded_outflow_cap_bps = 1_000;
+            config.guarded_outflow_window_blocks = 100;
+            config.guarded_exit_delay_blocks = 10;
+            config.guarded_approval_threshold_sat = 100_000_000;
+        }
+        let mut state = L2State::new(config);
         let funding = scenario
             .get("funding")
             .and_then(Value::as_object)
@@ -382,6 +414,120 @@ fn the_authority_and_credit_rules_match_the_independent_implementation() {
                         wallet_for(step.get("actor").and_then(Value::as_str).expect("an actor"));
                     let payload = CreditDefaultPayload::build(&actor, positions[index]).unwrap();
                     L2Transaction::new(L2Payload::CreditDefault(payload))
+                }
+                "credit_open_v2" => {
+                    let lender = wallet_for(
+                        step.get("lender")
+                            .and_then(Value::as_str)
+                            .expect("a lender"),
+                    );
+                    let borrower = wallet_for(
+                        step.get("borrower")
+                            .and_then(Value::as_str)
+                            .expect("a borrower"),
+                    );
+                    let payload = CreditOpenV2Payload::build(
+                        &lender,
+                        &borrower,
+                        u64_field(step, "amount"),
+                        u64_field(step, "collateral"),
+                        u64_field(step, "rate") as u32,
+                        u64_field(step, "window"),
+                        u64_field(step, "deadline"),
+                        u64_field(step, "nonce"),
+                    )
+                    .unwrap();
+                    let id = payload.derived_position_id();
+                    opened = Some(id);
+                    L2Transaction::new(L2Payload::CreditOpenV2(payload))
+                }
+                "guarded_optin" => {
+                    let owner = wallet_for(
+                        step.get("owner").and_then(Value::as_str).expect("an owner"),
+                    );
+                    let allow: Vec<srct_core::hash::Address> = step
+                        .get("allow_list")
+                        .and_then(Value::as_array)
+                        .expect("an allow-list")
+                        .iter()
+                        .map(|r| addr_for(r.as_str().expect("a role")))
+                        .collect();
+                    let payload = GuardedOptInPayload::build(
+                        &owner,
+                        addr_for(
+                            step.get("guardian")
+                                .and_then(Value::as_str)
+                                .expect("a guardian"),
+                        ),
+                        allow,
+                        10,
+                        10_000,
+                        1_000,
+                        100,
+                        1,
+                    )
+                    .unwrap();
+                    L2Transaction::new(L2Payload::GuardedOptIn(payload))
+                }
+                "guarded_cancel" => {
+                    let guardian = wallet_for(
+                        step.get("guardian")
+                            .and_then(Value::as_str)
+                            .expect("a guardian"),
+                    );
+                    let kind = u64_field(step, "kind") as u8;
+                    let target = hash_bytes(step.get("target").expect("a target"));
+                    let payload = GuardedCancelPayload::build(
+                        &guardian,
+                        addr_for(
+                            step.get("account")
+                                .and_then(Value::as_str)
+                                .expect("an account"),
+                        ),
+                        kind,
+                        target,
+                        1,
+                    )
+                    .unwrap();
+                    L2Transaction::new(L2Payload::GuardedCancel(payload))
+                }
+                "guarded_freeze" => {
+                    let guardian = wallet_for(
+                        step.get("guardian")
+                            .and_then(Value::as_str)
+                            .expect("a guardian"),
+                    );
+                    let frozen = step
+                        .get("frozen")
+                        .and_then(Value::as_bool)
+                        .expect("a frozen flag");
+                    let payload = GuardedFreezePayload::build(
+                        &guardian,
+                        addr_for(
+                            step.get("account")
+                                .and_then(Value::as_str)
+                                .expect("an account"),
+                        ),
+                        frozen,
+                        1,
+                    )
+                    .unwrap();
+                    L2Transaction::new(L2Payload::GuardedFreeze(payload))
+                }
+                "audit_anchor" => {
+                    let anchorer = wallet_for(
+                        step.get("anchorer")
+                            .and_then(Value::as_str)
+                            .expect("an anchorer"),
+                    );
+                    let payload = AuditAnchorPayload::build(
+                        &anchorer,
+                        hash_bytes(step.get("root").expect("a root")),
+                        0,
+                        u64_field(step, "nonce"),
+                    )
+                    .unwrap();
+                    L2Transaction::new(L2Payload::AuditAnchor(payload))
                 }
                 "advance" => {
                     height = u64_field(step, "to");
@@ -567,6 +713,85 @@ fn the_authority_and_credit_rules_match_the_independent_implementation() {
                 "{name}: the position state differs"
             );
         }
+
+        // Guarded accounts, if the vector file carries any.
+        if let Some(expected_guarded) = scenario.get("final").and_then(|f| f.get("guarded")) {
+            let expected_guarded = expected_guarded
+                .as_array()
+                .expect("the guarded accounts");
+            let got = state.guarded_accounts();
+            assert_eq!(
+                got.len(),
+                expected_guarded.len(),
+                "{name}: a different number of guarded accounts"
+            );
+            for expected_g in expected_guarded {
+                let owner = addr_for(
+                    expected_g
+                        .get("owner")
+                        .and_then(Value::as_str)
+                        .expect("an owner"),
+                );
+                let g = got
+                    .iter()
+                    .find(|g| g.owner == owner)
+                    .unwrap_or_else(|| panic!("{name}: the guarded account is missing"));
+                assert_eq!(
+                    g.guardian,
+                    addr_for(
+                        expected_g
+                            .get("guardian")
+                            .and_then(Value::as_str)
+                            .expect("a guardian")
+                    ),
+                    "{name}: the guardian differs"
+                );
+                let mut want_allow: Vec<String> = expected_g
+                    .get("allow_list")
+                    .and_then(Value::as_array)
+                    .expect("an allow-list")
+                    .iter()
+                    .map(|r| r.as_str().expect("a role").to_string())
+                    .collect();
+                want_allow.sort();
+                // Compare by address bytes instead of role names.
+                let want_addrs: Vec<srct_core::hash::Address> = want_allow
+                    .iter()
+                    .map(|r| addr_for(r))
+                    .collect();
+                let mut have_addrs = g.allow_list.clone();
+                have_addrs.sort();
+                let mut want_sorted = want_addrs;
+                want_sorted.sort();
+                assert_eq!(
+                    have_addrs, want_sorted,
+                    "{name}: the guarded allow-list differs"
+                );
+                assert_eq!(
+                    g.allowlist_active_height,
+                    u64_field(expected_g, "allowlist_active_height"),
+                    "{name}: the allow-list activation differs"
+                );
+                assert_eq!(
+                    g.frozen,
+                    expected_g
+                        .get("frozen")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                    "{name}: the freeze flag differs"
+                );
+            }
+        }
+        if let Some(expected_anchors) = scenario
+            .get("final")
+            .and_then(|f| f.get("audit_anchors"))
+        {
+            assert_eq!(
+                state.audit_anchor_count(),
+                expected_anchors.as_u64().expect("a count") as usize,
+                "{name}: the audit anchor count differs"
+            );
+        }
     }
 }
 
@@ -613,6 +838,8 @@ fn the_vector_file_is_current() {
         "credit_open_collateralise_repay",
         "credit_refusals",
         "credit_default_after_deadline",
+        "credit_consent_v2",
+        "guarded_accounts",
     ] {
         assert!(
             names.contains_key(expected),

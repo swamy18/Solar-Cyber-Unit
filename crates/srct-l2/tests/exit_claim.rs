@@ -21,7 +21,8 @@ use srct_core::mempool::Mempool;
 use srct_core::params::NetworkParams;
 use srct_core::tx::{OutPoint, Output};
 use srct_core::wallet::Wallet;
-use srct_l2::{ChainL2, DepositParams, L2Config, L2Genesis};
+use srct_l2::{ChainL2, DepositParams, L2Config, L2Genesis, L2State};
+use srct_l2::L2Error;
 
 use srct_core::bls_checkpoint::{MockBls, ValidatorSet};
 
@@ -219,6 +220,7 @@ fn build_claim(
         queued_height: q,
         inputs: vec![sink_op],
         proof,
+        proof_height: None,
     }
 }
 
@@ -449,6 +451,7 @@ fn exit_with_inexact_funding_is_refused() {
         queued_height: q,
         inputs: vec![sink_op],
         proof,
+        proof_height: None,
     };
     assert!(claim.verify_proof(&chain.block_at(q).unwrap().l2_state_root.unwrap()));
     let h = chain.height() + 1;
@@ -496,6 +499,7 @@ fn pre_activation_claim_is_refused() {
             leaf_count: 1,
             siblings: vec![],
         },
+        proof_height: None,
     };
     let h = chain.height() + 1;
     let mut pool = Mempool::new(1 << 20);
@@ -632,4 +636,367 @@ fn duplicate_claims_in_one_block_are_refused() {
         "duplicate claims must be refused as a double-spend, got {res:?}"
     );
     assert!(!chain.exit_released(&me, 1));
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3: guarded exit cancel/claim ordering
+// ---------------------------------------------------------------------------
+//
+// The cancel/claim race: a guarded exit cancelled inside the delay window has
+// no spendable L1 proof afterwards (no post-delay block commits the record),
+// and cancelling at/after the window is refused outright. Both directions are
+// decided by block order alone.
+
+use srct_core::l2::{GuardedCancelPayload, GuardedOptInPayload};
+
+const GUARDED_D: u64 = 10;
+
+fn guarded_params() -> NetworkParams {
+    let mut p = NetworkParams::mini();
+    p.guarded_activation_height = 1;
+    p.guarded_exit_delay_blocks = GUARDED_D;
+    p
+}
+
+fn guarded_l2config() -> L2Config {
+    let mut c = L2Config::mini();
+    c.exit_activation_height = 1;
+    c.guarded_activation_height = 1;
+    c.guarded_exit_delay_blocks = GUARDED_D;
+    c.guarded_grant_delay_blocks = 10;
+    c.guarded_max_grant_lifetime_blocks = 100_000;
+    c.guarded_outflow_cap_bps = 10_000;
+    c.guarded_outflow_window_blocks = 1_000_000;
+    c
+}
+
+fn guarded_view(chain: &Chain) -> ChainL2 {
+    let params = guarded_params();
+    ChainL2::replay(
+        chain,
+        guarded_l2config(),
+        &L2Genesis::for_params(&params),
+        DepositParams::for_params(&params),
+        &MockBls,
+    )
+    .unwrap()
+}
+
+/// Apply L2 transactions in a fresh block carrying the correctly computed
+/// post-state root, then resync the caller's L2 view to the new tip.
+fn mine_l2_block(chain: &mut Chain, l2: &mut ChainL2, miner: Address, txs: Vec<L2Transaction>) -> u64 {
+    let h = chain.height() + 1;
+    let vals = ValidatorSet::new(vec![]);
+    let mut sim = l2.state().clone();
+    sim.advance_block(h);
+    for tx in &txs {
+        sim.apply(tx, h, &vals, &MockBls)
+            .unwrap_or_else(|e| panic!("guarded test L2 tx must apply, got {e:?}"));
+    }
+    let root = sim.committed_root();
+    let b = chain
+        .mine_block_with_l2_root(miner, vec![], txs, root, ts(h), None, DEFAULT_MAX_ATTEMPTS)
+        .unwrap();
+    chain.submit(b).unwrap();
+    *l2 = guarded_view(chain);
+    h
+}
+
+/// A guarded world: owner holds a matured deposit and is opted into guarded
+/// mode with `guardian` watching and `dest` allow-listed.
+struct GuardedWorld {
+    chain: Chain,
+    l2: ChainL2,
+    owner: Wallet,
+    guardian: Wallet,
+    dest: Address,
+    params: NetworkParams,
+}
+
+fn guarded_world() -> GuardedWorld {
+    let params = guarded_params();
+    let owner = wallet(21);
+    let guardian = wallet(22);
+    let dest = addr(&wallet(23));
+    let me = addr(&owner);
+    let mut chain = Chain::new(params.clone()).unwrap();
+    for h in 1..=12u64 {
+        let b = chain.mine_block(me, vec![], ts(h)).unwrap();
+        chain.submit(b).unwrap();
+    }
+    let (op, value) = chain
+        .utxo()
+        .iter()
+        .filter(|(_, u)| u.out.address == me && chain.is_mature(u.height))
+        .map(|(op, u)| (op, u.out.value))
+        .next()
+        .expect("a mature coinbase");
+    let fee = fee_for(&chain, 1, 2);
+    let tx = owner
+        .build_tx(
+            &[op],
+            vec![
+                Output {
+                    value: SINK_VALUE,
+                    address: params.l2_deposit_sink(),
+                },
+                Output {
+                    value: value - SINK_VALUE - fee,
+                    address: me,
+                },
+            ],
+            fee,
+        )
+        .unwrap();
+    let d = chain.height() + 1;
+    let b = chain.mine_block(me, vec![tx], ts(d)).unwrap();
+    chain.submit(b).unwrap();
+    // Mature the deposit (mini finality depth 20).
+    while chain.height() < d + 20 {
+        let h = chain.height() + 1;
+        let b = chain.mine_block(me, vec![], ts(h)).unwrap();
+        chain.submit(b).unwrap();
+    }
+    let mut l2 = guarded_view(&chain);
+    // Opt in: owner guarded, guardian watching, dest allow-listed.
+    // Cap is 100% here so the integration flow (cancel/claim ordering) is
+    // what is under test; the cap itself is pinned by the vectors suite and
+    // the allow-list unit test below.
+    let opt = GuardedOptInPayload::build(&owner, addr(&guardian), vec![dest], 10, 100_000, 10_000, 1_000_000, 1)
+        .unwrap();
+    let h_opt = mine_l2_block(
+        &mut chain,
+        &mut l2,
+        me,
+        vec![L2Transaction::new(L2Payload::GuardedOptIn(opt))],
+    );
+    // Advance past the allow-list activation delay (D = 10): guarded exits
+    // queued before the list is active are refused by name.
+    while chain.height() < h_opt + GUARDED_D {
+        let h = chain.height() + 1;
+        let b = chain.mine_block(me, vec![], ts(h)).unwrap();
+        chain.submit(b).unwrap();
+    }
+    l2 = guarded_view(&chain);
+    GuardedWorld {
+        chain,
+        l2,
+        owner,
+        guardian,
+        dest,
+        params,
+    }
+}
+
+/// A guarded exit queued before its allow-list is active is refused outright.
+#[test]
+fn guarded_exit_before_allowlist_activation_is_refused() {
+    let cfg = guarded_l2config();
+    let mut s = L2State::new(cfg);
+    let owner = wallet(41);
+    let guardian = wallet(42);
+    let dest = addr(&wallet(43));
+    s.credit(addr(&owner), 10_000_000_000).unwrap();
+    // Opt in at height 1 with a 10-block activation delay.
+    let opt = GuardedOptInPayload::build(&owner, addr(&guardian), vec![dest], 10, 100_000, 1_000, 1_000_000, 1)
+        .unwrap();
+    let vals = ValidatorSet::new(vec![]);
+    s.apply(&L2Transaction::new(L2Payload::GuardedOptIn(opt)), 1, &vals, &MockBls)
+        .unwrap();
+    // Immediate queue (height 2 < 1 + 10) is refused by name.
+    let q = L2Transaction::new(L2Payload::ExitQueue(
+        ExitQueuePayload::build(&owner, 1, 1_000_000, dest, EXIT_FEE).unwrap(),
+    ));
+    assert!(matches!(
+        s.apply(&q, 2, &vals, &MockBls),
+        Err(L2Error::GuardedDestinationNotAllowed)
+    ));
+    // After the delay the same queue applies.
+    assert!(s.apply(&q, 12, &vals, &MockBls).is_ok());
+}
+
+fn guarded_queue(w: &mut GuardedWorld, nonce: u64, amount: u64) -> u64 {
+    let tx = L2Transaction::new(L2Payload::ExitQueue(
+        srct_core::l2::ExitQueuePayload::build(&w.owner, nonce, amount, w.dest, EXIT_FEE).unwrap(),
+    ));
+    let me = addr(&w.owner);
+    mine_l2_block(&mut w.chain, &mut w.l2, me, vec![tx])
+}
+
+fn guarded_cancel(w: &mut GuardedWorld, nonce: u64) -> Result<(), String> {
+    let mut target = [0u8; 32];
+    target[..8].copy_from_slice(&nonce.to_le_bytes());
+    let tx = L2Transaction::new(L2Payload::GuardedCancel(
+        GuardedCancelPayload::build(&w.guardian, addr(&w.owner), 0, target, nonce).unwrap(),
+    ));
+    let me = addr(&w.owner);
+    let h = w.chain.height() + 1;
+    let vals = ValidatorSet::new(vec![]);
+    let mut sim = w.l2.state().clone();
+    sim.advance_block(h);
+    match sim.apply(&tx, h, &vals, &MockBls) {
+        Ok(_) => {
+            let root = sim.committed_root();
+            let b = w
+                .chain
+                .mine_block_with_l2_root(me, vec![], vec![tx], root, ts(h), None, DEFAULT_MAX_ATTEMPTS)
+                .unwrap();
+            w.chain.submit(b).map_err(|e| e.to_string())?;
+            w.l2 = guarded_view(&w.chain);
+            Ok(())
+        }
+        Err(e) => Err(format!("{e:?}")),
+    }
+}
+
+/// A guarded exit cancelled inside the delay window cannot be claimed with a
+/// post-delay proof: no block at or after the window commits the record, so
+/// no valid guarded proof exists. Cancelling at or after the window is
+/// refused by name instead.
+#[test]
+fn guarded_cancel_inside_window_blocks_later_claims() {
+    let mut w = guarded_world();
+    let me = addr(&w.owner);
+    let l1_fee = 10 * (16_000 + 1_000 + 2 * 250);
+    let amount = SINK_VALUE - EXIT_FEE - l1_fee;
+    let q = guarded_queue(&mut w, 1, amount);
+    // Cancel inside the window: queued + D is still in the future.
+    assert!(q + GUARDED_D > w.chain.height() + 1);
+    guarded_cancel(&mut w, 1).expect("in-window cancel must apply");
+    // The record is gone from L2: no proof can be built against any root.
+    let l2h = guarded_view(&w.chain);
+    assert!(
+        l2h.state().exit_proof(&me, 1).is_none(),
+        "a cancelled exit must have no spendable proof"
+    );
+    // A cancel at/after the delay window is refused outright.
+    let q2 = guarded_queue(&mut w, 2, amount);
+    while w.chain.height() < q2 + GUARDED_D {
+        let h = w.chain.height() + 1;
+        let b = w.chain.mine_block(me, vec![], ts(h)).unwrap();
+        w.chain.submit(b).unwrap();
+        w.l2 = guarded_view(&w.chain);
+    }
+    let late = guarded_cancel(&mut w, 2);
+    assert!(
+        matches!(late, Err(ref e) if e.contains("GuardedCancelWindowClosed")),
+        "late cancel must be refused by name, got {late:?}"
+    );
+}
+
+/// A guarded exit that was never cancelled IS claimable — with a proof
+/// against a block at or after `queued + D`. A queue-block-only claim
+/// (no `proof_height`) is refused for a guarded exit: the guarded leaf does
+/// not match the legacy proof.
+#[test]
+fn guarded_exit_claimable_with_post_delay_proof() {
+    let mut w = guarded_world();
+    let me = addr(&w.owner);
+    let l1_fee = 10 * (16_000 + 1_000 + 2 * 250);
+    let amount = SINK_VALUE - EXIT_FEE - l1_fee;
+    let q = guarded_queue(&mut w, 1, amount);
+    // Advance past BOTH the guard delay and L2 maturity (mini depth 20),
+    // committing the L2 root in every block so post-delay proofs exist.
+    while w.chain.height() < q + 25 {
+        mine_l2_block(&mut w.chain, &mut w.l2, me, vec![]);
+    }
+    let sink_op = w
+        .chain
+        .utxo()
+        .outputs_for_address(&w.params.l2_deposit_sink())
+        .into_iter()
+        .next()
+        .expect("a sink output funds the claim")
+        .0;
+    // Legacy shape first: no proof height. The proof below is built against
+    // the queue block's own committed root (the exact root check_claim will
+    // verify against), so the ONLY reason it can fail is the leaf format:
+    // the committed record is guarded, the legacy proof is not.
+    let sim_q = ChainL2::replay_to(
+        &w.chain,
+        guarded_l2config(),
+        &L2Genesis::for_params(&w.params),
+        DepositParams::for_params(&w.params),
+        &MockBls,
+        q,
+    )
+    .expect("replay to the queue block works");
+    let legacy_proof = sim_q
+        .state()
+        .exit_proof(&me, 1)
+        .expect("a proof builds while the record is pending");
+    let legacy = ExitClaim {
+        owner: me,
+        nonce: 1,
+        amount_sat: amount,
+        destination: w.dest,
+        claimant: me,
+        exit_fee_sat: EXIT_FEE,
+        queued_height: q,
+        inputs: vec![sink_op],
+        proof: legacy_proof,
+        proof_height: None,
+    };
+    let h = w.chain.height() + 1;
+    let mut pool = Mempool::new(1 << 20);
+    let refused = w.chain.mine_from_pool_with_exits(
+        &mut pool,
+        me,
+        ts(h),
+        vec![],
+        vec![legacy],
+        None,
+    );
+    assert!(
+        matches!(refused, Err(ref e) if e.to_string().contains("exit proof does not verify")),
+        "guarded exit without a guarded proof must be refused, got {refused:?}"
+    );
+    // Guarded shape: prove against a post-delay block that still commits it.
+    let h_proof = w.chain.height();
+    assert!(
+        h_proof >= q + GUARDED_D,
+        "the proof block must clear the delay window"
+    );
+    assert!(w.chain.block_at(h_proof).unwrap().l2_state_root.is_some());
+    let tip2 = guarded_view(&w.chain);
+    let proof = tip2
+        .state()
+        .exit_proof(&me, 1)
+        .expect("the pending guarded exit must prove against a post-delay root");
+    // The refused legacy claim spent nothing: the sink output is still there.
+    let sink_op2 = w
+        .chain
+        .utxo()
+        .outputs_for_address(&w.params.l2_deposit_sink())
+        .into_iter()
+        .next()
+        .expect("the failed claim spent nothing")
+        .0;
+    let claim = ExitClaim {
+        owner: me,
+        nonce: 1,
+        amount_sat: amount,
+        destination: w.dest,
+        claimant: me,
+        exit_fee_sat: EXIT_FEE,
+        queued_height: q,
+        inputs: vec![sink_op2],
+        proof,
+        proof_height: Some(h_proof),
+    };
+    let h2 = w.chain.height() + 1;
+    let mut pool2 = Mempool::new(1 << 20);
+    let res = w.chain.mine_from_pool_with_exits(
+        &mut pool2,
+        me,
+        ts(h2),
+        vec![],
+        vec![claim],
+        None,
+    );
+    assert!(
+        res.is_ok(),
+        "guarded claim with a post-delay proof must be accepted, got {res:?}"
+    );
+    assert!(w.chain.exit_released(&me, 1));
 }

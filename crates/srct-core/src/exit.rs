@@ -21,7 +21,9 @@
 use crate::error::{Error, Result};
 use crate::hash::{sha512_dom, Address, Hash, Hash512};
 use crate::ser::{Reader, Writer};
-use crate::state_root::{exit_record_leaf, verify_inclusion, InclusionProof};
+use crate::state_root::{
+    exit_record_leaf, exit_record_leaf_v7, verify_inclusion, InclusionProof,
+};
 use crate::tx::{OutPoint, GAS_PER_INPUT, GAS_PER_OUTPUT, GAS_TX_BASE};
 
 /// Domain tag for the claim identity. Covers every consensus field, so a
@@ -74,6 +76,16 @@ pub struct ExitClaim {
     /// Inclusion proof of the exit record against the state root committed
     /// in the `queued_height` block.
     pub proof: InclusionProof,
+    /// Guarded-exit proof height (Phase 3, Decision 36).
+    ///
+    /// `None` is the legacy path: the proof is verified against the queue
+    /// block's committed root. `Some(h)` is the guarded path: the proof is
+    /// verified against block `h`'s committed root, and consensus requires
+    /// `h >= queued_height + D` (see `guarded_exit_delay_blocks`), so a
+    /// cancelled exit — removed from L2 state — has no block left to prove
+    /// against. Omitted from the wire when `None`, so legacy claims keep
+    /// their exact bytes and claim ids.
+    pub proof_height: Option<u64>,
 }
 
 impl ExitClaim {
@@ -100,8 +112,25 @@ impl ExitClaim {
     /// Verify the record proof against the root the queue block committed.
     /// Pure: needs only the root, not the chain. Every field the leaf commits
     /// to comes from `self` — a caller-supplied override of amount,
-    /// destination or fee fails here, not later.
+    /// destination or fee fails here, not later. This is the pre-guarded
+    /// (v7) leaf; post-activation claims use [`Self::verify_proof_v8`].
     pub fn verify_proof(&self, committed_root: &Hash) -> bool {
+        let leaf = exit_record_leaf_v7(
+            &self.owner,
+            self.nonce,
+            self.amount_sat,
+            &self.destination,
+            self.exit_fee_sat,
+            self.queued_height,
+        );
+        verify_inclusion(*committed_root, leaf, &self.proof)
+    }
+
+    /// Verify against a v8 (post-activation) root. `guarded` selects the leaf
+    /// variant: a guarded exit can only be proven with the guarded leaf and
+    /// an unguarded one only with the unguarded leaf, so the inclusion proof
+    /// itself binds which kind was committed — no flag needs trusting.
+    pub fn verify_proof_v8(&self, committed_root: &Hash, guarded: bool) -> bool {
         let leaf = exit_record_leaf(
             &self.owner,
             self.nonce,
@@ -109,6 +138,7 @@ impl ExitClaim {
             &self.destination,
             self.exit_fee_sat,
             self.queued_height,
+            guarded,
         );
         verify_inclusion(*committed_root, leaf, &self.proof)
     }
@@ -128,6 +158,11 @@ impl ExitClaim {
         }
         let proof = self.proof.serialize();
         w.u32le(proof.len() as u32).raw(&proof);
+        // Trailing optional proof height (Phase 3). Omitted when None so
+        // legacy claims keep their exact bytes and claim ids.
+        if let Some(h) = self.proof_height {
+            w.u64le(h);
+        }
         w.into_vec()
     }
 
@@ -169,6 +204,15 @@ impl ExitClaim {
         let mut pr = Reader::new(raw);
         let proof = InclusionProof::from_reader(&mut pr)?;
         pr.expect_end()?;
+        // Trailing optional proof height (Phase 3). Absent on every legacy
+        // claim; present only for guarded claims that must prove against a
+        // post-delay root.
+        let proof_height = if r.remaining() == 0 {
+            None
+        } else {
+            Some(r.u64le()?)
+        };
+        r.expect_end()?;
         Ok(ExitClaim {
             owner,
             nonce,
@@ -179,6 +223,7 @@ impl ExitClaim {
             queued_height,
             inputs,
             proof,
+            proof_height,
         })
     }
 }
@@ -224,6 +269,7 @@ mod tests {
                 leaf_count: 1,
                 siblings: vec![],
             },
+            proof_height: None,
         }
     }
 

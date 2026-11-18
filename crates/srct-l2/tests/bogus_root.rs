@@ -22,7 +22,7 @@ use srct_core::exit::ExitClaim;
 use srct_core::hash::Address;
 use srct_core::mempool::Mempool;
 use srct_core::params::NetworkParams;
-use srct_core::state_root::{exit_record_leaf, prove_inclusion, state_root};
+use srct_core::state_root::{exit_record_leaf_v7, prove_inclusion, state_root};
 use srct_core::tx::{OutPoint, Output};
 use srct_core::wallet::Wallet;
 use srct_l2::{ChainL2, DepositParams, L2Config, L2Genesis};
@@ -137,7 +137,7 @@ fn fabricated_root_exit_drains_sink_and_replays_as_unbacked() {
     let nonce = 1u64;
     let dest = thief;
     let q = chain.height() + 1;
-    let leaf = exit_record_leaf(&thief, nonce, amount, &dest, EXIT_FEE, q);
+    let leaf = exit_record_leaf_v7(&thief, nonce, amount, &dest, EXIT_FEE, q);
     let bogus_root = state_root(&[leaf]);
     let proof = prove_inclusion(&[leaf], 0).expect("one leaf proves itself");
 
@@ -182,6 +182,7 @@ fn fabricated_root_exit_drains_sink_and_replays_as_unbacked() {
         queued_height: q,
         inputs: vec![sink_op],
         proof,
+        proof_height: None,
     };
     assert!(claim.verify_proof(&bogus_root));
     let h = chain.height() + 1;

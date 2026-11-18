@@ -192,6 +192,10 @@ pub fn validate_signature(sig: &BlsSignature) -> Result<min_pk::Signature, BlsEr
 /// is the entire reason BLS is the right primitive for a 21-member committee.
 pub struct RealBls;
 
+/// Shared production verifier instance, for contexts (like [`Chain`]) that
+/// must name *which* verifier they use without carrying a fresh one around.
+pub static REAL_BLS: RealBls = RealBls;
+
 impl RealBls {
     /// Verify a single signature.
     pub fn verify(pk: &BlsPublicKey, message: &crate::hash::Hash, sig: &BlsSignature) -> bool {

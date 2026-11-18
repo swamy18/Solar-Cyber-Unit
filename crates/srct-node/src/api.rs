@@ -4436,6 +4436,11 @@ async fn guard_decide(State(state): State<ApiState>, Json(req): Json<GuardDecide
         if cap.audience != node_audience() {
             return deny("capability is scoped to another enforcing node");
         }
+        // High-assurance grants require a non-zero audience even on unscoped
+        // nodes: zero-audience stays legal only for legacy low-value grants.
+        if policy.requires_approval && cap.audience == [0u8; 32] {
+            return deny("high-assurance grant requires a non-zero audience");
+        }
         if height < policy.valid_from_height {
             return deny("grant not yet valid");
         }

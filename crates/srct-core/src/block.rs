@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::bls_checkpoint::Checkpoint;
 use crate::error::{Error, Result};
 use crate::exit::{ExitClaim, EXIT_CLAIM_MIN_ENCODED_LEN};
 use crate::hash::{sha256, sha512_dom, Hash, Hash512, DOM_BLOCK512, ZERO_HASH512};
@@ -166,6 +167,15 @@ pub struct Block {
     /// omitted when empty, so history is byte-identical.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub exit_claims: Vec<ExitClaim>,
+    /// Block-carried BLS checkpoint certificate (C1/N1 fix, Approach (ii)).
+    ///
+    /// Carries the full independently-verifiable certificate for a strictly
+    /// earlier height, enabling deterministic ancestry-derived binding
+    /// finality without P2P state. At most one per block. `None` for every
+    /// pre-activation block; the section is omitted when empty so history
+    /// stays byte-identical. BLS-only (no PQ sidecar) to bound block size.
+    #[serde(skip)]
+    pub checkpoint: Option<Checkpoint>,
 }
 
 impl Block {
@@ -206,6 +216,14 @@ impl Block {
                 let bytes = claim.serialize();
                 w.u32le(bytes.len() as u32).raw(&bytes);
             }
+        }
+        // Checkpoint section (C1/N1 Approach (ii)). Omitted entirely when
+        // empty, same discipline: pre-upgrade blocks keep exact bytes.
+        // At most one certificate; BLS-only (no PQ sidecar) to bound size.
+        if let Some(cp) = &self.checkpoint {
+            let bytes = cp.serialize();
+            w.u32le(1u32);
+            w.u32le(bytes.len() as u32).raw(&bytes);
         }
         w.into_vec()
     }
@@ -281,6 +299,12 @@ impl Block {
             // and consensus validation decides (it refuses a rootless L2
             // section post-activation, never a redundant root).
             if r.remaining() > 0 {
+                // Peek: exit-claim section or checkpoint section?
+                // Both start with a u32 count. Exit claims come first if both
+                // present. We try exit claims first; if the remaining bytes
+                // after a putative exit-claim section form a valid checkpoint
+                // section (or empty), accept. Simpler: checkpoint section is
+                // last, so parse exit claims, then checkpoint.
                 let k = r.u32le()? as usize;
                 if k == 0 {
                     return Err(Error::Malformed(
@@ -299,6 +323,35 @@ impl Block {
             }
         }
 
+        // Checkpoint section (C1/N1). Optional, last. At most one certificate.
+        let mut checkpoint = None;
+        if r.remaining() > 0 {
+            let n = r.u32le()? as usize;
+            if n == 0 {
+                return Err(Error::Malformed(
+                    "empty checkpoint section is not a canonical block encoding",
+                ));
+            }
+            if n != 1 {
+                return Err(Error::Malformed(
+                    "at most one checkpoint certificate per block",
+                ));
+            }
+            let len = r.u32le()? as usize;
+            if len == 0 || len > r.remaining() {
+                return Err(Error::Malformed("checkpoint length out of range"));
+            }
+            let bytes = r.fixed_slice(len)?;
+            let cp = Checkpoint::deserialize(bytes)?;
+            // BLS-only in blocks: sidecar would blow up block size.
+            if !cp.pq_sidecar.is_empty() {
+                return Err(Error::Malformed(
+                    "block-carried checkpoint must not carry PQ sidecar",
+                ));
+            }
+            checkpoint = Some(cp);
+        }
+
         r.expect_end()?;
         Ok(Block {
             header,
@@ -308,6 +361,7 @@ impl Block {
             l2_txs,
             l2_state_root,
             exit_claims,
+            checkpoint,
         })
     }
 
@@ -321,11 +375,12 @@ impl Block {
     /// claim stripped from the body no longer matches the header, exactly as
     /// for L2 transactions.
     pub fn merkle_root(&self) -> Hash {
-        merkle_root_with_l2(
+        merkle_root_with_checkpoint(
             &self.txs,
             &self.l2_txs,
             self.l2_state_root.as_ref(),
             &self.exit_claims,
+            self.checkpoint.as_ref(),
         )
     }
 
@@ -372,6 +427,11 @@ const LEAF_TAG_L2_ROOT: u8 = 0x03;
 /// transaction of either kind. `0x04` is sequential here; the L2 state tree's
 /// exit-record `0x04` is a different tree's tag, same precedent as above.
 const LEAF_TAG_EXIT_CLAIM: u8 = 0x04;
+/// Block-carried checkpoint certificate leaves (C1/N1 Approach (ii)): the
+/// certificate's canonical bytes under their own tag. `0x05` is sequential;
+/// stripping a checkpoint changes the root exactly like stripping any other
+/// section.
+const LEAF_TAG_CHECKPOINT: u8 = 0x05;
 
 /// Binary merkle root with domain-separated leaves and internal nodes.
 /// Odd nodes are duplicated, Bitcoin-style. SPEC.md §2.
@@ -384,24 +444,39 @@ pub fn merkle_root(txs: &[Transaction]) -> Hash {
 }
 
 /// Merkle root over a block body that may carry L2 transactions (Decision 6),
-/// a committed L2 state root and exit claims (approved P1).
+/// a committed L2 state root and exit claims (approved P1), plus an optional
+/// block-carried checkpoint certificate (C1/N1 Approach (ii)).
 ///
 /// L1 leaves come first in block order, then L2 leaves in block order, then
-/// the root leaf, then claim leaves in block order. When there is nothing but
-/// L1 to commit this is **bit-identical** to `merkle_root(l1)`, which is the
-/// property that keeps `genesis_block()` and every existing block unchanged.
-/// Every leaf kind uses its own domain tag, so a body cannot be presented
-/// with one kind where another is expected.
+/// the root leaf, then claim leaves in block order, then the checkpoint leaf
+/// if present. When there is nothing but L1 to commit this is **bit-identical**
+/// to `merkle_root(l1)`, which is the property that keeps `genesis_block()`
+/// and every existing block unchanged. Every leaf kind uses its own domain
+/// tag, so a body cannot be presented with one kind where another is expected.
 pub fn merkle_root_with_l2(
     l1: &[Transaction],
     l2: &[L2Transaction],
     root: Option<&Hash>,
     claims: &[ExitClaim],
 ) -> Hash {
-    if l2.is_empty() && root.is_none() && claims.is_empty() {
+    merkle_root_with_checkpoint(l1, l2, root, claims, None)
+}
+
+/// Full merkle root including an optional block-carried checkpoint certificate.
+/// Prefer `merkle_root_with_l2` when no checkpoint is carried; this entry point
+/// exists so checkpoint-carrying blocks commit to the certificate.
+pub fn merkle_root_with_checkpoint(
+    l1: &[Transaction],
+    l2: &[L2Transaction],
+    root: Option<&Hash>,
+    claims: &[ExitClaim],
+    checkpoint: Option<&crate::bls_checkpoint::Checkpoint>,
+) -> Hash {
+    if l2.is_empty() && root.is_none() && claims.is_empty() && checkpoint.is_none() {
         return merkle_root(l1);
     }
-    let mut leaves: Vec<Hash> = Vec::with_capacity(l1.len() + l2.len() + claims.len() + 1);
+    let mut leaves: Vec<Hash> =
+        Vec::with_capacity(l1.len() + l2.len() + claims.len() + 2);
     leaves.extend(l1.iter().map(|t| sha256(&[&[LEAF_TAG], &t.serialize()])));
     leaves.extend(l2.iter().map(|t| sha256(&[&[LEAF_TAG_L2], &t.serialize()])));
     if let Some(r) = root {
@@ -412,6 +487,9 @@ pub fn merkle_root_with_l2(
             .iter()
             .map(|c| sha256(&[&[LEAF_TAG_EXIT_CLAIM], &c.serialize()])),
     );
+    if let Some(cp) = checkpoint {
+        leaves.push(sha256(&[&[LEAF_TAG_CHECKPOINT], &cp.serialize()]));
+    }
     merkle_from_leaves(leaves)
 }
 
@@ -481,6 +559,7 @@ pub fn genesis_block(difficulty: u128) -> Block {
         l2_txs: Vec::new(),
         l2_state_root: None,
         exit_claims: Vec::new(),
+        checkpoint: None,
     }
 }
 

@@ -18,9 +18,10 @@ use srct_core::hash::{Address, Hash};
 use srct_core::l2::{
     ClaimTaskPayload, CreditOpenPayload, ExitQueuePayload, L2Payload, L2Transaction, L2TxType,
     PolicyPayload, PostTaskPayload, SettlePayload, SubmitResultPayload, Verdict, L2_TX_AGENT_SPEND,
-    L2_TX_CLAIM, L2_TX_CREDIT_COLLATERAL, L2_TX_CREDIT_DEFAULT, L2_TX_CREDIT_OPEN,
-    L2_TX_CREDIT_REPAY, L2_TX_DISPUTE, L2_TX_EXIT_QUEUE, L2_TX_POLICY, L2_TX_POLICY_REVOKE,
-    L2_TX_POST, L2_TX_SETTLE, L2_TX_SUBMIT, MIN_EXIT_FEE_SAT,
+    L2_TX_AUDIT_ANCHOR, L2_TX_CLAIM, L2_TX_CREDIT_COLLATERAL, L2_TX_CREDIT_DEFAULT,
+    L2_TX_CREDIT_OPEN, L2_TX_CREDIT_OPEN_V2, L2_TX_CREDIT_REPAY, L2_TX_DISPUTE, L2_TX_EXIT_QUEUE,
+    L2_TX_GUARDED_CANCEL, L2_TX_GUARDED_FREEZE, L2_TX_GUARDED_OPTIN, L2_TX_POLICY,
+    L2_TX_POLICY_REVOKE, L2_TX_POST, L2_TX_SETTLE, L2_TX_SUBMIT, MIN_EXIT_FEE_SAT,
 };
 use srct_core::state_root::verify_inclusion;
 use srct_core::wallet::Wallet;
@@ -48,6 +49,11 @@ fn thirteen_l2_transaction_types_exist_with_the_credit_types_last() {
         L2_TX_CREDIT_COLLATERAL,
         L2_TX_CREDIT_REPAY,
         L2_TX_CREDIT_DEFAULT,
+        L2_TX_CREDIT_OPEN_V2,
+        L2_TX_GUARDED_OPTIN,
+        L2_TX_GUARDED_CANCEL,
+        L2_TX_GUARDED_FREEZE,
+        L2_TX_AUDIT_ANCHOR,
     ];
     let mut accepted = Vec::new();
     for byte in 0u8..=255 {
@@ -64,8 +70,8 @@ fn thirteen_l2_transaction_types_exist_with_the_credit_types_last() {
     }
     assert_eq!(
         accepted.len(),
-        13,
-        "exactly thirteen L2 transaction types exist"
+        18,
+        "exactly eighteen L2 transaction types exist (13 original + CreditOpenV2 + 4 guarded/audit)"
     );
     assert_eq!(
         accepted,
@@ -83,10 +89,15 @@ fn thirteen_l2_transaction_types_exist_with_the_credit_types_last() {
             L2TxType::CreditCollateral,
             L2TxType::CreditRepay,
             L2TxType::CreditDefault,
+            L2TxType::CreditOpenV2,
+            L2TxType::GuardedOptIn,
+            L2TxType::GuardedCancel,
+            L2TxType::GuardedFreeze,
+            L2TxType::AuditAnchor,
         ]
     );
     assert_eq!(L2TxType::ExitQueue.fee_sat(), 2_000);
-    assert_eq!(known.len(), 13);
+    assert_eq!(known.len(), 18);
 }
 
 /// An exit-queue payload round-trips through the envelope and its signature

@@ -93,7 +93,9 @@
             "spends": 2
           }
         ],
-        "positions": []
+        "positions": [],
+        "guarded": [],
+        "audit_anchors": 0
       }
     },
     {
@@ -287,7 +289,9 @@
             "spends": 1
           }
         ],
-        "positions": []
+        "positions": [],
+        "guarded": [],
+        "audit_anchors": 0
       }
     },
     {
@@ -443,7 +447,9 @@
             "spends": 0
           }
         ],
-        "positions": []
+        "positions": [],
+        "guarded": [],
+        "audit_anchors": 0
       }
     },
     {
@@ -520,7 +526,9 @@
             "collateral_sat": 1500000,
             "state": "Open"
           }
-        ]
+        ],
+        "guarded": [],
+        "audit_anchors": 0
       }
     },
     {
@@ -643,7 +651,9 @@
             "collateral_sat": 1000000,
             "state": "Open"
           }
-        ]
+        ],
+        "guarded": [],
+        "audit_anchors": 0
       }
     },
     {
@@ -716,7 +726,392 @@
             "collateral_sat": 0,
             "state": "Defaulted"
           }
-        ]
+        ],
+        "guarded": [],
+        "audit_anchors": 0
+      }
+    },
+    {
+      "name": "credit_consent_v2",
+      "funding": {
+        "lender": 100000000,
+        "borrower": 100000000
+      },
+      "steps": [
+        {
+          "op": "credit_open_v2",
+          "lender": "lender",
+          "borrower": "borrower",
+          "amount": 1000000,
+          "collateral": 1000000,
+          "rate": 100,
+          "window": 10,
+          "deadline": 1000,
+          "nonce": 1,
+          "outcome": {
+            "ok": true
+          }
+        },
+        {
+          "op": "credit_open_v2",
+          "lender": "lender",
+          "borrower": "borrower",
+          "amount": 1000000,
+          "collateral": 3000000,
+          "rate": 100,
+          "window": 10,
+          "deadline": 1000,
+          "nonce": 2,
+          "outcome": {
+            "ok": false,
+            "error": "CreditTerms"
+          }
+        },
+        {
+          "op": "credit_open_v2",
+          "lender": "lender",
+          "borrower": "borrower",
+          "amount": 1000000,
+          "collateral": 1000000,
+          "rate": 100,
+          "window": 10,
+          "deadline": 500000,
+          "nonce": 3,
+          "outcome": {
+            "ok": false,
+            "error": "CreditTerms"
+          }
+        },
+        {
+          "op": "credit_open_v2",
+          "lender": "lender",
+          "borrower": "borrower",
+          "amount": 1000000,
+          "collateral": 1000000,
+          "rate": 100,
+          "window": 0,
+          "deadline": 1000,
+          "nonce": 4,
+          "outcome": {
+            "ok": false,
+            "error": "CreditTerms"
+          }
+        },
+        {
+          "op": "credit_open",
+          "lender": "lender",
+          "borrower": "borrower",
+          "amount": 1000000,
+          "collateral": 1000000,
+          "rate": 100,
+          "window": 10,
+          "deadline": 1000,
+          "nonce": 5,
+          "outcome": {
+            "ok": false,
+            "error": "CreditTerms"
+          }
+        },
+        {
+          "op": "credit_repay",
+          "position": 0,
+          "borrower": "borrower",
+          "amount": 100000,
+          "outcome": {
+            "ok": true
+          }
+        }
+      ],
+      "final": {
+        "balances": {
+          "lender": 99098000,
+          "borrower": 99898000
+        },
+        "funded_total": 200000000,
+        "burned": 2000,
+        "pscb": 2000,
+        "credit_locked": 1000000,
+        "conserved": true,
+        "policies": [],
+        "positions": [
+          {
+            "position_id": "33bf6fc9a95a60a9aefff7c049476c4e8d01aef4d18611a28e4bd9b0cc85b6b1",
+            "lender": "lender",
+            "borrower": "borrower",
+            "principal_sat": 1000000,
+            "outstanding_sat": 900000,
+            "interest_paid_sat": 0,
+            "collateral_sat": 1000000,
+            "state": "Open"
+          }
+        ],
+        "guarded": [],
+        "audit_anchors": 0
+      },
+      "config": {
+        "credit_consent_from": 1,
+        "guarded_from": 0
+      }
+    },
+    {
+      "name": "guarded_accounts",
+      "funding": {
+        "stranger": 100000000,
+        "owner": 100000000,
+        "agent": 100000000,
+        "recipient": 100000000
+      },
+      "steps": [
+        {
+          "op": "guarded_optin",
+          "owner": "owner",
+          "guardian": "stranger",
+          "allow_list": [
+            "recipient"
+          ],
+          "outcome": {
+            "ok": true
+          }
+        },
+        {
+          "op": "guarded_optin",
+          "owner": "owner",
+          "guardian": "stranger",
+          "allow_list": [
+            "recipient"
+          ],
+          "outcome": {
+            "ok": false,
+            "error": "Replay"
+          }
+        },
+        {
+          "op": "guarded_optin",
+          "owner": "stranger",
+          "guardian": "stranger",
+          "allow_list": [],
+          "outcome": {
+            "ok": false,
+            "error": "GuardedGuardianMustDiffer"
+          }
+        },
+        {
+          "op": "policy",
+          "policy": {
+            "network_id": "srct/mini",
+            "agent_id": "0fc2db1cc89b28f7fd01df380eebf8918d863bb3",
+            "owner": "owner",
+            "role": 1,
+            "per_tx_max_sat": 10000000,
+            "window_blocks": 100,
+            "cumulative_max_sat": 200000000,
+            "allowed_recipients": [
+              "recipient"
+            ],
+            "allowed_services": [],
+            "not_before_height": 4,
+            "expires_at_height": 100,
+            "revoked": false,
+            "parent_agent_id": null
+          },
+          "spender": "agent",
+          "owner": "owner",
+          "outcome": {
+            "ok": false,
+            "error": "GrantDelayNotSatisfied"
+          }
+        },
+        {
+          "op": "policy",
+          "policy": {
+            "network_id": "srct/mini",
+            "agent_id": "0fc2db1cc89b28f7fd01df380eebf8918d863bb3",
+            "owner": "owner",
+            "role": 1,
+            "per_tx_max_sat": 10000000,
+            "window_blocks": 100,
+            "cumulative_max_sat": 200000000,
+            "allowed_recipients": [
+              "recipient"
+            ],
+            "allowed_services": [],
+            "not_before_height": 15,
+            "expires_at_height": 100,
+            "revoked": false,
+            "parent_agent_id": null
+          },
+          "spender": "agent",
+          "owner": "owner",
+          "outcome": {
+            "ok": true
+          }
+        },
+        {
+          "op": "spend",
+          "policy_hash": "34c70abc3a91064ec93a68255602ecb17c903695118ffcf6d02c63647488a384",
+          "spender": "agent",
+          "nonce": 1,
+          "recipient": "recipient",
+          "amount": 6000000,
+          "service": null,
+          "outcome": {
+            "ok": false,
+            "error": "PolicyWindow"
+          }
+        },
+        {
+          "op": "advance",
+          "to": 20,
+          "outcome": {
+            "ok": true
+          }
+        },
+        {
+          "op": "spend",
+          "policy_hash": "34c70abc3a91064ec93a68255602ecb17c903695118ffcf6d02c63647488a384",
+          "spender": "agent",
+          "nonce": 1,
+          "recipient": "recipient",
+          "amount": 6000000,
+          "service": null,
+          "outcome": {
+            "ok": true
+          }
+        },
+        {
+          "op": "spend",
+          "policy_hash": "34c70abc3a91064ec93a68255602ecb17c903695118ffcf6d02c63647488a384",
+          "spender": "agent",
+          "nonce": 2,
+          "recipient": "recipient",
+          "amount": 6000000,
+          "service": null,
+          "outcome": {
+            "ok": false,
+            "error": "GuardedOutflowCapped"
+          }
+        },
+        {
+          "op": "guarded_freeze",
+          "account": "owner",
+          "guardian": "stranger",
+          "frozen": true,
+          "outcome": {
+            "ok": true
+          }
+        },
+        {
+          "op": "spend",
+          "policy_hash": "34c70abc3a91064ec93a68255602ecb17c903695118ffcf6d02c63647488a384",
+          "spender": "agent",
+          "nonce": 2,
+          "recipient": "recipient",
+          "amount": 1000,
+          "service": null,
+          "outcome": {
+            "ok": false,
+            "error": "AccountFrozen"
+          }
+        },
+        {
+          "op": "guarded_freeze",
+          "account": "owner",
+          "guardian": "stranger",
+          "frozen": false,
+          "outcome": {
+            "ok": true
+          }
+        },
+        {
+          "op": "spend",
+          "policy_hash": "34c70abc3a91064ec93a68255602ecb17c903695118ffcf6d02c63647488a384",
+          "spender": "agent",
+          "nonce": 2,
+          "recipient": "recipient",
+          "amount": 1000,
+          "service": null,
+          "outcome": {
+            "ok": true
+          }
+        },
+        {
+          "op": "guarded_cancel",
+          "account": "owner",
+          "guardian": "stranger",
+          "kind": 1,
+          "target": "34c70abc3a91064ec93a68255602ecb17c903695118ffcf6d02c63647488a384",
+          "outcome": {
+            "ok": true
+          }
+        },
+        {
+          "op": "spend",
+          "policy_hash": "34c70abc3a91064ec93a68255602ecb17c903695118ffcf6d02c63647488a384",
+          "spender": "agent",
+          "nonce": 3,
+          "recipient": "recipient",
+          "amount": 1000,
+          "service": null,
+          "outcome": {
+            "ok": false,
+            "error": "PolicyRevoked"
+          }
+        },
+        {
+          "op": "audit_anchor",
+          "anchorer": "stranger",
+          "root": "abababababababababababababababababababababababababababababababab",
+          "nonce": 1,
+          "outcome": {
+            "ok": true
+          }
+        }
+      ],
+      "final": {
+        "balances": {
+          "stranger": 99998000,
+          "owner": 93985000,
+          "agent": 100000000,
+          "recipient": 106001000
+        },
+        "funded_total": 400000000,
+        "burned": 8000,
+        "pscb": 8000,
+        "credit_locked": 0,
+        "conserved": true,
+        "policies": [
+          {
+            "policy_hash": "34c70abc3a91064ec93a68255602ecb17c903695118ffcf6d02c63647488a384",
+            "agent_id": "0fc2db1cc89b28f7fd01df380eebf8918d863bb3",
+            "spender": "agent",
+            "revoked": true,
+            "window_start_height": 5,
+            "spent_in_window_sat": 6001000,
+            "total_spent_sat": 6001000,
+            "last_nonce": 2,
+            "spends": 2
+          }
+        ],
+        "positions": [],
+        "guarded": [
+          {
+            "owner": "owner",
+            "guardian": "stranger",
+            "allow_list": [
+              "recipient"
+            ],
+            "allowlist_active_height": 1,
+            "frozen": false,
+            "window_balance_snapshot": 99998000,
+            "window_start_height": 1,
+            "window_outflow_total": 6001000
+          }
+        ],
+        "audit_anchors": 1
+      },
+      "config": {
+        "credit_consent_from": 0,
+        "guarded_from": 1
       }
     }
   ]

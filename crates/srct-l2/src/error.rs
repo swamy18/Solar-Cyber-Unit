@@ -188,6 +188,38 @@ pub enum L2Error {
     /// deadline, or a dispute window that reaches the deadline. Refused by
     /// name at construction rather than panicked.
     InvalidContractSpec(&'static str),
+    /// A guarded account is frozen: all outflows are halted pending guardian
+    /// review or unfreeze.
+    AccountFrozen,
+    /// A guarded-account grant was published before its activation delay
+    /// elapsed (`not_before_height < publish_height + D`).
+    GrantDelayNotSatisfied,
+    /// A guarded-account grant exceeds the maximum lifetime
+    /// (`expires_at - not_before > max_grant_lifetime`).
+    GrantLifetimeExceeded,
+    /// An exit or AgentSpend from a guarded account names a destination that
+    /// is not in the active allow-list.
+    GuardedDestinationNotAllowed,
+    /// Guarded opt-in names the owner itself as guardian. The guardian must
+    /// be independent of the owner, or the guard is theatre.
+    GuardedGuardianMustDiffer,
+    /// This account already opted into guarded mode.
+    GuardedAlreadyOptedIn,
+    /// This account is not in guarded mode.
+    GuardedNotOptedIn,
+    /// The signer is not the account's registered guardian.
+    GuardedGuardianMismatch,
+    /// GuardedCancel names an unknown target kind (only 0 = exit, 1 = grant).
+    GuardedUnknownTarget,
+    /// A guarded exit cancel arrived at or after the delay window: the exit
+    /// is claimable now, and cancelling would race an L1 proof against a
+    /// post-delay root.
+    GuardedCancelWindowClosed,
+    /// A guarded spend at or above the human-approval tier lacks the
+    /// guardian's co-signature on the identical terms.
+    GuardedApprovalRequired,
+    /// A guarded-account outflow would exceed the balance-relative window cap.
+    GuardedOutflowCapped { allowed: u64, requested: u64 },
 }
 
 impl fmt::Display for L2Error {
@@ -299,6 +331,39 @@ impl fmt::Display for L2Error {
             L2Error::InvalidContractSpec(why) => {
                 write!(f, "invalid service-contract spec: {why}")
             }
+            L2Error::AccountFrozen => write!(f, "guarded account is frozen"),
+            L2Error::GrantDelayNotSatisfied => {
+                write!(f, "guarded grant activation delay not satisfied")
+            }
+            L2Error::GrantLifetimeExceeded => {
+                write!(f, "guarded grant exceeds maximum lifetime")
+            }
+            L2Error::GuardedDestinationNotAllowed => {
+                write!(f, "destination not in guarded allow-list")
+            }
+            L2Error::GuardedGuardianMustDiffer => {
+                write!(f, "guardian must differ from the owner")
+            }
+            L2Error::GuardedAlreadyOptedIn => {
+                write!(f, "account already opted into guarded mode")
+            }
+            L2Error::GuardedNotOptedIn => write!(f, "account is not guarded"),
+            L2Error::GuardedGuardianMismatch => {
+                write!(f, "signer is not the account guardian")
+            }
+            L2Error::GuardedUnknownTarget => {
+                write!(f, "guarded cancel names an unknown target kind")
+            }
+            L2Error::GuardedCancelWindowClosed => {
+                write!(f, "guarded exit cancel arrived after the delay window")
+            }
+            L2Error::GuardedApprovalRequired => {
+                write!(f, "guarded spend needs guardian co-signature")
+            }
+            L2Error::GuardedOutflowCapped { allowed, requested } => write!(
+                f,
+                "guarded outflow capped: {requested} requested, {allowed} allowed this window"
+            ),
         }
     }
 }

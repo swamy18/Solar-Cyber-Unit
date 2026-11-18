@@ -415,6 +415,12 @@ pub trait BlsVerifier: Send + Sync {
 /// Replace with a `blst`-backed implementation for production.
 pub struct MockBls;
 
+/// Shared mock verifier instance, for test chains that must name a verifier
+/// without threading one through every call. Never use in production code
+/// paths: anything it accepts must be re-checked with [`crate::bls::REAL_BLS`]
+/// before it can affect consensus.
+pub static MOCK_BLS: MockBls = MockBls;
+
 impl BlsVerifier for MockBls {
     fn verify_aggregate(
         &self,

@@ -526,13 +526,18 @@ mod tests {
         authority: Box<dyn GateAuthority>,
     ) -> GuardGate {
         let workload = [4u8; 32];
+        // High-assurance grants require a non-zero audience (Phase 1 rule), so
+        // the shared test gate always uses a scoped audience on both sides.
+        // Low-value grants admit with any matching audience, so this keeps
+        // those tests green while letting the approval test reach gating.
+        let aud = [0xAAu8; 32];
         let cap = Capability {
             policy_hash: policy.hash(),
             action_hash: derive_action_hash(preimage_sign),
             context_hash: derive_context_hash(&workload, 50),
             expiry_height: 60,
             nonce: 1,
-            audience: [0u8; 32],
+            audience: aud,
         };
         let signed = SignedCapability::issue(owner, &cap).unwrap();
         let approval = if approval {
@@ -567,7 +572,7 @@ mod tests {
             network_id: "srct/testnet".to_string(),
             height: 50,
             workload_id: workload,
-            node_audience: [0u8; 32],
+            node_audience: aud,
             escalate_to_approval: false,
         }
     }

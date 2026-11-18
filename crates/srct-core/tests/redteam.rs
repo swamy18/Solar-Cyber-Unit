@@ -103,6 +103,7 @@ fn handcraft(chain: &Chain, miner: Address, body: Vec<Transaction>, height: u64)
         l2_txs: Vec::new(),
         l2_state_root: None,
         exit_claims: Vec::new(),
+        checkpoint: None,
     }
 }
 

@@ -366,6 +366,37 @@ pub struct NetworkParams {
     /// funds can never be encumbered with no release. All shipped profiles
     /// carry `1` (active from the first block).
     pub exit_activation_height: u64,
+    /// First L1 height at which blocks may carry BLS checkpoint certificates
+    /// (C1/N1 fix, Approach (ii)). `0` means never: the checkpoint section is
+    /// refused below activation so history stays byte-identical. Must be a
+    /// multiple of `checkpoint_interval_blocks` when nonzero (same rule as
+    /// `finality_activation_height`). Testnet/mini carry a test value first;
+    /// mainnet stays `0` until explicit sign-off.
+    pub checkpoint_carry_activation_height: u64,
+    /// First L1 height at which L2 state roots are validated against
+    /// deterministic replay (C1/N1 fix). `0` means never (current behavior:
+    /// roots recorded but not enforced). Must be `0` or `>=
+    /// checkpoint_carry_activation_height` plus at least one checkpoint
+    /// interval, so binding history exists before root enforcement begins.
+    /// Testnet/mini first; mainnet stays `0` until explicit sign-off.
+    pub l2_root_validation_height: u64,
+    /// First L1 height at which CreditOpenV2 (borrower-consented) is required
+    /// for new credit positions (Phase 2 fix). `0` means never: the old
+    /// lender-only CreditOpen (0x19) remains accepted. At/after activation,
+    /// new positions must use 0x1D with both signatures and caps; old 0x19
+    /// still decodes for pre-activation replay. Testnet/mini first; mainnet
+    /// stays `0` until explicit sign-off.
+    pub credit_consent_activation_height: u64,
+    /// First L1 height at which guarded accounts may be created (Phase 3).
+    /// `0` means never. Testnet/mini first; mainnet stays `0` until sign-off.
+    pub guarded_activation_height: u64,
+    /// Guarded-exit delay D (blocks). Guarded exits may only be cancelled
+    /// while `tip < queued_height + D`, and a guarded L1 exit claim must
+    /// prove the record against a block at or after `queued_height + D`.
+    /// The two rules share this one chain-level constant so the cancel/claim
+    /// race has a deterministic winner by block order. `0` disables guarded
+    /// exits (keep with `guarded_activation_height` unset).
+    pub guarded_exit_delay_blocks: u64,
     /// Maximum total exit principal per `exit_window_blocks` window, in
     /// satoshis. The L2 deposit sink is a honeypot: without a window cap a
     /// single compromised key set drains it in one window. A refused queue
@@ -559,6 +590,13 @@ impl NetworkParams {
             // Exits active from genesis on mainnet — withdrawals work without a
             // committee, same as Bitcoin spends.
             exit_activation_height: 1,
+            // Block-carried checkpoints and L2 root validation stay off on
+            // mainnet until explicit sign-off (C1/N1 Approach (ii)).
+            checkpoint_carry_activation_height: 0,
+            l2_root_validation_height: 0,
+            credit_consent_activation_height: 0,
+            guarded_activation_height: 0,
+            guarded_exit_delay_blocks: 0,
             // PQ spend enforcement is off on mainnet until the post-quantum
             // launch decision sets a height.
             pq_activation_height: 0,
@@ -654,6 +692,13 @@ impl NetworkParams {
             // Exits are active from the first block on mini, so the queue →
             // mature → release loop is exercisable in tests.
             exit_activation_height: 1,
+            // Block-carried checkpoints and L2 root validation off by default
+            // on mini; C1/N1 tests enable them via custom profiles.
+            checkpoint_carry_activation_height: 0,
+            l2_root_validation_height: 0,
+            credit_consent_activation_height: 0,
+            guarded_activation_height: 0,
+            guarded_exit_delay_blocks: 0,
             // PQ enforcement off on mini; the migration tests build their own
             // profile with a nonzero activation height.
             pq_activation_height: 0,
@@ -727,6 +772,15 @@ impl NetworkParams {
             finality_activation_height: 20,
             // Exits are active from the first block on testnet, like mini.
             exit_activation_height: 1,
+            // Block-carried checkpoints and L2 root validation off by default
+            // on testnet; C1/N1 tests enable them via custom profiles.
+            // Mainnet-style activation (with real heights) is exercised in
+            // dedicated C1/N1 tests, not in the base profile.
+            checkpoint_carry_activation_height: 0,
+            l2_root_validation_height: 0,
+            credit_consent_activation_height: 0,
+            guarded_activation_height: 0,
+            guarded_exit_delay_blocks: 0,
             // PQ enforcement off on testnet too; activated by governance.
             pq_activation_height: 0,
             // PoUW active from height 1 on testnet: staging/integration proof
@@ -950,6 +1004,28 @@ impl NetworkParams {
             return Err(Error::Malformed(
                 "finality_activation_height must be a multiple of checkpoint_interval_blocks",
             ));
+        }
+        // Block-carried checkpoints (C1/N1): activation must align to the
+        // checkpoint interval, same rule as binding finality.
+        if self.checkpoint_carry_activation_height > 0
+            && self.checkpoint_carry_activation_height % self.checkpoint_interval_blocks != 0
+        {
+            return Err(Error::Malformed(
+                "checkpoint_carry_activation_height must be a multiple of checkpoint_interval_blocks",
+            ));
+        }
+        // L2 root validation requires checkpoint history to exist first.
+        if self.l2_root_validation_height > 0 {
+            if self.checkpoint_carry_activation_height == 0 {
+                return Err(Error::Malformed(
+                    "l2_root_validation_height requires checkpoint_carry_activation_height",
+                ));
+            }
+            if self.l2_root_validation_height < self.checkpoint_carry_activation_height {
+                return Err(Error::Malformed(
+                    "l2_root_validation_height must be at or after checkpoint_carry_activation_height",
+                ));
+            }
         }
         Ok(())
     }

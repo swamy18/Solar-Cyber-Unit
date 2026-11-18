@@ -524,3 +524,91 @@ fn deposit_is_spendable(
     let binding_ok = binding_finalized == 0 || d.height <= binding_finalized;
     depth_ok && binding_ok
 }
+
+// ---------------------------------------------------------------------------
+// C1/N1 Approach (ii): deterministic L2 root validator
+// ---------------------------------------------------------------------------
+
+/// Deterministic L2 root validator (C1/N1 Approach (ii)).
+///
+/// Replays L2 from genesis with `tip = block.height()` and `binding` derived
+/// deterministically from block ancestry (never node-local P2P state).
+/// The `verifier` selects the BLS backend used for L2 settlement checks
+/// during replay: [`ChainVerifier::Real`] in production, `Mock` in tests.
+/// It must match the verifier real nodes replay with, or the same block
+/// maps to different roots in test vs production (a test-only divergence
+/// by construction, never a consensus rule).
+#[derive(Debug, Clone)]
+pub struct AncestryRootValidator {
+    config: L2Config,
+    deposits: DepositParams,
+    verifier: srct_core::chain::ChainVerifier,
+}
+
+impl AncestryRootValidator {
+    pub fn new(
+        config: L2Config,
+        deposits: DepositParams,
+        verifier: srct_core::chain::ChainVerifier,
+    ) -> Self {
+        Self {
+            config,
+            deposits,
+            verifier,
+        }
+    }
+}
+
+impl srct_core::chain::L2RootValidator for AncestryRootValidator {
+    fn expected_root_at(
+        &self,
+        chain: &srct_core::chain::Chain,
+        parent_hash: srct_core::hash::Hash512,
+        block: &srct_core::block::Block,
+    ) -> std::result::Result<srct_core::hash::Hash, srct_core::chain::L2RootError> {
+        use srct_core::chain::L2RootError;
+
+        let height = block.header.height;
+        // Tip is the block's own height (deterministic per ancestry).
+        let tip = height;
+        // Binding derived from ancestry, not node-local FinalityManager.
+        let binding = chain.ancestry_binding_height(&parent_hash);
+        let verifier = self.verifier.verifier();
+
+        // Rebuild L2 state from genesis to parent, then apply this block.
+        // Full rebuild ensures determinism regardless of cache state.
+        let mut l2 = ChainL2::empty(
+            self.config.clone(),
+            &L2Genesis::empty(),
+            self.deposits,
+        )
+        .map_err(|e| L2RootError::Replay(e.to_string()))?;
+
+        // Replay blocks 1..=parent height via ancestry walk.
+        // Collect the ancestry path first (genesis to parent).
+        let mut ancestry: Vec<srct_core::block::Block> = Vec::new();
+        let mut cursor = parent_hash;
+        while let Some(b) = chain.block_by_hash(&cursor) {
+            if b.header.height == 0 {
+                break;
+            }
+            ancestry.push(b.clone());
+            cursor = b.header.prev_hash;
+        }
+        ancestry.reverse();
+
+        // Authority as of each block, mirroring `replay_to`: a post-rotation
+        // committee must not verify pre-rotation history against post-rotation
+        // keys on some nodes and old keys on others.
+        for b in &ancestry {
+            // Authority as of the block, not the tip or the candidate.
+            let validators = chain.settlement_committee_at(b.header.height);
+            l2.apply_block(b, tip, binding, &validators, verifier);
+        }
+        // Apply the candidate block itself.
+        let validators = chain.settlement_committee_at(height);
+        l2.apply_block(block, tip, binding, &validators, verifier);
+
+        Ok(l2.state().committed_root())
+    }
+}

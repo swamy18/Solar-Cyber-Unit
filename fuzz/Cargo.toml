@@ -215,3 +215,10 @@ path = "fuzz_targets/shield_bundle_parse.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "block_checkpoint_parse"
+path = "fuzz_targets/block_checkpoint_parse.rs"
+test = false
+doc = false
+bench = false

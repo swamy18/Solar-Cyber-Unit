@@ -113,7 +113,7 @@ jobs:
         # verification/sim/check_fuzz_targets.py). The budget per target is
         # deliberately small: the loop is a smoke test, not a campaign.
         run: |
-          for t in tx_decode block_decode wire_msg_decode mempool_admit storage_recover checkpoint_validate meta_parse l2_payload_decode m3_readers dispute_arbitrate l2_state_apply vwc_decode worker_flows checkpoint_codec deliverable_codec l2_policy_apply l2_credit_apply compute_state_decode tdx_quote_parse snp_report_parse nvidia_report_parse vendor_chain_parse confid_keystore_parse confid_sealed_open shield_bundle_parse; do
+          for t in tx_decode block_decode wire_msg_decode mempool_admit storage_recover checkpoint_validate meta_parse l2_payload_decode m3_readers dispute_arbitrate l2_state_apply vwc_decode worker_flows checkpoint_codec deliverable_codec l2_policy_apply l2_credit_apply compute_state_decode tdx_quote_parse snp_report_parse nvidia_report_parse vendor_chain_parse confid_keystore_parse confid_sealed_open shield_bundle_parse block_checkpoint_parse; do
             cargo fuzz run "$t" -- -max_total_time=20 -rss_limit_mb=4096
           done
         working-directory: fuzz
