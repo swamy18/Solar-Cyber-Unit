@@ -1,7 +1,7 @@
 # SOLAR CYBER UNIT PROTOCOL SPECIFICATION
 
 **Version:** 0.1.0 (the workspace version in `Cargo.toml`)
-**Status:** Draft — §0–§12 normative for `srct-core`; §13 normative for `srct-net`; §14 records the M1–M5 protocol mechanisms and, for each, whether it is consensus-active today; §15–§17 normative for `srct-l2`; §18 for `srct-worker`; §19 for L1↔L2 integration. §19.1, §19.2, §19.4, §19.5 and §19.6 are implemented and tested. §20 (conditional escrow) is implemented as a non-consensus node-records-state surface in `srct-core::escrow` and `srct-node::api`; coin settlement runs via `POST /v1/escrow/{id}/settle` (§20.2).
+**Status:** Draft — §0–§12 normative for `srct-core`; §13 normative for `srct-net`; §14 records the M1–M5 protocol mechanisms and, for each, whether it is consensus-active today; §15–§17 normative for `srct-l2`; §18 for `srct-worker`; §19 for L1↔L2 integration. §19.1, §19.2, §19.4, §19.5, §19.6 and §19.7 are implemented and tested. §19.7's block-carried checkpoint and deterministic root validation are activation-gated; the shipped network profiles currently set those heights to `0`. §20 (conditional escrow) is implemented as a non-consensus node-records-state surface in `srct-core::escrow` and `srct-node::api`; coin settlement runs via `POST /v1/escrow/{id}/settle` (§20.2).
 **Scope:** Layer 1 (base layer, §0–§13), the M1–M5 protocol mechanisms (§14), Layer 2 and the worker SDK (§15–§18), and L1↔L2 integration including deposits and exits (§19). §13 covers block and transaction relay between nodes.
 
 This document is the **normative reference**. Any implementation in any language must produce identical byte-level output for the vectors in `verification/tests/vectors/`. Five vector files exist today — the four covering §0–§12, plus `net_vectors.json` (§13.12) for the wire format.
@@ -689,7 +689,9 @@ its own deterministic committee (distinct derivation), and the §14.8
 activation height. `mainnet` carries a 21-key public deterministic bootstrap
 committee (Decision 27) so binding finality can activate at height 100 on a
 fresh chain; the first bond replaces it under the TopN rule. Mainnet's separate
-`l2_settlement_validators` set is empty, so L2 settlements stay fail-closed. No
+`l2_settlement_validators` set is populated with the bootstrap keys and live
+verification resolves the committee at the applying block height (Decision 28).
+No
 profile carries a stock supply cap (Decision 18).
 
 **`exit_activation_height` gates the whole exit rule of §19.6, and `0` means
@@ -1858,9 +1860,10 @@ in the payload and in the issued VWC. Both halves verify through the existing
 `BlsVerifier` trait and the epoch set's registered keys **against the
 profile's declared `l2_settlement_validators`** — separate from the L1
 `genesis_validators` committee used at §14.8, never keys pulled from finality
-machinery by convenience. Mainnet declares an empty settlement set, verifies
-against nothing, and therefore refuses every settlement by name (`BadQuorum`)
-— fail closed, never fail open. A bitmap
+machinery by convenience. Mainnet declares the bootstrap settlement set and
+resolves the live committee for the applying block's height: bootstrap before
+the first bond, then bonded TopN (Decision 28). A stale bootstrap quorum after
+rotation is refused by name (`BadQuorum`) — fail closed, never fail open. A bitmap
 signer with a registered key and no valid sidecar entry is refused by name
 (`BadPqSidecar`) — fail closed, never silently downgraded. The aggregate
 message is the domain-separated hash of
@@ -3050,19 +3053,21 @@ machinery are reused unchanged.
 5. `queued_height < height`: the queue block must be final before the block that
    settles it.
 
-**Trust assumption: the committed root is miner-supplied (C1/N1).** Consensus
+**Pre-activation trust assumption: the committed root is miner-supplied (C1/N1).** Before `l2_root_validation_height`, consensus
 verifies the exit proof against the `l2_state_root` the queue block committed,
-but it never recomputes that root from the L2 transactions — the L2 state
-machine runs in each node's replay, and a replay mismatch is recorded
-(`UnbackedClaim`), not rejected. Consequences, stated plainly: a miner that
+but it does not yet compare the deterministic replay root with the header —
+a replay mismatch is recorded (`UnbackedClaim`), not rejected. Consequences
+before activation, stated plainly: a miner that
 commits a fabricated root plus a self-consistent proof can release sink deposits
 it does not own (`crates/srct-l2/tests/bogus_root.rs` proves this on a live
 chain), and two honest nodes can agree on every L1 block while holding
 different L2 balances. `srct-node verify` fails on any unbacked claim rather
 than printing "ok" over a drained sink, but that is detection, not prevention.
-Before mainnet the project must take one of the two exits: make the block
-validator reject any root that differs from the replayed L2 state, or
-re-document L2 as a federated layer with explicit trust assumptions.
+§19.7 implements the first option: at and after the activation, the block
+validator rejects a root that differs from deterministic replay, using
+ancestry-carried checkpoint finality. The built-in profiles currently leave
+the activation height at `0`, so this pre-activation limitation remains the
+deployed behavior until a scheduled activation.
 
 **Who may settle it.** Permissionless (E-2). Anyone may build and submit a
 claim; consensus pays only the recorded `destination` and the `claimant`'s

@@ -5,6 +5,49 @@ relying on anything here.
 
 ## Scope
 
+## 2026-11-14 to 2026-11-18 implementation update
+
+This is the current implementation snapshot for the changes reviewed in this
+repository. Numeric test and fuzz campaign results elsewhere in this long-lived
+status log are dated historical records unless they are repeated here or in a
+current verification run; they are not release evidence by themselves.
+
+- **Compute market:** the production money loop now supports measured,
+  capability-matched offers; max-min fair planning across provider identities;
+  capacity-gated bonded exposure; funded job escrow; signed assignments or a
+  gossiped open-ticket board with first-valid-claim wins; dual-signed ticket
+  claims; receipt settlement; delayed or pre-authorized payouts; refund,
+  challenge and slash paths; a persisted usage ledger; and CPU/loopback backend
+  registration. The node persists this marketplace state in `state.bin` v18.
+- **Confidential compute:** `srct-compute` now has shield bundles, guest,
+  inference and training helpers, vendor-chain verification for TDX, SEV-SNP
+  and NVIDIA CC evidence, and simulator-tested attestation policy. The new
+  consumer-only `srct-confid` crate provides an encrypted keystore and
+  attestation-gated HPKE key release. The node persists provider attestations
+  and exposes `POST /v1/compute/attest/submit` and
+  `POST /v1/compute/attest/verify`. These surfaces are non-consensus and
+  simulator-tested only; no real-hardware assurance is claimed.
+- **C1/N1 finality:** blocks can carry an ancestry-derived BLS checkpoint and,
+  after activation, must commit the deterministic L2 replay root. The code is
+  implemented and fuzzed, but all shipped profiles set the carry and root
+  validation activation heights to `0`; activation remains a release and
+  testnet decision.
+- **Credit and guarded accounts:** new credit positions can require matching
+  lender and borrower signatures with term caps (`CreditOpenV2`) after the
+  consent activation. Guarded L2 accounts add per-account guardians,
+  delayed allow-lists and grants, bounded outflow, guardian cancel/freeze and
+  audit anchors. Their consensus code is present; the applicable activation
+  choices remain network parameters.
+- **Fuzzing:** the CI smoke loop now covers all 26 registered targets,
+  including compute-state, shield-bundle, vendor-chain, TDX, SNP, NVIDIA,
+  confidential-keystore, HPKE-open and block-checkpoint parsers. See
+  [`docs/fuzz.md`](fuzz.md) for the inventory and the separately dated long
+  campaign result.
+
+The DiLoCo crate and `docs/dual-mining.md` were removed in this window. Hash
+mining is the sole consensus mechanism; useful AI work belongs to the compute
+market, not block production.
+
 Layer 1 (base layer) implementation per SPEC.md. Includes the P2P networking layer
 (`srct-net`) supporting multi-peer block relay, locator-based sync, handshake
 isolation, ban scoring and side-branch pruning. Also defines the five core

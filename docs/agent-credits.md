@@ -70,7 +70,8 @@ agent:      srct-worker trial-repay --node $NODE --agent <agent> --txid <txid>
 - `POST /v1/trials/repay` confirms the payback to the sponsor the same way.
 - Total unpaid trials are capped (`SRCT_TRIAL_MAX_OUTSTANDING_SAT`, default
   10 000 000 sat): the sponsor's exposure is bounded by construction.
-- Every record persists in `state.bin` (envelope v9) and every step appends
+- Every record persists in `state.bin` (current envelope v18; v8–v17 migrate)
+  and every step appends
   to the audit log (`trial_request` / `trial_fund` / `trial_repay`).
 
 The trial is a free-trial entry point, but every trial is real SRCT the

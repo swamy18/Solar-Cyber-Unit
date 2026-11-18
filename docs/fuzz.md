@@ -10,7 +10,7 @@ the numbers a specific execution produced, and they are labelled as such.
 
 ## Target inventory
 
-Eighteen targets in `fuzz/fuzz_targets/`, each asserting a property, not merely
+Twenty-six targets in `fuzz/fuzz_targets/`, each asserting a property, not merely
 panic-freedom.
 
 | # | Target | Surface | Invariant asserted |
@@ -33,6 +33,14 @@ panic-freedom.
 | 16 | `l2_policy_apply` | L2 policy state machine | Value conservation; grant caps never exceeded; revocation absolute; authority narrows; replay refused |
 | 17 | `l2_credit_apply` | L2 credit state machine | Conservation; collateral locked not spent; debt one-way; default not early; interest once per period |
 | 18 | `compute_state_decode` | Compute state decoders + revoke accumulator | Total decode; encode stability; re-filing never grows the book |
+| 19 | `tdx_quote_parse` | Intel TDX quote parser | Malformed or truncated quotes refuse without panic |
+| 20 | `snp_report_parse` | AMD SEV-SNP report parser | Malformed reports refuse without panic |
+| 21 | `nvidia_report_parse` | NVIDIA confidential-computing report parser | Malformed JWT/report input refuses without panic |
+| 22 | `vendor_chain_parse` | Vendor certificate-chain verification | Untrusted, malformed, or wrong-curve chains fail closed |
+| 23 | `confid_keystore_parse` | Consumer confidential keystore | Malformed encrypted keystores refuse without panic |
+| 24 | `confid_sealed_open` | HPKE sealed-key opening | Tampered or mismatched sealed payloads never open |
+| 25 | `shield_bundle_parse` | Shield bundle parser | Bounds, truncation, and authentication failures refuse cleanly |
+| 26 | `block_checkpoint_parse` | Block-carried checkpoint section | Malformed or misplaced checkpoint payloads refuse cleanly |
 
 Not yet covered: the PoW boundary (template construction, header solving,
 `extra_nonce` rolling) and the stratum wire protocol (`getjob`/`submit`
@@ -109,8 +117,8 @@ seedless start plus the committed corpus; it does not claim the coverage above.
 Any crash found by fuzzing becomes a regression test in the workspace suite
 before the fix merges. `crates/*/tests/fuzz_invariants.rs` holds the
 total-over-mutation tests derived from earlier fuzz-discovered panics. **No
-product bug was surfaced by the 2026-10-09 campaign** — 0 crashes across all
-seventeen targets — which is a statement about this run's coverage, not a proof
+product bug was surfaced by the 2026-10-09 campaign** — 0 crashes across the
+fourteen targets included in that dated run — which is a statement about this run's coverage, not a proof
 that none exists.
 
 ## 2026-10-29 incident: `l2_credit_apply` false bound (target bug, not product)

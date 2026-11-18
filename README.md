@@ -152,7 +152,7 @@ backends stay off where drivers are missing; CPU always works.
 - **Big exits wait in line.** Mainnet lets one owner queue 100 SRCT per 144-block window. Moving a fortune out takes several windows. Refusals delay you — they never destroy your money — but plan around it.
 - **The Smart Gate speaks per node, but revocations travel.** Each node enforces what it sees; revokes created anywhere are broadcast over P2P (verified by the receiver, applied through the same path, relayed onward), so kills converge without a cross-node lock. Nonce windows stay per-node — pin high-value actions to one node via audience scoping. Audit receipts live on the node (verifiable, exportable) rather than on the chain. The managed-cluster admission webhook is designed but not built — the worker SDK's in-process gate is the real boundary today.
 - **The slash vault is empty by design (for now).** The 50%-burn / 50%-vest rule is written and tested, but nothing has created a slash record yet.
-- **Mainnet Layer 2 settlement starts closed.** Its validator set begins empty, so settlements refuse until configured. Testnet and mini use deterministic keys.
+- **Mainnet Layer 2 settlement follows the live committee.** It starts with the 21 bootstrap keys (quorum 15) and rotates to the bonded TopN committee after the first bond; stale bootstrap quorums are refused after rotation. Testnet and mini use deterministic keys.
 - **A few switches are staged or off.** The memory-hard mining puzzle is registered but never active. Mining bound to verified work is opt-in. Post-quantum spending rules and useful-work consensus are off on mainnet (age-gated when flipped, rehearsed on testnet first).
 
 ---
@@ -230,7 +230,7 @@ The dance: agent asks → sponsor drips coins with `srct-node send` → agent co
 
 ### Consensus state vs. service layer
 
-Two buckets, and it matters which is which. The **policy layer is consensus state** (SPEC §21): grants live on chain, signatures bind spender to agent, caps and nonces are checked against state the chain keeps, and revoking a grant kills all its descendants. **Credit is the same** (SPEC §22): loans are chain facts, the lender signs, real principal moves, real collateral answers for the debt.
+Two buckets, and it matters which is which. The **policy layer is consensus state** (SPEC §21): grants live on chain, signatures bind spender to agent, caps and nonces are checked against state the chain keeps, and revoking a grant kills all its descendants. **Credit is the same** (SPEC §22): loans are chain facts and real principal and collateral are chain state. The legacy `CreditOpen` format is replay-compatible; once a network enables `credit_consent_activation_height`, new positions use `CreditOpenV2`, signed by both lender and borrower and bounded by collateral, term and window caps.
 
 The **service layer is each node's own notebook**: the payment book, receipt book, credit gate, offline helpers. Useful, persisted across restarts — but never spendable balance, and consensus never depends on it.
 
@@ -416,7 +416,7 @@ Money runs on block heights; wall-clock time only ever advises. The rules in pla
 
 - **Bench harness:** `crates/srct-bench` builds deterministic chains — `run --workload empty|realistic|adversarial --blocks N` on the mini profile with scratch-dir stores. It exercises the real `Chain::submit` path and measures.
 - **Reports (measurements, not marketing):** `docs/performance/README.md`, the i5 baseline, the Phase-C scalability report, plus raw JSON results. Known harness quirk: giant realistic/adversarial 1k runs can trip on fee-drifted outputs — a bench-sizing bug, not a consensus bug.
-- **Further reading:** `docs/final-report.md` (round summaries), `docs/fuzz.md` (18 cargo-fuzz targets over wire, mempool, storage, L2, compute state and the worker), and the HBM security review.
+- **Further reading:** `docs/final-report.md` (a dated historical report), `docs/fuzz.md` (the current 26-target cargo-fuzz inventory over wire, mempool, storage, L2, compute and confidential-compute parsers), and the HBM security review.
 - **Test vectors.** `verification/tests/vectors/` holds the canonical byte layouts, generated from the implementation — never hand-edited. A second, independent proof-of-work implementation written from the spec (`verification/sim/srct_reference.py`) reproduces all 21 puzzle digests — evidence the spec is unambiguous, not just self-consistent.
 - **Red team.** 21 adversarial integration tests across four files, each one confirmed to fail against the code it now guards. The defect log lives in [docs/status.md](docs/status.md). Author-run, like everything above — see [Honest limits](#honest-limits).
 
@@ -621,6 +621,13 @@ The claim is authorized by a **proof, not a signature** — the sink holds no ke
 
 **Slashing stays in its lane.** Each checkpoint is verified against *its own* epoch's committee, failing closed when that set is unavailable — no fallbacks, no guessing. A validator who left the TopN can still be slashed for misbehaving while bonded. Committee caches keep the current set plus the previous one through its grace period, then expire; a failed derivation is a hard error, and there's no genesis fallback once bonds exist.
 
+**C1/N1 root validation is shipped but not activated.** The chain can carry a
+BLS checkpoint certificate in a block and, after its two activation heights,
+rejects a block whose `l2_state_root` differs from deterministic replay. All
+built-in profiles currently set those heights to `0`, so operators must not
+present this as an active-network guarantee before a scheduled, tested
+activation.
+
 ### Wallets, transfers and policies
 
 **Wallets you'll recognize.** Keys live in `wallets.json`, encrypted with your `SRCT_WALLET_PASSPHRASE` (Argon2id + ChaCha20-Poly1305, locked-down file permissions, atomic writes). Plaintext files are refused unless you deliberately pass `--allow-plaintext-wallet`. Addresses are 20-byte hex with a `jt1` prefix; classical, hybrid and post-quantum addresses are distinct by construction. Secrets are redacted in logs and wiped from memory on drop.
@@ -650,7 +657,7 @@ srct-node credit --default --position <id>
 srct-node credit --list
 ```
 
-The lender signs `CreditOpen`; the borrower signs `CreditRepay`; any wallet can sign `CreditDefault` once time's up. Locally the CLI mines the transaction directly; over the network, serialize the `L2Transaction` to hex and POST it to `/v1/l2/broadcast`, which dry-runs it and queues it for the next block.
+Before the consent activation, the lender signs legacy `CreditOpen`; the borrower signs `CreditRepay`; any wallet can sign `CreditDefault` once time's up. At and after activation, `CreditOpenV2` requires matching lender and borrower signatures before collateral can be locked. Locally the CLI mines the transaction directly; over the network, serialize the `L2Transaction` to hex and POST it to `/v1/l2/broadcast`, which dry-runs it and queues it for the next block.
 
 Topping up collateral (`CreditCollateral`, `0x1A`) goes through the same broadcast endpoint — the CLI doesn't expose it directly, but the worker SDK does (`add_credit_collateral`).
 
@@ -670,7 +677,7 @@ Same code, different numbers — pick your playground:
 | Finality depth | 100 | 20 | 20 |
 | Coinbase maturity | 100 | 10 | 10 |
 | Genesis validators | 21 public bootstrap (quorum 15) | 4 deterministic | 4 deterministic |
-| L2 settlement validators | **none** (fail closed) | 4 deterministic | 4 deterministic |
+| L2 settlement validators | 21 bootstrap keys, then live bonded TopN | 4 deterministic | 4 deterministic |
 | Binding finality | on at height 100 | on at height 20 | off |
 | Exits | on at height 1 | on at height 1 | on at height 1 |
 | PQ spend requirement | **off** | off | off |
@@ -678,7 +685,7 @@ Same code, different numbers — pick your playground:
 | Retarget | LWMA every block, ±10% | LWMA every block, ±10% | LWMA every block, ±10% |
 | Genesis difficulty | 1 | 1 | 1 |
 
-Reading the table: `mainnet` boots with 21 public deterministic keys (quorum 15) so finality can bind before any stake exists — the first bond swaps in the stake-weighted TopN committee. Its separate L2 settlement set starts empty, so settlements fail closed until configured. Exits work from height 1. The PQ row is Decision 24's `pq_activation_height`: `0` means nobody is refused for lacking a lattice signature, and flipping it on only affects outputs created *after* the height — history is never stranded.
+Reading the table: `mainnet` boots with 21 public deterministic keys (quorum 15) so finality can bind before any stake exists — the first bond swaps in the stake-weighted TopN committee. The L2 settlement authority follows that same live committee: bootstrap before the first bond, then bonded TopN by applying-block height. Exits work from height 1. The PQ row is Decision 24's `pq_activation_height`: `0` means nobody is refused for lacking a lattice signature, and flipping it on only affects outputs created *after* the height — history is never stranded.
 
 Network magic bytes (§13.3): `mainnet` = `6A4E5402`, `mini` = `6A4E5403`, `testnet` = `6A4E5404`. They change with every protocol version that alters the wire format or state root — outdated peers are refused at the door before they can join.
 
@@ -762,7 +769,7 @@ srct-node serve --network testnet --data-dir ./chain --api-listen 127.0.0.1:8080
 
 Exposed binds demand `Authorization: Bearer <token>` on every request (compared in constant time). Every bind — loopback included — requires a `Host` header as DNS-rebinding armor: loopback accepts loopback names only; non-loopback additionally accepts IP literals, the bound address, and `--api-allowed-host` / `SRCT_API_ALLOWED_HOSTS` entries. Missing, unknown or malformed `Host` gets a 403. Exposed binds also rate-limit per address, and every bind caps requests at 10 seconds, 64 in flight, 128 connections, and 30 seconds for headers (the slowloris bound).
 
-Node-local state (credit, escrow, delegation books — never consensus) now survives restarts: receipts, replay tracker, payments and settlement links, reservations, policy accounting, credit and minted attestations, delegations, issued policies, revocations, escrows and exit bindings — plus compute assignments, settled payouts and their exit bindings, the compute escrow and bond books, open challenges, queued P2P revoke broadcasts, and the node-local compute usage ledger — all persist to `state.bin` (envelope v17) — an atomic, digest-checked file that refuses to start from corruption — flushed on every change, plus once at shutdown.
+Node-local state (credit, escrow, delegation books — never consensus) now survives restarts: receipts, replay tracker, payments and settlement links, reservations, policy accounting, credit and minted attestations, delegations, issued policies, revocations, escrows and exit bindings — plus compute assignments, settled payouts and their exit bindings, the compute escrow and bond books, open challenges, queued P2P revoke broadcasts, the usage ledger, and confidential-tier attestation records — all persist to `state.bin` (envelope v18; v8–v17 migrate) — an atomic, digest-checked file that refuses to start from corruption — flushed on every change, plus once at shutdown.
 
 ---
 
@@ -811,13 +818,13 @@ cargo test -p srct-core --test pq_signature     # post-quantum bundle attacks
 cargo test -p srct-node --test universal_security # finance-gate V1: decide/authorize fail-closed over HTTP
 ```
 
-CI (`.github/workflows/ci.yml`) runs format, clippy, the full suite, a release build, the vector cross-checks, attack simulations, and all 17 fuzz targets on nightly with ASan. `.github/workflows/release.yml` re-runs the same gate on a tagged tree before publishing artifacts with checksums and a keyless cosign/Sigstore bundle.
+CI (`.github/workflows/ci.yml`) runs format, clippy, the full suite, a release build, the vector cross-checks, attack simulations, and all 26 fuzz targets on nightly with ASan. `.github/workflows/release.yml` re-runs the same gate on a tagged tree before publishing artifacts with checksums and a keyless cosign/Sigstore bundle.
 
 **Every CI action is pinned to a commit SHA**, with its tag in a trailing comment — a compromised or retagged action can't silently change what runs. Job tokens are least-privilege: `contents: read` by default; only the two jobs that genuinely write take more (the signing job's `id-token: write` for its OIDC identity, the publish job's `contents: write`). Dependabot keeps the pins honest but opens **no pull requests** — every update is a branch, and this repo keeps `main` as its only branch, so bumps are an owner step (`cargo update -p <crate>` plus `cargo audit`). Security *alerts* still flow normally from the advisory database.
 
 **Vectors.** `verification/tests/vectors/` holds the canonical byte layouts, generated from the implementation — never hand-edited. `verification/sim/srct_reference.py` is a second proof-of-work implementation written from the spec rather than the Rust (same author, so a second implementation, not a second party) — and it reproduces all 21 puzzle digests, evidence the spec is unambiguous rather than merely self-consistent.
 
-**Fuzzing.** 17 cargo-fuzz targets across L1 wire, mempool, storage, checkpoints, L2 codec, disputes, state, certificates and the worker. They assert real invariants — decode/encode round-trips, bounded allocation, value conservation under adversarial transaction programs — not just "didn't crash".
+**Fuzzing.** 26 cargo-fuzz targets cover L1 wire, mempool, storage, checkpoints, L2 codecs and state, compute state, shield bundles, vendor certificate chains, TDX/SNP/NVIDIA reports, the confidential keystore and the worker. They assert real invariants — decode/encode round-trips, bounded allocation, value conservation and fail-closed parsing under adversarial inputs — not just "didn't crash".
 
 **Red team.** 21 adversarial integration tests across four files, each confirmed to fail against the code it now guards. The defect log: [docs/status.md](docs/status.md). Author-run, like everything above — see [Honest limits](#honest-limits).
 

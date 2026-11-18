@@ -1,6 +1,6 @@
 # Decentralized compute sharing
 
-Status: **production money loop** with core in `crates/srct-compute` and endpoints in `crates/srct-node`. Any device advertises capability (RAM, measured throughput, bandwidth, determinism) behind a signed bond, requesters shard work across devices, and verified receipts settle completed units — via planned assignments or the open ticket board. Offers, jobs, assignments, tickets, claims, receipts, payouts, preauth exits, escrow and bond books, challenges, usage records and the metering ledger persist in `state.bin` (envelope v17).
+Status: **production money loop** with core in `crates/srct-compute` and endpoints in `crates/srct-node`. Any device advertises capability (RAM, measured throughput, bandwidth, determinism) behind a signed bond, requesters shard work across devices, and verified receipts settle completed units — via planned assignments or the open ticket board. Offers, jobs, assignments, tickets, claims, receipts, payouts, preauth exits, escrow and bond books, challenges, usage records, the metering ledger, and provider attestation records persist in `state.bin` (envelope v18; v8–v17 migrate).
 
 ```bash
 cargo test -p srct-compute
@@ -633,14 +633,17 @@ the runbook for those runs is a deliverable of the later phases.
 
 ### Threat model (read first)
 
-**Protected against:**
-- a malicious provider process (sees only ciphertext and attested-channel
-  bytes; plaintext exists only inside the approved guest image);
-- the provider's OS and hypervisor admin (memory encryption + attested
-  measurements; admin sees encrypted pages, not content);
-- other tenants on the same machine (per-job keys; no cross-job key reuse);
-- passive network observers (payloads are AEAD; the live channel is
-  attested TLS).
+**Intended protection, conditional on real hardware and integration:**
+- a malicious provider process (the guest/key-release design keeps plaintext
+  in the approved guest image);
+- the provider's OS and hypervisor admin (memory encryption and attested
+  measurements);
+- other tenants on the same machine (per-job keys);
+- passive network observers (encrypted bundles and channel traffic).
+
+These guarantees are architectural goals, not measured hardware assurances.
+The current implementation is simulator-tested; production guest isolation
+and an attested TLS transport are not established by that test coverage.
 
 **NOT protected against — stated plainly, no unconditional privacy claimed:**
 - hardware vendor compromise (Intel/AMD/NVIDIA roots are trust anchors;
@@ -656,16 +659,17 @@ jobs, labelled non-confidential at match time. The existing `privacy`
 confidential job** — only a verified attestation matching the job SLA
 does. One test pins exactly this.
 
-### 1. Confidential providers (planned)
+### 1. Confidential provider foundations (implemented; hardware integration pending)
 
 - Confidential VMs: Intel TDX and AMD SEV-SNP, plus NVIDIA
   confidential-computing GPUs (H100/H200/Blackwell) with CC mode on. No
   SGX for ML workloads.
-- The provider runs a measured guest image (reproducible build)
-  containing the shield runtime and the inference/training runtimes. The
-  host never sees plaintext.
-- Provider offers carry TEE capability, TEE family, GPU CC support and
-  attestation evidence alongside the existing capability floors.
+- Guest, inference and training helper modules and attestation-aware job
+  fields exist. A production measured guest image and host isolation have not
+  been demonstrated; the provider-visible workload caveat still applies.
+- The node accepts provider-signed evidence and persists it. Evidence
+  registration is node-local and does not itself make marketplace admission
+  or execution confidential.
 
 ### 2. Remote attestation (implemented, simulator-tested only)
 
@@ -721,45 +725,48 @@ does. One test pins exactly this.
   keystore init/list/revoke, key wrap/open, and attestation-gated release.
   Key-release code never links into the provider-side `srct-worker`.
 
-### 4. Shield bundle (planned; data protection)
+### 4. Shield bundle (implemented format and helpers; end-to-end deployment pending)
 
-- Versioned format: manifest plus AEAD-encrypted chunks with unique
+- Versioned shield bundle: manifest plus AEAD-encrypted chunks with unique
   nonces, integrity chain or Merkle tree, bound to job id, ticket and the
   approved measurement; streaming support for large datasets.
 - Model weights encrypted the same way, or a public model pre-installed
   inside the measured image and referenced by service name.
 - Consumer-to-enclave channel uses attested TLS. Results and checkpoints
   are encrypted to the consumer's key before they leave the enclave.
-- The bundle parser gets a fuzz target (`cargo fuzz` style, like the
-  existing 18 targets).
+- The bundle parser has a fuzz target (`shield_bundle_parse`) in the current
+  26-target inventory.
 
-### 5. Guest runtime and attested metering (later phase, simulator-backed)
+### 5. Guest runtime and attested metering (helpers implemented; production isolation pending)
 
-- No outbound network except the attested channel. No unencrypted
-  persistent storage. Memory wipe on exit. Provider `--ram-pct`,
-  `--cpu-pct`, `--gpu-pct` limits still enforced from outside the guest.
-- Session lifecycle: attest, key release, run, seal output, wipe.
-- The enclave signs usage records per compute slice; these plug into the
-  existing slice and ledger design (§5 metering) and the delayed payout.
+- Runtime helpers encode the intended no-network, no-plaintext-persistence,
+  wipe-on-exit lifecycle, and resource limits are applied by the host
+  executor. Hardware-enforced isolation has not been verified.
+- Attestation and key-release helpers exist, but a real enclave session
+  lifecycle is not yet demonstrated end to end.
+- The ordinary signed usage ledger exists; enclave-signed usage metering has
+  not been shown on hardware.
 
-### 6. Matching and policy (minimal slice in the first stage)
+### 6. Matching and policy (implemented with simulator evidence)
 
 - Jobs declare a confidentiality level (new `ComputeJob` field:
   `JOB_VERSION` 2 → 3; v1/v2 decode as non-confidential). The planner
   only considers providers with a valid, fresh attestation matching the
   job SLA, then applies the existing fair allocation.
-- Re-attest per session and periodically for long jobs. Bond, capacity
-  and reputation rules stay unchanged. Attestation expiry and revocation
-  handling included; `state.bin` 17 → 18 with fail-closed decode.
+- Attestation expiry, freshness and revocation checks are implemented in the
+  evidence-verification path. Session-level re-attestation on real hardware
+  remains unverified. Bond, capacity and reputation rules are unchanged.
 
-### 7. Inference (deferred)
+### 7. Inference helpers (implemented; confidential deployment pending)
 
 - Interactive and batch inference inside attested enclaves with encrypted
   request/response streams. Batching, timeouts, and graceful failure
   (no plaintext fallback, ever).
 
-### 8. Training — production-proven scope only (deferred)
+### 8. Training helpers (implemented; confidential deployment pending)
 
+- The repository has training helpers, including local CPU execution; the
+  following production confidential workloads remain unverified:
 - (a) Training and fine-tuning (including LoRA) on one provider's
   confidential GPU(s), with multi-GPU data parallelism inside that
   single machine.
@@ -772,15 +779,18 @@ does. One test pins exactly this.
   training of one model across independent providers, split learning,
   MPC, FHE, DiLoCo-style methods.
 
-### 9. Integration (later phases)
+### 9. Current integration boundary
 
 - Consumer-side component: `srct-confid` CLI (job submit not yet wired to
   node endpoints; attestation verification, key broker, bundle creation,
   result decryption available as library + CLI). Key-release code never
   links into `srct-worker`.
-- Node endpoints for attestation evidence submission and verification —
-  deferred (state.bin 17 → 18 with fail-closed decode, attestation
-  registry). No consensus changes.
+- Node endpoints for attestation evidence submission and verification are
+  implemented: `POST /v1/compute/attest/submit` verifies and persists a
+  provider quote, and `POST /v1/compute/attest/verify` reports whether a
+  provider has a fresh matching record. The v18 `state.bin` section is
+  fail-closed and migrates v8–v17. These records are node-local; they do not
+  change consensus.
 
 ### Validation gates (what counts as done)
 
@@ -840,7 +850,7 @@ does. One test pins exactly this.
    scheduled payout (`payable_at`, per-network delay, auto-release tick,
    dispute hold, refund of unused escrow); node-local metering ledger
    (slices, dual-signed usage records, `GET /v1/compute/ledger`,
-   `state.bin` v17); demand broadcast over `srct-net` (ticket gossip +
+   `state.bin` v18); demand broadcast over `srct-net` (ticket gossip +
    capability/capacity-gated auto-claim); percentage template caps with
    hard OS enforcement; extensible backend registry (CPU + loopback
    reference backends, GPU/NPU interface-only); session sandbox with the

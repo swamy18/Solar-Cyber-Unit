@@ -800,8 +800,9 @@ never made less safe. After activation, a deposit is not spendable merely
 because depth is satisfied if the canonical history at that height is not
 finalized. L2 does not grow a second finality system. `Settle`/VWC keep their
 existing verification semantics but use the declared committee. Decision 27
-later split this into `l2_settlement_validators`; mainnet keeps that set empty
-and continues to fail closed.
+later split this into `l2_settlement_validators`; mainnet initially kept that
+set empty and failed closed. Decision 28 later populated the bootstrap set and
+made live-committee resolution authoritative.
 
 ---
 
@@ -1629,8 +1630,10 @@ and L2 settlement keeps its own fail-closed set.**
    and the first bond ends it.
 5. **L2 settlement is separate.** `NetworkParams::l2_settlement_validators` is a
    distinct declaration consumed by `srct_node::l2::validator_set` and the
-   worker. Mainnet leaves it empty and therefore refuses every settlement by
-   name. Mini/testnet use the same four keys for both sets.
+   worker. At this decision's time mainnet left it empty and refused every
+   settlement by name. Decision 28 later populated the bootstrap set and
+   rotates verification to the live bonded committee. Mini/testnet use the
+   same four keys for both sets.
 6. **Genesis bytes do not change.** The committee is not part of the genesis
    block, so populating it does not alter the genesis hash.
 

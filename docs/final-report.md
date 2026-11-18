@@ -1,4 +1,4 @@
-# Final Verification Report — 2026-10-09
+# Historical Final Verification Report — 2026-10-09
 
 > **Historical snapshot.** Later decisions supersede parts of this report:
 > Decisions 25–26 moved policy and credit on chain, and Decision 27 added the
@@ -11,7 +11,7 @@ public-testnet / mainnet-candidate state — **without** inventing protocol
 economics, changing consensus, or faking verification. No code was changed; all
 changes are documentation truthfulness plus new design/audit records.
 
-## 1. Current HEAD commit
+## 1. HEAD commit at the time of this report
 
 `dd2e1da782197303254111a53b825a14c158a221` ("fix: update worker_flows fuzz target
 to L2NodeView fallible interface"), branch `main`. Working tree has uncommitted

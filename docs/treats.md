@@ -82,6 +82,7 @@ Read the balance with `GET /v1/treats/balance/{agent}?role=` (also in
   Invariant: `burned + pscb_retained + bsaver + treat == full_base`.
 - `Chain::treat_reserve` is credited and rewound per block and re-derived
   by `verify_canonical_chain`. Transfers and gifts never touch it.
-- Balances are this node's view (persisted in `state.bin` envelope v13,
+- Balances are this node's view (persisted in `state.bin` envelope v18; v8–v17
+  migrate,
   Treats section v4 with redemption nonces); the
   reserve and the UTXO set are the cross-node truth.

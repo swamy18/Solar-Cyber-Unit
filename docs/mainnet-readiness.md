@@ -1,10 +1,12 @@
 # Mainnet Operational Readiness
 
-**Status: NOT READY.** No release tag exists. C1/N1 is open (SPEC §19.6:
-committed `l2_state_root` is miner-supplied; replay mismatch is only recorded
-as `UnbackedClaim`, not rejected). Until root validation ships behind an
-activation height with testnet/mini first, L2 state is trust-based, not
-consensus-secured. This document records the operational state honestly.
+**Status: NOT READY.** No release tag exists and no shipped profile enables
+the new C1/N1 activation heights. The block-carried checkpoint and
+deterministic L2-root-validation implementation is present (Decision 34,
+SPEC §19.7), but `checkpoint_carry_activation_height` and
+`l2_root_validation_height` are `0` in the current profiles. L2 roots are
+therefore not protected by that new consensus rule on a deployed network;
+activation must be scheduled and tested before any mainnet launch.
 
 **Author and copyright holder:** Community-owned. No single person holds it,
 like Bitcoin. (© 2026).
@@ -26,7 +28,7 @@ like Bitcoin. (© 2026).
 | Pool mining | stratum-lite JSON-lines (`getjob`/`submit`, single-use job ids, anti-theft template pinning, share vs network difficulty) with PPLNS accounting (`fee_bps`, windowed split, dust carry, `mark_paid`) |
 | **On-chain agent authority** | **Consensus state, not node-local.** `Policy` (`0x16`), `PolicyRevoke` (`0x17`) and `AgentSpend` (`0x18`) are Layer-2 transaction types (SPEC §21, Decision 25). The owner's signature binds the grant bytes, the **spender** and the **agent identity** together; one live grant per agent; the per-transaction cap, the tumbling per-window cap, the recipient and service allow-lists, the validity window and the strictly increasing nonce are enforced against state the chain keeps; a delegated grant that widens its parent is refused; revocation reaches every descendant. Committed under the Layer-2 state root (`POLICY_LEAF_TAG` `0x05`) |
 | **Credit positions on chain** | **Consensus state.** `CreditOpen` (`0x19`), `CreditCollateral` (`0x1A`), `CreditRepay` (`0x1B`) and `CreditDefault` (`0x1C`) (SPEC §22, Decision 26). The **lender signs** the terms, the principal moves to the borrower's balance, the borrower's own funds are locked as collateral (checked before the principal arrives), interest is charged once per period and paid before the principal, a repayment larger than the debt is refused, and a default is permissionless: the collateral answers for the debt, the surplus returns to the borrower, the remainder is a shortfall the lender absorbs. Committed under the Layer-2 state root (`CREDIT_LEAF_TAG` `0x06`). **Borrower consent (Decision 35):** at/after `credit_consent_activation_height`, new positions require `CreditOpenV2` (`0x1D`) with BOTH lender and borrower signatures plus caps (collateral ≤ 2x required, bounded term, minimum window); old `0x19` still replays pre-activation history |
-| **L2 root validation (C1/N1)** | **Consensus-checked.** At/after `l2_root_validation_height`, every block's `l2_state_root` must equal deterministic replay (`tip` = block height, binding from ancestry-carried BLS checkpoints, Decision 34, SPEC §19.7). Blocks may carry one BLS checkpoint certificate (leaf tag `0x05`) at/after `checkpoint_carry_activation_height`; mismatched roots fail closed. Pre-activation blocks unchanged |
+| **L2 root validation (C1/N1)** | **Implemented, activation-gated.** At/after `l2_root_validation_height`, every block's `l2_state_root` must equal deterministic replay (`tip` = block height, binding from ancestry-carried BLS checkpoints, Decision 34, SPEC §19.7). Blocks may carry one BLS checkpoint certificate (leaf tag `0x05`) at/after `checkpoint_carry_activation_height`; mismatched roots fail closed. Both heights are currently `0`, so this rule is not active yet |
 | **Guarded accounts** | **Consensus state (Phase 3, Decision 36).** Per-account opt-in (`GuardedOptIn` `0x1E`, no global key) creating a guarded record (leaf tag `0x07`, state wire 8). Guardian must differ from owner; allow-list changes take effect after delay D; grant activation delayed by D with bounded lifetime; balance-relative outflow cap per window; `GuardedCancel` (`0x1F`) / `GuardedFreeze` (`0x20`) by guardian only; audit anchors (`0x21`) commit off-chain audit roots. Existing exit throttle applies on top, unchanged |
 | **Independent cross-check** | `verification/sim/l2_authority_reference.py` is a second implementation of the authority and credit rules, written from SPEC §21–§22 in Python (it derives the same addresses, agent identities, grant hashes and position ids). It emits `verification/tests/vectors/l2_authority_vectors.json`, and `crates/srct-l2/tests/l2_authority_vectors.rs` replays those scenarios and asserts the same verdicts, the same reasons and the same final state |
 | **Agent tooling** | Worker SDK `srct-worker/src/authority.rs` (publish, spend, revoke, open, collateralise, repay, default - plan locally, then broadcast); MCP `inspect.policy`, `inspect.agent_spend`, `inspect.credit` (keyless) plus the wallet-guard ops `wallet.guard`, `policy.decide/export/verify`, `delegation.prove/verify`, `auth.bind/verify_bound`, `audit.verify`; chain-agnostic `crates/srct-policy` (intent → allow/deny/approval-needed JSON, TS/Python bindings, no consensus imports); short-lived exact-transaction grants via `service::admit_bound_payment`; node API `GET /v1/policies`, `GET /v1/policies/{agent_id}`, `GET /v1/credit/positions`, `GET /v1/credit/positions/{id}`; CLI `policy`, `agent-spend`, `credit`, `l2 --deposit-address` (every command checks the transaction against the state the chain will replay and refuses with the chain's own reason) |
@@ -58,7 +60,7 @@ also exists now, with a conservation gate before its first pass.)
   |---|---|---|
   | 1 | `cargo fmt --all --check` | clean |
   | 2 | `cargo clippy --workspace --all-targets --all-features -- -D warnings` | clean |
-    | 3 | `cargo test --workspace` | 1924 passed, 0 failed, 4 ignored (last recorded 2026-11-13 working tree; re-run `scripts/test_count.sh` — counts move with the tree) |
+    | 3 | `cargo test --workspace` | run for the release candidate; do not treat the 2026-11-13 count as current |
   | 4 | `cargo build --workspace --release` | succeeds |
   | 5 | vector cross-check: `python verification/sim/verify_vectors.py --check` | see `docs/status.md` |
   | 6 | confirm every `#[ignore]`d test is a documented manual/benchmark probe, not a skipped regression | re-check on each run; the ignored set is exactly these four probes: `vwc_perf_probe` (`srct-l2`), `bench_zk_prove_verify` (`srct-zkml`), `bench_fhe_ops` (`srct-fhe`), `bench_tee_quote_verify` (`srct-compute`) — a fifth name means something got skipped that should not have been |
@@ -262,10 +264,10 @@ reached.
 |---|---|
 | `cargo fmt --all --check` clean | ✅ |
 | `cargo clippy --workspace --all-targets --all-features -- -D warnings` clean | ✅ |
-| `cargo test --workspace` passes | ✅ 1924 passed, 0 failed, 4 ignored (last recorded 2026-11-13 working tree; see `docs/status.md`) |
+| `cargo test --workspace` passes | verify on the release candidate; historical counts are not a release result |
 | Release build compiles | ✅ |
 | Vector cross-check (Python vs Rust) | ✅ (`docs/status.md`) |
-| Fuzz: 17 targets executed, real campaigns | ✅ see `docs/fuzz.md` |
+| Fuzz: 26 targets registered and smoke-run in CI; dated long campaign | ✅ see `docs/fuzz.md` |
 | Deterministic genesis across profiles | ✅ |
 | BLS finality adversarial tests | ✅ (18 checkpoint tests) |
 | L2 end-to-end (deposits, tasks, VWC, reputation) | ✅ (2-process E2E + chaos suite) |
@@ -328,9 +330,15 @@ Read every ✅ above as **implemented + tested only**:
   `docs/status.md`; they are not a substitute.
 - **Operationally deployed** — ❌ no public network with real value exists;
   multi-node runs are local scripts and operator-verified relays.
-- **Still required before mainnet** — release tagging + `CHANGELOG.md`,
+- **Historical 2026-11-13 requirement (superseded below)** — release tagging + `CHANGELOG.md`,
   published PGP disclosure key, log-shipping/OTLP observability, backup
   runbooks, external audit, and (for any PoUW activation) the fork schedule,
   migration plan, and wire-v2 commitments in `docs/dual-mining.md` §7–§8.
 
 A green test column is not a launch decision.
+
+**2026-11-18 correction.** The DiLoCo crate and `docs/dual-mining.md` were
+removed; there is no PoUW/dual-mining activation path. Hash mining remains the
+only consensus mechanism. The additional protocol requirement before mainnet
+is an activation plan and testnet evidence for C1/N1 block-carried checkpoints
+and deterministic L2-root validation.

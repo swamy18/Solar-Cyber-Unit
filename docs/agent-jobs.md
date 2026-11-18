@@ -33,7 +33,7 @@ bare job id is not accepted as delivery authorization — and a receipt naming
 a different result is refused rather than filed alongside.
 
 Dispute locks are node-enforced (`held_escrows`, persisted in `state.bin` —
-currently envelope v7): release, settlement binding and the timeout
+current envelope v18; v8–v17 migrate): release, settlement binding and the timeout
 auto-refund all refuse while
 a job is disputed. An unresponsive arbitrator cannot be distinguished from a
 slow one by the machine — expiry policy says the hirer should pick
