@@ -1331,9 +1331,10 @@ impl AgentSpendPayload {
         // Compute the message first: it borrows `self` immutably, which would
         // conflict with the mutable slot borrow below.
         let msg = self.signing_hash();
-        let slot = self.guardian_approval.as_mut().ok_or(Error::Malformed(
-            "no guardian approval slot to co-sign",
-        ))?;
+        let slot = self
+            .guardian_approval
+            .as_mut()
+            .ok_or(Error::Malformed("no guardian approval slot to co-sign"))?;
         if slot.guardian != guardian {
             return Err(Error::WrongAddress);
         }
@@ -2445,21 +2446,15 @@ impl L2Payload {
             L2TxType::CreditDefault => {
                 L2Payload::CreditDefault(CreditDefaultPayload::from_reader(r)?)
             }
-            L2TxType::CreditOpenV2 => {
-                L2Payload::CreditOpenV2(CreditOpenV2Payload::from_reader(r)?)
-            }
-            L2TxType::GuardedOptIn => {
-                L2Payload::GuardedOptIn(GuardedOptInPayload::from_reader(r)?)
-            }
+            L2TxType::CreditOpenV2 => L2Payload::CreditOpenV2(CreditOpenV2Payload::from_reader(r)?),
+            L2TxType::GuardedOptIn => L2Payload::GuardedOptIn(GuardedOptInPayload::from_reader(r)?),
             L2TxType::GuardedCancel => {
                 L2Payload::GuardedCancel(GuardedCancelPayload::from_reader(r)?)
             }
             L2TxType::GuardedFreeze => {
                 L2Payload::GuardedFreeze(GuardedFreezePayload::from_reader(r)?)
             }
-            L2TxType::AuditAnchor => {
-                L2Payload::AuditAnchor(AuditAnchorPayload::from_reader(r)?)
-            }
+            L2TxType::AuditAnchor => L2Payload::AuditAnchor(AuditAnchorPayload::from_reader(r)?),
         })
     }
 }

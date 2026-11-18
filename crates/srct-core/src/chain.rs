@@ -1809,14 +1809,10 @@ impl Chain {
                 }
                 let d = self.params.guarded_exit_delay_blocks;
                 if ph < claim.queued_height.saturating_add(d) {
-                    return Err(Error::Malformed(
-                        "guarded proof precedes the delay window",
-                    ));
+                    return Err(Error::Malformed("guarded proof precedes the delay window"));
                 }
                 if ph >= height {
-                    return Err(Error::Malformed(
-                        "guarded proof block is not yet canonical",
-                    ));
+                    return Err(Error::Malformed("guarded proof block is not yet canonical"));
                 }
                 let root = self
                     .block_at(ph)

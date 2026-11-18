@@ -2254,7 +2254,10 @@ mod tests {
             ),
             Decision::Deny(GuardError::WrongAudience)
         );
-        assert!(book.is_empty(), "refused high-assurance zero-audience commits nothing");
+        assert!(
+            book.is_empty(),
+            "refused high-assurance zero-audience commits nothing"
+        );
     }
 
     #[test]

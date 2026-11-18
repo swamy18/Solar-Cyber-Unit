@@ -475,8 +475,7 @@ pub fn merkle_root_with_checkpoint(
     if l2.is_empty() && root.is_none() && claims.is_empty() && checkpoint.is_none() {
         return merkle_root(l1);
     }
-    let mut leaves: Vec<Hash> =
-        Vec::with_capacity(l1.len() + l2.len() + claims.len() + 2);
+    let mut leaves: Vec<Hash> = Vec::with_capacity(l1.len() + l2.len() + claims.len() + 2);
     leaves.extend(l1.iter().map(|t| sha256(&[&[LEAF_TAG], &t.serialize()])));
     leaves.extend(l2.iter().map(|t| sha256(&[&[LEAF_TAG_L2], &t.serialize()])));
     if let Some(r) = root {

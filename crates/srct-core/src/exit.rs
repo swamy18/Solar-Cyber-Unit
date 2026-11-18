@@ -21,9 +21,7 @@
 use crate::error::{Error, Result};
 use crate::hash::{sha512_dom, Address, Hash, Hash512};
 use crate::ser::{Reader, Writer};
-use crate::state_root::{
-    exit_record_leaf, exit_record_leaf_v7, verify_inclusion, InclusionProof,
-};
+use crate::state_root::{exit_record_leaf, exit_record_leaf_v7, verify_inclusion, InclusionProof};
 use crate::tx::{OutPoint, GAS_PER_INPUT, GAS_PER_OUTPUT, GAS_TX_BASE};
 
 /// Domain tag for the claim identity. Covers every consensus field, so a

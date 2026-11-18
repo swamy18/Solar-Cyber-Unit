@@ -50,8 +50,7 @@ fn throttle_capacity_single_owner() {
     // so 10 fit and the 11th is refused — all inside one window. Height
     // advances one per attempt, staying inside the first window throughout.
     for nonce in 1..=30u64 {
-        let payload =
-            ExitQueuePayload::build(&owner, nonce, EXIT_AMOUNT, dest, 1_000_000).unwrap();
+        let payload = ExitQueuePayload::build(&owner, nonce, EXIT_AMOUNT, dest, 1_000_000).unwrap();
         let tx = L2Transaction::new(L2Payload::ExitQueue(payload));
         if state.apply(&tx, nonce, &validators(), &verifier).is_ok() {
             accepted += 1;

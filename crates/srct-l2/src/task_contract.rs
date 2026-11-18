@@ -190,8 +190,8 @@ impl L2Config {
             guarded_max_grant_lifetime_blocks: 0,
             guarded_outflow_cap_bps: 0,
             guarded_outflow_window_blocks: 0,
-        guarded_exit_delay_blocks: 0,
-        guarded_approval_threshold_sat: 0,
+            guarded_exit_delay_blocks: 0,
+            guarded_approval_threshold_sat: 0,
         }
     }
 
@@ -220,8 +220,8 @@ impl L2Config {
             guarded_max_grant_lifetime_blocks: 0,
             guarded_outflow_cap_bps: 0,
             guarded_outflow_window_blocks: 0,
-        guarded_exit_delay_blocks: 0,
-        guarded_approval_threshold_sat: 0,
+            guarded_exit_delay_blocks: 0,
+            guarded_approval_threshold_sat: 0,
         }
     }
 }

@@ -21,8 +21,8 @@ use srct_core::mempool::Mempool;
 use srct_core::params::NetworkParams;
 use srct_core::tx::{OutPoint, Output};
 use srct_core::wallet::Wallet;
-use srct_l2::{ChainL2, DepositParams, L2Config, L2Genesis, L2State};
 use srct_l2::L2Error;
+use srct_l2::{ChainL2, DepositParams, L2Config, L2Genesis, L2State};
 
 use srct_core::bls_checkpoint::{MockBls, ValidatorSet};
 
@@ -684,7 +684,12 @@ fn guarded_view(chain: &Chain) -> ChainL2 {
 
 /// Apply L2 transactions in a fresh block carrying the correctly computed
 /// post-state root, then resync the caller's L2 view to the new tip.
-fn mine_l2_block(chain: &mut Chain, l2: &mut ChainL2, miner: Address, txs: Vec<L2Transaction>) -> u64 {
+fn mine_l2_block(
+    chain: &mut Chain,
+    l2: &mut ChainL2,
+    miner: Address,
+    txs: Vec<L2Transaction>,
+) -> u64 {
     let h = chain.height() + 1;
     let vals = ValidatorSet::new(vec![]);
     let mut sim = l2.state().clone();
@@ -762,8 +767,17 @@ fn guarded_world() -> GuardedWorld {
     // Cap is 100% here so the integration flow (cancel/claim ordering) is
     // what is under test; the cap itself is pinned by the vectors suite and
     // the allow-list unit test below.
-    let opt = GuardedOptInPayload::build(&owner, addr(&guardian), vec![dest], 10, 100_000, 10_000, 1_000_000, 1)
-        .unwrap();
+    let opt = GuardedOptInPayload::build(
+        &owner,
+        addr(&guardian),
+        vec![dest],
+        10,
+        100_000,
+        10_000,
+        1_000_000,
+        1,
+    )
+    .unwrap();
     let h_opt = mine_l2_block(
         &mut chain,
         &mut l2,
@@ -798,11 +812,25 @@ fn guarded_exit_before_allowlist_activation_is_refused() {
     let dest = addr(&wallet(43));
     s.credit(addr(&owner), 10_000_000_000).unwrap();
     // Opt in at height 1 with a 10-block activation delay.
-    let opt = GuardedOptInPayload::build(&owner, addr(&guardian), vec![dest], 10, 100_000, 1_000, 1_000_000, 1)
-        .unwrap();
+    let opt = GuardedOptInPayload::build(
+        &owner,
+        addr(&guardian),
+        vec![dest],
+        10,
+        100_000,
+        1_000,
+        1_000_000,
+        1,
+    )
+    .unwrap();
     let vals = ValidatorSet::new(vec![]);
-    s.apply(&L2Transaction::new(L2Payload::GuardedOptIn(opt)), 1, &vals, &MockBls)
-        .unwrap();
+    s.apply(
+        &L2Transaction::new(L2Payload::GuardedOptIn(opt)),
+        1,
+        &vals,
+        &MockBls,
+    )
+    .unwrap();
     // Immediate queue (height 2 < 1 + 10) is refused by name.
     let q = L2Transaction::new(L2Payload::ExitQueue(
         ExitQueuePayload::build(&owner, 1, 1_000_000, dest, EXIT_FEE).unwrap(),
@@ -839,7 +867,15 @@ fn guarded_cancel(w: &mut GuardedWorld, nonce: u64) -> Result<(), String> {
             let root = sim.committed_root();
             let b = w
                 .chain
-                .mine_block_with_l2_root(me, vec![], vec![tx], root, ts(h), None, DEFAULT_MAX_ATTEMPTS)
+                .mine_block_with_l2_root(
+                    me,
+                    vec![],
+                    vec![tx],
+                    root,
+                    ts(h),
+                    None,
+                    DEFAULT_MAX_ATTEMPTS,
+                )
                 .unwrap();
             w.chain.submit(b).map_err(|e| e.to_string())?;
             w.l2 = guarded_view(&w.chain);
@@ -939,14 +975,9 @@ fn guarded_exit_claimable_with_post_delay_proof() {
     };
     let h = w.chain.height() + 1;
     let mut pool = Mempool::new(1 << 20);
-    let refused = w.chain.mine_from_pool_with_exits(
-        &mut pool,
-        me,
-        ts(h),
-        vec![],
-        vec![legacy],
-        None,
-    );
+    let refused =
+        w.chain
+            .mine_from_pool_with_exits(&mut pool, me, ts(h), vec![], vec![legacy], None);
     assert!(
         matches!(refused, Err(ref e) if e.to_string().contains("exit proof does not verify")),
         "guarded exit without a guarded proof must be refused, got {refused:?}"
@@ -986,14 +1017,9 @@ fn guarded_exit_claimable_with_post_delay_proof() {
     };
     let h2 = w.chain.height() + 1;
     let mut pool2 = Mempool::new(1 << 20);
-    let res = w.chain.mine_from_pool_with_exits(
-        &mut pool2,
-        me,
-        ts(h2),
-        vec![],
-        vec![claim],
-        None,
-    );
+    let res = w
+        .chain
+        .mine_from_pool_with_exits(&mut pool2, me, ts(h2), vec![], vec![claim], None);
     assert!(
         res.is_ok(),
         "guarded claim with a post-delay proof must be accepted, got {res:?}"

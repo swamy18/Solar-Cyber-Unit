@@ -39,7 +39,8 @@ use srct_core::l2::{
     settle_fee_sat, AgentSpendPayload, ClaimTaskPayload, CreditCollateralPayload,
     CreditDefaultPayload, CreditOpenPayload, CreditOpenV2Payload, CreditRepayPayload,
     DisputePayload, ExitQueuePayload, L2Payload, L2Transaction, PolicyPayload, PolicyRevokePayload,
-    PostTaskPayload, SettlePayload, SubmitResultPayload, Verdict, MIN_EXIT_FEE_SAT, VWC_HASH_EXPIRED,
+    PostTaskPayload, SettlePayload, SubmitResultPayload, Verdict, MIN_EXIT_FEE_SAT,
+    VWC_HASH_EXPIRED,
 };
 use srct_core::params::MAX_CREDIT_RATE_BPS_PER_WINDOW;
 use srct_core::ser::{Reader, Writer};
@@ -155,11 +156,20 @@ pub enum L2Effect {
         excess_returned_sat: u64,
     },
     /// A guarded account was opted in (Phase 3).
-    GuardedOptedIn { owner: Address, guardian: Address },
+    GuardedOptedIn {
+        owner: Address,
+        guardian: Address,
+    },
     /// A guarded action was taken (cancel/freeze, Phase 3).
-    GuardedAction { account: Address, kind: &'static str },
+    GuardedAction {
+        account: Address,
+        kind: &'static str,
+    },
     /// An audit root was anchored (Phase 3).
-    AuditAnchored { anchorer: Address, root: Hash },
+    AuditAnchored {
+        anchorer: Address,
+        root: Hash,
+    },
     /// Generic catch-all for future effects (kept for extensibility).
     Custom(&'static str),
 }
@@ -1497,7 +1507,9 @@ impl L2State {
             if g.frozen {
                 return Err(L2Error::AccountFrozen);
             }
-            let delay = g.grant_delay_blocks.max(self.config.guarded_grant_delay_blocks);
+            let delay = g
+                .grant_delay_blocks
+                .max(self.config.guarded_grant_delay_blocks);
             if policy.not_before_height < height.saturating_add(delay) {
                 return Err(L2Error::GrantDelayNotSatisfied);
             }
@@ -1641,7 +1653,10 @@ impl L2State {
             // the signature itself; this binds it to the right guardian).
             let tier = self.config.guarded_approval_threshold_sat;
             if tier != 0 && p.amount_sat >= tier {
-                let co = p.guardian_approval.as_ref().ok_or(L2Error::GuardedApprovalRequired)?;
+                let co = p
+                    .guardian_approval
+                    .as_ref()
+                    .ok_or(L2Error::GuardedApprovalRequired)?;
                 let g = self
                     .guarded
                     .get(&policy.owner)
@@ -1733,7 +1748,9 @@ impl L2State {
         }
         // Allow-list must contain the recipient AND have been active long
         // enough (changes take effect only after the delay).
-        let delay = g.grant_delay_blocks.max(self.config.guarded_grant_delay_blocks);
+        let delay = g
+            .grant_delay_blocks
+            .max(self.config.guarded_grant_delay_blocks);
         if !g.allow_list.contains(recipient)
             || height < g.allowlist_active_height.saturating_add(delay)
         {
@@ -1798,7 +1815,10 @@ impl L2State {
         // Read-only snapshot first: `balance` borrows `self` immutably and
         // must not run while the guarded entry is mutably borrowed below.
         let snap = self.balance(owner);
-        let g = self.guarded.get_mut(owner).ok_or(L2Error::GuardedNotOptedIn)?;
+        let g = self
+            .guarded
+            .get_mut(owner)
+            .ok_or(L2Error::GuardedNotOptedIn)?;
         if height >= g.window_start_height.saturating_add(window) {
             g.window_start_height = height;
             g.window_balance_snapshot = snap;
@@ -2008,7 +2028,9 @@ impl L2State {
                 .checked_mul(self.config.credit_max_collateral_multiple)
                 .ok_or(L2Error::Overflow)?;
             if collateral_sat > max_allowed {
-                return Err(L2Error::CreditTerms("collateral exceeds the maximum multiple"));
+                return Err(L2Error::CreditTerms(
+                    "collateral exceeds the maximum multiple",
+                ));
             }
         }
         // Position id covers all terms (same scheme as v1 so vectors stay comparable).
@@ -2162,11 +2184,7 @@ impl L2State {
                 nb.copy_from_slice(&p.target[..8]);
                 let nonce = u64::from_le_bytes(nb);
                 let key = (p.account, nonce);
-                let record = self
-                    .exits
-                    .get(&key)
-                    .ok_or(L2Error::UnknownExit)?
-                    .clone();
+                let record = self.exits.get(&key).ok_or(L2Error::UnknownExit)?.clone();
                 // Cancel window: only before queued_height + D. At or after,
                 // the exit is claimable and the L1 side may already hold a
                 // post-delay proof; removing the record then would fork the
@@ -2199,9 +2217,8 @@ impl L2State {
                 // budget in the *new* window (saturating at zero) - at most
                 // one exit of extra headway.
                 if let Some(g) = self.guarded.get_mut(&p.account) {
-                    g.window_outflow_total = g
-                        .window_outflow_total
-                        .saturating_sub(record.amount_sat);
+                    g.window_outflow_total =
+                        g.window_outflow_total.saturating_sub(record.amount_sat);
                 }
                 Ok(L2Effect::GuardedAction {
                     account: p.account,
@@ -2272,7 +2289,15 @@ impl L2State {
         }
         use srct_core::hash::sha256_dom;
         const DOM_AUDIT: &[u8] = b"srct/l2/audit-anchor/v1";
-        let id = sha256_dom(DOM_AUDIT, &[&p.anchorer, &p.root, &height.to_le_bytes(), &p.nonce.to_le_bytes()]);
+        let id = sha256_dom(
+            DOM_AUDIT,
+            &[
+                &p.anchorer,
+                &p.root,
+                &height.to_le_bytes(),
+                &p.nonce.to_le_bytes(),
+            ],
+        );
         if self.audit_anchors.contains_key(&id) {
             return Err(L2Error::Replay);
         }
@@ -3117,10 +3142,10 @@ impl L2State {
             .u64le(self.config.guarded_grant_delay_blocks)
             .u64le(self.config.guarded_max_grant_lifetime_blocks)
             .u64le(self.config.guarded_outflow_cap_bps)
-        .u64le(self.config.guarded_outflow_window_blocks)
-        .u64le(self.config.guarded_exit_delay_blocks)
-        .u64le(self.config.guarded_approval_threshold_sat)
-        .u8(u8::from(self.genesis_applied))
+            .u64le(self.config.guarded_outflow_window_blocks)
+            .u64le(self.config.guarded_exit_delay_blocks)
+            .u64le(self.config.guarded_approval_threshold_sat)
+            .u8(u8::from(self.genesis_applied))
             .u64le(self.funded_total)
             .u64le(self.deposited_total)
             .u64le(self.exited_total)
@@ -3219,7 +3244,11 @@ impl L2State {
         anchors.sort_by_key(|(h, _)| **h);
         w.u64le(anchors.len() as u64);
         for (id, a) in anchors {
-            w.fixed(id).fixed(&a.anchorer).fixed(&a.root).u64le(a.height).u64le(a.nonce);
+            w.fixed(id)
+                .fixed(&a.anchorer)
+                .fixed(&a.root)
+                .u64le(a.height)
+                .u64le(a.nonce);
         }
         w.into_vec()
     }
@@ -3307,16 +3336,16 @@ impl L2State {
             } else {
                 0
             },
-        guarded_outflow_window_blocks: if wire_v8 {
-            r.u64le().map_err(|_| codec_err("guarded window"))?
-        } else {
-            0
-        },
-        guarded_exit_delay_blocks: if wire_v8 {
-            r.u64le().map_err(|_| codec_err("guarded exit delay"))?
-        } else {
-            0
-        },
+            guarded_outflow_window_blocks: if wire_v8 {
+                r.u64le().map_err(|_| codec_err("guarded window"))?
+            } else {
+                0
+            },
+            guarded_exit_delay_blocks: if wire_v8 {
+                r.u64le().map_err(|_| codec_err("guarded exit delay"))?
+            } else {
+                0
+            },
             guarded_approval_threshold_sat: if wire_v8 {
                 r.u64le().map_err(|_| codec_err("guarded approval tier"))?
             } else {
@@ -3619,7 +3648,15 @@ impl L2State {
                 let height = r.u64le().map_err(|_| codec_err("audit height"))?;
                 let nonce = r.u64le().map_err(|_| codec_err("audit nonce"))?;
                 if audit_anchors
-                    .insert(id, AuditAnchorRecord { anchorer, root, height, nonce })
+                    .insert(
+                        id,
+                        AuditAnchorRecord {
+                            anchorer,
+                            root,
+                            height,
+                            nonce,
+                        },
+                    )
                     .is_some()
                 {
                     return Err(codec_err("duplicate audit anchor"));

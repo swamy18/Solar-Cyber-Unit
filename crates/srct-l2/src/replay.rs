@@ -577,12 +577,8 @@ impl srct_core::chain::L2RootValidator for AncestryRootValidator {
 
         // Rebuild L2 state from genesis to parent, then apply this block.
         // Full rebuild ensures determinism regardless of cache state.
-        let mut l2 = ChainL2::empty(
-            self.config.clone(),
-            &L2Genesis::empty(),
-            self.deposits,
-        )
-        .map_err(|e| L2RootError::Replay(e.to_string()))?;
+        let mut l2 = ChainL2::empty(self.config.clone(), &L2Genesis::empty(), self.deposits)
+            .map_err(|e| L2RootError::Replay(e.to_string()))?;
 
         // Replay blocks 1..=parent height via ancestry walk.
         // Collect the ancestry path first (genesis to parent).

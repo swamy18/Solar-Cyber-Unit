@@ -442,9 +442,8 @@ fn the_authority_and_credit_rules_match_the_independent_implementation() {
                     L2Transaction::new(L2Payload::CreditOpenV2(payload))
                 }
                 "guarded_optin" => {
-                    let owner = wallet_for(
-                        step.get("owner").and_then(Value::as_str).expect("an owner"),
-                    );
+                    let owner =
+                        wallet_for(step.get("owner").and_then(Value::as_str).expect("an owner"));
                     let allow: Vec<srct_core::hash::Address> = step
                         .get("allow_list")
                         .and_then(Value::as_array)
@@ -716,9 +715,7 @@ fn the_authority_and_credit_rules_match_the_independent_implementation() {
 
         // Guarded accounts, if the vector file carries any.
         if let Some(expected_guarded) = scenario.get("final").and_then(|f| f.get("guarded")) {
-            let expected_guarded = expected_guarded
-                .as_array()
-                .expect("the guarded accounts");
+            let expected_guarded = expected_guarded.as_array().expect("the guarded accounts");
             let got = state.guarded_accounts();
             assert_eq!(
                 got.len(),
@@ -755,10 +752,8 @@ fn the_authority_and_credit_rules_match_the_independent_implementation() {
                     .collect();
                 want_allow.sort();
                 // Compare by address bytes instead of role names.
-                let want_addrs: Vec<srct_core::hash::Address> = want_allow
-                    .iter()
-                    .map(|r| addr_for(r))
-                    .collect();
+                let want_addrs: Vec<srct_core::hash::Address> =
+                    want_allow.iter().map(|r| addr_for(r)).collect();
                 let mut have_addrs = g.allow_list.clone();
                 have_addrs.sort();
                 let mut want_sorted = want_addrs;
@@ -782,10 +777,7 @@ fn the_authority_and_credit_rules_match_the_independent_implementation() {
                 );
             }
         }
-        if let Some(expected_anchors) = scenario
-            .get("final")
-            .and_then(|f| f.get("audit_anchors"))
-        {
+        if let Some(expected_anchors) = scenario.get("final").and_then(|f| f.get("audit_anchors")) {
             assert_eq!(
                 state.audit_anchor_count(),
                 expected_anchors.as_u64().expect("a count") as usize,
