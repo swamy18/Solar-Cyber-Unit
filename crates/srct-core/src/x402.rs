@@ -35,7 +35,7 @@
 //! name. Base64 errors are `Malformed`, never panics.
 
 use crate::hash::address_from_hex;
-use crate::hash::Address;
+use crate::hash::{Address, Hash};
 use serde::{Deserialize, Serialize};
 
 /// x402 protocol version this adapter speaks (x402 v2).
@@ -189,20 +189,59 @@ pub struct X402Response {
 /// A present allow-list mirrors `SpendPolicy` exactly (empty present list =
 /// deny-all; a tagged-services list refuses untagged spending); an absent
 /// (`None`) list means unbounded on that axis.
+///
+/// Multi-asset extension (non-consensus, client-side only): `allowed_chains`
+/// scopes which CAIP-2 networks the agent may pay on (`None` = SRCT only,
+/// the pre-interop default), and `allowed_assets` scopes which intent
+/// [`AssetId`](crate::hash::Hash)s it may settle in. Both follow the same
+/// deny-on-present-empty rule.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct X402Budget {
     pub max_amount_sat: u64,
     pub allowed_recipients: Option<Vec<Address>>,
     pub allowed_services: Option<Vec<[u8; 32]>>,
+    pub allowed_chains: Option<Vec<String>>,
+    pub allowed_assets: Option<Vec<Hash>>,
 }
 
 impl X402Budget {
+    /// SRCT-only budget: pre-interop behaviour, chains/assets unbounded only
+    /// in the sense that the SRCT signing path admits nothing else anyway.
+    pub fn srct_only(
+        max_amount_sat: u64,
+        allowed_recipients: Option<Vec<Address>>,
+        allowed_services: Option<Vec<[u8; 32]>>,
+    ) -> Self {
+        Self {
+            max_amount_sat,
+            allowed_recipients,
+            allowed_services,
+            allowed_chains: None,
+            allowed_assets: None,
+        }
+    }
+
     /// Refuse anything outside the budget before any key is touched.
     pub fn check(
         &self,
         amount_sat: u64,
         recipient: &Address,
         service: &Option<[u8; 32]>,
+    ) -> Result<(), X402Error> {
+        self.check_asset(amount_sat, recipient, service, &None, &None)
+    }
+
+    /// Budget check plus chain/asset scoping for cross-chain intents. `chain`
+    /// is a CAIP-2 id (`srct:testnet`, `eip155:8453`); `asset` is the intent
+    /// asset id. `None` chain means the SRCT signing path (always allowed);
+    /// `None` asset means a plain SRCT payment (always allowed).
+    pub fn check_asset(
+        &self,
+        amount_sat: u64,
+        recipient: &Address,
+        service: &Option<[u8; 32]>,
+        chain: &Option<String>,
+        asset: &Option<Hash>,
     ) -> Result<(), X402Error> {
         if amount_sat == 0 {
             return Err(X402Error::ZeroAmount);
@@ -213,15 +252,11 @@ impl X402Budget {
                 max: self.max_amount_sat,
             });
         }
-        // Recipient allow-list (a present but empty list denies everything,
-        // exactly like `SpendPolicy`).
         if let Some(allowed) = &self.allowed_recipients {
             if !allowed.contains(recipient) {
                 return Err(X402Error::RecipientNotAllowed);
             }
         }
-        // Service allow-list (a tagged list refuses untagged spending:
-        // the tag is how the owner restricts *what* the money buys).
         match (service, &self.allowed_services) {
             (None, Some(allowed)) if !allowed.is_empty() => {
                 return Err(X402Error::ServiceNotAllowed);
@@ -230,6 +265,20 @@ impl X402Budget {
                 return Err(X402Error::ServiceNotAllowed);
             }
             _ => {}
+        }
+        if let (Some(chain), Some(allowed)) = (chain, &self.allowed_chains) {
+            if !allowed.iter().any(|c| c == chain) {
+                return Err(X402Error::BudgetExceeded(format!(
+                    "chain {chain} outside agent budget"
+                )));
+            }
+        }
+        if let (Some(asset), Some(allowed)) = (asset, &self.allowed_assets) {
+            if !allowed.contains(asset) {
+                return Err(X402Error::BudgetExceeded(
+                    "asset outside agent budget".to_string(),
+                ));
+            }
         }
         Ok(())
     }
@@ -692,11 +741,7 @@ mod tests {
 
     #[test]
     fn budget_refuses_overrun_and_allowlist() {
-        let budget = X402Budget {
-            max_amount_sat: 600,
-            allowed_recipients: Some(vec![[1u8; 20]]),
-            allowed_services: Some(vec![[2u8; 32]]),
-        };
+        let budget = X402Budget::srct_only(600, Some(vec![[1u8; 20]]), Some(vec![[2u8; 32]]));
         assert!(budget.check(500, &[1u8; 20], &Some([2u8; 32])).is_ok());
         assert!(matches!(
             budget.check(700, &[1u8; 20], &Some([2u8; 32])),
@@ -716,40 +761,24 @@ mod tests {
     fn budget_mirrors_spend_policy_allow_lists() {
         // A present-but-empty recipient list denies everything (deny-all,
         // exactly like `SpendPolicy`), while an absent list is unbounded.
-        let deny_all = X402Budget {
-            max_amount_sat: 600,
-            allowed_recipients: Some(vec![]),
-            allowed_services: None,
-        };
+        let deny_all = X402Budget::srct_only(600, Some(vec![]), None);
         assert_eq!(
             deny_all.check(500, &[1u8; 20], &None),
             Err(X402Error::RecipientNotAllowed)
         );
-        let open = X402Budget {
-            max_amount_sat: 600,
-            allowed_recipients: None,
-            allowed_services: None,
-        };
+        let open = X402Budget::srct_only(600, None, None);
         assert!(open.check(500, &[1u8; 20], &None).is_ok());
 
         // A tagged-services list refuses untagged spending (the tag is how
         // the owner restricts *what* the money buys); untagged lists allow
         // plain payments.
-        let tagged = X402Budget {
-            max_amount_sat: 600,
-            allowed_recipients: None,
-            allowed_services: Some(vec![[2u8; 32]]),
-        };
+        let tagged = X402Budget::srct_only(600, None, Some(vec![[2u8; 32]]));
         assert_eq!(
             tagged.check(500, &[1u8; 20], &None),
             Err(X402Error::ServiceNotAllowed)
         );
         assert!(tagged.check(500, &[1u8; 20], &Some([2u8; 32])).is_ok());
-        let untagged_ok = X402Budget {
-            max_amount_sat: 600,
-            allowed_recipients: None,
-            allowed_services: Some(vec![]),
-        };
+        let untagged_ok = X402Budget::srct_only(600, None, Some(vec![]));
         assert!(untagged_ok.check(500, &[1u8; 20], &None).is_ok());
         assert_eq!(
             untagged_ok.check(500, &[1u8; 20], &Some([2u8; 32])),
@@ -759,11 +788,7 @@ mod tests {
 
     #[test]
     fn guard_is_short_lived_and_evm_routes_parse() {
-        let budget = X402Budget {
-            max_amount_sat: 600,
-            allowed_recipients: Some(vec![[1u8; 20]]),
-            allowed_services: Some(vec![]),
-        };
+        let budget = X402Budget::srct_only(600, Some(vec![[1u8; 20]]), Some(vec![]));
         let grant = budget
             .check_guarded(500, &[1u8; 20], &None, 100, 110)
             .unwrap();
@@ -821,5 +846,46 @@ mod tests {
         assert_eq!(required.accepts[1].network, "eip155:8453");
         let picked = select_accept(&required, &budget, &[1u8; 20], &None).unwrap();
         assert_eq!(picked.network, "srct:testnet");
+    }
+
+    #[test]
+    fn budget_scopes_chains_and_assets() {
+        let asset = [0xabu8; 32];
+        let budget = X402Budget {
+            max_amount_sat: 600,
+            allowed_recipients: Some(vec![[1u8; 20]]),
+            allowed_services: None,
+            allowed_chains: Some(vec!["eip155:8453".to_string()]),
+            allowed_assets: Some(vec![asset]),
+        };
+        assert!(budget
+            .check_asset(
+                500,
+                &[1u8; 20],
+                &None,
+                &Some("eip155:8453".to_string()),
+                &Some(asset)
+            )
+            .is_ok());
+        assert!(budget
+            .check_asset(
+                500,
+                &[1u8; 20],
+                &None,
+                &Some("eip155:1".to_string()),
+                &Some(asset)
+            )
+            .is_err());
+        assert!(budget
+            .check_asset(
+                500,
+                &[1u8; 20],
+                &None,
+                &Some("eip155:8453".to_string()),
+                &Some([0u8; 32])
+            )
+            .is_err());
+        // Plain SRCT path stays allowed regardless of chain/asset lists.
+        assert!(budget.check(500, &[1u8; 20], &None).is_ok());
     }
 }

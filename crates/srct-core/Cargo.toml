@@ -20,6 +20,8 @@ ml-dsa.workspace = true
 # Wipes the wallet scalar on drop, so a freed allocation is not left holding
 # a spendable key for its next taker.
 zeroize.workspace = true
+sha3.workspace = true
+hmac.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true

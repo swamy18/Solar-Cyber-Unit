@@ -11470,6 +11470,47 @@ async fn ramp_intents(
     })?
 }
 
+// --- Cross-chain assets + EVM receipt registry (non-consensus) ---
+
+/// `GET /v1/assets` — canonical asset ids the interop layer speaks.
+/// SRCT native, EVM native per chain, plus usage for ERC-20 derivation.
+/// Per-node registry info, not consensus: no coin moves here.
+async fn assets_list() -> ApiResult {
+    Ok(Json(json!({
+        "assets": [
+            { "id": "srct:native", "chain": "srct", "kind": "native",
+              "note": "native SRCT, settled by L1/L2" },
+            { "id": "eip155:8453:native", "chain": "eip155:8453", "kind": "native",
+              "note": "Base ETH, solver-settled" },
+            { "id": "eip155:84532:native", "chain": "eip155:84532", "kind": "native",
+              "note": "Base Sepolia ETH, solver-settled" },
+            { "id": "erc20:<chain_id>:<contract20>", "chain": "eip155:*", "kind": "erc20",
+              "note": "derive via srct-intent evm::erc20_asset(chain, contract)" },
+        ],
+        "rails": ["srct", "eip155:8453", "eip155:84532"],
+    })))
+}
+
+#[derive(Deserialize)]
+struct XchainStatusReq {
+    intent_hex: String,
+}
+
+/// `POST /v1/xchain/status` — decode an intent id and report the rail
+/// verification recipe: what receipt the solver must post, how many
+/// confirmations the rail demands, and which script checks it.
+/// Read-only: no escrow, no settlement, no key use.
+async fn xchain_status(Json(req): Json<XchainStatusReq>) -> ApiResult {
+    let intent = decode_hash(&req.intent_hex)?;
+    Ok(Json(json!({
+        "intent_id": hash_to_hex(&intent),
+        "rail": "evm",
+        "min_confirmations": srct_intent::EVM_MIN_CONFIRMATIONS,
+        "check": "templates/check_evm_receipt.py --rpc <RPC> --tx <TX> --to <TO> --min-value-wei <WEI>",
+        "note": "solver executes on the EVM side, operator verifies via RPC, then confirms on the rail",
+    })))
+}
+
 // --- Productive lending ---
 
 #[derive(Deserialize)]
@@ -12998,6 +13039,8 @@ pub fn router(state: ApiState, cfg: &ApiConfig) -> Router {
         .route("/v1/ramp/intent", post(ramp_intent))
         .route("/v1/ramp/intent/{id}/settle", post(ramp_intent_settle))
         .route("/v1/ramp/intents", get(ramp_intents))
+        .route("/v1/assets", get(assets_list))
+        .route("/v1/xchain/status", post(xchain_status))
         .route("/v1/loans/offers", post(loan_offer_post))
         .route("/v1/loans/offers/list", get(loan_offers))
         .route("/v1/loans/accept", post(loan_accept))

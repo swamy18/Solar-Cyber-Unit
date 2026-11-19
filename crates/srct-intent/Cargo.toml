@@ -11,6 +11,8 @@ repository.workspace = true
 [dependencies]
 srct-core.workspace = true
 srct-verify.workspace = true
+sha3.workspace = true
+hmac.workspace = true
 
 [dev-dependencies]
 srct-compute.workspace = true

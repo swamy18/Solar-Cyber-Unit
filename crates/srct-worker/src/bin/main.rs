@@ -55,6 +55,13 @@ type CliClient = WorkerClient<HttpNode, HttpNode, CpuExecutor>;
 fn usage() -> String {
     "usage:
   srct-worker address  --from-file <path>
+  srct-worker hd-address --from-file <path> [--chain evm|btc|srct]
+                         [--index <n>] [--chain-id <n>]
+  srct-worker evm-sign --from-file <path> --payload-hex <hex>
+                         [--index <n>] [--chain-id <n>]
+  srct-worker xchain-quote --kind srct|evm-native|erc20 [--chain-id <n>]
+                         [--contract 0x<20 bytes>]
+  srct-worker xchain-confirm --confirmations <n> [--confirmed-ok]
   srct-worker generate --out-file <path> [--label <label>]
   srct-worker run      --from-file <path> --node <base-url> [--network <name>]
                       [--iterations <n>] [--interval-ms <n>] [--max-tasks <n>]
@@ -141,6 +148,8 @@ fn run(args: &[String]) -> Result<i32, String> {
             Ok(0)
         }
         "address" => cmd_address(args),
+        "hd-address" => cmd_hd_address(args),
+        "evm-sign" => cmd_evm_sign(args),
         "generate" => cmd_generate(args),
         "run" => cmd_run(args),
         "grant" => cmd_grant(args),
@@ -150,6 +159,8 @@ fn run(args: &[String]) -> Result<i32, String> {
         "stream-open" => cmd_stream_open(args),
         "stream-voucher" => cmd_stream_voucher(args),
         "stream-status" => cmd_stream_status(args),
+        "xchain-quote" => cmd_xchain_quote(args),
+        "xchain-confirm" => cmd_xchain_confirm(args),
         "batch-quote" => cmd_batch_quote(args),
         "trial-request" => cmd_trial_request(args),
         "trial-fund" => cmd_trial_fund(args),
@@ -178,6 +189,122 @@ fn cmd_address(args: &[String]) -> Result<i32, String> {
         .map_err(|e| format!("wallet unusable: {e}"))?;
     println!("{}", srct_core::hash::address_to_hex(&addr));
     Ok(0)
+}
+
+fn cmd_hd_address(args: &[String]) -> Result<i32, String> {
+    let path = str_arg(args, "--from-file").ok_or("hd-address needs --from-file <path>")?;
+    let chain = str_arg(args, "--chain")
+        .map(String::as_str)
+        .unwrap_or("evm");
+    let index: u32 = str_arg(args, "--index")
+        .map(|s| s.parse().map_err(|_| "bad --index".to_string()))
+        .transpose()?
+        .unwrap_or(0);
+    let chain_id: u64 = str_arg(args, "--chain-id")
+        .map(|s| s.parse().map_err(|_| "bad --chain-id".to_string()))
+        .transpose()?
+        .unwrap_or(8453);
+    let wallet = load_wallet(path)?;
+    let hd = srct_core::hd::HdWallet::from_seed(&wallet.private_key, wallet.label.clone())
+        .map_err(|e| format!("hd wallet unusable: {e}"))?;
+    match chain {
+        "evm" => {
+            let hex = hd
+                .evm_address_hex(chain_id, index)
+                .map_err(|e| format!("evm address failed: {e}"))?;
+            println!("{hex}");
+            Ok(0)
+        }
+        "btc" => {
+            let prog = hd
+                .btc_program(index)
+                .map_err(|e| format!("btc program failed: {e}"))?;
+            println!("{}", hex::encode(prog));
+            Ok(0)
+        }
+        "srct" => {
+            let addr = hd
+                .srct_child_address(index)
+                .map_err(|e| format!("srct child failed: {e}"))?;
+            println!("{}", srct_core::hash::address_to_hex(&addr));
+            Ok(0)
+        }
+        _ => Err("hd-address --chain must be evm|btc|srct".into()),
+    }
+}
+
+fn cmd_evm_sign(args: &[String]) -> Result<i32, String> {
+    let path = str_arg(args, "--from-file").ok_or("evm-sign needs --from-file <path>")?;
+    let payload_hex = str_arg(args, "--payload-hex").ok_or("evm-sign needs --payload-hex <hex>")?;
+    let index: u32 = str_arg(args, "--index")
+        .map(|s| s.parse().map_err(|_| "bad --index".to_string()))
+        .transpose()?
+        .unwrap_or(0);
+    let chain_id: u64 = str_arg(args, "--chain-id")
+        .map(|s| s.parse().map_err(|_| "bad --chain-id".to_string()))
+        .transpose()?
+        .unwrap_or(8453);
+    let payload = hex::decode(payload_hex.trim()).map_err(|_| "bad --payload-hex".to_string())?;
+    let wallet = load_wallet(path)?;
+    let hd = srct_core::hd::HdWallet::from_seed(&wallet.private_key, wallet.label.clone())
+        .map_err(|e| format!("hd wallet unusable: {e}"))?;
+    let sig = hd
+        .sign_evm_payload(chain_id, index, &payload)
+        .map_err(|e| format!("evm sign failed: {e}"))?;
+    println!("{}", hex::encode(sig));
+    Ok(0)
+}
+
+/// Solver helper: print a canonical asset id for a chain/token.
+/// `xchain-quote --kind srct|evm-native|erc20 --chain-id 8453 [--contract 0x..]`
+fn cmd_xchain_quote(args: &[String]) -> Result<i32, String> {
+    let kind = str_arg(args, "--kind")
+        .map(String::as_str)
+        .unwrap_or("evm-native");
+    let chain_id: u64 = str_arg(args, "--chain-id")
+        .map(|s| s.parse().map_err(|_| "bad --chain-id".to_string()))
+        .transpose()?
+        .unwrap_or(8453);
+    let id = match kind {
+        "srct" => srct_intent::srct_asset(),
+        "evm-native" => srct_intent::evm_native_asset(chain_id),
+        "erc20" => {
+            let contract = str_arg(args, "--contract")
+                .ok_or("xchain-quote --kind erc20 needs --contract 0x<20 bytes>")?;
+            let raw = contract.trim().trim_start_matches("0x");
+            let bytes = hex::decode(raw).map_err(|_| "bad --contract hex".to_string())?;
+            if bytes.len() != 20 {
+                return Err("contract must be 20 bytes".into());
+            }
+            let mut arr = [0u8; 20];
+            arr.copy_from_slice(&bytes);
+            srct_intent::erc20_asset(chain_id, &arr)
+        }
+        _ => return Err("xchain-quote --kind must be srct|evm-native|erc20".into()),
+    };
+    println!("{}", hex::encode(id.0));
+    Ok(0)
+}
+
+/// Solver helper: verify an RPC report shape before confirming on the rail.
+/// Prints the decision (confirm/refuse + reason). State-free: the rail itself
+/// enforces exactly-once; this only formats the operator's check.
+fn cmd_xchain_confirm(args: &[String]) -> Result<i32, String> {
+    let confirmations: u64 = str_arg(args, "--confirmations")
+        .map(|s| s.parse().map_err(|_| "bad --confirmations".to_string()))
+        .transpose()?
+        .unwrap_or(0);
+    let confirmed = str_arg(args, "--confirmed-ok").is_some();
+    if confirmed && confirmations >= srct_intent::EVM_MIN_CONFIRMATIONS {
+        println!("confirm: sufficiently confirmed");
+        Ok(0)
+    } else {
+        println!(
+            "refuse: need --confirmed-ok and >= {} confirmations",
+            srct_intent::EVM_MIN_CONFIRMATIONS
+        );
+        Ok(2)
+    }
 }
 
 fn cmd_generate(args: &[String]) -> Result<i32, String> {
@@ -485,11 +612,7 @@ fn cmd_pay(args: &[String]) -> Result<i32, String> {
         seen.push(pay_to);
         let provider = provider_override.unwrap_or(pay_to);
         let tag = derive_service_id(&params.network_id, &provider, service_name.as_bytes());
-        let budget = X402Budget {
-            max_amount_sat: max_amount,
-            allowed_recipients: recipients.clone(),
-            allowed_services: Some(vec![tag]),
-        };
+        let budget = X402Budget::srct_only(max_amount, recipients.clone(), Some(vec![tag]));
         let Ok(offer) = select_accept(&required, &budget, &pay_to, &Some(tag)) else {
             continue;
         };
@@ -516,11 +639,7 @@ fn cmd_pay(args: &[String]) -> Result<i32, String> {
         .map_err(|e| format!("could not read node height: {e}"))?
         .height;
     let expires_at = height + expiry_blocks;
-    let budget = X402Budget {
-        max_amount_sat: max_amount,
-        allowed_recipients: recipients,
-        allowed_services: Some(vec![tag]),
-    };
+    let budget = X402Budget::srct_only(max_amount, recipients, Some(vec![tag]));
     budget
         .check_guarded(amount, &recipient, &Some(tag), height, expires_at)
         .map_err(|e| format!("budget refuses this payment: {e}"))?;

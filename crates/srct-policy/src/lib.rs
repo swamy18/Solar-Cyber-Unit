@@ -530,11 +530,7 @@ mod tests {
         let policy = root_policy(&wallet);
         // The pre-sign guard (budget + short window) and the engine seam
         // answer the same payment the same way: both allow here.
-        let budget = X402Budget {
-            max_amount_sat: 600,
-            allowed_recipients: Some(vec![[1u8; 20]]),
-            allowed_services: Some(vec![]),
-        };
+        let budget = X402Budget::srct_only(600, Some(vec![[1u8; 20]]), Some(vec![]));
         let grant = budget
             .check_guarded(500, &[1u8; 20], &None, 100, 110)
             .expect("fits the budget and the window");

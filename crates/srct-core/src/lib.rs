@@ -45,6 +45,7 @@ pub mod fx;
 pub mod guard;
 pub mod hash;
 pub mod hbm_pow;
+pub mod hd;
 pub mod hexserde;
 pub mod jobs;
 pub mod l2;

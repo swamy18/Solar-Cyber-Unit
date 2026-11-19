@@ -36,6 +36,7 @@
 
 pub mod adapter;
 pub mod book;
+pub mod evm;
 pub mod solver;
 pub mod types;
 
@@ -44,6 +45,10 @@ pub use book::{
     meets_privacy, meets_verification, BondRelease, BondSlash, IntentBook, IntentError,
     IntentState, RefundInstruction, RefundReason, ResolutionOutcome, SettlementInstruction,
     MAX_SPLIT_INTENTS,
+};
+pub use evm::{
+    erc20_asset, evm_native_asset, srct_asset, EvmRail, ForeignReceipt, VerifiedForeignTx,
+    EVM_MIN_CONFIRMATIONS,
 };
 pub use solver::{
     decode_quote_batch, encode_quote_batch, SolverDirectory, MAX_BATCH_BYTES, MAX_GOSSIP_QUOTES,

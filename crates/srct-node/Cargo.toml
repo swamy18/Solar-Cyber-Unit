@@ -14,6 +14,7 @@ srct-l2.workspace = true
 srct-net.workspace = true
 srct-store.workspace = true
 srct-compute.workspace = true
+srct-intent.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 hex.workspace = true

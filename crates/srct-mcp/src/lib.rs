@@ -1000,11 +1000,11 @@ fn budget_from(v: &Value) -> Result<srct_core::x402::X402Budget, McpError> {
         }
         allowed_services = Some(parsed);
     }
-    Ok(srct_core::x402::X402Budget {
+    Ok(srct_core::x402::X402Budget::srct_only(
         max_amount_sat,
         allowed_recipients,
         allowed_services,
-    })
+    ))
 }
 
 /// Optional `service_hex` field: absent means untagged.
