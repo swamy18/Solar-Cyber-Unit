@@ -173,10 +173,15 @@ hold custody and cannot release funds by itself.
    truncation fail the whole restore, dispute bonds and FHE expectations
    included; trust roots and verifier replay books stay operator state and
    rebuild through the attach rules).
-2. Chain adapters — **seam plus executing rail done** (`adapter::SettlementAdapter`
+2. **Chain adapters** — **seam plus rails done** (`adapter::SettlementAdapter`
    with `MemRail`: escrow funding, exactly-once settlement/refund execution
    with balance movement and replay refusal, pinned by end-to-end tests).
-   External-chain adapters remain per-rail work.
+   **EVM rail done** (`evm::EvmRail`: canonical asset ids + local SRCT-side
+   ledger; settlement only after a confirmed foreign receipt — 12
+   confirmations with txhash/recipient/value match, `confirm_verified`;
+   operator-trust `confirm_foreign` kept for whitelisted solvers; full flow
+   in [`docs/xchain.md`](../docs/xchain.md)). Other external-chain adapters
+   remain per-rail work.
 3. Solver discovery and quote gossip — **done** (`solver::SolverDirectory`:
    liveness advertisement plus verified quote-batch gossip that feeds the
    book's normal admission path; merging is deterministic, tampered batches

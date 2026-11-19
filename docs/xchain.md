@@ -1,15 +1,15 @@
-# Cross-chain interop (EVM rail)
+# Cross-chain interop (HD wallet + EVM rail) — 19 Nov 2026
 
-Non-consensus. L1/L2 untouched. SRCT stays the settlement coin; foreign
-chains settle via the solver/intent pattern.
+Status: **implemented, tested, non-consensus.** L1/L2 untouched. SRCT stays
+the settlement coin; foreign chains settle via the solver/intent pattern.
 
-## Pieces
+## Pieces (all live)
 
 - **HD wallet** (`crates/srct-core/src/hd.rs`): one seed, many chains.
   SRCT leg = existing `Wallet` (bundle `jt1` address). EVM = same scalar,
   secp256k1 ECDSA over keccak256, `0x` address. BTC = placeholder
   `SHA256`-truncated program with real bech32 (`bc1q`/`tb1q`) encoding —
-  review RIPEMD-160 before mainnet funding.
+  review RIPEMD-160 before mainnet funding. 7 tests (`hd::tests`).
 - **EVM rail** (`crates/srct-intent/src/evm.rs`): canonical asset ids
   (`srct_asset`, `evm_native_asset`, `erc20_asset`), `EvmRail`
   (local SRCT-side ledger + exactly-once), foreign receipt gate.
@@ -22,6 +22,19 @@ chains settle via the solver/intent pattern.
   `xchain-quote`, `xchain-confirm`.
 - **Node REST**: `GET /v1/assets`, `POST /v1/xchain/status`.
 - **RPC checker**: `templates/check_evm_receipt.py` (read-only, no keys).
+
+## Try it
+
+```bash
+cargo run -q -p srct-worker -- generate --out-file /tmp/w.json --label demo
+cargo run -q -p srct-worker -- hd-address --from-file /tmp/w.json --chain evm
+cargo run -q -p srct-worker -- hd-address --from-file /tmp/w.json --chain btc
+cargo run -q -p srct-worker -- xchain-quote --kind erc20 --chain-id 8453 \
+  --contract 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913
+python templates/check_evm_receipt.py --rpc <RPC> --chain-id 84532 \
+  --tx 0x<hash> --to 0x<addr> --min-value-wei 1000000
+curl "$NODE/v1/assets"
+```
 
 ## Solver flow
 

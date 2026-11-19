@@ -137,9 +137,12 @@ anything that matters:
 
 `wallets.json` is Argon2id + ChaCha20-Poly1305, 0600, atomic write; plaintext
 only with explicit `--allow-plaintext-wallet`; the API never signs and never
-sees a key. No HSM/seed-phrase support yet — that is future work, and the
-policy/session/approval layers above are what make a file key survivable
-until then.
+sees a key. One seed derives every chain (`srct-core/src/hd.rs`: SRCT `jt1`
++ EVM `0x` + BTC bech32; `srct-worker hd-address/evm-sign`) — the same
+scalar, per-chain addresses, no new backup to lose. Full flow:
+[`docs/xchain.md`](xchain.md). No HSM/seed-phrase import yet for operator
+wallets — that is future work, and the policy/session/approval layers above
+are what make a file key survivable until then.
 
 Separation that matters operationally, HSM or not:
 

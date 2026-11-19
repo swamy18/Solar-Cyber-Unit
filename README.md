@@ -541,6 +541,31 @@ Release pays for *this exact result* — not "some dataset, trust me". The resol
 
 **Getting in and out** ([`docs/ramps.md`](docs/ramps.md)). The node is the auditable registry; the ramp provider handles custody and compliance off-protocol. Provider-signed quotes in either direction, intents that only the quoted provider can close, terminal states of filled *or* refunded (never both).
 
+**Cross-chain without a bridge** ([`docs/xchain.md`](docs/xchain.md)). One seed
+derives SRCT + EVM (`0x`) + BTC (`bc1q`/`tb1q`) addresses; agents pay or earn
+across chains through signed intents + bonded solvers, not wrapped mints.
+`srct-worker hd-address/evm-sign/xchain-quote`, REST `GET /v1/assets`,
+`POST /v1/xchain/status`, RPC checker `templates/check_evm_receipt.py`.
+L1/L2 consensus untouched — see [Cross-chain interop](#cross-chain-interop).
+
+### Cross-chain interop
+
+Foreign coins without a bridge or a wrapped mint. Full design:
+[`docs/xchain.md`](docs/xchain.md).
+
+- **HD wallet** (`srct-core/src/hd.rs`): one seed derives SRCT (`jt1`),
+  EVM (`0x`, keccak256) and BTC bech32 (`bc1q`/`tb1q`) addresses.
+  `srct-worker hd-address --chain evm|btc|srct`, `evm-sign` for EVM payloads.
+- **EVM rail** (`srct-intent/src/evm.rs`): canonical asset ids
+  (`srct_asset`, `evm_native_asset`, `erc20_asset`) and `EvmRail` — local
+  SRCT-side ledger with exactly-once settlement gated on a confirmed foreign
+  receipt (12 confirmations, txhash/recipient/value match).
+- **Agent budgets** (`X402Budget`): `allowed_chains` + `allowed_assets` with
+  `check_asset(chain, asset)`; `srct_only()` preserves the old path.
+- **REST + tooling**: `GET /v1/assets`, `POST /v1/xchain/status`,
+  `srct-worker xchain-quote/xchain-confirm`,
+  `templates/check_evm_receipt.py` (read-only RPC checker, no keys).
+
 **Loans for getting things done** ([`docs/lending.md`](docs/lending.md)). Lenders publish standard terms (rate ≤ 10%/window, full collateral); borrowers browse cheapest-first and accept — with bond and collateral already funded, because terms come from the offer, not from negotiation. History prices risk (advisory only; any default zeroes your limit; no history means zero), a dashboard shows exposure and due-soon items, and collateral coverage is quoted live in basis points. If things go wrong: collateral first, then the borrower's bond, then the lender absorbs the rest — new money is never printed. Borrowers can even authorize automatic repayment from revenue (revocable, capped, expiring).
 
 One demo ties reputation, tiers, jobs, dollar quotes, ramps and lending together: `python verification/sim/agent_economy_demo.py`.
@@ -630,7 +655,7 @@ activation.
 
 ### Wallets, transfers and policies
 
-**Wallets you'll recognize.** Keys live in `wallets.json`, encrypted with your `SRCT_WALLET_PASSPHRASE` (Argon2id + ChaCha20-Poly1305, locked-down file permissions, atomic writes). Plaintext files are refused unless you deliberately pass `--allow-plaintext-wallet`. Addresses are 20-byte hex with a `jt1` prefix; classical, hybrid and post-quantum addresses are distinct by construction. Secrets are redacted in logs and wiped from memory on drop.
+**Wallets you'll recognize.** Keys live in `wallets.json`, encrypted with your `SRCT_WALLET_PASSPHRASE` (Argon2id + ChaCha20-Poly1305, locked-down file permissions, atomic writes). Plaintext files are refused unless you deliberately pass `--allow-plaintext-wallet`. Addresses are 20-byte hex with a `jt1` prefix; classical, hybrid and post-quantum addresses are distinct by construction. Secrets are redacted in logs and wiped from memory on drop. One seed now derives every chain: `srct-worker hd-address --chain evm|btc|srct` (`0x…`, `bc1q…`/`tb1q…` beside `jt1…`) — see [Cross-chain interop](#cross-chain-interop).
 
 **Transfers you'll recognize.** Spend confirmed outputs to an address with an integer amount and a fee. Future-dated transactions can't mine early. Freshly mined coins need to mature first (100 blocks mainnet, 10 elsewhere). Balances come in three flavors — confirmed, spendable, pending (`GET /v1/balance/{address}`).
 
